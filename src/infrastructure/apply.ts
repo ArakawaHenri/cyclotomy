@@ -1,0 +1,1513 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants, type Stats } from "node:fs";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readlink,
+  realpath,
+  rename,
+  rmdir,
+  stat,
+  symlink,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+
+import {
+  type FileRecreationMode,
+  type TreeEntry,
+  type TreeManifest,
+} from "./tree-manifest.ts";
+import { planWorkspaceRestore } from "./restore-plan.ts";
+import {
+  summarizeScanProblems,
+  type WorkspaceEntry,
+  type WorkspaceSnapshot,
+} from "./workspace-scan.ts";
+import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
+
+export type ApplyProblemKind =
+  | "write-failed"
+  | "delete-failed"
+  | "mkdir-failed"
+  | "read-failed";
+
+export interface ApplyProblem {
+  readonly path: string;
+  readonly kind: ApplyProblemKind;
+  readonly detail: string;
+}
+
+/**
+ * Diff result of one apply run. The path buckets cover file and symlink
+ * paths only: `created` holds target paths absent from the current
+ * snapshot, `updated` holds paths whose type, content, or target text changed
+ * (including file<->directory migrations), and `deleted` holds
+ * current paths the target drops entirely. Pruned directories are implicit
+ * structure and are not listed; every per-path failure lands in `problems`
+ * without aborting the remaining paths.
+ */
+export interface ApplyReport {
+  readonly created: readonly string[];
+  readonly updated: readonly string[];
+  readonly deleted: readonly string[];
+  readonly unchangedCount: number;
+  readonly problems: readonly ApplyProblem[];
+}
+
+/**
+ * Preflight failures only: the current inventory is incomplete or stale at a
+ * replacement boundary, the target lacks platform-required creation metadata,
+ * or the workspace root is unavailable. Per-path failures raced after this
+ * preflight are reported in ApplyReport.problems instead of being thrown.
+ */
+export class ApplyError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ApplyError";
+  }
+}
+
+type RegularTargetEntry = Extract<
+  TreeEntry,
+  { readonly type: "regular" }
+>;
+type SymlinkTargetEntry = Extract<
+  TreeEntry,
+  { readonly type: "symlink" }
+>;
+
+const GIT_INTERNAL_DETAIL = "git-internal path refused";
+const UNOBSERVED_PATH_DETAIL =
+  "refusing to replace a path that exists but was absent from the current inventory";
+const BLOCKED_ANCESTOR_DETAIL =
+  "refusing to mutate below an unsafe or unavailable target directory";
+
+function errorCode(error: unknown): string | undefined {
+  try {
+    if (typeof error !== "object" || error === null) {
+      return undefined;
+    }
+    const value = Reflect.get(error, "code");
+    return typeof value === "string" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function errorDetail(action: string, error: unknown): string {
+  const message =
+    error instanceof Error ? error.message : String(error);
+  return `${action}: ${message}`;
+}
+
+function comparePaths(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function pathDepth(relativePath: string): number {
+  return relativePath.split("/").length;
+}
+
+/**
+ * Defense in depth: scanners and manifests never carry git internals, but a
+ * path that still names a `.git` component (NFC-normalized, case-insensitive)
+ * must never be created, modified, or deleted by an apply run.
+ */
+function isGitInternalPath(relativePath: string): boolean {
+  return relativePath
+    .normalize("NFC")
+    .toLowerCase()
+    .split("/")
+    .includes(".git");
+}
+
+function ancestorDirectories(
+  relativePath: string,
+  into: Set<string>,
+): void {
+  let separator = relativePath.lastIndexOf("/");
+  while (separator !== -1) {
+    const ancestor = relativePath.slice(0, separator);
+    into.add(ancestor);
+    separator = ancestor.lastIndexOf("/");
+  }
+}
+
+/** Publish a missing/recreated regular file through an atomic sibling rename. */
+async function writeRegularAtomically(
+  absolute: string,
+  content: Uint8Array,
+  recreationMode: FileRecreationMode,
+  beforeCommit: () => Promise<void>,
+): Promise<void> {
+  const temporary = join(
+    dirname(absolute),
+    `.cyclotomy-${process.pid}-${randomUUID()}.tmp`,
+  );
+  let handle: FileHandle | undefined;
+  try {
+    await beforeCommit();
+    handle = await open(
+      temporary,
+      constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_WRONLY |
+        (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.writeFile(content);
+    if (process.platform !== "win32" && recreationMode !== null) {
+      await handle.chmod(recreationMode);
+    }
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await beforeCommit();
+    await rename(temporary, absolute);
+  } catch (error) {
+    if (handle !== undefined) {
+      try {
+        await handle.close();
+      } catch {
+        // Preserve the original write failure.
+      }
+    }
+    try {
+      await unlink(temporary);
+    } catch (cleanupError) {
+      if (errorCode(cleanupError) !== "ENOENT") {
+        // Orphan temporary files are inert; preserve the original failure.
+      }
+    }
+    throw error;
+  }
+}
+
+function sameInode(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertSingleLinkRegular(metadata: Stats, detail: string): void {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+    throw new Error(detail);
+  }
+}
+
+async function assertPathBindsOpenedRegular(
+  absolute: string,
+  opened: Stats,
+): Promise<void> {
+  const pathNow = await lstat(absolute);
+  if (
+    pathNow.isSymbolicLink() ||
+    !pathNow.isFile() ||
+    !sameInode(pathNow, opened)
+  ) {
+    throw new Error("regular file pathname no longer names the opened inode");
+  }
+}
+
+async function hashOpenedRegular(
+  handle: FileHandle,
+  maximumBytes: number,
+): Promise<{ readonly byteLength: number; readonly sha256: string }> {
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let byteLength = 0;
+  while (true) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      buffer.byteLength,
+      byteLength,
+    );
+    if (bytesRead === 0) break;
+    byteLength += bytesRead;
+    if (byteLength > maximumBytes) {
+      throw new Error("regular file grew while its content was verified");
+    }
+    hash.update(buffer.subarray(0, bytesRead));
+  }
+  return { byteLength, sha256: hash.digest("hex") };
+}
+
+function assertStableRead(
+  before: Stats,
+  after: Stats,
+): void {
+  if (
+    !sameInode(before, after) ||
+    before.size !== after.size ||
+    before.nlink !== after.nlink ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs
+  ) {
+    throw new Error("regular file changed while its content was verified");
+  }
+}
+
+async function writeAll(
+  handle: FileHandle,
+  content: Uint8Array,
+): Promise<void> {
+  let offset = 0;
+  while (offset < content.byteLength) {
+    const { bytesWritten } = await handle.write(
+      content,
+      offset,
+      content.byteLength - offset,
+      offset,
+    );
+    if (bytesWritten === 0) {
+      throw new Error("zero-byte write during in-place regular-file rewrite");
+    }
+    offset += bytesWritten;
+  }
+}
+
+/**
+ * Rewrite a changed regular file through its already-opened inode. This is
+ * deliberately not a rename: owner, ACLs, xattrs, flags, and mode remain the
+ * host filesystem's responsibility and naturally stay attached to the inode.
+ * The tradeoff is explicit: unlike creation through a temporary sibling, an
+ * in-place rewrite is not single-file atomic, so a crash or I/O error after
+ * truncate can leave partial content. Every observable failure is reported by
+ * the caller and a later restore can retry it.
+ */
+async function rewriteRegularInPlace(
+  absolute: string,
+  content: Uint8Array,
+  observed: Extract<WorkspaceEntry, { readonly kind: "regular" }>,
+  validateAncestors: () => Promise<void>,
+): Promise<void> {
+  await validateAncestors();
+  const handle = await openWorkspaceRegularCandidate(
+    absolute,
+    constants.O_RDWR,
+  );
+  try {
+    const opened = await handle.stat();
+    assertSingleLinkRegular(
+      opened,
+      "existing path is no longer a single-link regular file",
+    );
+    await assertPathBindsOpenedRegular(absolute, opened);
+
+    const beforeRead = await handle.stat();
+    assertSingleLinkRegular(
+      beforeRead,
+      "existing path is no longer a single-link regular file",
+    );
+    const previous = await hashOpenedRegular(handle, observed.byteLength);
+    const afterRead = await handle.stat();
+    assertSingleLinkRegular(
+      afterRead,
+      "existing path is no longer a single-link regular file",
+    );
+    assertStableRead(beforeRead, afterRead);
+    if (
+      previous.byteLength !== observed.byteLength ||
+      previous.sha256 !== observed.sha256
+    ) {
+      throw new Error("regular file content changed after scan");
+    }
+
+    // Tighten the pathname race window as far as Node's path-based APIs
+    // permit before the first destructive operation. The opened handle is
+    // the sole object truncated and written from this point onward.
+    await validateAncestors();
+    const beforeCommit = await handle.stat();
+    assertSingleLinkRegular(
+      beforeCommit,
+      "existing path is no longer a single-link regular file",
+    );
+    if (!sameInode(opened, beforeCommit)) {
+      throw new Error("opened regular-file identity changed before rewrite");
+    }
+    await assertPathBindsOpenedRegular(absolute, opened);
+
+    await handle.truncate(0);
+    await writeAll(handle, content);
+    await handle.truncate(content.byteLength);
+    await handle.sync();
+
+    const expectedSha256 = createHash("sha256").update(content).digest("hex");
+    const beforeVerification = await handle.stat();
+    assertSingleLinkRegular(
+      beforeVerification,
+      "rewritten inode is no longer a single-link regular file",
+    );
+    if (!sameInode(opened, beforeVerification)) {
+      throw new Error("opened regular-file identity changed during rewrite");
+    }
+    const written = await hashOpenedRegular(handle, content.byteLength);
+    const afterVerification = await handle.stat();
+    assertSingleLinkRegular(
+      afterVerification,
+      "rewritten inode is no longer a single-link regular file",
+    );
+    assertStableRead(beforeVerification, afterVerification);
+    if (
+      written.byteLength !== content.byteLength ||
+      written.sha256 !== expectedSha256
+    ) {
+      throw new Error("rewritten regular-file content failed verification");
+    }
+    await validateAncestors();
+    await assertPathBindsOpenedRegular(absolute, opened);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Prepare a sibling symlink and atomically rename it over a non-directory. */
+async function writeSymlinkAtomically(
+  absolute: string,
+  target: string,
+  symlinkKind: SymlinkTargetEntry["symlinkKind"],
+  beforeCommit: () => Promise<void>,
+): Promise<void> {
+  const temporary = join(
+    dirname(absolute),
+    `.cyclotomy-${process.pid}-${randomUUID()}.tmp`,
+  );
+  try {
+    await beforeCommit();
+    if (process.platform === "win32") {
+      if (symlinkKind === null) {
+        throw new Error(
+          "cannot safely recreate a Windows symlink without a recorded target type",
+        );
+      }
+      await symlink(
+        target,
+        temporary,
+        symlinkKind === "directory" ? "dir" : "file",
+      );
+    } else {
+      await symlink(target, temporary);
+    }
+    await beforeCommit();
+    await rename(temporary, absolute);
+  } catch (error) {
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
+}
+
+function targetRecreationMode(
+  entry: RegularTargetEntry,
+): FileRecreationMode {
+  if (process.platform === "win32") return null;
+  return entry.recreationMode;
+}
+
+async function syncDirectory(absolute: string): Promise<void> {
+  // Windows does not expose a portable directory FlushFileBuffers contract.
+  // File contents are still fsynced; directory-entry crash durability remains
+  // best-effort on that platform instead of making capture/restore unusable.
+  if (process.platform === "win32") return;
+  const handle = await open(
+    absolute,
+    constants.O_RDONLY |
+      (constants.O_DIRECTORY ?? 0) |
+      (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isDirectory()) {
+      throw new Error("path is no longer a directory");
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+type DirectoryObservation = WorkspaceSnapshot["directoryObservations"][number];
+type ExcludedObservation = WorkspaceSnapshot["excludedOccupancies"][number];
+
+async function assertObservedDirectory(
+  workspaceRoot: string,
+  observation: DirectoryObservation,
+): Promise<void> {
+  const absolute = observation.path === ""
+    ? workspaceRoot
+    : join(workspaceRoot, observation.path);
+  const current = await lstat(absolute);
+  if (
+    current.isSymbolicLink() ||
+    !current.isDirectory() ||
+    current.dev !== observation.dev ||
+    current.ino !== observation.ino
+  ) {
+    throw new ApplyError(
+      `workspace directory changed since scan: ${observation.path || "."}`,
+    );
+  }
+}
+
+function observedAncestorPaths(relativePath: string): string[] {
+  const result = [""];
+  let separator = relativePath.indexOf("/");
+  while (separator !== -1) {
+    result.push(relativePath.slice(0, separator));
+    separator = relativePath.indexOf("/", separator + 1);
+  }
+  return result;
+}
+
+async function assertObservedAncestors(
+  workspaceRoot: string,
+  relativePath: string,
+  observations: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  for (const path of observedAncestorPaths(relativePath)) {
+    const observation = observations.get(path);
+    if (observation !== undefined) {
+      await assertObservedDirectory(workspaceRoot, observation);
+    }
+  }
+}
+
+function excludedKind(metadata: Stats): ExcludedObservation["kind"] {
+  if (metadata.isDirectory()) return "directory";
+  if (metadata.isSymbolicLink()) return "symlink";
+  if (metadata.isFile()) return "regular";
+  return "other";
+}
+
+async function assertExcludedObservation(
+  workspaceRoot: string,
+  observation: ExcludedObservation,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  await assertObservedAncestors(
+    workspaceRoot,
+    observation.path,
+    directories,
+  );
+  const current = await lstat(join(workspaceRoot, observation.path));
+  if (
+    current.dev !== observation.dev ||
+    current.ino !== observation.ino ||
+    excludedKind(current) !== observation.kind
+  ) {
+    throw new ApplyError(
+      `excluded workspace path changed since scan: ${observation.path}`,
+    );
+  }
+}
+
+async function preflightScopeBlockers(
+  workspaceRoot: string,
+  blockers: readonly { readonly path: string; readonly targetPath: string }[],
+  excluded: ReadonlyMap<string, ExcludedObservation>,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  const blocker = blockers[0];
+  if (blocker === undefined) return;
+  const observation = excluded.get(blocker.path);
+  if (observation !== undefined) {
+    try {
+      await assertExcludedObservation(
+        workspaceRoot,
+        observation,
+        directories,
+      );
+    } catch (error) {
+      throw new ApplyError(
+        `refusing a stale replacement preflight for excluded path "${blocker.path}"`,
+        error,
+      );
+    }
+  }
+  throw new ApplyError(
+    `refusing to replace target path "${blocker.targetPath}": unmanaged descendant "${blocker.path}" would have to be deleted`,
+  );
+}
+
+function currentEntryAncestor(
+  relativePath: string,
+  current: ReadonlyMap<string, WorkspaceEntry>,
+): WorkspaceEntry | undefined {
+  let separator = relativePath.lastIndexOf("/");
+  while (separator !== -1) {
+    const entry = current.get(relativePath.slice(0, separator));
+    if (entry !== undefined) return entry;
+    separator = relativePath.lastIndexOf("/", separator - 1);
+  }
+  return undefined;
+}
+
+function isAtOrBelow(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+async function assertUnobservedPathAbsent(
+  workspaceRoot: string,
+  relativePath: string,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  await assertObservedAncestors(workspaceRoot, relativePath, directories);
+  try {
+    await lstat(join(workspaceRoot, relativePath));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(UNOBSERVED_PATH_DETAIL);
+}
+
+async function assertWorkspaceEntryKindUnchanged(
+  workspaceRoot: string,
+  entry: WorkspaceEntry,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  await assertObservedAncestors(workspaceRoot, entry.path, directories);
+  const current = await lstat(join(workspaceRoot, entry.path));
+  const matches = entry.kind === "regular"
+    ? !current.isSymbolicLink() && current.isFile()
+    : current.isSymbolicLink();
+  if (!matches) {
+    throw new Error(`workspace entry type changed since scan: ${entry.path}`);
+  }
+  await assertObservedAncestors(workspaceRoot, entry.path, directories);
+}
+
+async function assertReplacementDirectoryInventory(
+  workspaceRoot: string,
+  replacementRoot: string,
+  current: ReadonlyMap<string, WorkspaceEntry>,
+  excluded: ReadonlyMap<string, ExcludedObservation>,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  const observedDirectories = [...directories.values()]
+    .filter((observation) => isAtOrBelow(observation.path, replacementRoot))
+    .sort((left, right) => comparePaths(left.path, right.path));
+  if (observedDirectories[0]?.path !== replacementRoot) {
+    throw new Error("replacement directory was absent from the current inventory");
+  }
+
+  // Validate the namespace kind of every managed leaf that will have to
+  // disappear before this directory can become a non-directory. Content is
+  // deliberately left to the existing per-path TOCTOU checks, avoiding a
+  // second full-workspace hash pass on the normal restore path.
+  for (const entry of current.values()) {
+    if (entry.path.startsWith(`${replacementRoot}/`)) {
+      await assertWorkspaceEntryKindUnchanged(
+        workspaceRoot,
+        entry,
+        directories,
+      );
+    }
+  }
+
+  const expectedChildren = new Map<string, Set<string>>();
+  const addKnownPath = (path: string): void => {
+    if (path === replacementRoot || !isAtOrBelow(path, replacementRoot)) {
+      return;
+    }
+    const parentValue = dirname(path);
+    const parent = parentValue === "." ? "" : parentValue;
+    if (!directories.has(parent)) return;
+    const names = expectedChildren.get(parent) ?? new Set<string>();
+    names.add(basename(path));
+    expectedChildren.set(parent, names);
+  };
+  for (const path of directories.keys()) addKnownPath(path);
+  for (const path of current.keys()) addKnownPath(path);
+  for (const path of excluded.keys()) addKnownPath(path);
+
+  for (const observation of observedDirectories) {
+    await assertObservedDirectory(workspaceRoot, observation);
+    const actual = await readdir(join(workspaceRoot, observation.path));
+    await assertObservedDirectory(workspaceRoot, observation);
+    const expected = [...(expectedChildren.get(observation.path) ?? [])]
+      .sort(comparePaths);
+    actual.sort(comparePaths);
+    if (
+      actual.length !== expected.length ||
+      actual.some((name, index) => name !== expected[index])
+    ) {
+      throw new Error(
+        `replacement directory contents changed since scan: ${observation.path}`,
+      );
+    }
+  }
+}
+
+/** Validate every namespace root whose type or absence apply relies on. */
+async function preflightReplacementNamespace(
+  workspaceRoot: string,
+  target: ReadonlyMap<string, TreeEntry>,
+  targetDirectories: ReadonlySet<string>,
+  plannedCreates: ReadonlySet<string>,
+  plannedModifications: ReadonlySet<string>,
+  current: ReadonlyMap<string, WorkspaceEntry>,
+  excluded: ReadonlyMap<string, ExcludedObservation>,
+  directories: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  const validatedEntries = new Set<string>();
+  const validateEntry = async (entry: WorkspaceEntry): Promise<void> => {
+    if (validatedEntries.has(entry.path)) return;
+    await assertWorkspaceEntryKindUnchanged(
+      workspaceRoot,
+      entry,
+      directories,
+    );
+    validatedEntries.add(entry.path);
+  };
+
+  try {
+    for (const path of [...targetDirectories].sort(comparePaths)) {
+      const entry = current.get(path);
+      if (entry !== undefined) {
+        await validateEntry(entry);
+        continue;
+      }
+      const observation = directories.get(path);
+      if (observation !== undefined) {
+        await assertObservedDirectory(workspaceRoot, observation);
+        continue;
+      }
+      const ancestor = currentEntryAncestor(path, current);
+      if (ancestor !== undefined) {
+        await validateEntry(ancestor);
+        continue;
+      }
+      await assertUnobservedPathAbsent(workspaceRoot, path, directories);
+    }
+
+    for (const entry of target.values()) {
+      if (
+        !plannedCreates.has(entry.path) &&
+        !plannedModifications.has(entry.path)
+      ) {
+        continue;
+      }
+      const observed = current.get(entry.path);
+      if (observed !== undefined) {
+        await validateEntry(observed);
+        continue;
+      }
+      if (directories.has(entry.path)) {
+        await assertReplacementDirectoryInventory(
+          workspaceRoot,
+          entry.path,
+          current,
+          excluded,
+          directories,
+        );
+        continue;
+      }
+      const ancestor = currentEntryAncestor(entry.path, current);
+      if (ancestor !== undefined) {
+        await validateEntry(ancestor);
+        continue;
+      }
+      await assertUnobservedPathAbsent(
+        workspaceRoot,
+        entry.path,
+        directories,
+      );
+    }
+  } catch (error) {
+    throw new ApplyError(
+      "workspace replacement namespace changed since the current scan",
+      error,
+    );
+  }
+}
+
+function preflightWindowsSymlinkKinds(
+  target: ReadonlyMap<string, TreeEntry>,
+  created: readonly string[],
+  modified: readonly string[],
+): void {
+  if (process.platform !== "win32") return;
+  const writes = new Set([...created, ...modified]);
+  for (const entry of target.values()) {
+    if (
+      entry.type === "symlink" &&
+      writes.has(entry.path) &&
+      entry.symlinkKind === null
+    ) {
+      throw new ApplyError(
+        `cannot safely recreate Windows symlink "${entry.path}" without a recorded target type`,
+      );
+    }
+  }
+}
+
+async function assertRegularEntryUnchanged(
+  absolute: string,
+  entry: Extract<WorkspaceEntry, { readonly kind: "regular" }>,
+): Promise<void> {
+  const handle = await openWorkspaceRegularCandidate(
+    absolute,
+    constants.O_RDONLY,
+  );
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.nlink !== 1) {
+      throw new Error("path is no longer a single-link regular file");
+    }
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let byteLength = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        buffer.byteLength,
+        null,
+      );
+      if (bytesRead === 0) break;
+      byteLength += bytesRead;
+      if (byteLength > entry.byteLength) {
+        throw new Error("regular file grew after scan");
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    const after = await handle.stat();
+    const pathNow = await lstat(absolute);
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.nlink !== after.nlink ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs ||
+      pathNow.isSymbolicLink() ||
+      !pathNow.isFile() ||
+      pathNow.dev !== after.dev ||
+      pathNow.ino !== after.ino ||
+      byteLength !== entry.byteLength ||
+      hash.digest("hex") !== entry.sha256
+    ) {
+      throw new Error("regular file content changed after scan");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertWorkspaceEntryUnchanged(
+  workspaceRoot: string,
+  entry: WorkspaceEntry,
+  observations: ReadonlyMap<string, DirectoryObservation>,
+): Promise<void> {
+  await assertObservedAncestors(workspaceRoot, entry.path, observations);
+  const absolute = join(workspaceRoot, entry.path);
+  if (entry.kind === "regular") {
+    await assertRegularEntryUnchanged(absolute, entry);
+  } else {
+    const targetBytes = await readlink(absolute, { encoding: "buffer" });
+    if (!targetBytes.equals(Buffer.from(entry.target, "utf8"))) {
+      throw new Error("symlink target changed after scan");
+    }
+  }
+  // A long content read must not let an ancestor swap redirect the pathname
+  // mutation that immediately follows this check.
+  await assertObservedAncestors(workspaceRoot, entry.path, observations);
+}
+
+/**
+ * Materialize a target tree into a workspace: diff the freshly scanned
+ * current snapshot against the target manifest, then delete, prune, create,
+ * and rewrite paths until the workspace matches the target. Steps run in a
+ * fixed order (unlink, prune directories, create directories, write regular
+ * files, write symlinks) so a run is idempotent and
+ * safe to re-enter: applying the same target twice leaves every path
+ * unchanged. The caller owns scanning `current` beforehand and re-scanning
+ * for verification afterwards.
+ */
+export async function applyTreeToWorkspace(
+  root: string,
+  target: TreeManifest,
+  readBlob: (oid: string) => Promise<Uint8Array>,
+  current: WorkspaceSnapshot,
+): Promise<ApplyReport> {
+  if (current.problems.length > 0) {
+    throw new ApplyError(
+      `refusing to apply from an incomplete current workspace scan: ${summarizeScanProblems(
+        current.problems,
+      )}`,
+    );
+  }
+  let workspaceRoot: string;
+  try {
+    // Match scanner/store identity when Pi entered the workspace through a
+    // symlink, and freeze that trusted root so a later symlink retarget cannot
+    // redirect mutations outside the inventory we preflighted.
+    workspaceRoot = await realpath(resolve(root));
+  } catch (error) {
+    throw new ApplyError(
+      `workspace root does not exist or is not readable: ${root}`,
+      error,
+    );
+  }
+  if (current.rootPath !== workspaceRoot) {
+    throw new ApplyError(
+      `workspace root changed since the current inventory was scanned: ${root}`,
+    );
+  }
+  let rootMetadata: Stats;
+  try {
+    rootMetadata = await stat(workspaceRoot);
+  } catch (error) {
+    throw new ApplyError(
+      `workspace root does not exist or is not readable: ${root}`,
+      error,
+    );
+  }
+  if (!rootMetadata.isDirectory()) {
+    throw new ApplyError(
+      `workspace root is not a directory: ${root}`,
+    );
+  }
+
+  const directoryObservations = new Map<string, DirectoryObservation>();
+  for (const observation of current.directoryObservations) {
+    directoryObservations.set(observation.path, observation);
+  }
+  if (!directoryObservations.has("")) {
+    throw new ApplyError("workspace inventory lacks a root identity");
+  }
+  // Bind the operation to the scanned root up front. Individual mutation
+  // paths validate their observed ancestors and content just before commit;
+  // hashing every untouched file here would make a restore re-read the
+  // entire workspace solely for preflight.
+  await assertObservedDirectory(
+    workspaceRoot,
+    directoryObservations.get("")!,
+  );
+
+  const problems: ApplyProblem[] = [];
+  const created: string[] = [];
+  const updated: string[] = [];
+  const deleted: string[] = [];
+  let unchangedCount = 0;
+  // Directories whose entries changed, relative to the root ("" names the
+  // root itself); each is fsynced once after all mutations complete.
+  const dirtiedDirectories = new Set<string>();
+  const blockedDirectories = new Set<string>();
+  const isBlocked = (relativePath: string): boolean => {
+    for (const blocked of blockedDirectories) {
+      if (
+        relativePath === blocked ||
+        relativePath.startsWith(`${blocked}/`)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const markDirty = (relativePath: string): void => {
+    const parent = dirname(relativePath);
+    dirtiedDirectories.add(parent === "." ? "" : parent);
+  };
+
+  // Index both sides, refusing git-internal paths before anything else can
+  // touch them.
+  const refusedPaths = new Set<string>();
+  const refuseGitInternal = (relativePath: string): void => {
+    if (refusedPaths.has(relativePath)) {
+      return;
+    }
+    refusedPaths.add(relativePath);
+    problems.push({
+      path: relativePath,
+      kind: "write-failed",
+      detail: GIT_INTERNAL_DETAIL,
+    });
+  };
+
+  const targetByPath = new Map<string, TreeEntry>();
+  for (const entry of target.entries) {
+    if (isGitInternalPath(entry.path)) {
+      refuseGitInternal(entry.path);
+      continue;
+    }
+    targetByPath.set(entry.path, entry);
+  }
+
+  const currentByPath = new Map<string, WorkspaceEntry>();
+  const excludedByPath = new Map<string, ExcludedObservation>();
+  for (const observation of current.excludedOccupancies) {
+    if (isGitInternalPath(observation.path)) {
+      refuseGitInternal(observation.path);
+      continue;
+    }
+    excludedByPath.set(observation.path, observation);
+  }
+  const currentDirectories = new Set<string>();
+  for (const entry of current.entries) {
+    if (isGitInternalPath(entry.path)) {
+      refuseGitInternal(entry.path);
+      continue;
+    }
+    currentByPath.set(entry.path, entry);
+    ancestorDirectories(entry.path, currentDirectories);
+  }
+  for (const directory of currentDirectories) {
+    if (!directoryObservations.has(directory)) {
+      throw new ApplyError(
+        `workspace inventory lacks directory identity: ${directory}`,
+      );
+    }
+  }
+  const restorePlan = planWorkspaceRestore(current, target);
+  await preflightScopeBlockers(
+    workspaceRoot,
+    restorePlan.scopeBlockers,
+    excludedByPath,
+    directoryObservations,
+  );
+  if (restorePlan.problems.length > 0) {
+    throw new ApplyError(
+      `refusing to apply an invalid restore plan: ${summarizeScanProblems(
+        restorePlan.problems,
+      )}`,
+    );
+  }
+  preflightWindowsSymlinkKinds(
+    targetByPath,
+    restorePlan.created,
+    restorePlan.modified,
+  );
+  const plannedCreates = new Set(restorePlan.created);
+  const plannedDeletes = new Set(restorePlan.deleted);
+  const plannedModifications = new Set(restorePlan.modified);
+
+  // Directories are implicit ancestors of managed content paths; empty
+  // directories are deliberately outside the checkpoint model.
+  const targetKeptDirectories = new Set<string>();
+  for (const entry of targetByPath.values()) {
+    ancestorDirectories(entry.path, targetKeptDirectories);
+  }
+  await preflightReplacementNamespace(
+    workspaceRoot,
+    targetByPath,
+    targetKeptDirectories,
+    plannedCreates,
+    plannedModifications,
+    currentByPath,
+    excludedByPath,
+    directoryObservations,
+  );
+
+  const assertCurrentPath = async (entry: WorkspaceEntry): Promise<void> => {
+    await assertWorkspaceEntryUnchanged(
+      workspaceRoot,
+      entry,
+      directoryObservations,
+    );
+  };
+  const assertCreatedPathStillAbsent = async (
+    relativePath: string,
+  ): Promise<void> => {
+    await assertObservedAncestors(
+      workspaceRoot,
+      relativePath,
+      directoryObservations,
+    );
+    try {
+      await lstat(join(workspaceRoot, relativePath));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    throw new Error(UNOBSERVED_PATH_DETAIL);
+  };
+
+  // Step 1: unlink current files/symlinks the target does not have. File and
+  // symlink replacements remain in place until a prepared sibling can rename
+  // over them atomically in a later step.
+  const currentEntries = [...currentByPath.values()].sort((left, right) =>
+    comparePaths(left.path, right.path)
+  );
+  for (const currentEntry of currentEntries) {
+    const relativePath = currentEntry.path;
+    if (targetByPath.has(relativePath)) {
+      continue;
+    }
+    if (
+      !targetKeptDirectories.has(relativePath) &&
+      !plannedDeletes.has(relativePath)
+    ) {
+      continue;
+    }
+    try {
+      await assertCurrentPath(currentEntry);
+      await unlink(join(workspaceRoot, relativePath));
+      markDirty(relativePath);
+      if (targetKeptDirectories.has(relativePath)) {
+        // The path survives as a directory in the target state.
+        updated.push(relativePath);
+      } else {
+        deleted.push(relativePath);
+      }
+    } catch (error) {
+      problems.push({
+        path: relativePath,
+        kind: "delete-failed",
+        detail: errorDetail("unlink", error),
+      });
+    }
+  }
+
+  // Step 2: prune directories the target no longer needs, deepest first.
+  // A directory that still holds unmanaged content is kept on purpose.
+  const prunableDirectories = [...currentDirectories]
+    .filter(
+      (relativePath) => !targetKeptDirectories.has(relativePath),
+    )
+    .sort(
+      (left, right) =>
+        pathDepth(right) - pathDepth(left) ||
+        comparePaths(left, right),
+    );
+  for (const relativePath of prunableDirectories) {
+    try {
+      await assertObservedAncestors(
+        workspaceRoot,
+        relativePath,
+        directoryObservations,
+      );
+      const observation = directoryObservations.get(relativePath);
+      if (observation !== undefined) {
+        await assertObservedDirectory(workspaceRoot, observation);
+      }
+      await rmdir(join(workspaceRoot, relativePath));
+      // The pruned directory itself can no longer be fsynced; its removal
+      // is covered by the parent fsync.
+      directoryObservations.delete(relativePath);
+      dirtiedDirectories.delete(relativePath);
+      markDirty(relativePath);
+    } catch (error) {
+      const code = errorCode(error);
+      if (
+        code === "ENOTEMPTY" ||
+        code === "ENOTDIR" ||
+        code === "EEXIST"
+      ) {
+        continue;
+      }
+      problems.push({
+        path: relativePath,
+        kind: "delete-failed",
+        detail: errorDetail("rmdir", error),
+      });
+    }
+  }
+
+  // Empty directories are deliberately absent from the logical snapshot, but
+  // the scanner still records their identities. A target file or symlink may
+  // therefore collide with a wholly empty observed subtree without having a
+  // current entry. Remove that subtree deepest-first, revalidating every
+  // directory. rmdir is atomic with respect to non-emptiness, so ignored
+  // content or a raced-in child makes the replacement fail closed instead of
+  // being deleted.
+  const blockedDirectoryReplacements = new Set<string>();
+  const directoryReplacementRoots = [...targetByPath.keys()]
+    .filter(
+      (relativePath) =>
+        !currentByPath.has(relativePath) &&
+        directoryObservations.has(relativePath),
+    )
+    .sort(comparePaths);
+  for (const replacementRoot of directoryReplacementRoots) {
+    const observedSubtree = [...directoryObservations.keys()]
+      .filter(
+        (relativePath) =>
+          relativePath === replacementRoot ||
+          relativePath.startsWith(`${replacementRoot}/`),
+      )
+      .sort(
+        (left, right) =>
+          pathDepth(right) - pathDepth(left) ||
+          comparePaths(left, right),
+      );
+    for (const relativePath of observedSubtree) {
+      try {
+        await assertObservedAncestors(
+          workspaceRoot,
+          relativePath,
+          directoryObservations,
+        );
+        await assertObservedDirectory(
+          workspaceRoot,
+          directoryObservations.get(relativePath)!,
+        );
+        await rmdir(join(workspaceRoot, relativePath));
+        directoryObservations.delete(relativePath);
+        dirtiedDirectories.delete(relativePath);
+        markDirty(relativePath);
+      } catch (error) {
+        problems.push({
+          path: relativePath,
+          kind: "delete-failed",
+          detail: errorDetail("rmdir before type replacement", error),
+        });
+        blockedDirectoryReplacements.add(replacementRoot);
+        break;
+      }
+    }
+  }
+
+  // Step 3: create target directories, shallowest first so parents exist.
+  // A file or symlink sitting at a directory path is unlinked first.
+  const directoriesToCreate = [...targetKeptDirectories].sort(
+    (left, right) =>
+      pathDepth(left) - pathDepth(right) ||
+      comparePaths(left, right),
+  );
+  for (const relativePath of directoriesToCreate) {
+    if (isBlocked(relativePath)) {
+      blockedDirectories.add(relativePath);
+      continue;
+    }
+    const absolute = join(workspaceRoot, relativePath);
+    let existing: Stats | undefined;
+    try {
+      existing = await lstat(absolute);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") {
+        problems.push({
+          path: relativePath,
+          kind: "read-failed",
+          detail: errorDetail("lstat", error),
+        });
+        blockedDirectories.add(relativePath);
+        continue;
+      }
+    }
+    let replacedManagedEntry = false;
+    if (existing !== undefined) {
+      if (!existing.isSymbolicLink() && existing.isDirectory()) {
+        const observation = directoryObservations.get(relativePath);
+        if (observation === undefined) {
+          problems.push({
+            path: relativePath,
+            kind: "write-failed",
+            detail: UNOBSERVED_PATH_DETAIL,
+          });
+          blockedDirectories.add(relativePath);
+          continue;
+        }
+        try {
+          await assertObservedDirectory(workspaceRoot, observation);
+        } catch (error) {
+          problems.push({
+            path: relativePath,
+            kind: "write-failed",
+            detail: errorDetail("validate directory", error),
+          });
+          blockedDirectories.add(relativePath);
+          continue;
+        }
+        if (existing.dev !== rootMetadata.dev) {
+          problems.push({
+            path: relativePath,
+            kind: "write-failed",
+            detail:
+              "refusing to use a cross-device directory as a target ancestor",
+          });
+          blockedDirectories.add(relativePath);
+        }
+        continue;
+      }
+      if (!currentByPath.has(relativePath)) {
+        problems.push({
+          path: relativePath,
+          kind: "write-failed",
+          detail: UNOBSERVED_PATH_DETAIL,
+        });
+        blockedDirectories.add(relativePath);
+        continue;
+      }
+      try {
+        const observed = currentByPath.get(relativePath);
+        if (observed !== undefined) {
+          await assertCurrentPath(observed);
+        }
+        await unlink(absolute);
+        markDirty(relativePath);
+        replacedManagedEntry = currentByPath.has(relativePath);
+      } catch (error) {
+        problems.push({
+          path: relativePath,
+          kind: "delete-failed",
+          detail: errorDetail("unlink", error),
+        });
+        blockedDirectories.add(relativePath);
+        continue;
+      }
+    }
+    try {
+      // The earlier lstat only classified the path. Revalidate every
+      // observed ancestor and the final absence immediately before mkdir so
+      // an ancestor swapped for a symlink cannot redirect directory creation
+      // outside the scanned workspace.
+      await assertCreatedPathStillAbsent(relativePath);
+      await mkdir(absolute);
+      // mkdir has already changed the parent entry even if the identity
+      // check below fails, so record that durability obligation immediately.
+      markDirty(relativePath);
+      const created = await lstat(absolute);
+      if (
+        created.isSymbolicLink() ||
+        !created.isDirectory() ||
+        created.dev !== rootMetadata.dev
+      ) {
+        throw new Error("created directory identity is unsafe");
+      }
+      directoryObservations.set(relativePath, {
+        path: relativePath,
+        dev: created.dev,
+        ino: created.ino,
+      });
+      if (replacedManagedEntry) {
+        // A managed file or symlink became a directory.
+        updated.push(relativePath);
+      }
+    } catch (error) {
+      problems.push({
+        path: relativePath,
+        kind: "mkdir-failed",
+        detail: errorDetail("mkdir", error),
+      });
+      blockedDirectories.add(relativePath);
+    }
+  }
+
+  // Classify target file/symlink entries before writing so steps 4-5 run in
+  // a fixed order. A regular entry's content matches exactly when the
+  // scanned SHA-256 equals the blob oid (the object store names blobs by
+  // their SHA-256 digest).
+  const regularWrites: Array<{
+    readonly entry: RegularTargetEntry;
+    readonly createdPath: boolean;
+    readonly existingRegular:
+      | Extract<WorkspaceEntry, { readonly kind: "regular" }>
+      | undefined;
+  }> = [];
+  const symlinkWrites: Array<{
+    readonly entry: SymlinkTargetEntry;
+    readonly createdPath: boolean;
+  }> = [];
+  const targetPaths = [...targetByPath.keys()].sort(comparePaths);
+  for (const relativePath of targetPaths) {
+    const entry = targetByPath.get(relativePath);
+    if (entry === undefined) {
+      continue;
+    }
+    const currentEntry = currentByPath.get(relativePath);
+    const createdPath = plannedCreates.has(relativePath);
+    if (!createdPath && !plannedModifications.has(relativePath)) {
+      unchangedCount += 1;
+      continue;
+    }
+    if (entry.type === "regular") {
+      regularWrites.push({
+        entry,
+        createdPath,
+        existingRegular:
+          currentEntry?.kind === "regular" ? currentEntry : undefined,
+      });
+      continue;
+    }
+    symlinkWrites.push({
+      entry,
+      createdPath,
+    });
+  }
+
+  // Step 4: write new and changed regular files.
+  for (const { entry, createdPath, existingRegular } of regularWrites) {
+    if (blockedDirectoryReplacements.has(entry.path)) {
+      continue;
+    }
+    if (isBlocked(dirname(entry.path) === "." ? "" : dirname(entry.path))) {
+      problems.push({
+        path: entry.path,
+        kind: "write-failed",
+        detail: BLOCKED_ANCESTOR_DETAIL,
+      });
+      continue;
+    }
+    if (createdPath) {
+      try {
+        await lstat(join(workspaceRoot, entry.path));
+        problems.push({
+          path: entry.path,
+          kind: "write-failed",
+          detail: UNOBSERVED_PATH_DETAIL,
+        });
+        continue;
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") {
+          problems.push({
+            path: entry.path,
+            kind: "read-failed",
+            detail: errorDetail("lstat before create", error),
+          });
+          continue;
+        }
+      }
+    }
+    let content: Uint8Array;
+    try {
+      content = await readBlob(entry.blobOid);
+    } catch (error) {
+      problems.push({
+        path: entry.path,
+        kind: "write-failed",
+        detail: errorDetail(`read blob ${entry.blobOid}`, error),
+      });
+      continue;
+    }
+    try {
+      const absolute = join(workspaceRoot, entry.path);
+      if (existingRegular !== undefined) {
+        await rewriteRegularInPlace(
+          absolute,
+          content,
+          existingRegular,
+          () =>
+            assertObservedAncestors(
+              workspaceRoot,
+              entry.path,
+              directoryObservations,
+            ),
+        );
+      } else {
+        const validateDestination = createdPath
+          ? () => assertCreatedPathStillAbsent(entry.path)
+          : () => assertCurrentPath(currentByPath.get(entry.path)!);
+        await validateDestination();
+        await writeRegularAtomically(
+          absolute,
+          content,
+          targetRecreationMode(entry),
+          validateDestination,
+        );
+      }
+      // In-place content writes fsync the inode itself and do not mutate a
+      // directory entry. Atomic publication of a missing/recreated inode does.
+      if (existingRegular === undefined) {
+        markDirty(entry.path);
+      }
+      if (createdPath) {
+        created.push(entry.path);
+      } else {
+        updated.push(entry.path);
+      }
+    } catch (error) {
+      problems.push({
+        path: entry.path,
+        kind: "write-failed",
+        detail: errorDetail("write", error),
+      });
+    }
+  }
+
+  // Step 5: create or replace symlinks whose target text differs.
+  for (const { entry, createdPath } of symlinkWrites) {
+    if (blockedDirectoryReplacements.has(entry.path)) {
+      continue;
+    }
+    if (isBlocked(dirname(entry.path) === "." ? "" : dirname(entry.path))) {
+      problems.push({
+        path: entry.path,
+        kind: "write-failed",
+        detail: BLOCKED_ANCESTOR_DETAIL,
+      });
+      continue;
+    }
+    const absolute = join(workspaceRoot, entry.path);
+    try {
+      if (createdPath) {
+        try {
+          await lstat(absolute);
+          problems.push({
+            path: entry.path,
+            kind: "write-failed",
+            detail: UNOBSERVED_PATH_DETAIL,
+          });
+          continue;
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") {
+            throw error;
+          }
+        }
+      }
+      await writeSymlinkAtomically(
+        absolute,
+        entry.target,
+        entry.symlinkKind,
+        createdPath
+          ? () => assertCreatedPathStillAbsent(entry.path)
+          : () => assertCurrentPath(currentByPath.get(entry.path)!),
+      );
+      markDirty(entry.path);
+      if (createdPath) {
+        created.push(entry.path);
+      } else {
+        updated.push(entry.path);
+      }
+    } catch (error) {
+      problems.push({
+        path: entry.path,
+        kind: "write-failed",
+        detail: errorDetail("symlink", error),
+      });
+    }
+  }
+
+  // Fsync every directory that gained or lost an entry, once each.
+  const dirtied = [...dirtiedDirectories].sort(comparePaths);
+  for (const relativePath of dirtied) {
+    // A failed identity check can leave a newly created directory untrusted.
+    // Its parent is still synced; never open the untrusted directory itself.
+    if (!directoryObservations.has(relativePath)) {
+      continue;
+    }
+    try {
+      await assertObservedAncestors(
+        workspaceRoot,
+        relativePath === ""
+          ? ".cyclotomy-durability-barrier"
+          : `${relativePath}/.cyclotomy-durability-barrier`,
+        directoryObservations,
+      );
+      await syncDirectory(
+        relativePath === ""
+          ? workspaceRoot
+          : join(workspaceRoot, relativePath),
+      );
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") {
+        // The directory was removed after it was dirtied (e.g. a pruned
+        // parent took it away); the removal is the parent's fsync concern.
+        continue;
+      }
+      problems.push({
+        path: relativePath === "" ? "." : relativePath,
+        kind: "write-failed",
+        detail: errorDetail("fsync directory", error),
+      });
+    }
+  }
+
+  created.sort(comparePaths);
+  updated.sort(comparePaths);
+  deleted.sort(comparePaths);
+  return { created, updated, deleted, unchangedCount, problems };
+}

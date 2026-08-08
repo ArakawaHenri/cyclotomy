@@ -1,0 +1,53 @@
+{
+  "name": "cyclotomy",
+  "version": "0.0.1",
+  "private": false,
+  "description": "A single-state workspace checkpointer for Pi Coding Agent.",
+  "author": "Henri",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArakawaHenri/cyclotomy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ArakawaHenri/cyclotomy/issues"
+  },
+  "homepage": "https://github.com/ArakawaHenri/cyclotomy#readme",
+  "type": "module",
+  "files": [
+    "src",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package"
+  ],
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:package": "node scripts/package-smoke.mjs",
+    "test:performance": "vitest run test/scan-publication-performance.test.ts --reporter=verbose",
+    "test:real-pi": "vitest run test/real-pi-integration.test.ts",
+    "test:watch": "vitest",
+    "verify": "npm run check && npm test",
+    "prepublishOnly": "npm run verify && npm run test:package"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}
