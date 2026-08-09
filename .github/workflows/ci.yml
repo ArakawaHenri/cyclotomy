@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -50,6 +53,7 @@ jobs:
     # this job answers whether the newest published Pi still integrates, so an
     # upstream release surfaces here instead of in a user's install.
     name: Latest Pi compatibility probe
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true

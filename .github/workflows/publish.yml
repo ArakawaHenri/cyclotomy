@@ -1,4 +1,4 @@
-name: Publish
+name: Release
 
 on:
   push:
@@ -7,21 +7,34 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: npm-publish
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  publish:
-    name: Publish to npm
+  ci:
+    name: Required three-platform CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release_check:
+    name: Final release check
+    needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      package_sha256: ${{ steps.package.outputs.sha256 }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -30,18 +43,106 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Require tag to match package version
+      - name: Validate release identity
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          node -e '
-            const { version } = require("./package.json");
-            const tag = process.env.GITHUB_REF_NAME;
-            if (tag !== `v${version}`) {
-              throw new Error(`tag ${tag} does not match package version ${version}`);
-            }
-          '
+          node <<'NODE'
+          const { version } = require("./package.json");
+          const lock = require("./package-lock.json");
+          const tag = process.env.RELEASE_TAG;
+
+          if (tag !== `v${version}`) {
+            throw new Error(`tag ${tag} does not match package version ${version}`);
+          }
+          if (lock.version !== version || lock.packages?.[""]?.version !== version) {
+            throw new Error("package-lock versions do not match package.json");
+          }
+          NODE
+
+      - name: Require release commit to be on main
+        run: |
+          git fetch --no-tags origin +main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tag must point to a commit reachable from main"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Publish package
-        run: npm publish --access public --provenance
+      - name: Run release checks
+        run: npm run prepublishOnly
+
+      - name: Build checked package
+        id: package
+        run: |
+          mkdir release
+          npm pack --pack-destination release
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { appendFileSync, readFileSync, readdirSync, renameSync } = require("node:fs");
+
+          const archives = readdirSync("release").filter((name) => name.endsWith(".tgz"));
+          if (archives.length !== 1) {
+            throw new Error(`expected one package archive, found ${archives.length}`);
+          }
+
+          const packagePath = "release/package.tgz";
+          renameSync(`release/${archives[0]}`, packagePath);
+          const sha256 = createHash("sha256").update(readFileSync(packagePath)).digest("hex");
+          appendFileSync(process.env.GITHUB_OUTPUT, `sha256=${sha256}\n`);
+          NODE
+
+      - name: Dry-run checked package
+        run: npm publish ./release/package.tgz --dry-run --ignore-scripts --access public
+
+      - name: Preserve checked package
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release/package.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to npm
+    needs: release_check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download checked package
+        uses: actions/download-artifact@v6
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+
+      - name: Verify checked package
+        env:
+          EXPECTED_SHA256: ${{ needs.release_check.outputs.package_sha256 }}
+        run: |
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { readFileSync } = require("node:fs");
+
+          const actual = createHash("sha256")
+            .update(readFileSync("release/package.tgz"))
+            .digest("hex");
+          if (actual !== process.env.EXPECTED_SHA256) {
+            throw new Error(`package checksum mismatch: expected ${process.env.EXPECTED_SHA256}, got ${actual}`);
+          }
+          NODE
+
+      - name: Publish checked package
+        run: npm publish ./release/package.tgz --ignore-scripts --access public
