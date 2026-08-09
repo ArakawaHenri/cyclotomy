@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 import {
   chmod,
   link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -17,14 +19,21 @@ import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MetadataStore } from "../src/infrastructure/metadata.ts";
+import {
+  MetadataStore,
+  type MissingNodeStateIntent,
+  type NodeStatePin,
+} from "../src/infrastructure/metadata.ts";
 import {
   openObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
+import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import { CyclotomyI18n, type MessageKey } from "../src/pi/i18n.ts";
+import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { FakePi, FakeSessionManager, type FakeEntry } from "./fake-pi.ts";
+import { commitTestNodeState } from "./metadata-fixture.ts";
 import { gitScope } from "./workspace-scope-fixture.ts";
 
 let workspace: string;
@@ -77,9 +86,14 @@ function messageFor(key: MessageKey): string {
   // A template's text before its first placeholder identifies the key without
   // depending on the interpolated host detail. The sentinel must survive
   // `formatUiDetail`, which escapes control characters, so it stays ASCII.
-  return TEST_I18N.t(key, { message: SENTINEL, preview: SENTINEL }).split(
-    SENTINEL,
-  )[0]!;
+  return TEST_I18N.t(key, {
+    applied: SENTINEL,
+    count: SENTINEL,
+    message: SENTINEL,
+    mutations: SENTINEL,
+    preview: SENTINEL,
+    problems: SENTINEL,
+  }).split(SENTINEL)[0]!;
 }
 
 function notified(pi: FakePi, key: MessageKey): boolean {
@@ -110,6 +124,24 @@ function lastStatus(pi: FakePi): string | undefined {
   return pi.statuses.get("cyclotomy");
 }
 
+async function workspaceAliasesCase(): Promise<boolean> {
+  const lower = join(workspace, ".cyclotomy-case-probe");
+  const upper = join(workspace, ".CYCLOTOMY-CASE-PROBE");
+  await mkdir(lower);
+  try {
+    const observed = await lstat(lower);
+    const alias = await lstat(upper).catch(() => undefined);
+    return (
+      alias !== undefined &&
+      observed.dev === alias.dev &&
+      observed.ino === alias.ino
+    );
+  } finally {
+    await rm(lower, { recursive: true, force: true });
+    await rm(upper, { recursive: true, force: true });
+  }
+}
+
 async function spyOnReadTree() {
   const store = await openObjectStore(storeRoot);
   return vi.spyOn(
@@ -129,6 +161,30 @@ async function twoStates(pi: FakePi) {
   return { first, second };
 }
 
+async function leavePendingNoNodeAfterRestore(pi: FakePi): Promise<string> {
+  const { first } = await twoStates(pi);
+  pi.manager.setLeaf(first);
+  const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+  let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+  pi.selectHook = async () => {
+    leafSpy = vi
+      .spyOn(pi.manager, "getLeafId")
+      .mockImplementation(() =>
+        readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+          ? null
+          : getLeafId(),
+      );
+  };
+  try {
+    await pi.runCommand("restore");
+  } finally {
+    leafSpy?.mockRestore();
+    pi.selectHook = undefined;
+  }
+  pi.manager.setLeaf(null);
+  return first;
+}
+
 describe("single-state Pi lifecycle", () => {
   describe("registration and configuration", () => {
     it("registers only the two top-level commands", () => {
@@ -138,6 +194,35 @@ describe("single-state Pi lifecycle", () => {
 
       expect(pi.registeredCommandNames()).toEqual(["drift", "restore"]);
       expect(pi.registeredCommandNames()).not.toContain("cyclotomy");
+    });
+
+    it("reports a new automatic GC failure after a successful recovery", async () => {
+      const maybeRunAutomaticGc = vi
+        .spyOn(CyclotomyRuntime.prototype, "maybeRunAutomaticGc")
+        .mockRejectedValueOnce(new Error("first failure"))
+        .mockRejectedValueOnce(new Error("repeated failure"))
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("new failure"));
+      try {
+        const pi = new FakePi(workspace);
+        registerCyclotomy(pi.api);
+        pi.manager.appendEntry();
+        const failureCount = (): number =>
+          pi.notifications.filter(({ message }) =>
+            message.includes(messageFor("automaticGcFailed")),
+          ).length;
+
+        await pi.startSession("startup");
+        expect(failureCount()).toBe(1);
+        await pi.endTurn(0);
+        expect(failureCount()).toBe(1);
+        await pi.endTurn(0);
+        expect(failureCount()).toBe(1);
+        await pi.endTurn(0);
+        expect(failureCount()).toBe(2);
+      } finally {
+        maybeRunAutomaticGc.mockRestore();
+      }
     });
 
     it("refuses control data that overlaps the workspace", async () => {
@@ -251,6 +336,151 @@ describe("single-state Pi lifecycle", () => {
       db = metadata();
       expect(db.getState(pi.manager.sessionId, leaf.id)).toEqual(saved);
       db.close();
+      expect(notified(pi, "reloadProtected")).toBe(true);
+    });
+
+    it("reports reload protection when a concurrent exact state makes its pin stale", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "external");
+      pi.notifications.length = 0;
+
+      const concurrentTreeOid = "f".repeat(64);
+      const original = MetadataStore.prototype.protectNodeWrite;
+      const raced = vi
+        .spyOn(MetadataStore.prototype, "protectNodeWrite")
+        .mockImplementationOnce(function (
+          this: MetadataStore,
+          sessionId: string,
+          entryId: string,
+          pin?: NodeStatePin,
+        ) {
+          const concurrent = metadata();
+          try {
+            commitTestNodeState(
+              concurrent,
+              sessionId,
+              entryId,
+              concurrentTreeOid,
+            );
+          } finally {
+            concurrent.close();
+          }
+          return original.call(this, sessionId, entryId, pin);
+        });
+
+      try {
+        await pi.startSession("reload");
+      } finally {
+        raced.mockRestore();
+      }
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, leaf.id)?.treeOid).toBe(
+        concurrentTreeOid,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
+      expect(notified(pi, "reloadProtected")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("external");
+    });
+
+    it("reports a guard installed between missing authority and reload admission", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      const original = CyclotomyRuntime.prototype.admitLocation;
+      const raced = vi
+        .spyOn(CyclotomyRuntime.prototype, "admitLocation")
+        .mockImplementationOnce(function (
+          this: CyclotomyRuntime,
+          view,
+          treeOid,
+        ) {
+          const concurrent = metadata();
+          try {
+            expect(
+              concurrent.protectNodeWrite(pi.manager.sessionId, leaf.id),
+            ).toBe("protected");
+          } finally {
+            concurrent.close();
+          }
+          return original.call(this, view, treeOid);
+        });
+
+      try {
+        await pi.startSession("reload");
+      } finally {
+        raced.mockRestore();
+      }
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, leaf.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
+      expect(notified(pi, "sessionMissingProtected")).toBe(true);
+    });
+
+    it("durably protects a missing arrival reached while reload reconciliation is yielding", async () => {
+      const firstHost = new FakePi(workspace);
+      registerCyclotomy(firstHost.api);
+      await writeFile(join(workspace, "a.txt"), "ancestor");
+      const ancestor = firstHost.manager.appendEntry();
+      await firstHost.startSession("startup");
+      firstHost.manager.setLeaf(null);
+      const missingArrival = firstHost.manager.appendEntry();
+
+      firstHost.manager.setLeaf(ancestor.id);
+      await writeFile(join(workspace, "a.txt"), "ambiguous");
+      const original = CyclotomyRuntime.prototype.workspaceStillBound;
+      const raced = vi
+        .spyOn(CyclotomyRuntime.prototype, "workspaceStillBound")
+        .mockImplementationOnce(async function (
+          this: CyclotomyRuntime,
+          root: string,
+        ) {
+          const bound = await original.call(this, root);
+          firstHost.manager.setLeaf(missingArrival.id);
+          return bound;
+        });
+
+      try {
+        await firstHost.startSession("reload");
+      } finally {
+        raced.mockRestore();
+      }
+
+      let db = metadata();
+      expect(
+        db.getState(firstHost.manager.sessionId, missingArrival.id),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(firstHost.manager.sessionId, missingArrival.id),
+      ).toBe(true);
+      db.close();
+
+      const persistedSession = firstHost.manager;
+      await firstHost.dispose();
+      const restarted = new FakePi(workspace);
+      restarted.manager = persistedSession;
+      registerCyclotomy(restarted.api);
+      await restarted.startSession("startup");
+
+      db = metadata();
+      expect(
+        db.getState(restarted.manager.sessionId, missingArrival.id),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, missingArrival.id),
+      ).toBe(true);
+      db.close();
+      expect(notified(restarted, "sessionMissingProtected")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "ambiguous",
+      );
     });
 
     it.each(["startup", "new", "resume", "fork"] as const)(
@@ -269,6 +499,113 @@ describe("single-state Pi lifecycle", () => {
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(reason);
       },
     );
+
+    it("preserves a guard installed after fresh-node preparation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "unassigned");
+
+      const original = MetadataStore.prototype.materializeMissingNodeState;
+      const raced = vi
+        .spyOn(MetadataStore.prototype, "materializeMissingNodeState")
+        .mockImplementationOnce(function (
+          this: MetadataStore,
+          sessionId: string,
+          entryId: string,
+          treeOid: string,
+          intent: MissingNodeStateIntent,
+        ) {
+          expect(intent).toBe("initialize-fresh");
+          const concurrent = metadata();
+          try {
+            expect(concurrent.protectNodeWrite(sessionId, entryId)).toBe(
+              "protected",
+            );
+          } finally {
+            concurrent.close();
+          }
+          return original.call(this, sessionId, entryId, treeOid, intent);
+        });
+
+      try {
+        await pi.startSession("startup");
+      } finally {
+        raced.mockRestore();
+      }
+
+      let db = metadata();
+      expect(db.getState(pi.manager.sessionId, leaf.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unassigned",
+      );
+      expect(notified(pi, "sessionMissingProtected")).toBe(true);
+
+      await pi.endTurn(0);
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, leaf.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
+    });
+
+    it("does not admit a different arrival after fresh checkpoint initialization", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const intended = pi.manager.appendEntry();
+      pi.manager.setLeaf(null);
+      const lateArrival = pi.manager.appendEntry();
+      pi.manager.setLeaf(intended.id);
+      await writeFile(join(workspace, "a.txt"), "first-observation");
+
+      const original = MetadataStore.prototype.materializeMissingNodeState;
+      const raced = vi
+        .spyOn(MetadataStore.prototype, "materializeMissingNodeState")
+        .mockImplementationOnce(function (
+          this: MetadataStore,
+          sessionId: string,
+          entryId: string,
+          treeOid: string,
+          intent: MissingNodeStateIntent,
+        ) {
+          expect(entryId).toBe(intended.id);
+          expect(intent).toBe("initialize-fresh");
+          const result = original.call(
+            this,
+            sessionId,
+            entryId,
+            treeOid,
+            intent,
+          );
+          pi.manager.setLeaf(lateArrival.id);
+          return result;
+        });
+
+      try {
+        await pi.startSession("startup");
+      } finally {
+        raced.mockRestore();
+      }
+
+      let db = metadata();
+      expect(db.getState(pi.manager.sessionId, intended.id)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, lateArrival.id)).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(pi.manager.sessionId, lateArrival.id),
+      ).toBe(true);
+      db.close();
+      expect(notified(pi, "checkpointInitializedConflictProtected")).toBe(true);
+      expect(notified(pi, "restoreInitialized")).toBe(false);
+
+      await pi.endTurn(0);
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, lateArrival.id)).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(pi.manager.sessionId, lateArrival.id),
+      ).toBe(true);
+      db.close();
+    });
 
     it("does not invent a node for an empty session or materialize on reload", async () => {
       const empty = new FakePi(workspace);
@@ -302,7 +639,7 @@ describe("single-state Pi lifecycle", () => {
       db.close();
     });
 
-    it("keeps an inherited cold-start location exact-slotless", async () => {
+    it("pins a successful inherited cold-start restore at its exact node", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -318,8 +655,14 @@ describe("single-state Pi lifecycle", () => {
         "ancestor-state",
       );
       const db = metadata();
-      expect(db.getState(pi.manager.sessionId, ancestor)).toBeDefined();
-      expect(db.getState(pi.manager.sessionId, child.id)).toBeUndefined();
+      const ancestorState = db.getState(pi.manager.sessionId, ancestor);
+      expect(ancestorState).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, child.id)).toEqual(
+        ancestorState,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child.id)).toBe(
+        false,
+      );
       db.close();
     });
 
@@ -392,6 +735,37 @@ describe("single-state Pi lifecycle", () => {
       pi.selectDestructive = true;
       await pi.startSession("startup");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
+    });
+
+    it("preserves a declined loaded node while checkpointing new work", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      const loaded = pi.manager.getLeafId()!;
+      let db = metadata();
+      const savedState = db.getState(pi.manager.sessionId, loaded)!;
+      db.close();
+      await writeFile(join(workspace, "a.txt"), "kept-current");
+      pi.selectDestructive = false;
+
+      await pi.startSession("resume");
+      expect(await pi.submitInput()).toBe("continued");
+      const descendant = pi.manager.getLeafId()!;
+      await pi.endTurn(0);
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, loaded)).toEqual(savedState);
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, loaded)).toBe(true);
+      expect(db.getState(pi.manager.sessionId, descendant)).toBeDefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, descendant)).toBe(
+        false,
+      );
+      db.close();
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "kept-current",
+      );
     });
 
     it("does not restore a loaded session if the agent becomes busy in the dialog", async () => {
@@ -512,7 +886,7 @@ describe("single-state Pi lifecycle", () => {
       );
       await rm(targetPath);
       const db = metadata();
-      db.setState(pi.manager.sessionId, leaf.id, treeOid);
+      commitTestNodeState(db, pi.manager.sessionId, leaf.id, treeOid);
       db.close();
       const selectionsBefore = pi.selections.length;
 
@@ -725,6 +1099,676 @@ describe("single-state Pi lifecycle", () => {
       expect(pi.notifications.at(-1)?.message).toContain("/restore");
     });
 
+    it("preserves a completed manual outcome when the workspace operation rejects afterward", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      before.close();
+      pi.manager.setLeaf(first);
+
+      const original = CyclotomyRuntime.prototype.enqueueWorkspace;
+      const releaseFailure = vi
+        .spyOn(CyclotomyRuntime.prototype, "enqueueWorkspace")
+        .mockImplementation(function <T>(
+          this: CyclotomyRuntime,
+          operation: string,
+          action: () => Promise<T>,
+        ): Promise<T> {
+          const enqueue = original.bind(this) as (
+            name: string,
+            run: () => Promise<T>,
+          ) => Promise<T>;
+          return enqueue(operation, action).then((result) => {
+            if (operation === "manual-restore-apply") {
+              throw new Error("workspace lock release failed");
+            }
+            return result;
+          });
+        });
+
+      try {
+        await pi.runCommand("restore");
+      } finally {
+        releaseFailure.mockRestore();
+      }
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+      expect(
+        notifiedWithDetail(
+          pi,
+          "restorePostMutationControlProtected",
+          "workspace lock release failed",
+        ),
+      ).toBe(true);
+      expect(notified(pi, "restoreSuccessOne")).toBe(true);
+      expect(notified(pi, "restoreExecutionFailed")).toBe(false);
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+      db.close();
+    });
+
+    it("protects a late manual arrival after a verified restore mutation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      const secondState = before.getState(pi.manager.sessionId, second)!;
+      before.close();
+      pi.manager.setLeaf(first);
+      let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+        leafSpy = vi
+          .spyOn(pi.manager, "getLeafId")
+          .mockImplementation(() =>
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+              ? second
+              : getLeafId(),
+          );
+      };
+
+      try {
+        await pi.runCommand("restore");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(notified(pi, "restorePostMutationLocationProtected")).toBe(true);
+        expect(notified(pi, "commandLocationChanged")).toBe(false);
+        let db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+
+        await pi.endTurn(0);
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+
+        leafSpy?.mockRestore();
+        leafSpy = undefined;
+        pi.manager.setLeaf(second);
+        await pi.runCommand("restore");
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          false,
+        );
+        db.close();
+      } finally {
+        leafSpy?.mockRestore();
+      }
+    });
+
+    it("protects a late manual arrival after a partial restore", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      const secondState = before.getState(pi.manager.sessionId, second)!;
+      before.close();
+      const extra = join(workspace, "extra.txt");
+      await writeFile(extra, "observed");
+      pi.manager.setLeaf(first);
+      let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+        let reads = 0;
+        leafSpy = vi.spyOn(pi.manager, "getLeafId").mockImplementation(() => {
+          reads += 1;
+          // The second post-confirmation read is beforeMutation: change a
+          // planned deletion after the final preview scan, but keep the target
+          // location stable until file application has started.
+          if (reads === 2) writeFileSync(extra, "raced");
+          return readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+            ? second
+            : getLeafId();
+        });
+      };
+
+      try {
+        await pi.runCommand("restore");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(await readFile(extra, "utf8")).toBe("raced");
+        expect(pi.notifications.map(({ message }) => message)).toEqual(
+          expect.arrayContaining([
+            expect.stringContaining(messageFor("restoreApplyIncomplete")),
+          ]),
+        );
+        expect(notified(pi, "restorePostMutationLocationProtected")).toBe(true);
+        let db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+
+        await pi.endTurn(0);
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+      } finally {
+        leafSpy?.mockRestore();
+      }
+    });
+
+    it("reports when a post-mutation arrival cannot be authenticated", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      before.close();
+      pi.manager.setLeaf(first);
+      let sessionSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getSessionId = pi.manager.getSessionId.bind(pi.manager);
+        sessionSpy = vi
+          .spyOn(pi.manager, "getSessionId")
+          .mockImplementation(() =>
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+              ? "unregistered-session"
+              : getSessionId(),
+          );
+      };
+
+      try {
+        await pi.runCommand("restore");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(
+          notifiedWithDetail(
+            pi,
+            "restorePostMutationLocationUnavailable",
+            "current persisted session identity is unavailable",
+          ),
+        ).toBe(true);
+        expect(pi.notifications.at(-1)?.level).toBe("error");
+        const db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        expect(db.getState("unregistered-session", first)).toBeUndefined();
+        expect(db.isNodeWriteProtected("unregistered-session", first)).toBe(
+          false,
+        );
+        db.close();
+      } finally {
+        sessionSpy?.mockRestore();
+      }
+    });
+
+    it("persists pending protection for an unresolvable post-mutation arrival", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      const secondState = before.getState(pi.manager.sessionId, second)!;
+      before.close();
+      pi.manager.setLeaf(first);
+      let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+        leafSpy = vi
+          .spyOn(pi.manager, "getLeafId")
+          .mockImplementation(() =>
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+              ? "unknown-post-mutation-arrival"
+              : getLeafId(),
+          );
+      };
+
+      try {
+        await pi.runCommand("restore");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(notified(pi, "restorePostMutationLocationPending")).toBe(true);
+        let db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        expect(
+          db.pendingNodeGuard(
+            pi.manager.sessionId,
+            pi.manager.getSessionFile()!,
+          ),
+        ).toBe(true);
+        db.close();
+
+        leafSpy.mockRestore();
+        leafSpy = undefined;
+        pi.manager.setLeaf(second);
+        await pi.endTurn(0);
+
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        expect(
+          db.pendingNodeGuard(
+            pi.manager.sessionId,
+            pi.manager.getSessionFile()!,
+          ),
+        ).toBe(false);
+        db.close();
+      } finally {
+        leafSpy?.mockRestore();
+      }
+    });
+
+    it("keeps real input blocked while a no-node guard is pending", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await leavePendingNoNodeAfterRestore(pi);
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+      expect(notified(pi, "restorePostMutationLocationPending")).toBe(true);
+      let db = metadata();
+      expect(
+        db.pendingNodeGuard(pi.manager.sessionId, pi.manager.getSessionFile()!),
+      ).toBe(true);
+      db.close();
+
+      expect(await pi.submitInput("after-conflict")).toBe("handled");
+      expect(pi.manager.getLeafId()).toBeNull();
+      db = metadata();
+      expect(
+        db.pendingNodeGuard(pi.manager.sessionId, pi.manager.getSessionFile()!),
+      ).toBe(true);
+      db.close();
+    });
+
+    it("guards the first custom child at Pi's post-persistence context hook", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await leavePendingNoNodeAfterRestore(pi);
+
+      const custom = await pi.sendCustomMessage("after-conflict", true);
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, custom)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, custom)).toBe(true);
+      expect(
+        db.pendingNodeGuard(pi.manager.sessionId, pi.manager.getSessionFile()!),
+      ).toBe(false);
+      db.close();
+    });
+
+    it("reports protected Missing after /drift consumes a pending bash child", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await leavePendingNoNodeAfterRestore(pi);
+      await pi.executeUserBash("echo blocked", async () => {
+        throw new Error("pending protection must block bash execution");
+      });
+      const child = pi.manager.getLeafId()!;
+      pi.notifications.length = 0;
+
+      await pi.runCommand("drift");
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, child)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child)).toBe(true);
+      expect(
+        db.pendingNodeGuard(pi.manager.sessionId, pi.manager.getSessionFile()!),
+      ).toBe(false);
+      db.close();
+      expect(notified(pi, "driftMissingProtected")).toBe(true);
+      expect(notified(pi, "driftMissing")).toBe(false);
+    });
+
+    it.each(["bash", "custom"] as const)(
+      "keeps a pending %s child unassigned across an immediate cold restart",
+      async (entryKind) => {
+        const firstHost = new FakePi(workspace);
+        registerCyclotomy(firstHost.api);
+        await leavePendingNoNodeAfterRestore(firstHost);
+
+        let child: string;
+        if (entryKind === "bash") {
+          let ran = false;
+          await firstHost.executeUserBash("echo unsafe", async () => {
+            ran = true;
+          });
+          expect(ran).toBe(false);
+          child = firstHost.manager.getLeafId()!;
+        } else {
+          firstHost.afterCustomMessageCommit = async () => {
+            throw new Error("simulated process loss before context");
+          };
+          await expect(
+            firstHost.sendCustomMessage("after-conflict", true),
+          ).rejects.toThrow("simulated process loss before context");
+          child = firstHost.manager.getLeafId()!;
+        }
+
+        let db = metadata();
+        expect(db.getState(firstHost.manager.sessionId, child)).toBeUndefined();
+        expect(
+          db.isNodeWriteProtected(firstHost.manager.sessionId, child),
+        ).toBe(false);
+        expect(
+          db.pendingNodeGuard(
+            firstHost.manager.sessionId,
+            firstHost.manager.getSessionFile()!,
+          ),
+        ).toBe(true);
+        db.close();
+
+        const persistedSession = firstHost.manager;
+        await firstHost.dispose();
+        const restarted = new FakePi(workspace);
+        restarted.manager = persistedSession;
+        registerCyclotomy(restarted.api);
+        await restarted.startSession("startup");
+
+        db = metadata();
+        expect(db.getState(restarted.manager.sessionId, child)).toBeUndefined();
+        expect(
+          db.isNodeWriteProtected(restarted.manager.sessionId, child),
+        ).toBe(true);
+        expect(
+          db.pendingNodeGuard(
+            restarted.manager.sessionId,
+            restarted.manager.getSessionFile()!,
+          ),
+        ).toBe(false);
+        db.close();
+        expect(notified(restarted, "sessionMissingProtected")).toBe(true);
+      },
+    );
+
+    it("guards every stable control node appended before pending intent is observed", async () => {
+      const firstHost = new FakePi(workspace);
+      registerCyclotomy(firstHost.api);
+      await leavePendingNoNodeAfterRestore(firstHost);
+
+      // Pi persists both entries before its awaited model_select hook. A cold
+      // runtime must protect the whole newly visible ancestry, not only its leaf.
+      const selected = await firstHost.selectModel("provider", "model", "high");
+      const persistedSession = firstHost.manager;
+      await firstHost.dispose();
+
+      const restarted = new FakePi(workspace);
+      restarted.manager = persistedSession;
+      registerCyclotomy(restarted.api);
+      await restarted.startSession("startup");
+
+      let db = metadata();
+      expect(
+        db.pendingNodeGuard(
+          restarted.manager.sessionId,
+          restarted.manager.getSessionFile()!,
+        ),
+      ).toBe(false);
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, selected.modelId),
+      ).toBe(true);
+      expect(
+        db.isNodeWriteProtected(
+          restarted.manager.sessionId,
+          selected.thinkingId!,
+        ),
+      ).toBe(true);
+      expect(
+        db.getState(restarted.manager.sessionId, selected.modelId),
+      ).toBeUndefined();
+      expect(
+        db.getState(restarted.manager.sessionId, selected.thinkingId!),
+      ).toBeUndefined();
+      db.close();
+
+      expect(await restarted.navigate(selected.modelId)).toBe("done");
+      db = metadata();
+      expect(
+        db.getState(restarted.manager.sessionId, selected.modelId),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, selected.modelId),
+      ).toBe(true);
+      db.close();
+    });
+
+    it.each(["empty", "concrete"] as const)(
+      "propagates a pending parent into a cold %s fork",
+      async (shape) => {
+        const parentHost = new FakePi(workspace);
+        registerCyclotomy(parentHost.api);
+        await leavePendingNoNodeAfterRestore(parentHost);
+        const parentSessionFile = parentHost.manager.getSessionFile()!;
+        await parentHost.dispose();
+
+        const fork = new FakeSessionManager(
+          `cold-${shape}-fork`,
+          `/sessions/cold-${shape}-fork.jsonl`,
+          workspace,
+          parentSessionFile,
+        );
+        const leaf = shape === "concrete" ? fork.appendEntry() : undefined;
+        const forkHost = new FakePi(workspace);
+        forkHost.manager = fork;
+        registerCyclotomy(forkHost.api);
+
+        await forkHost.startSession("fork", parentSessionFile);
+
+        const db = metadata();
+        if (leaf === undefined) {
+          expect(
+            db.pendingNodeGuard(fork.sessionId, fork.getSessionFile()!),
+          ).toBe(true);
+          expect(notified(forkHost, "sessionPendingNodeGuard")).toBe(true);
+        } else {
+          expect(db.getState(fork.sessionId, leaf.id)).toBeUndefined();
+          expect(db.isNodeWriteProtected(fork.sessionId, leaf.id)).toBe(true);
+          expect(
+            db.pendingNodeGuard(fork.sessionId, fork.getSessionFile()!),
+          ).toBe(false);
+          expect(notified(forkHost, "sessionMissingProtected")).toBe(true);
+        }
+        db.close();
+      },
+    );
+
+    it("keeps a cold empty pending session quarantined until explicit reload", async () => {
+      const firstHost = new FakePi(workspace);
+      registerCyclotomy(firstHost.api);
+      const target = await leavePendingNoNodeAfterRestore(firstHost);
+      const persistedSession = firstHost.manager;
+      await firstHost.dispose();
+
+      const restarted = new FakePi(workspace);
+      restarted.manager = persistedSession;
+      registerCyclotomy(restarted.api);
+      await restarted.startSession("startup");
+      expect(notified(restarted, "sessionPendingNodeGuard")).toBe(true);
+      expect(await restarted.submitInput("still-blocked")).toBe("handled");
+      expect(restarted.manager.getLeafId()).toBeNull();
+      restarted.notifications.length = 0;
+      await restarted.startSession("resume");
+      expect(notified(restarted, "sessionPendingNodeGuard")).toBe(true);
+      expect(await restarted.navigate(target)).toBe("cancelled");
+      expect(await restarted.compact()).toBe("cancelled");
+      expect(await restarted.fork(target)).toBe("cancelled");
+      expect(await restarted.resumeTo(restarted.newDetachedSession())).toBe(
+        "cancelled",
+      );
+
+      let db = metadata();
+      expect(
+        db.pendingNodeGuard(
+          restarted.manager.sessionId,
+          restarted.manager.getSessionFile()!,
+        ),
+      ).toBe(true);
+      db.close();
+
+      await restarted.startSession("reload");
+      db = metadata();
+      expect(
+        db.pendingNodeGuard(
+          restarted.manager.sessionId,
+          restarted.manager.getSessionFile()!,
+        ),
+      ).toBe(false);
+      db.close();
+      expect(await restarted.submitInput("after-reload")).toBe("continued");
+    });
+
+    it("rejects an arrival that changes during post-mutation workspace authentication", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      await writeFile(join(workspace, "a.txt"), "v3");
+      await pi.endTurn();
+      const third = pi.manager.getLeafId()!;
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      const thirdState = before.getState(pi.manager.sessionId, third)!;
+      before.close();
+      pi.manager.setLeaf(first);
+      let reportedLeaf = second;
+      let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+      let bindingSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+        leafSpy = vi
+          .spyOn(pi.manager, "getLeafId")
+          .mockImplementation(() =>
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+              ? reportedLeaf
+              : getLeafId(),
+          );
+        const workspaceStillBound =
+          CyclotomyRuntime.prototype.workspaceStillBound;
+        bindingSpy = vi
+          .spyOn(CyclotomyRuntime.prototype, "workspaceStillBound")
+          .mockImplementation(async function (
+            this: CyclotomyRuntime,
+            cwd: string,
+          ) {
+            const bound = await workspaceStillBound.call(this, cwd);
+            if (readFileSync(join(workspace, "a.txt"), "utf8") === "v1") {
+              reportedLeaf = third;
+            }
+            return bound;
+          });
+      };
+
+      try {
+        await pi.runCommand("restore");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(
+          notifiedWithDetail(
+            pi,
+            "restorePostMutationLocationUnavailable",
+            "current arrival changed during workspace authentication",
+          ),
+        ).toBe(true);
+        let db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        db.close();
+
+        bindingSpy.mockRestore();
+        bindingSpy = undefined;
+        leafSpy.mockRestore();
+        leafSpy = undefined;
+        pi.manager.setLeaf(third);
+        await pi.endTurn(0);
+
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, third)).toEqual(thirdState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, third)).toBe(true);
+        db.close();
+      } finally {
+        bindingSpy?.mockRestore();
+        leafSpy?.mockRestore();
+      }
+    });
+
+    it("shows the complete destructive plan in the interactive confirmation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      pi.manager.appendEntry();
+      await pi.startSession("startup");
+      for (let index = 0; index < 6; index += 1) {
+        await writeFile(join(workspace, `delete-${index}.txt`), "current");
+      }
+      pi.selectDestructive = false;
+
+      await pi.runCommand("restore");
+
+      const prompt = pi.selections.at(-1)?.prompt;
+      expect(prompt).toBeDefined();
+      for (let index = 0; index < 6; index += 1) {
+        expect(prompt).toContain(`- delete-${index}.txt`);
+      }
+      expect(prompt).not.toContain("more");
+      expect(await readFile(join(workspace, "delete-5.txt"), "utf8")).toBe(
+        "current",
+      );
+    });
+
+    it("clears write protection only after a verified restore", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      const leaf = pi.manager.getLeafId()!;
+      const before = metadata();
+      const savedOid = before.getState(pi.manager.sessionId, leaf)!.treeOid;
+      before.close();
+      await writeFile(join(workspace, "a.txt"), "kept-current");
+
+      pi.selectDestructive = false;
+      await pi.startSession("resume");
+      let db = metadata();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(true);
+      expect(db.getState(pi.manager.sessionId, leaf)?.treeOid).toBe(savedOid);
+      db.close();
+
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.runCommand("drift");
+      expect(notified(pi, "driftCleanProtected")).toBe(true);
+      db = metadata();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(true);
+      db.close();
+      await writeFile(join(workspace, "a.txt"), "kept-current");
+
+      pi.selectDestructive = true;
+      await pi.runCommand("restore");
+      db = metadata();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(false);
+      db.close();
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
+
+      await writeFile(join(workspace, "a.txt"), "after-restore");
+      await pi.endTurn(0);
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, leaf)?.treeOid).not.toBe(
+        savedOid,
+      );
+      db.close();
+    });
+
     it("authenticates a confirmed restore once per user-separated phase", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -776,12 +1820,16 @@ describe("single-state Pi lifecycle", () => {
         expect(stderr).toHaveBeenCalledWith(
           expect.stringContaining(messageFor("restoreNeedsUi")),
         );
+        const diagnostic = stderr.mock.calls.flat().join("\n");
+        expect(diagnostic).toContain("/drift");
+        expect(diagnostic).toContain("/restore");
+        expect(diagnostic).toContain("交互式 TUI");
       } finally {
         stderr.mockRestore();
       }
     });
 
-    it("reports print-mode reconciliation and keeps its current-wins capture semantics", async () => {
+    it("keeps a no-UI loaded node protected while admitting its descendant", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -802,16 +1850,36 @@ describe("single-state Pi lifecycle", () => {
         expect(unchanged.getState(pi.manager.sessionId, leaf)?.treeOid).toBe(
           savedOid,
         );
+        expect(unchanged.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(
+          true,
+        );
         unchanged.close();
         expect(stderr).toHaveBeenCalledWith(
           expect.stringContaining(messageFor("sessionRestoreNeedsUi")),
         );
 
         expect(await pi.submitInput()).toBe("continued");
-        const accepted = metadata();
-        expect(accepted.getState(pi.manager.sessionId, leaf)?.treeOid).not.toBe(
+        const descendant = pi.manager.getLeafId()!;
+        let accepted = metadata();
+        expect(accepted.getState(pi.manager.sessionId, leaf)?.treeOid).toBe(
           savedOid,
         );
+        expect(accepted.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(
+          true,
+        );
+        expect(
+          accepted.getState(pi.manager.sessionId, descendant),
+        ).toBeUndefined();
+        accepted.close();
+
+        await pi.endTurn(0);
+        accepted = metadata();
+        expect(
+          accepted.getState(pi.manager.sessionId, descendant),
+        ).toBeDefined();
+        expect(
+          accepted.isNodeWriteProtected(pi.manager.sessionId, descendant),
+        ).toBe(false);
         accepted.close();
       } finally {
         stderr.mockRestore();
@@ -893,7 +1961,12 @@ describe("single-state Pi lifecycle", () => {
       db.close();
       pi.selectHook = async () => {
         const concurrent = metadata();
-        concurrent.setState(pi.manager.sessionId, child.id, alternate.treeOid);
+        commitTestNodeState(
+          concurrent,
+          pi.manager.sessionId,
+          child.id,
+          alternate.treeOid,
+        );
         concurrent.close();
       };
 
@@ -971,6 +2044,58 @@ describe("single-state Pi lifecycle", () => {
       after.close();
     });
 
+    it("rejects a physical excluded alias in navigation preview before offering destructive actions", async (context) => {
+      context.skip(
+        !(await workspaceAliasesCase()),
+        "requires a case-insensitive physical namespace",
+      );
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const targetNode = pi.manager.appendEntry();
+      const targetBytes = Buffer.from("target", "utf8");
+      const blobOid = createHash("sha256").update(targetBytes).digest("hex");
+      const payload = join(home, "target-payload");
+      await writeFile(payload, targetBytes);
+      const store = await openObjectStore(storeRoot);
+      const publication = store.beginSnapshotPublication();
+      await publication.publishBlobFromFile(
+        payload,
+        blobOid,
+        targetBytes.byteLength,
+      );
+      const treeOid = await publication.publishTree(
+        [
+          {
+            path: "x",
+            type: "regular",
+            blobOid,
+            recreationMode: process.platform === "win32" ? null : 0o600,
+          },
+        ],
+        gitScope({ globalExclude: "X\n" }),
+      );
+      const db = metadata();
+      commitTestNodeState(db, pi.manager.sessionId, targetNode.id, treeOid);
+      db.close();
+      const sourceNode = pi.manager.appendEntry();
+      await writeFile(join(workspace, "X"), "ignored current");
+      await writeFile(join(workspace, "delete-me"), "must survive preview");
+      const selectionsBefore = pi.selections.length;
+
+      expect(await pi.navigate(targetNode.id)).toBe("cancelled");
+
+      expect(pi.manager.getLeafId()).toBe(sourceNode.id);
+      expect(pi.selections).toHaveLength(selectionsBefore);
+      expect(notified(pi, "navigationScanIncomplete")).toBe(true);
+      expect(await readFile(join(workspace, "X"), "utf8")).toBe(
+        "ignored current",
+      );
+      expect(await readFile(join(workspace, "delete-me"), "utf8")).toBe(
+        "must survive preview",
+      );
+    });
+
     it("captures safely even when selecting a child prompt leaves the leaf unchanged", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -1044,6 +2169,26 @@ describe("single-state Pi lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "still-current",
       );
+    });
+
+    it("directs a stale pre-departure preview back to navigation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      await writeFile(join(workspace, "a.txt"), "previewed-source");
+      pi.selectHook = async () => {
+        await writeFile(join(workspace, "a.txt"), "changed-during-preview");
+      };
+
+      expect(await pi.navigate(first)).toBe("cancelled");
+
+      expect(pi.manager.getLeafId()).toBe(second);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "changed-during-preview",
+      );
+      expect(notified(pi, "navigationChangedBeforeDeparture")).toBe(true);
+      expect(pi.notifications.at(-1)?.message).toContain("/tree");
+      expect(pi.notifications.at(-1)?.message).not.toContain("/restore");
     });
 
     it("cancels navigation if the agent becomes busy during confirmation", async () => {
@@ -1177,19 +2322,40 @@ describe("single-state Pi lifecycle", () => {
       db.close();
     });
 
-    it("accepts Pi's summary-plus-label wrappers without inventing snapshots", async () => {
+    it("keeps repeated summary and label round-trips on the stable anchor", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
-      const { first } = await twoStates(pi);
+      const { first, second } = await twoStates(pi);
 
       expect(await pi.prepareNavigation(first)).toBe("ready");
       const summary = await pi.commitPreparedSummary(first, true);
       const label = pi.manager.getLeafId()!;
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      const db = metadata();
-      expect(db.getState(pi.manager.sessionId, summary)).toBeUndefined();
+      let db = metadata();
+      expect(db.getState(pi.manager.sessionId, summary)).toBeDefined();
       expect(db.getState(pi.manager.sessionId, label)).toBeUndefined();
+      db.close();
+
+      await writeFile(join(workspace, "a.txt"), "summary-edit");
+      expect(await pi.navigate(second)).toBe("done");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+
+      for (let round = 0; round < 2; round += 1) {
+        expect(await pi.navigate(summary)).toBe("done");
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+          "summary-edit",
+        );
+        expect(await pi.navigate(second)).toBe("done");
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+      }
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, summary)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, label)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, summary)).toBe(
+        false,
+      );
       db.close();
     });
 
@@ -1291,6 +2457,151 @@ describe("single-state Pi lifecycle", () => {
       // The retry retires the harmless orphan and proceeds in one attempt.
       expect(await pi.navigate(first)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+    });
+
+    it("retires a vetoed tree plan before a custom-trigger turn", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      pi.api.on("session_before_tree", async () => ({ cancel: true }));
+
+      expect(await pi.navigate(first)).toBe("cancelled");
+      await pi.sendCustomMessage("after-veto", true);
+      await writeFile(join(workspace, "a.txt"), "custom-turn-state");
+      await pi.endTurn();
+      const child = pi.manager.getLeafId()!;
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, child)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, child)?.treeOid).not.toBe(
+        db.getState(pi.manager.sessionId, second)?.treeOid,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child)).toBe(false);
+      db.close();
+      expect(notified(pi, "captureLaterFailed")).toBe(false);
+
+      await writeFile(join(workspace, "a.txt"), "later-drift");
+      await pi.runCommand("restore");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "custom-turn-state",
+      );
+    });
+
+    it("retires a prepare-only tree plan before a custom-trigger turn", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+
+      // Pi emits no session_tree when branch summarization is aborted after its
+      // before hook. Running preparation without commit models that native gap.
+      expect(await pi.prepareNavigation(first)).toBe("ready");
+      await pi.sendCustomMessage("after-summary-abort", true);
+      await writeFile(join(workspace, "a.txt"), "post-abort-turn-state");
+      await pi.endTurn();
+      const child = pi.manager.getLeafId()!;
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, child)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, child)?.treeOid).not.toBe(
+        db.getState(pi.manager.sessionId, second)?.treeOid,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child)).toBe(false);
+      db.close();
+      expect(notified(pi, "captureLaterFailed")).toBe(false);
+    });
+
+    it("protects a late navigation arrival after restore mutation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first, second } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      const secondState = before.getState(pi.manager.sessionId, second)!;
+      before.close();
+      let leafSpy: ReturnType<typeof vi.spyOn> | undefined;
+      pi.selectHook = async () => {
+        const getLeafId = pi.manager.getLeafId.bind(pi.manager);
+        leafSpy = vi.spyOn(pi.manager, "getLeafId").mockImplementation(() => {
+          const actual = getLeafId();
+          return actual === first &&
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+            ? second
+            : actual;
+        });
+      };
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+        expect(notified(pi, "restorePostMutationLocationProtected")).toBe(true);
+        expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
+        let db = metadata();
+        expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+
+        await pi.endTurn(0);
+        db = metadata();
+        expect(db.getState(pi.manager.sessionId, second)).toEqual(secondState);
+        expect(db.isNodeWriteProtected(pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+      } finally {
+        leafSpy?.mockRestore();
+      }
+    });
+
+    it("preserves a completed navigation outcome when post-restore admission throws", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const { first } = await twoStates(pi);
+      const before = metadata();
+      const firstState = before.getState(pi.manager.sessionId, first)!;
+      before.close();
+
+      const original = CyclotomyRuntime.prototype.admitLocation;
+      let rejectTargetAdmission = true;
+      const admissionFailure = vi
+        .spyOn(CyclotomyRuntime.prototype, "admitLocation")
+        .mockImplementation(function (this: CyclotomyRuntime, view, treeOid) {
+          if (
+            rejectTargetAdmission &&
+            treeOid === firstState.treeOid &&
+            pi.manager.getLeafId() === first &&
+            readFileSync(join(workspace, "a.txt"), "utf8") === "v1"
+          ) {
+            rejectTargetAdmission = false;
+            throw new Error("post-restore admission failed");
+          }
+          return original.call(this, view, treeOid);
+        });
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+      } finally {
+        admissionFailure.mockRestore();
+      }
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+      expect(
+        notifiedWithDetail(
+          pi,
+          "restorePostMutationControlProtected",
+          "post-restore admission failed",
+        ),
+      ).toBe(true);
+      expect(notified(pi, "restoreSuccessOne")).toBe(true);
+      expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, first)).toEqual(firstState);
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, first)).toBe(true);
+      db.close();
     });
 
     it("never attributes an earlier arrival handler's target edit to source", async () => {
@@ -1477,7 +2788,7 @@ describe("single-state Pi lifecycle", () => {
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
     });
 
-    it("does not materialize a genuinely missing unplanned arrival", async () => {
+    it("does not inherit live workspace state from a protected source", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -1488,13 +2799,278 @@ describe("single-state Pi lifecycle", () => {
 
       await pi.landUnmanaged(ancestor.id);
 
-      const db = metadata();
+      let db = metadata();
       expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, ancestor.id)).toBe(
+        true,
+      );
       db.close();
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "descendant",
       );
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
+
+      const child = pi.manager.appendEntry();
+      pi.manager.setLeaf(ancestor.id);
+      expect(await pi.navigate(child.id)).toBe("done");
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeUndefined();
+      expect(db.getState(pi.manager.sessionId, child.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child.id)).toBe(
+        true,
+      );
+      db.close();
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "descendant",
+      );
+      expect(notified(pi, "sessionMissingProtected")).toBe(true);
+    });
+
+    it("preserves a guarded Missing historical node when it is forked", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const ancestor = pi.manager.appendEntry();
+      const descendant = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "descendant-workspace");
+      await pi.endTurn(0);
+
+      // An unplanned historical arrival is guarded without assigning the
+      // descendant's live workspace to it.
+      await pi.landUnmanaged(ancestor.id);
+      const sourceSessionId = pi.manager.sessionId;
+      let db = metadata();
+      expect(db.getState(sourceSessionId, ancestor.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(sourceSessionId, ancestor.id)).toBe(true);
+      expect(db.getState(sourceSessionId, descendant.id)).toBeDefined();
+      db.close();
+
+      expect(await pi.fork(ancestor.id)).toBe("done");
+      const forkSessionId = pi.manager.sessionId;
+      expect(forkSessionId).not.toBe(sourceSessionId);
+
+      // Fork startup must inherit the selected node's negative state instead
+      // of materializing the current descendant workspace as its checkpoint.
+      db = metadata();
+      expect(db.getState(forkSessionId, ancestor.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(forkSessionId, ancestor.id)).toBe(true);
+      db.close();
+      expect(notified(pi, "sessionMissingProtected")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "descendant-workspace",
+      );
+
+      await pi.endTurn(0);
+      db = metadata();
+      expect(db.getState(forkSessionId, ancestor.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(forkSessionId, ancestor.id)).toBe(true);
+      db.close();
+    });
+
+    it("keeps a guarded missing node unassigned across a cold runtime restart", async () => {
+      const firstHost = new FakePi(workspace);
+      registerCyclotomy(firstHost.api);
+      await firstHost.startSession("startup");
+      const ancestor = firstHost.manager.appendEntry();
+      firstHost.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "unassigned-current");
+      await firstHost.endTurn(0);
+
+      await firstHost.landUnmanaged(ancestor.id);
+      let db = metadata();
+      expect(
+        db.getState(firstHost.manager.sessionId, ancestor.id),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(firstHost.manager.sessionId, ancestor.id),
+      ).toBe(true);
+      db.close();
+
+      const persistedSession = firstHost.manager;
+      await firstHost.dispose();
+      const restarted = new FakePi(workspace);
+      restarted.manager = persistedSession;
+      registerCyclotomy(restarted.api);
+
+      await restarted.startSession("startup");
+      // A normal capture boundary must also retain the durable classification,
+      // rather than treating it as an unknown fresh node on the first event.
+      await restarted.endTurn(0);
+
+      db = metadata();
+      expect(
+        db.getState(restarted.manager.sessionId, ancestor.id),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, ancestor.id),
+      ).toBe(true);
+      db.close();
+      expect(notified(restarted, "sessionMissingProtected")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unassigned-current",
+      );
+
+      restarted.notifications.length = 0;
+      await restarted.startSession("reload");
+      expect(notified(restarted, "sessionMissingProtected")).toBe(true);
+
+      await restarted.runCommand("drift");
+      expect(notified(restarted, "driftMissingProtected")).toBe(true);
+      db = metadata();
+      expect(
+        db.getState(restarted.manager.sessionId, ancestor.id),
+      ).toBeUndefined();
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, ancestor.id),
+      ).toBe(true);
+      db.close();
+
+      await restarted.runCommand("restore");
+
+      db = metadata();
+      expect(
+        db.getState(restarted.manager.sessionId, ancestor.id),
+      ).toBeDefined();
+      expect(
+        db.isNodeWriteProtected(restarted.manager.sessionId, ancestor.id),
+      ).toBe(false);
+      db.close();
+      expect(notified(restarted, "restoreInitialized")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unassigned-current",
+      );
+    });
+
+    it("does not admit a different arrival after guarded-node adoption", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "ancestor-state");
+      await pi.endTurn();
+      const lateArrival = pi.manager.getLeafId()!;
+      const intended = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "intended-first-state");
+
+      let db = metadata();
+      const lateArrivalState = db.getState(pi.manager.sessionId, lateArrival)!;
+      expect(db.protectNodeWrite(pi.manager.sessionId, intended.id)).toBe(
+        "protected",
+      );
+      db.close();
+
+      const original = MetadataStore.prototype.materializeMissingNodeState;
+      const raced = vi
+        .spyOn(MetadataStore.prototype, "materializeMissingNodeState")
+        .mockImplementationOnce(function (
+          this: MetadataStore,
+          sessionId: string,
+          entryId: string,
+          treeOid: string,
+          intent: MissingNodeStateIntent,
+        ) {
+          expect(entryId).toBe(intended.id);
+          expect(intent).toBe("adopt-protected");
+          const result = original.call(
+            this,
+            sessionId,
+            entryId,
+            treeOid,
+            intent,
+          );
+          pi.manager.setLeaf(lateArrival);
+          return result;
+        });
+
+      try {
+        await pi.runCommand("restore");
+      } finally {
+        raced.mockRestore();
+      }
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, intended.id)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, lateArrival)).toEqual(
+        lateArrivalState,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, lateArrival)).toBe(
+        true,
+      );
+      db.close();
+      expect(notified(pi, "checkpointInitializedConflictProtected")).toBe(true);
+      expect(notified(pi, "restoreInitialized")).toBe(false);
+
+      await pi.endTurn(0);
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, lateArrival)).toEqual(
+        lateArrivalState,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, lateArrival)).toBe(
+        true,
+      );
+      db.close();
+    });
+
+    it("materializes a guarded missing node without adopting a later ancestor state", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const ancestor = pi.manager.appendEntry();
+      const target = pi.manager.appendEntry();
+      pi.manager.setLeaf(null);
+      const rootPrompt = pi.manager.appendEntry({
+        type: "message",
+        message: { role: "user" },
+      });
+      await writeFile(join(workspace, "a.txt"), "unplanned-target");
+
+      // Neither the target nor any of its ancestry owns a checkpoint when the
+      // unplanned arrival makes the target fail-closed.
+      await pi.landUnmanaged(target.id);
+      let db = metadata();
+      expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeUndefined();
+      expect(db.getState(pi.manager.sessionId, target.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, target.id)).toBe(
+        true,
+      );
+      db.close();
+
+      // Leave through Pi's root-prompt landing, then give only the ancestor a
+      // state. The older target must remain truly missing despite inheritance.
+      expect(await pi.navigate(rootPrompt.id)).toBe("done");
+      expect(pi.manager.getLeafId()).toBeNull();
+      await writeFile(join(workspace, "a.txt"), "ancestor-state");
+      expect(await pi.navigate(ancestor.id)).toBe("done");
+
+      await writeFile(join(workspace, "a.txt"), "later-ancestor-state");
+      expect(await pi.navigate(target.id)).toBe("done");
+      db = metadata();
+      const ancestorState = db.getState(pi.manager.sessionId, ancestor.id);
+      expect(ancestorState).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, target.id)).toBeUndefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, target.id)).toBe(
+        true,
+      );
+      db.close();
+
+      // With no effective restore target, explicit restore adopts the current
+      // workspace as this node's first exact state and retires its guard.
+      await writeFile(join(workspace, "a.txt"), "target-current");
+      await pi.runCommand("restore");
+      db = metadata();
+      const targetState = db.getState(pi.manager.sessionId, target.id);
+      expect(targetState).toBeDefined();
+      expect(targetState?.treeOid).not.toBe(ancestorState?.treeOid);
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, target.id)).toBe(
+        false,
+      );
+      db.close();
+
+      await writeFile(join(workspace, "a.txt"), "target-drift");
+      await pi.runCommand("restore");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "target-current",
+      );
     });
 
     it("cancels navigation when the authoritative target is corrupt", async () => {
@@ -1552,27 +3128,35 @@ describe("single-state Pi lifecycle", () => {
       expect(db.getState(pi.manager.sessionId, descendant)).toBeDefined();
       db.close();
 
-      // A process cold-start at the newly materialized ancestor observes an
-      // ordinary matching checkpoint and neither restores nor asks.
-      const selectionsBefore = pi.selections.length;
-      await pi.startSession("startup");
-      expect(pi.selections).toHaveLength(selectionsBefore);
+      // A genuinely new runtime at the newly materialized ancestor observes
+      // an ordinary matching checkpoint and neither restores nor asks.
+      const persistedSession = pi.manager;
+      await pi.dispose();
+      const restarted = new FakePi(workspace);
+      restarted.manager = persistedSession;
+      registerCyclotomy(restarted.api);
+      await restarted.startSession("startup");
+      expect(restarted.selections).toHaveLength(0);
 
       await writeFile(join(workspace, "a.txt"), "ancestor-edit");
-      expect(await pi.navigate(descendant)).toBe("done");
+      expect(await restarted.navigate(descendant)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-edit",
       );
-      expect(await pi.navigate(ancestor.id)).toBe("done");
+      expect(await restarted.navigate(ancestor.id)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "ancestor-edit",
       );
 
       db = metadata();
-      expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeDefined();
-      expect(db.getState(pi.manager.sessionId, descendant)).toBeDefined();
+      expect(
+        db.getState(restarted.manager.sessionId, ancestor.id),
+      ).toBeDefined();
+      expect(
+        db.getState(restarted.manager.sessionId, descendant),
+      ).toBeDefined();
       db.close();
-      expect(lastStatus(pi)).toBeUndefined();
+      expect(lastStatus(restarted)).toBeUndefined();
     });
 
     it("materializes a planned missing logical target, not its summary or label wrappers", async () => {
@@ -1592,6 +3176,54 @@ describe("single-state Pi lifecycle", () => {
       expect(db.getState(pi.manager.sessionId, summary)).toBeUndefined();
       expect(db.getState(pi.manager.sessionId, label)).toBeUndefined();
       db.close();
+    });
+
+    it("does not admit a different arrival after planned target initialization", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const intended = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "source-state");
+      await pi.endTurn();
+      const lateArrival = pi.manager.getLeafId()!;
+      const before = metadata();
+      const lateArrivalState = before.getState(
+        pi.manager.sessionId,
+        lateArrival,
+      )!;
+      before.close();
+
+      const original = MetadataStore.prototype.commitNodeState;
+      const raced = vi
+        .spyOn(MetadataStore.prototype, "commitNodeState")
+        .mockImplementation(function (
+          this: MetadataStore,
+          ...args: Parameters<MetadataStore["commitNodeState"]>
+        ) {
+          const result = original.apply(this, args);
+          if (args[1] === intended.id && args[3]?.treeOid === undefined) {
+            pi.manager.setLeaf(lateArrival);
+          }
+          return result;
+        });
+
+      try {
+        expect(await pi.navigate(intended.id)).toBe("done");
+      } finally {
+        raced.mockRestore();
+      }
+
+      const db = metadata();
+      expect(db.getState(pi.manager.sessionId, intended.id)).toBeDefined();
+      expect(db.getState(pi.manager.sessionId, lateArrival)).toEqual(
+        lateArrivalState,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, lateArrival)).toBe(
+        true,
+      );
+      db.close();
+      expect(notified(pi, "checkpointInitializedConflictProtected")).toBe(true);
+      expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
     });
 
     it("uses an authenticated root summary when the logical destination is null", async () => {
@@ -1614,6 +3246,48 @@ describe("single-state Pi lifecycle", () => {
       expect(db.getState(pi.manager.sessionId, summary)).toBeDefined();
       expect(db.getState(pi.manager.sessionId, label)).toBeUndefined();
       db.close();
+    });
+
+    it("treats a root label without a summary as an admitted no-node arrival", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const rootPrompt = pi.manager.appendEntry({
+        type: "message",
+        message: { role: "user" },
+      });
+      await writeFile(join(workspace, "a.txt"), "source-state");
+      await pi.endTurn();
+      const source = pi.manager.getLeafId()!;
+
+      expect(await pi.prepareNavigation(rootPrompt.id)).toBe("ready");
+      // Pi resets its leaf for the root editor point before appendLabelChange,
+      // so a no-summary label is structurally rooted at null.
+      pi.manager.setLeaf(null);
+      const label = pi.manager.appendEntry({ type: "label" });
+      pi.manager.setLeaf(source);
+      await pi.landUnmanaged(label.id);
+
+      let db = metadata();
+      expect(
+        db.pendingNodeGuard(pi.manager.sessionId, pi.manager.getSessionFile()!),
+      ).toBe(false);
+      expect(db.getState(pi.manager.sessionId, rootPrompt.id)).toBeUndefined();
+      expect(db.getState(pi.manager.sessionId, label.id)).toBeUndefined();
+      db.close();
+      expect(notified(pi, "navigationPlanMismatch")).toBe(false);
+      expect(await pi.submitInput("continue-from-root")).toBe("continued");
+
+      await writeFile(join(workspace, "a.txt"), "root-turn-state");
+      await pi.endTurn();
+      const child = pi.manager.getLeafId()!;
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, child)).toBeDefined();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, child)).toBe(false);
+      db.close();
+      expect(notified(pi, "captureLaterFailed")).toBe(false);
+      expect(notified(pi, "sourceCaptureFailed")).toBe(false);
+      expect(notified(pi, "inputCaptureFailed")).toBe(false);
     });
 
     it("never materializes a selected label id", async () => {
@@ -1665,6 +3339,59 @@ describe("single-state Pi lifecycle", () => {
       );
     });
 
+    it("scans only the target scope when leaving a protected source", async () => {
+      await execFileAsync("git", ["-C", workspace, "init", "-q"]);
+      await writeFile(join(workspace, ".gitignore"), "outside/\n");
+      await writeFile(join(workspace, "a.txt"), "v1");
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await pi.endTurn();
+      const target = pi.manager.getLeafId()!;
+      await writeFile(join(workspace, "a.txt"), "v2");
+      await pi.endTurn();
+      const source = pi.manager.getLeafId()!;
+
+      // Current policy sees both hard links and therefore cannot produce a
+      // complete full-workspace snapshot. The target's archived policy excludes
+      // their namespace, so they are irrelevant to restoring that checkpoint.
+      await writeFile(join(workspace, ".gitignore"), "");
+      await mkdir(join(workspace, "outside"));
+      await writeFile(join(workspace, "outside", "hard-a"), "same inode");
+      await link(
+        join(workspace, "outside", "hard-a"),
+        join(workspace, "outside", "hard-b"),
+      );
+      const fullScan = await scanWorkspace(workspace);
+      expect(
+        fullScan.problems
+          .filter(({ kind }) => kind === "hardlink")
+          .map(({ path }) => path),
+      ).toEqual(["outside/hard-a", "outside/hard-b"]);
+
+      pi.selectDestructive = false;
+      await pi.startSession("resume");
+      let db = metadata();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, source)).toBe(true);
+      db.close();
+
+      pi.selectDestructive = true;
+      expect(await pi.navigate(target)).toBe("done");
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+      expect(await readFile(join(workspace, ".gitignore"), "utf8")).toBe(
+        "outside/\n",
+      );
+      expect(await readFile(join(workspace, "outside", "hard-b"), "utf8")).toBe(
+        "same inode",
+      );
+      expect(notified(pi, "navigationScanIncomplete")).toBe(false);
+      db = metadata();
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, source)).toBe(true);
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, target)).toBe(false);
+      db.close();
+    }, 15_000);
+
     it("cancels a transition when a complete source snapshot is impossible", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -1688,6 +3415,63 @@ describe("single-state Pi lifecycle", () => {
   });
 
   describe("idle input and custom messages", () => {
+    it("carries admission across direct label and unlabel changes", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "baseline");
+      await pi.endTurn();
+      const firstStable = pi.manager.getLeafId()!;
+      let db = metadata();
+      const baselineOid = db.getState(
+        pi.manager.sessionId,
+        firstStable,
+      )!.treeOid;
+      db.close();
+
+      // Pi's label command changes only the raw leaf and emits no tree event.
+      const firstLabel = pi.manager.appendEntry({ type: "label" });
+      await writeFile(join(workspace, "a.txt"), "labelled-edit");
+      expect(await pi.submitInput()).toBe("continued");
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, firstStable)?.treeOid).not.toBe(
+        baselineOid,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, firstStable)).toBe(
+        false,
+      );
+      expect(db.getState(pi.manager.sessionId, firstLabel.id)).toBeUndefined();
+      db.close();
+
+      // Establish the new stable node while its label is active, then model
+      // Pi's unlabel command by returning the raw leaf without session_tree.
+      const secondStable = pi.manager.getLeafId()!;
+      await pi.endTurn(0);
+      const secondLabel = pi.manager.appendEntry({ type: "label" });
+      await pi.endTurn(0);
+      db = metadata();
+      const labelledOid = db.getState(
+        pi.manager.sessionId,
+        secondStable,
+      )!.treeOid;
+      db.close();
+      pi.manager.setLeaf(secondStable);
+      await writeFile(join(workspace, "a.txt"), "unlabelled-edit");
+
+      expect(await pi.submitInput()).toBe("continued");
+
+      db = metadata();
+      expect(db.getState(pi.manager.sessionId, secondStable)?.treeOid).not.toBe(
+        labelledOid,
+      );
+      expect(db.isNodeWriteProtected(pi.manager.sessionId, secondStable)).toBe(
+        false,
+      );
+      expect(db.getState(pi.manager.sessionId, secondLabel.id)).toBeUndefined();
+      db.close();
+    });
+
     it("captures between-turn edits before appending an idle prompt", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -1818,7 +3602,7 @@ describe("single-state Pi lifecycle", () => {
   });
 
   describe("compaction and metadata-only leaves", () => {
-    it("keeps auto-compaction metadata inheriting the before-input source", async () => {
+    it("pins auto-compaction at its stable metadata node", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -1836,14 +3620,12 @@ describe("single-state Pi lifecycle", () => {
       const userLeaf = pi.manager.getLeafId()!;
       const db = metadata();
       expect(compactionLeaf).toBeDefined();
-      expect(
-        db.getState(pi.manager.sessionId, compactionLeaf!),
-      ).toBeUndefined();
+      expect(db.getState(pi.manager.sessionId, compactionLeaf!)).toBeDefined();
       expect(db.getState(pi.manager.sessionId, userLeaf)).toBeUndefined();
       db.close();
     });
 
-    it("captures before compaction and lets the metadata-only leaf inherit", async () => {
+    it("captures both sides of compaction at their exact stable nodes", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -1860,7 +3642,7 @@ describe("single-state Pi lifecycle", () => {
       expect(db.getState(pi.manager.sessionId, source)).toBeDefined();
       expect(
         db.getState(pi.manager.sessionId, pi.manager.getLeafId()!),
-      ).toBeUndefined();
+      ).toBeDefined();
       db.close();
     });
 
@@ -2191,7 +3973,7 @@ describe("single-state Pi lifecycle", () => {
       const originalOid = "a".repeat(64);
       let db = metadata();
       db.touchSession("shared-session", "/sessions/original.jsonl");
-      db.setState("shared-session", leaf.id, originalOid);
+      commitTestNodeState(db, "shared-session", leaf.id, originalOid);
       db.close();
       await writeFile(join(workspace, "a.txt"), "must-not-be-captured");
 

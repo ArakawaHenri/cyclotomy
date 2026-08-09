@@ -27,6 +27,7 @@ import {
   MAX_GITIGNORE_POLICY_BYTES,
   MAX_GITIGNORE_SOURCES,
   MAX_GITIGNORE_SOURCE_BYTES,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
   WorkspaceScopeError,
   canonicalizeWorkspaceScope,
   workspaceGitignoreSource,
@@ -478,6 +479,30 @@ describe("Git ignore oracle", () => {
     }
   });
 
+  it("keeps Unicode policy-directory aliases unmanaged when Git matching is case-sensitive", async () => {
+    const scope = canonicalizeWorkspaceScope({
+      kind: "git",
+      repositoryPrefix: "",
+      ignoreCase: false,
+      gitignoreSources: [
+        workspaceGitignoreSource("Σ/.gitignore", Buffer.alloc(0)),
+      ],
+      infoExcludeBase64: "",
+      globalExcludeBase64: "",
+    });
+    const synthetic = await createSyntheticGitIgnoreOracle(scope);
+    try {
+      await expect(
+        synthetic.managed([
+          { path: "ς", isDirectory: false },
+          { path: "ς", isDirectory: true },
+        ]),
+      ).resolves.toEqual([false, true]);
+    } finally {
+      await synthetic.close();
+    }
+  });
+
   it("keeps synthetic control files outside legal policy and prefix paths", async () => {
     const scope = canonicalizeWorkspaceScope({
       kind: "git",
@@ -516,6 +541,44 @@ describe("Git ignore oracle", () => {
       const managed = await oracle.managed(paths);
       expect(managed).toHaveLength(paths.length);
       expect(managed.every((value) => !value)).toBe(true);
+    } finally {
+      await oracle.close();
+    }
+  });
+
+  it("rejects an overlong query path before writing it to Git", async () => {
+    const oracle = await createSyntheticGitIgnoreOracle(syntheticScope());
+    try {
+      await expect(
+        oracle.managed([
+          {
+            path: "a".repeat(DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES + 1),
+            isDirectory: false,
+          },
+        ]),
+      ).rejects.toThrow("invalid Git ignore query");
+    } finally {
+      await oracle.close();
+    }
+  });
+
+  it("uses configured path limits for oracle queries", async () => {
+    const overDefault = "a".repeat(
+      DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES + 1,
+    );
+    const oracle = await createSyntheticGitIgnoreOracle(
+      { kind: "all-managed" },
+      {
+        pathLimits: {
+          maxPathBytes: Buffer.byteLength(overDefault),
+          maxPathComponents: 256,
+        },
+      },
+    );
+    try {
+      await expect(
+        oracle.managed([{ path: overDefault, isDirectory: false }]),
+      ).resolves.toEqual([true]);
     } finally {
       await oracle.close();
     }

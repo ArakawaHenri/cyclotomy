@@ -23,7 +23,7 @@ import {
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-async function runNpm(args, cwd) {
+async function runNpm(args, cwd, cache) {
   const npmCli = process.env.npm_execpath;
   const command =
     npmCli === undefined
@@ -32,19 +32,31 @@ async function runNpm(args, cwd) {
         : "npm"
       : process.execPath;
   const commandArgs = npmCli === undefined ? args : [npmCli, ...args];
+  const inheritedEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => key.toLowerCase() !== "npm_config_dry_run",
+    ),
+  );
   await execFileAsync(command, commandArgs, {
     cwd,
     env: {
-      ...process.env,
+      ...inheritedEnvironment,
       NPM_CONFIG_AUDIT: "false",
+      NPM_CONFIG_CACHE: cache,
+      // `npm publish --dry-run` exports this setting to prepublishOnly. The
+      // nested pack/install are local smoke-test mechanics and must still
+      // materialize their temporary artifact.
+      NPM_CONFIG_DRY_RUN: "false",
       NPM_CONFIG_FUND: "false",
       NPM_CONFIG_UPDATE_NOTIFIER: "false",
+      npm_config_dry_run: "false",
     },
     maxBuffer: 10 * 1024 * 1024,
   });
 }
 
 const sandbox = await mkdtemp(join(tmpdir(), "cyclotomy-package-smoke-"));
+const npmCache = join(sandbox, "npm-cache");
 const packDirectory = join(sandbox, "pack");
 const agentDir = join(sandbox, "agent");
 const installRoot = join(agentDir, "npm");
@@ -56,6 +68,7 @@ try {
   await Promise.all([
     mkdir(packDirectory, { recursive: true }),
     mkdir(installRoot, { recursive: true }),
+    mkdir(npmCache, { recursive: true }),
     mkdir(workspace, { recursive: true }),
   ]);
 
@@ -64,6 +77,7 @@ try {
   await runNpm(
     ["pack", "--ignore-scripts", "--pack-destination", packDirectory],
     repositoryRoot,
+    npmCache,
   );
   const archives = (await readdir(packDirectory)).filter((name) =>
     name.endsWith(".tgz"),
@@ -87,6 +101,7 @@ try {
       archive,
     ],
     sandbox,
+    npmCache,
   );
 
   const installedRoot = join(installRoot, "node_modules", "cyclotomy");

@@ -1,4 +1,7 @@
-import type { MetadataStore } from "../infrastructure/metadata.ts";
+import type {
+  MetadataStore,
+  MissingNodeStateIntent,
+} from "../infrastructure/metadata.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 import { publishSnapshot } from "../infrastructure/snapshot-publication.ts";
 import {
@@ -31,6 +34,7 @@ export type CaptureErrorKind =
   | "publish-failed"
   | "metadata-failed"
   | "state-changed"
+  | "write-protected"
   | "workspace-changed";
 
 export type CaptureError =
@@ -140,28 +144,64 @@ export async function prepareObservedNodeState(
  * require the exact pointer observed at prepare time so a concurrent capture
  * cannot be overwritten.
  */
-export async function commitPreparedNodeState(
+export function commitPreparedNodeState(
   deps: CaptureDeps,
   node: NodeKey,
   prepared: CaptureSuccess,
   expected?: { readonly treeOid: TreeOid | undefined },
-): Promise<Result<CaptureSuccess, CaptureError>> {
+): Result<CaptureSuccess, CaptureError> {
   try {
-    const existing = deps.metadata.getState(node.sessionId, node.entryId);
-    if (expected !== undefined && existing?.treeOid !== expected.treeOid) {
+    const committed = deps.metadata.commitNodeState(
+      node.sessionId,
+      node.entryId,
+      prepared.treeOid,
+      expected,
+    );
+    if (committed === "state-changed") {
       return failure({
         kind: "state-changed",
         message: "node checkpoint changed after capture preparation",
       });
     }
-    if (existing?.treeOid !== prepared.treeOid) {
-      deps.metadata.setState(node.sessionId, node.entryId, prepared.treeOid);
+    if (committed === "write-protected") {
+      return failure({
+        kind: "write-protected",
+        message: "node checkpoint is write-protected until it is restored",
+      });
     }
   } catch (error) {
     return failure({
       kind: "metadata-failed",
       message: messageOf(error),
     });
+  }
+  return success(prepared);
+}
+
+/** Atomically materialize a node that has no effective historical checkpoint. */
+export function commitPreparedMissingNodeState(
+  deps: CaptureDeps,
+  node: NodeKey,
+  prepared: CaptureSuccess,
+  intent: MissingNodeStateIntent,
+): Result<CaptureSuccess, CaptureError> {
+  try {
+    if (
+      deps.metadata.materializeMissingNodeState(
+        node.sessionId,
+        node.entryId,
+        prepared.treeOid,
+        intent,
+      ) === "state-changed"
+    ) {
+      return failure({
+        kind: "state-changed",
+        message:
+          "node checkpoint eligibility changed after capture preparation",
+      });
+    }
+  } catch (error) {
+    return failure({ kind: "metadata-failed", message: messageOf(error) });
   }
   return success(prepared);
 }
@@ -178,7 +218,7 @@ export async function recordObservedNodeState(
 ): Promise<Result<CaptureSuccess, CaptureError>> {
   const prepared = await prepareObservedNodeState(deps, snapshot);
   return prepared.ok
-    ? await commitPreparedNodeState(deps, node, prepared.value)
+    ? commitPreparedNodeState(deps, node, prepared.value)
     : prepared;
 }
 
@@ -211,6 +251,6 @@ export async function captureNodeState(
 ): Promise<Result<CaptureSuccess, CaptureError>> {
   const prepared = await prepareNodeState(deps, root);
   return prepared.ok
-    ? await commitPreparedNodeState(deps, node, prepared.value)
+    ? commitPreparedNodeState(deps, node, prepared.value)
     : prepared;
 }

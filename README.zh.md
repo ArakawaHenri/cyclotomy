@@ -42,10 +42,11 @@ pi remove npm:cyclotomy
 ```text
 - path/only-in-workspace    删除
 ~ path/with-differences     覆盖
+> path/Old → path/old       重命名
 + path/only-in-checkpoint   创建
 ```
 
-确认框默认选中安全选项；按 Escape 会取消，文件保持不动。`/drift` 列出完整计划；交互提示只展示有界样本，让大型变更依然容易阅读。
+确认框默认选中安全选项；按 Escape 会取消，文件保持不动。`/drift` 和交互提示都会展示完整计划。
 
 ## 一个节点，一种状态
 
@@ -104,7 +105,7 @@ Cyclotomy 会按工作区串行化自身操作。重复扫描和身份检查能�
 
 当前没有累计容量上限，也不会淘汰仍被活跃节点引用的检查点。长期会话可能保留大量数据；请监控存储卷，或按需选择其他 `storageDir`。
 
-卸载或重新安装 Cyclotomy 都不会删除或迁移存储。归档或删除之前，请停止所有正在使用该工作区的 Pi 进程，并把精确的工作区哈希目录作为整体操作。
+卸载或重新安装 Cyclotomy 都不会删除存储。归档或删除存储之前，请停止所有正在使用该工作区的 Pi 进程，并把精确的工作区哈希目录作为整体操作。
 
 ## 配置
 
@@ -116,6 +117,8 @@ Cyclotomy 会按工作区串行化自身操作。重复扫描和身份检查能�
   "maxSnapshotMiB": 2048,
   "maxEntries": 100000,
   "maxManifestMiB": 64,
+  "maxPathBytes": 65536,
+  "maxPathComponents": 256,
   "lockTimeoutMs": 5000,
   "gc": {
     "intervalMs": 86400000,
@@ -132,6 +135,8 @@ Cyclotomy 会按工作区串行化自身操作。重复扫描和身份检查能�
 | `maxSnapshotMiB`        | 全局/工作区 |                  `2048` | 单次工作区观察允许的累计字节数。                                                    |
 | `maxEntries`            | 全局/工作区 |                `100000` | 单次扫描观察到的条目上限。硬上限：`1000000`。                                       |
 | `maxManifestMiB`        | 全局/工作区 |                    `64` | 编码后的目录树清单（含忽略策略）的最大体积。硬上限：`256`。                         |
+| `maxPathBytes`          | 全局/工作区 |                 `65536` | 单个工作区相对路径的 UTF-8 字节上限。硬上限：`1048576`。                            |
+| `maxPathComponents`     | 全局/工作区 |                   `256` | 单个工作区相对路径中以斜杠分隔的组件数上限。硬上限：`4096`。                        |
 | `lockTimeoutMs`         | 全局/工作区 |                  `5000` | 工作区锁超时时间。                                                                  |
 | `gc.intervalMs`         | 全局/工作区 |              `86400000` | 自动 GC 的最小间隔；`0` 表示禁用。                                                  |
 | `gc.sessionRetentionMs` | 全局/工作区 |            `2592000000` | 持续缺失的 Pi 会话数据保留期。                                                      |

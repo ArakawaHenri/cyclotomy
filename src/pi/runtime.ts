@@ -21,8 +21,10 @@ import {
 } from "node:path";
 
 import {
+  commitPreparedMissingNodeState,
   commitPreparedNodeState,
   prepareNodeState,
+  type CaptureSuccess,
   type CaptureDeps,
 } from "../application/capture.ts";
 import {
@@ -31,6 +33,7 @@ import {
   type CyclotomyConfig,
 } from "../config.ts";
 import { collectCyclotomyGarbage } from "../application/gc.ts";
+import { migrateReferencedTrees } from "../application/tree-migration.ts";
 import {
   ResolutionTraversalError,
   resolveReadableNodeState,
@@ -39,12 +42,18 @@ import {
 } from "../application/resolve.ts";
 import type { RestoreDeps } from "../application/restore.ts";
 import type { NodeKey, TreeOid } from "../domain/model.ts";
-import { MetadataStore } from "../infrastructure/metadata.ts";
+import {
+  MetadataStore,
+  type MissingNodeStateIntent,
+} from "../infrastructure/metadata.ts";
 import {
   openObjectStore,
   type ObjectStore,
 } from "../infrastructure/object-store.ts";
-import type { TreeManifest } from "../infrastructure/tree-manifest.ts";
+import {
+  migrateTreeManifestToCurrent,
+  type TreeManifest,
+} from "../infrastructure/tree-manifest.ts";
 import { validateTreeEntriesAgainstScope } from "../infrastructure/tree-scope-validation.ts";
 import { withWorkspaceLock } from "../infrastructure/workspace-lock.ts";
 import {
@@ -55,6 +64,11 @@ import {
 } from "../infrastructure/workspace-scan.ts";
 import type { WorkspaceScope } from "../infrastructure/workspace-scope.ts";
 import { CyclotomyI18n } from "./i18n.ts";
+import {
+  CheckpointAdmission,
+  type AdmissionDecision,
+  type AdmissionLease,
+} from "./checkpoint-admission.ts";
 import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
 import {
@@ -120,7 +134,9 @@ export function messageOf(error: unknown): string {
 
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
-    ? `${formatUiPath(error.settingsPath)}: ${formatUiDetail(error.detail)}`
+    ? `${formatUiPath(basename(error.settingsPath))}: ${formatUiDetail(
+        error.detail,
+      )} (${formatUiPath(error.settingsPath)})`
     : formatUiDetail(messageOf(error));
 }
 
@@ -187,6 +203,7 @@ async function assertControlPathDoesNotOverlap(
 export class CyclotomyRuntime {
   readonly i18n: CyclotomyI18n;
   readonly transitions = new TransitionState();
+  readonly #admission = new CheckpointAdmission();
 
   readonly #globalConfig: CyclotomyConfig;
   #config: CyclotomyConfig;
@@ -279,7 +296,11 @@ export class CyclotomyRuntime {
     manifest: TreeManifest,
   ): Promise<void> {
     if (this.#scopeValidatedTreeOid === treeOid) return;
-    await validateTreeEntriesAgainstScope(manifest, {
+    const current = migrateTreeManifestToCurrent(manifest, {
+      maxPathBytes: this.config.scan.maxPathBytes,
+      maxPathComponents: this.config.scan.maxPathComponents,
+    });
+    await validateTreeEntriesAgainstScope(current, {
       scratchParent: this.storeRoot,
       forbiddenRoots: [this.workspaceRoot],
     });
@@ -432,10 +453,32 @@ export class CyclotomyRuntime {
       const store = await openObjectStore(root, {
         maxEntries: config.scan.maxEntries,
         maxManifestBytes: config.scan.maxManifestBytes,
+        maxPathBytes: config.scan.maxPathBytes,
+        maxPathComponents: config.scan.maxPathComponents,
       });
-      // Open only a validated schema; MetadataStore performs explicit,
-      // transactional migrations for supported older versions.
-      const metadata = new MetadataStore(join(root, "state.db"));
+      // Serialize the deferred v1 open as well as migration. Two new-version
+      // processes must not race one connection's v1 schema validation against
+      // the other's atomic cutover.
+      const metadata = await withWorkspaceLock(
+        root,
+        "tree-format-migrate",
+        async () => {
+          const candidate = new MetadataStore(join(root, "state.db"), {
+            deferPublishedV1Migration: true,
+          });
+          try {
+            // Tree objects are immutable content-addressed records. Publish v2
+            // replacements first, then retarget SQLite roots in the same SQL
+            // transaction that advances its schema.
+            await migrateReferencedTrees(store, candidate);
+            return candidate;
+          } catch (error) {
+            candidate.close();
+            throw error;
+          }
+        },
+        config.lock,
+      );
       this.#config = config;
       this.#storeRoot = root;
       this.#workspaceRoot = canonical;
@@ -535,38 +578,215 @@ export class CyclotomyRuntime {
     });
   }
 
-  currentNode(view: SessionView): NodeKey | undefined {
-    return view.leafId === null
-      ? undefined
-      : { sessionId: view.sessionId, entryId: view.leafId };
-  }
-
   /**
    * Pi rewrites label-entry ids when forking. Labels carry no conversation or
-   * workspace state, so captures anchor at their nearest stable parent.
+   * workspace state, so captures anchor at their nearest stable parent. A
+   * label chain rooted at null is Pi's valid root editor point and has no node.
    */
   captureAnchor(
     view: SessionView,
     leafId: string | null = view.leafId,
   ): NodeKey | undefined {
     if (leafId === null) return undefined;
-    for (const current of walkNodeAncestry(
-      { sessionId: view.sessionId, entryId: leafId },
-      this.parentOfIn(view),
-    )) {
-      const type = view.entryTypeOf(current.entryId);
+    let entryId = leafId;
+    const visited = new Set<string>();
+    while (true) {
+      if (visited.has(entryId)) {
+        throw new ResolutionTraversalError("cycle");
+      }
+      visited.add(entryId);
+      const type = view.entryTypeOf(entryId);
       if (type === undefined) {
-        throw new ResolutionTraversalError("unknown-node", current.entryId);
+        throw new ResolutionTraversalError("unknown-node", entryId);
       }
       if (type !== "label") {
-        return current;
+        return { sessionId: view.sessionId, entryId };
+      }
+      const parentId = view.parentIdOf(entryId);
+      if (parentId === undefined) {
+        throw new ResolutionTraversalError("unknown-node", entryId);
+      }
+      if (parentId === null) return undefined;
+      entryId = parentId;
+    }
+  }
+
+  beginAdmission(view: SessionView): void {
+    this.#admission.begin(view, this.captureAnchor(view));
+  }
+
+  /** Fail closed until one concrete live location is authenticated again. */
+  quarantineAdmission(): void {
+    this.#admission.reset();
+  }
+
+  setPendingNodeGuard(view: SessionView): boolean {
+    if (
+      view.sessionFile === null ||
+      !this.metadata.setPendingNodeGuard(view.sessionId, view.sessionFile)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  pendingNodeGuard(view: SessionView): boolean | undefined {
+    return view.sessionFile === null
+      ? undefined
+      : this.metadata.pendingNodeGuard(view.sessionId, view.sessionFile);
+  }
+
+  clearPendingNodeGuard(view: SessionView): boolean {
+    return (
+      view.sessionFile !== null &&
+      this.metadata.clearPendingNodeGuard(view.sessionId, view.sessionFile)
+    );
+  }
+
+  consumePendingNodeGuard(
+    view: SessionView,
+    node: NodeKey,
+  ): "protected" | "not-pending" | "session-unregistered" {
+    if (view.sessionFile === null) return "session-unregistered";
+    const current = this.captureAnchor(view);
+    if (
+      current === undefined ||
+      current.sessionId !== node.sessionId ||
+      current.entryId !== node.entryId
+    ) {
+      return "not-pending";
+    }
+    const consumed = this.metadata.consumePendingNodeGuard(
+      view.sessionId,
+      view.sessionFile,
+      this.ancestryIds(view, node.entryId),
+    );
+    if (consumed === "protected") this.#admission.protect(view, node);
+    if (consumed === "session-unregistered") this.#admission.reset();
+    return consumed;
+  }
+
+  /** Carry a planned raw-leaf rewrite that remains on the same stable anchor. */
+  carryAdmission(view: SessionView, node: NodeKey | undefined): boolean {
+    return this.#admission.carry(view, node);
+  }
+
+  /**
+   * Admit the live stable location after a match, verified restore, or first
+   * materialization. A durable guard is cleared only against the exact tree
+   * that was just authenticated.
+   */
+  admitLocation(view: SessionView, treeOid?: TreeOid): boolean {
+    const node = this.captureAnchor(view);
+    if (node !== undefined && treeOid !== undefined) {
+      const cleared = this.metadata.clearNodeWriteProtection(
+        node.sessionId,
+        node.entryId,
+        treeOid,
+      );
+      if (cleared === "state-changed") return false;
+    } else if (
+      node !== undefined &&
+      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
+    ) {
+      return false;
+    }
+    this.#admission.admit(view, node);
+    return true;
+  }
+
+  protectLocation(view: SessionView, resolution?: ResolvedNodeState): boolean {
+    const node = this.captureAnchor(view);
+    if (node === undefined) {
+      this.#admission.protect(view, node);
+      return true;
+    }
+    return this.protectNode(view, node, resolution);
+  }
+
+  /** Returns false only when the guard was installed against a stale pin. */
+  protectNode(
+    view: SessionView,
+    node: NodeKey,
+    resolution?: ResolvedNodeState,
+  ): boolean {
+    const pending = this.consumePendingNodeGuard(view, node);
+    if (pending === "session-unregistered" && this.sessionIsUsable(view)) {
+      return false;
+    }
+    if (resolution === undefined) {
+      try {
+        resolution = this.#resolveMetadataIn(view, node);
+      } catch {
+        // Malformed ancestry still needs an exact fail-closed guard. There is
+        // no trustworthy effective tree to pin in this branch.
       }
     }
-    throw new Error("active label has no stable parent capture node");
+    const protectedResult = this.metadata.protectNodeWrite(
+      node.sessionId,
+      node.entryId,
+      resolution === undefined
+        ? undefined
+        : {
+            treeOid: resolution.treeOid,
+            expectedTreeOid:
+              resolution.foundAt.sessionId === node.sessionId &&
+              resolution.foundAt.entryId === node.entryId
+                ? resolution.treeOid
+                : undefined,
+          },
+    );
+    this.#admission.protect(view, node);
+    return protectedResult === "protected";
+  }
+
+  captureAdmission(
+    view: SessionView,
+    node: NodeKey | undefined,
+  ): AdmissionDecision {
+    if (node !== undefined) {
+      const pending = this.consumePendingNodeGuard(view, node);
+      if (pending === "protected") return { kind: "protected" };
+      if (pending === "session-unregistered") return { kind: "blocked" };
+    }
+    const previousEntryId = this.#admission.entryIdIn(view);
+    const isNaturalDescendant =
+      !this.transitions.hasNavigation() &&
+      node !== undefined &&
+      previousEntryId !== undefined &&
+      previousEntryId !== node.entryId &&
+      (previousEntryId === null ||
+        this.ancestryIds(view, node.entryId).includes(previousEntryId));
+    const writeProtected =
+      node !== undefined &&
+      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId);
+    const decision = this.#admission.decideCapture({
+      view,
+      node,
+      isNaturalDescendant,
+      writeProtected,
+    });
+    if (decision.kind === "blocked" && node !== undefined) {
+      // An unrelated or unclassified Pi arrival must survive reload/restart.
+      this.protectNode(view, node);
+    }
+    return decision;
+  }
+
+  captureLeaseIsCurrent(
+    lease: AdmissionLease,
+    view: SessionView,
+    node: NodeKey,
+  ): boolean {
+    return (
+      this.#admission.leaseIsCurrent(lease, view, node) &&
+      !this.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
+    );
   }
 
   beginSessionRegistration(): void {
     this.#registeredSessionToken = undefined;
+    this.#admission.reset();
   }
 
   completeSessionRegistration(view: SessionView): void {
@@ -620,6 +840,20 @@ export class CyclotomyRuntime {
     view: SessionView,
     node: NodeKey,
   ): Promise<ResolvedReadableTree | undefined> {
+    const pending = this.consumePendingNodeGuard(view, node);
+    if (pending === "session-unregistered" && this.sessionIsUsable(view)) {
+      throw new Error("current session registration changed before resolution");
+    }
+    // A guard without an exact state records that this exact node had no
+    // effective checkpoint when protected. Later ancestor captures must not
+    // retroactively give that node a different restore target; descendants
+    // remain independent and may inherit normally.
+    if (
+      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId) &&
+      this.metadata.getState(node.sessionId, node.entryId) === undefined
+    ) {
+      return undefined;
+    }
     let manifest: TreeManifest | undefined;
     const resolution = await resolveReadableNodeState(
       node,
@@ -648,6 +882,12 @@ export class CyclotomyRuntime {
     view: SessionView,
     node: NodeKey,
   ): ResolvedNodeState | undefined {
+    if (
+      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId) &&
+      this.metadata.getState(node.sessionId, node.entryId) === undefined
+    ) {
+      return undefined;
+    }
     for (const current of walkNodeAncestry(node, this.parentOfIn(view))) {
       const state = this.metadata.getState(current.sessionId, current.entryId);
       if (state !== undefined) {
@@ -691,6 +931,19 @@ export class CyclotomyRuntime {
     );
   }
 
+  commitPreparedMissingCapture(
+    node: NodeKey,
+    prepared: CaptureSuccess,
+    intent: MissingNodeStateIntent,
+  ): ReturnType<typeof commitPreparedMissingNodeState> {
+    return commitPreparedMissingNodeState(
+      this.checkpointDeps(),
+      node,
+      prepared,
+      intent,
+    );
+  }
+
   /** Best-effort registry hygiene after an authoritative turn checkpoint. */
   touchCapturedSession(view: SessionView): void {
     if (view.sessionFile === null) return;
@@ -702,11 +955,12 @@ export class CyclotomyRuntime {
   }
 
   importForkAncestry(view: SessionView): void {
-    if (view.parentSessionFile === null || view.leafId === null) return;
+    if (view.parentSessionFile === null) return;
     this.metadata.copyForkAncestry({
       targetSessionId: view.sessionId,
       parentSessionFile: view.parentSessionFile,
-      ancestryEntryIds: this.ancestryIds(view, view.leafId),
+      ancestryEntryIds:
+        view.leafId === null ? [] : this.ancestryIds(view, view.leafId),
     });
   }
 
@@ -722,6 +976,7 @@ export class CyclotomyRuntime {
     this.#workspaceRoot = undefined;
     this.#config = this.#globalConfig;
     this.transitions.reset();
+    this.#admission.reset();
     this.#notificationWorkspace = undefined;
     this.#initFailureNotified = false;
     this.#captureFailureNotified = false;

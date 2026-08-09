@@ -11,7 +11,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -22,11 +23,75 @@ import {
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import type { SessionView } from "../src/pi/session-view.ts";
+import {
+  PUBLISHED_TREE_MANIFEST_FORMAT,
+  TREE_MANIFEST_FORMAT,
+} from "../src/infrastructure/tree-manifest.ts";
+import { commitTestNodeState } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
 const roots: string[] = [];
 const TEST_SCOPE = ALL_MANAGED_SCOPE;
+const compatibleV1TreeOid =
+  "0c53042c58202208b41f5cf8fd2b96f7c9f275ba2a38fb4d884831eae5ed5557";
+const compatibleV2TreeOid =
+  "0500eb0932f28766eda94dfb32673db387e463cb3b56e1eaf6dfb89b1c794568";
+const compatibleV1BlobOid =
+  "657ac5c3ed8157bd26ba717404992b3a2e7eb771d53dd299c631c637a8aa3f33";
+
+function objectPath(
+  root: string,
+  kind: "blobs" | "trees",
+  oid: string,
+): string {
+  return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
+}
+
+async function seedCompatiblePublishedV1Store(
+  home: string,
+  workspace: string,
+): Promise<string> {
+  const hash = createHash("sha256")
+    .update(await realpath(workspace))
+    .digest("hex");
+  const storeRoot = join(home, "cyclotomy", hash);
+  for (const [kind, oid, fixture] of [
+    ["blobs", compatibleV1BlobOid, "compatible.blob"],
+    ["trees", compatibleV1TreeOid, "compatible.tree"],
+  ] as const) {
+    const path = objectPath(storeRoot, kind, oid);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(
+      path,
+      await readFile(
+        new URL(`./fixtures/cyclotomy-0.0.1-tree/${fixture}`, import.meta.url),
+      ),
+    );
+  }
+  const db = new DatabaseSync(join(storeRoot, "state.db"));
+  db.exec(`
+    CREATE TABLE node_state(
+      session_id TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      tree_oid TEXT NOT NULL,
+      PRIMARY KEY(session_id, entry_id)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE session_registry(
+      session_id TEXT NOT NULL PRIMARY KEY,
+      session_file TEXT NOT NULL UNIQUE,
+      missing_since INTEGER,
+      missing_observed_at INTEGER
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX session_registry_missing
+    ON session_registry(missing_since, missing_observed_at);
+    INSERT INTO node_state(session_id, entry_id, tree_oid)
+    VALUES ('legacy', 'checkpoint', '${compatibleV1TreeOid}');
+    PRAGMA user_version = 1;
+  `);
+  db.close();
+  return storeRoot;
+}
 
 async function createRuntime() {
   const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-"));
@@ -77,6 +142,35 @@ afterEach(async () => {
 });
 
 describe("Cyclotomy runtime", () => {
+  it("migrates a published-v1 store before exposing the runtime", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-v1-"));
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const home = join(parent, "home");
+    await Promise.all([mkdir(workspace), mkdir(home)]);
+    const storeRoot = await seedCompatiblePublishedV1Store(home, workspace);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+
+    expect(await runtime.ensureStore(workspace)).toBe(true);
+    expect(runtime.metadata.isSchemaCurrent()).toBe(true);
+    expect(runtime.metadata.getState("legacy", "checkpoint")?.treeOid).toBe(
+      compatibleV2TreeOid,
+    );
+    await expect(
+      runtime.store.readTree(compatibleV1TreeOid),
+    ).resolves.toMatchObject({ format: PUBLISHED_TREE_MANIFEST_FORMAT });
+    await expect(
+      runtime.store.readTree(compatibleV2TreeOid),
+    ).resolves.toMatchObject({ format: TREE_MANIFEST_FORMAT });
+    await expect(
+      lstat(objectPath(storeRoot, "trees", compatibleV1TreeOid)),
+    ).resolves.toBeDefined();
+    runtime.close();
+  });
+
   it("fails closed without opening a store after a registration failure", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-disabled-"));
     roots.push(parent);
@@ -116,8 +210,8 @@ describe("Cyclotomy runtime", () => {
     runtime.notifyInitFailure(context);
     expect(notifications).toHaveLength(1);
     expect(notifications[0]!.level).toBe("error");
-    // Long paths are middle-elided into one bounded UI line, so assert the
-    // tail the user actually needs to find the file.
+    // The basename and diagnostic lead the bounded detail so a long absolute
+    // path cannot hide the actionable setting name.
     expect(notifications[0]!.message).toContain(basename(settingsPath));
     expect(notifications[0]!.message).toContain("maxFileMiB");
     expect(notifications[0]!.message).toContain("/reload");
@@ -145,6 +239,8 @@ describe("Cyclotomy runtime", () => {
       JSON.stringify({
         storageDir: "../external-store",
         maxFileMiB: 8,
+        maxPathBytes: 80 * 1024,
+        maxPathComponents: 384,
         gc: { intervalMs: 90_000, sessionRetentionMs: 200_000 },
       }),
     );
@@ -156,13 +252,19 @@ describe("Cyclotomy runtime", () => {
     await mkdir(storeRoot, { recursive: true });
     await writeFile(
       join(storeRoot, "settings.json"),
-      JSON.stringify({ maxFileMiB: 2, gc: { intervalMs: 0 } }),
+      JSON.stringify({
+        maxFileMiB: 2,
+        maxPathComponents: 320,
+        gc: { intervalMs: 0 },
+      }),
     );
     const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
 
     expect(await runtime.ensureStore(workspace)).toBe(true);
     expect(runtime.storeRoot).toBe(await realpath(storeRoot));
     expect(runtime.config.scan.maxFileBytes).toBe(2 * 1024 * 1024);
+    expect(runtime.config.scan.maxPathBytes).toBe(80 * 1024);
+    expect(runtime.config.scan.maxPathComponents).toBe(320);
     expect(runtime.config.autoGcIntervalMs).toBe(0);
     expect(runtime.config.sessionMetadataRetentionMs).toBe(200_000);
     runtime.close();
@@ -387,7 +489,7 @@ describe("Cyclotomy runtime", () => {
     );
     expect(await runtime.ensureStore(first)).toBe(true);
     const firstRoot = runtime.storeRoot;
-    runtime.metadata.setState("s", "e", "a".repeat(64));
+    commitTestNodeState(runtime.metadata, "s", "e", "a".repeat(64));
     expect(await runtime.ensureStore(second)).toBe(false);
     expect(runtime.storeRoot).toBe(firstRoot);
     expect(runtime.metadata.getState("s", "e")?.treeOid).toBe("a".repeat(64));
@@ -466,8 +568,8 @@ describe("Cyclotomy runtime", () => {
       ],
       TEST_SCOPE,
     );
-    runtime.metadata.setState("s", "parent", parentTree);
-    runtime.metadata.setState("s", "leaf", leafTree);
+    commitTestNodeState(runtime.metadata, "s", "parent", parentTree);
+    commitTestNodeState(runtime.metadata, "s", "leaf", leafTree);
     await writeFile(join(workspace, "file.txt"), "current");
     await rm(
       join(

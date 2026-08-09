@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   openObjectStore,
+  PUBLISHED_TREE_MANIFEST_FORMAT,
   TREE_MANIFEST_FORMAT,
   type ObjectStore,
   type TreeEntry,
@@ -47,6 +48,19 @@ function physicalObjectPath(
   oid: string,
 ): string {
   return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
+}
+
+async function installTreeObject(
+  root: string,
+  content: Buffer,
+): Promise<string> {
+  const oid = digest(content);
+  const path = physicalObjectPath(root, "trees", oid);
+  await mkdir(join(root, "objects", "trees", oid.slice(0, 2)), {
+    recursive: true,
+  });
+  await writeFile(path, content, { flag: "wx" });
+  return oid;
 }
 
 async function fileHandlePrototype(): Promise<{
@@ -192,6 +206,69 @@ describe("object store", () => {
     const afterTree = await stat(treePath);
     expect(afterTree.ino).toBe(beforeTree.ino);
     expect(afterTree.mtimeMs).toBe(beforeTree.mtimeMs);
+  });
+
+  it("migrates an authenticated published-v1 tree to a deterministic v2 object", async () => {
+    const legacyBytes = Buffer.from(
+      `${JSON.stringify({
+        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        entries: [],
+        scope: completeScope,
+      })}\n`,
+    );
+    const oldTreeOid = await installTreeObject(root, legacyBytes);
+
+    await expect(store.readTree(oldTreeOid)).resolves.toMatchObject({
+      format: PUBLISHED_TREE_MANIFEST_FORMAT,
+    });
+    const first = await store.migrateLegacyTree(oldTreeOid);
+    expect(first).toMatchObject({ kind: "migrated", oldTreeOid });
+    if (first.kind !== "migrated") throw new Error("expected migration");
+    expect(first.treeOid).not.toBe(oldTreeOid);
+    expect(
+      await readFile(physicalObjectPath(root, "trees", oldTreeOid)),
+    ).toEqual(legacyBytes);
+    expect(await store.readTree(first.treeOid)).toEqual({
+      format: TREE_MANIFEST_FORMAT,
+      entries: [],
+      scope: completeScope,
+    });
+
+    const migratedPath = physicalObjectPath(root, "trees", first.treeOid);
+    const beforeRetry = await stat(migratedPath);
+    await expect(store.migrateLegacyTree(oldTreeOid)).resolves.toEqual(first);
+    const afterRetry = await stat(migratedPath);
+    expect(afterRetry.ino).toBe(beforeRetry.ino);
+    expect(afterRetry.mtimeMs).toBe(beforeRetry.mtimeMs);
+  });
+
+  it("keeps a valid v1 tree isolated when portable v2 conversion is lossy", async () => {
+    const blobOid = await publishTestBlob(store, Buffer.from("legacy"));
+    const entry = (path: string) => ({
+      path,
+      type: "regular" as const,
+      blobOid,
+      recreationMode: 0o600,
+    });
+    const legacyBytes = Buffer.from(
+      `${JSON.stringify({
+        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        entries: [entry("Σ/a"), entry("ς/b")],
+        scope: completeScope,
+      })}\n`,
+    );
+    const treeOid = await installTreeObject(root, legacyBytes);
+
+    await expect(store.readTree(treeOid)).resolves.toMatchObject({
+      format: PUBLISHED_TREE_MANIFEST_FORMAT,
+    });
+    await expect(store.migrateLegacyTree(treeOid)).resolves.toMatchObject({
+      kind: "legacy-incompatible",
+      treeOid,
+    });
+    expect(await readdir(join(root, "objects", "trees"))).toEqual([
+      treeOid.slice(0, 2),
+    ]);
   });
 
   it("detects blob tampering on reads and repairs it from authenticated bytes", async () => {

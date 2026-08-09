@@ -176,6 +176,8 @@ export class FakePi {
   beforeTreeCommit: (() => Promise<void>) | undefined;
   /** Test-only hook for host work after input acceptance but before user append. */
   beforeUserMessageCommit: (() => Promise<void>) | undefined;
+  /** Test-only crash boundary after custom append but before provider context. */
+  afterCustomMessageCommit: (() => Promise<void>) | undefined;
   manager: FakeSessionManager;
   readonly cwd: string;
 
@@ -373,10 +375,18 @@ export class FakePi {
         this.idle = wasIdle;
       }
     }
-    return this.manager.appendEntry({
+    const entry = this.manager.appendEntry({
       type: "message",
       message: { role: "custom", content },
-    }).id;
+    });
+    if (triggerTurn) {
+      await this.afterCustomMessageCommit?.();
+      await this.#emit("context", {
+        type: "context",
+        messages: [],
+      });
+    }
+    return entry.id;
   }
 
   /** Emit only preflight input, simulating a later host validation failure. */

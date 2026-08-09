@@ -133,7 +133,7 @@ describe("Pi runtime replacement", () => {
     );
     await pi.reloadExtension();
     expect(pi.factoryLoads).toBe(2);
-    // Recovery must not reconcile files: reload never scans or restores.
+    // Recovery may inspect existing checkpoints, but never captures or restores.
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
 
     await pi.endTurn();
@@ -143,6 +143,101 @@ describe("Pi runtime replacement", () => {
       db.getState(pi.manager.sessionId, pi.manager.getLeafId()!),
     ).toBeDefined();
     db.close();
+  });
+
+  it("keeps a declined node write-protected across reload and cold start", async () => {
+    const pi = new ReloadingFakePi(workspace, registerCyclotomy);
+    await pi.startSession("startup");
+    await writeFile(join(workspace, "a.txt"), "saved");
+    await pi.endTurn();
+    const leaf = pi.manager.getLeafId()!;
+    let db = metadata();
+    const savedState = db.getState(pi.manager.sessionId, leaf)!;
+    db.close();
+    await writeFile(join(workspace, "a.txt"), "kept-current");
+    pi.hasUI = false;
+
+    await pi.startSession("resume");
+    db = metadata();
+    expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(true);
+    expect(db.getState(pi.manager.sessionId, leaf)).toEqual(savedState);
+    db.close();
+
+    await pi.reloadExtension();
+    await pi.endTurn(0);
+    db = metadata();
+    expect(db.isNodeWriteProtected(pi.manager.sessionId, leaf)).toBe(true);
+    expect(db.getState(pi.manager.sessionId, leaf)).toEqual(savedState);
+    db.close();
+    expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+      "kept-current",
+    );
+
+    const persistedSession = pi.manager;
+    await pi.dispose();
+    const restarted = new ReloadingFakePi(
+      workspace,
+      registerCyclotomy,
+      persistedSession,
+    );
+    restarted.hasUI = false;
+    await restarted.startSession("startup");
+    await restarted.endTurn(0);
+
+    db = metadata();
+    expect(db.isNodeWriteProtected(restarted.manager.sessionId, leaf)).toBe(
+      true,
+    );
+    expect(db.getState(restarted.manager.sessionId, leaf)).toEqual(savedState);
+    db.close();
+    expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+      "kept-current",
+    );
+  });
+
+  it("does not trust a reload handoff through a disabled runtime", async () => {
+    const settingsPath = join(home, "cyclotomy", "settings.json");
+    const pi = new ReloadingFakePi(workspace, registerCyclotomy);
+    await pi.startSession("startup");
+    await writeFile(join(workspace, "a.txt"), "saved");
+    await pi.endTurn();
+    const protectedLeaf = pi.manager.getLeafId()!;
+    let db = metadata();
+    const savedState = db.getState(pi.manager.sessionId, protectedLeaf)!;
+    db.close();
+
+    await writeFile(settingsPath, JSON.stringify({ maxFileMiB: -1 }));
+    await pi.reloadExtension();
+    await writeFile(join(workspace, "a.txt"), "kept-current");
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ locale: "zh-CN", gc: { intervalMs: 0 } }),
+    );
+    await pi.reloadExtension();
+
+    db = metadata();
+    expect(db.getState(pi.manager.sessionId, protectedLeaf)).toEqual(
+      savedState,
+    );
+    expect(db.isNodeWriteProtected(pi.manager.sessionId, protectedLeaf)).toBe(
+      true,
+    );
+    db.close();
+
+    await pi.endTurn();
+    const descendant = pi.manager.getLeafId()!;
+    db = metadata();
+    expect(db.getState(pi.manager.sessionId, protectedLeaf)).toEqual(
+      savedState,
+    );
+    expect(db.getState(pi.manager.sessionId, descendant)).toBeDefined();
+    expect(db.isNodeWriteProtected(pi.manager.sessionId, descendant)).toBe(
+      false,
+    );
+    db.close();
+    expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+      "kept-current",
+    );
   });
 
   it("copies only retained ancestry and restores the selected state", async () => {

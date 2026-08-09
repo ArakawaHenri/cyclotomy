@@ -1,14 +1,16 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-import {
-  planWorkspaceRestore,
-  restorePlanHasChanges,
-} from "../infrastructure/restore-plan.ts";
+import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
+import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
 import {
   runConfirmedRestore,
   type ConfirmedRestoreResult,
 } from "./confirmed-restore.ts";
-import { notifyRestoreOutcome } from "./restore-outcome.ts";
+import {
+  notifyCheckpointInitializationConflict,
+  notifyPostMutationConflict,
+  notifyRestoreOutcome,
+} from "./restore-outcome.ts";
 import { messageOf, type CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 
@@ -18,6 +20,12 @@ function finishRestore(
   execution: ConfirmedRestoreResult,
 ): void {
   switch (execution.kind) {
+    case "initialization-conflict":
+      notifyCheckpointInitializationConflict(runtime, context, execution);
+      break;
+    case "post-mutation-conflict":
+      notifyPostMutationConflict(runtime, context, execution);
+      break;
     case "location-changed":
       runtime.notify(
         context,
@@ -49,6 +57,16 @@ function finishRestore(
       break;
     case "missing":
       runtime.notify(context, runtime.i18n.t("restoreMissing"), "info");
+      break;
+    case "protected-missing":
+      runtime.notify(
+        context,
+        runtime.i18n.t("sessionMissingProtected"),
+        "warning",
+      );
+      break;
+    case "initialized":
+      runtime.notify(context, runtime.i18n.t("restoreInitialized"), "info");
       break;
     case "matches":
       runtime.notify(context, runtime.i18n.t("restoreAlreadyMatches"), "info");
@@ -86,17 +104,20 @@ async function restoreCommand(
     runtime.notify(context, runtime.i18n.t("transitionInProgress"), "warning");
     return;
   }
-  const node = runtime.currentNode(view);
+  const node = runtime.captureAnchor(view);
   if (node === undefined) {
     runtime.notify(context, runtime.i18n.t("locationUnknown"), "warning");
     return;
   }
 
-  finishRestore(
+  const execution = await runConfirmedRestore(
     runtime,
     context,
-    await runConfirmedRestore(runtime, context, view, node, "manual"),
+    view,
+    node,
+    "manual",
   );
+  finishRestore(runtime, context, execution);
 }
 
 async function driftCommand(
@@ -104,7 +125,7 @@ async function driftCommand(
   context: ExtensionCommandContext,
   view: SessionView,
 ): Promise<void> {
-  const node = runtime.currentNode(view);
+  const node = runtime.captureAnchor(view);
   if (node === undefined) {
     runtime.notify(context, runtime.i18n.t("locationUnknown"), "warning");
     return;
@@ -114,23 +135,42 @@ async function driftCommand(
     try {
       return await runtime.enqueueWorkspace("drift", async () => {
         const readable = await runtime.resolveReadableTreeIn(view, node);
-        if (readable === undefined) return undefined;
+        if (readable === undefined) {
+          return {
+            kind: "missing" as const,
+            writeProtected: runtime.metadata.isNodeWriteProtected(
+              node.sessionId,
+              node.entryId,
+            ),
+          };
+        }
         const { resolution, manifest } = readable;
         const snapshot = await runtime.scanCurrentWorkspaceForScope(
           view.cwd,
           manifest.scope,
         );
         return {
+          kind: "checkpoint" as const,
           resolution,
-          drift: planWorkspaceRestore(snapshot, manifest),
+          drift: (await prepareWorkspaceRestorePlan(snapshot, manifest)).plan,
+          writeProtected: runtime.metadata.isNodeWriteProtected(
+            node.sessionId,
+            node.entryId,
+          ),
         };
       });
     } finally {
       runtime.setStatus(context, undefined);
     }
   })();
-  if (prepared === undefined) {
-    runtime.notify(context, runtime.i18n.t("driftMissing"), "info");
+  if (prepared.kind === "missing") {
+    runtime.notify(
+      context,
+      runtime.i18n.t(
+        prepared.writeProtected ? "driftMissingProtected" : "driftMissing",
+      ),
+      "info",
+    );
     return;
   }
   const inherited =
@@ -142,7 +182,13 @@ async function driftCommand(
   ) {
     runtime.notify(
       context,
-      runtime.i18n.t(inherited ? "driftCleanInherited" : "driftClean"),
+      runtime.i18n.t(
+        prepared.writeProtected
+          ? "driftCleanProtected"
+          : inherited
+            ? "driftCleanInherited"
+            : "driftClean",
+      ),
       "info",
     );
     return;

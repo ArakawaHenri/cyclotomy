@@ -218,7 +218,7 @@ describe("workspace scanner", () => {
     ]);
   });
 
-  it("keeps the first of two paths colliding after NFC + lowercase normalization", async (context) => {
+  it("keeps the first of two paths colliding after portable case normalization", async (context) => {
     const root = await workspace();
     await writeFile(join(root, "README.md"), "upper");
     await writeFile(join(root, "readme.md"), "lower");
@@ -275,6 +275,37 @@ describe("workspace scanner", () => {
     ]);
   });
 
+  it("rejects Unicode physical aliases that coexist on a case-sensitive host", async (context) => {
+    const root = await workspace();
+    await mkdir(join(root, "Σ"));
+    const createdSecondDirectory = await mkdir(join(root, "ς"))
+      .then(() => true)
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "EEXIST") return false;
+        throw error;
+      });
+    if (!createdSecondDirectory) {
+      context.skip(
+        true,
+        "this filesystem physically aliases the Unicode spellings",
+      );
+      return;
+    }
+    await writeFile(join(root, "Σ", "a"), "first");
+    await writeFile(join(root, "ς", "b"), "second");
+
+    const observed = await scanWorkspace(root);
+
+    expect(pathsOf(observed)).toEqual(["Σ/a"]);
+    expect(observed.problems).toEqual([
+      {
+        path: "ς",
+        kind: "path-collision",
+        detail: expect.stringContaining("Σ"),
+      },
+    ]);
+  });
+
   it("throws ScanError once the cumulative snapshot quota overflows", async () => {
     const root = await workspace();
     await writeFile(join(root, "a"), "1234");
@@ -285,6 +316,102 @@ describe("workspace scanner", () => {
     );
     await expect(scanWorkspace(root, { maxSnapshotBytes: 5 })).rejects.toThrow(
       /5-byte limit/,
+    );
+  });
+
+  it.each([
+    ["maxFileBytes", Number.NaN],
+    ["maxFileBytes", Number.POSITIVE_INFINITY],
+    ["maxFileBytes", Number.NEGATIVE_INFINITY],
+    ["maxFileBytes", -1],
+    ["maxFileBytes", 0],
+    ["maxFileBytes", 1.5],
+    ["maxSnapshotBytes", Number.NaN],
+    ["maxSnapshotBytes", Number.POSITIVE_INFINITY],
+    ["maxSnapshotBytes", Number.NEGATIVE_INFINITY],
+    ["maxSnapshotBytes", -1],
+    ["maxSnapshotBytes", 0],
+    ["maxSnapshotBytes", 1.5],
+  ] as const)("rejects invalid %s=%s before scanning", async (name, value) => {
+    const root = await workspace();
+    await writeFile(join(root, "entry"), "content");
+
+    await expect(scanWorkspace(root, { [name]: value })).rejects.toThrow(
+      "scan limits are outside the supported range",
+    );
+  });
+
+  it.each([1, Number.MAX_SAFE_INTEGER])(
+    "accepts positive safe-integer byte limits (%s)",
+    async (limit) => {
+      const root = await workspace();
+
+      await expect(
+        scanWorkspace(root, {
+          maxFileBytes: limit,
+          maxSnapshotBytes: limit,
+        }),
+      ).resolves.toMatchObject({ entries: [] });
+    },
+  );
+
+  it("applies configurable path byte and component limits while scanning", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "four"), "root");
+    await mkdir(join(root, "a", "b"), { recursive: true });
+    await writeFile(join(root, "a", "b", "c"), "nested");
+
+    const byteConstrained = await scanWorkspace(root, {
+      maxPathBytes: 3,
+      maxPathComponents: 3,
+    });
+    expect(pathsOf(byteConstrained)).toEqual([]);
+    expect(byteConstrained.problems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "a/b/c",
+          kind: "unsupported",
+          detail: expect.stringContaining("byte limit"),
+        }),
+        expect.objectContaining({
+          path: "four",
+          kind: "unsupported",
+          detail: expect.stringContaining("byte limit"),
+        }),
+      ]),
+    );
+
+    const componentConstrained = await scanWorkspace(root, {
+      maxPathBytes: 5,
+      maxPathComponents: 2,
+    });
+    expect(pathsOf(componentConstrained)).toEqual(["four"]);
+    expect(componentConstrained.problems).toEqual([
+      expect.objectContaining({
+        path: "a/b/c",
+        kind: "unsupported",
+        detail: expect.stringContaining("component limit"),
+      }),
+    ]);
+
+    const relaxed = await scanWorkspace(root, {
+      maxPathBytes: 5,
+      maxPathComponents: 3,
+    });
+    expect(relaxed.problems).toEqual([]);
+    expect(pathsOf(relaxed)).toEqual(["a/b/c", "four"]);
+  });
+
+  it.each([
+    ["maxPathBytes", 0],
+    ["maxPathBytes", 1024 * 1024 + 1],
+    ["maxPathComponents", 0],
+    ["maxPathComponents", 4_097],
+  ] as const)("rejects invalid %s=%s before scanning", async (name, value) => {
+    const root = await workspace();
+
+    await expect(scanWorkspace(root, { [name]: value })).rejects.toThrow(
+      "scan limits are outside the supported range",
     );
   });
 

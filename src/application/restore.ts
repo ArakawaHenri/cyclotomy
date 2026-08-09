@@ -8,11 +8,19 @@ import {
 } from "../infrastructure/blob-staging.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 import { validateTreeEntriesAgainstScope } from "../infrastructure/tree-scope-validation.ts";
-import type { TreeManifest } from "../infrastructure/tree-manifest.ts";
+import {
+  migrateTreeManifestToCurrent,
+  type TreeManifest,
+} from "../infrastructure/tree-manifest.ts";
+import {
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+} from "../infrastructure/workspace-scope.ts";
 import {
   planWorkspaceRestore,
   restorePlanHasChanges,
 } from "../infrastructure/restore-plan.ts";
+import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
 import {
   scanWorkspaceForScope,
   summarizeScanProblems,
@@ -38,6 +46,8 @@ export interface RestoreDeps {
 export interface RestoreOptions {
   /** Complete observation made under the same cooperative workspace lock. */
   readonly current: WorkspaceSnapshot;
+  /** Durable fail-closed marker installed immediately before workspace writes. */
+  readonly beforeMutation?: () => void;
 }
 
 function effectiveScanOptions(deps: RestoreDeps): ScanOptions {
@@ -105,7 +115,17 @@ export async function restoreWorkspace(
     // A clean diff is meaningful only when the entire durable checkpoint is
     // readable. Authenticate every referenced blob before planning or staging
     // so "restored" never blesses a tree with a damaged unused member.
-    manifest = await deps.store.readTree(resolution.treeOid);
+    manifest = migrateTreeManifestToCurrent(
+      await deps.store.readTree(resolution.treeOid),
+      {
+        maxPathBytes:
+          deps.scanOptions?.maxPathBytes ??
+          DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+        maxPathComponents:
+          deps.scanOptions?.maxPathComponents ??
+          DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+      },
+    );
     await (deps.validateManifestScope === undefined
       ? validateTreeEntriesAgainstScope(manifest, {
           scratchParent: deps.store.storageRoot,
@@ -132,7 +152,16 @@ export async function restoreWorkspace(
     };
   }
   const operationRoot = current.rootPath;
-  const restorePlan = planWorkspaceRestore(current, manifest);
+  let restorePlan: ReturnType<typeof planWorkspaceRestore>;
+  try {
+    restorePlan = (await prepareWorkspaceRestorePlan(current, manifest)).plan;
+  } catch (error) {
+    return {
+      kind: "failed",
+      stage: "current-scan",
+      message: messageOf(error),
+    };
+  }
   if (restorePlan.problems.length > 0) {
     return {
       kind: "failed",
@@ -174,6 +203,7 @@ export async function restoreWorkspace(
 
   let report: ApplyReport;
   try {
+    options.beforeMutation?.();
     report = await applyTreeToWorkspace(
       root,
       manifest,

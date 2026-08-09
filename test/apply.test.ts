@@ -39,6 +39,7 @@ import {
   type WorkspaceSnapshot,
 } from "../src/infrastructure/workspace-scan.ts";
 import { planWorkspaceRestore } from "../src/infrastructure/restore-plan.ts";
+import { prepareWorkspaceRestorePlan } from "../src/infrastructure/restore-preparation.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const encoder = new TextEncoder();
@@ -154,6 +155,58 @@ function regularTarget(
     blobOid: publish(content),
     recreationMode,
   };
+}
+
+async function workspaceAliasesSpellings(
+  observedName: string,
+  aliasName: string,
+): Promise<boolean> {
+  const observedPath = join(root, observedName);
+  const aliasPath = join(root, aliasName);
+  await mkdir(observedPath);
+  try {
+    const observed = await lstat(observedPath);
+    const alias = await lstat(aliasPath).catch(() => undefined);
+    return (
+      alias !== undefined &&
+      observed.dev === alias.dev &&
+      observed.ino === alias.ino
+    );
+  } finally {
+    await rm(observedPath, { recursive: true, force: true });
+    await rm(aliasPath, { recursive: true, force: true });
+  }
+}
+
+async function workspaceAliasesCase(): Promise<boolean> {
+  return workspaceAliasesSpellings(
+    ".cyclotomy-case-probe",
+    ".CYCLOTOMY-CASE-PROBE",
+  );
+}
+
+async function portableDistinctSpellings(): Promise<
+  { readonly from: string; readonly to: string } | undefined
+> {
+  for (const [from, to] of [
+    ["X", "x"],
+    ["ı", "i"],
+  ] as const) {
+    if (!(await workspaceAliasesSpellings(from, to))) return { from, to };
+  }
+  return undefined;
+}
+
+async function workspaceSupportsSymlinks(): Promise<boolean> {
+  const probe = join(root, ".cyclotomy-symlink-probe");
+  try {
+    await symlink("probe-target", probe);
+    return (await lstat(probe)).isSymbolicLink();
+  } catch {
+    return false;
+  } finally {
+    await rm(probe, { force: true });
+  }
 }
 
 describe("applyTreeToWorkspace", () => {
@@ -1360,6 +1413,640 @@ describe("applyTreeToWorkspace", () => {
     expect(report.updated).toEqual([]);
     expect(report.deleted).toEqual(["sub/old.txt"]);
     expect(report.problems).toEqual([]);
+  });
+
+  it("restores a case-only managed leaf without inferring host behavior from Git", async () => {
+    const aliasesCase = await workspaceAliasesCase();
+    await writeFile(join(root, "X"), "current");
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget("x", "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(
+      prepared.workspaceAliases.some(
+        (alias) =>
+          alias.from === "X" &&
+          alias.to === "x" &&
+          alias.targetExisted === aliasesCase,
+      ),
+    ).toBe(true);
+
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    expect(await readdir(root)).toEqual(["x"]);
+    await expectRegular("x", "target");
+    expect(report.created).toEqual(["x"]);
+    expect(report.deleted).toEqual(["X"]);
+    expect(report.renamed).toEqual([]);
+    expect(report.problems).toEqual([]);
+  });
+
+  it("removes an empty absent-target portable alias before creating a leaf", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    await mkdir(join(root, spellings.from, "nested-empty"), {
+      recursive: true,
+    });
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget(spellings.to, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.workspaceAliases).toContainEqual(
+      expect.objectContaining({
+        from: spellings.from,
+        to: spellings.to,
+        sourceKind: "directory",
+        targetExisted: false,
+      }),
+    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectAbsent(spellings.from);
+    await expectRegular(spellings.to, "target");
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("recases an empty absent-target portable directory before creating below it", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    await mkdir(join(root, spellings.from, "nested-empty"), {
+      recursive: true,
+    });
+    const current = await scanRealWorkspace(root);
+    const targetPath = `${spellings.to}/child`;
+    const target = manifest([regularTarget(targetPath, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.renamed).toEqual([
+      { from: spellings.from, to: spellings.to },
+    ]);
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectAbsent(spellings.from);
+    await expectRegular(targetPath, "target");
+    expect(await readdir(join(root, spellings.to))).toContain("nested-empty");
+    expect(report.renamed).toEqual(prepared.plan.renamed);
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("remaps nested absent-target recases after their parent spelling changes", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    const sourceDirectory = `${spellings.from}/${spellings.from}`;
+    const targetDirectory = `${spellings.to}/${spellings.to}`;
+    await mkdir(join(root, sourceDirectory, "keep-empty"), {
+      recursive: true,
+    });
+    const current = await scanRealWorkspace(root);
+    const targetPath = `${targetDirectory}/child`;
+    const target = manifest([regularTarget(targetPath, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.renamed).toEqual([
+      { from: spellings.from, to: spellings.to },
+      { from: sourceDirectory, to: targetDirectory },
+    ]);
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectRegular(targetPath, "target");
+    expect(await readdir(join(root, targetDirectory))).toContain("keep-empty");
+    expect(report.renamed).toEqual(prepared.plan.renamed);
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("remaps a nested directory replacement after its parent recase", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    const sourcePath = `${spellings.from}/${spellings.from}`;
+    const targetPath = `${spellings.to}/${spellings.to}`;
+    await mkdir(join(root, sourcePath), { recursive: true });
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget(targetPath, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.problems).toEqual([]);
+    expect(prepared.plan.created).toEqual([targetPath]);
+    expect(prepared.plan.renamed).toEqual([
+      { from: spellings.from, to: spellings.to },
+    ]);
+    expect(prepared.workspaceAliases).toContainEqual(
+      expect.objectContaining({
+        from: sourcePath,
+        to: targetPath,
+        sourceKind: "directory",
+        targetExisted: false,
+        canRecaseDirectory: true,
+      }),
+    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectAbsent(spellings.from);
+    await expectRegular(targetPath, "target");
+    expect(report.created).toEqual([targetPath]);
+    expect(report.renamed).toEqual(prepared.plan.renamed);
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("accepts a nested alias already satisfied by its parent recase", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    const sourceDirectory = `${spellings.from}/Y`;
+    const targetDirectory = `${spellings.to}/Y`;
+    await mkdir(join(root, sourceDirectory, "keep-empty"), {
+      recursive: true,
+    });
+    const current = await scanRealWorkspace(root);
+    const targetPath = `${targetDirectory}/child`;
+    const target = manifest([regularTarget(targetPath, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.renamed).toEqual([
+      { from: spellings.from, to: spellings.to },
+    ]);
+    expect(prepared.workspaceAliases).toContainEqual(
+      expect.objectContaining({
+        from: sourceDirectory,
+        to: targetDirectory,
+        targetExisted: false,
+      }),
+    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectRegular(targetPath, "target");
+    expect(await readdir(join(root, targetDirectory))).toContain("keep-empty");
+    expect(report.renamed).toEqual(prepared.plan.renamed);
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("tears down nested aliases under an absent parent that cannot be recased", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    const sourceDirectory = `${spellings.from}/${spellings.from}`;
+    const targetDirectory = `${spellings.to}/${spellings.to}`;
+    await mkdir(join(root, sourceDirectory, "keep-empty"), {
+      recursive: true,
+    });
+    await writeFile(join(root, spellings.from, "managed"), "current");
+    const current = await scanRealWorkspace(root);
+    const targetPath = `${targetDirectory}/child`;
+    const target = manifest([regularTarget(targetPath, "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.renamed).toEqual([]);
+    expect(
+      prepared.workspaceAliases
+        .filter((alias) => alias.sourceKind === "directory")
+        .every((alias) => !alias.canRecaseDirectory),
+    ).toBe(true);
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectAbsent(spellings.from);
+    await expectRegular(targetPath, "target");
+    expect(report.deleted).toEqual([`${spellings.from}/managed`]);
+    expect(report.renamed).toEqual([]);
+    expect(report.problems).toEqual([]);
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("preflights an excluded absent-target portable alias", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    await writeFile(join(root, spellings.from), "ignored");
+    await writeFile(join(root, "delete-me"), "must survive preflight");
+    const scope = gitScope({ globalExclude: `${spellings.from}\n` });
+    const current = await scanWorkspaceForScope(root, scope);
+    const target: TreeManifest = {
+      format: TREE_MANIFEST_FORMAT,
+      entries: [regularTarget(spellings.to, "target")],
+      scope,
+    };
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.scopeBlockers).toContainEqual({
+      path: spellings.from,
+      targetPath: spellings.to,
+    });
+    await expect(
+      applyTreeToWorkspace(root, target, readBlob, current),
+    ).rejects.toThrow(/unmanaged descendant/u);
+
+    await expectRegular("delete-me", "must survive preflight");
+    await expectRegular(spellings.from, "ignored");
+    await expectAbsent(spellings.to);
+  });
+
+  it("preflights an excluded descendant under an absent portable directory alias", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    await mkdir(join(root, spellings.from));
+    await writeFile(join(root, spellings.from, "hidden"), "ignored");
+    await writeFile(join(root, "delete-me"), "must survive preflight");
+    const scope = gitScope({
+      globalExclude: `${spellings.from}/hidden\n`,
+    });
+    const current = await scanWorkspaceForScope(root, scope);
+    const target: TreeManifest = {
+      format: TREE_MANIFEST_FORMAT,
+      entries: [regularTarget(`${spellings.to}/child`, "target")],
+      scope,
+    };
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.scopeBlockers).toContainEqual({
+      path: `${spellings.from}/hidden`,
+      targetPath: spellings.to,
+    });
+    await expect(
+      applyTreeToWorkspace(root, target, readBlob, current),
+    ).rejects.toThrow(/unmanaged descendant/u);
+
+    await expectRegular("delete-me", "must survive preflight");
+    await expectRegular(`${spellings.from}/hidden`, "ignored");
+    await expectAbsent(`${spellings.to}/child`);
+  });
+
+  it("blocks an absent portable target when its managed alias cannot be deleted", async (context) => {
+    const spellings = await portableDistinctSpellings();
+    context.skip(
+      spellings === undefined,
+      "the host aliases every available portable spelling pair",
+    );
+    if (spellings === undefined) return;
+    await writeFile(join(root, spellings.from), "scanned");
+    const current = await scanRealWorkspace(root);
+    await writeFile(join(root, spellings.from), "changed after scan");
+    const target = manifest([regularTarget(spellings.to, "target")]);
+
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectRegular(spellings.from, "changed after scan");
+    await expectAbsent(spellings.to);
+    expect(report.created).toEqual([]);
+    expect(report.problems).toContainEqual(
+      expect.objectContaining({
+        path: spellings.from,
+        kind: "delete-failed",
+      }),
+    );
+    expect((await scanRealWorkspace(root)).problems).toEqual([]);
+  });
+
+  it("restores a case-only symlink leaf when the host supports it", async (context) => {
+    context.skip(
+      !(await workspaceAliasesCase()) || !(await workspaceSupportsSymlinks()),
+      "requires case aliases and symlink creation",
+    );
+    // Windows deliberately refuses to capture a dangling symlink because its
+    // target kind cannot be recovered portably. Keep the source target live so
+    // this test reaches the case-alias behavior it is meant to exercise.
+    await writeFile(join(root, "current-target"), "");
+    await symlink("current-target", join(root, "X"));
+    const current = await scanRealWorkspace(root);
+    const target = manifest([
+      regularTarget("current-target", ""),
+      {
+        path: "x",
+        type: "symlink",
+        target: "target",
+        symlinkKind: process.platform === "win32" ? "file" : null,
+      },
+    ]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.workspaceAliases).toContainEqual(
+      expect.objectContaining({ from: "X", to: "x", sourceKind: "entry" }),
+    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    expect(await readdir(root)).toEqual(["current-target", "x"]);
+    expect(await readlink(join(root, "x"))).toBe("target");
+    expect(report.created).toEqual(["x"]);
+    expect(report.deleted).toEqual(["X"]);
+    expect(report.renamed).toEqual([]);
+    expect(report.problems).toEqual([]);
+  });
+
+  it("recases nested physical directories while preserving unmodeled empty directories", async () => {
+    const aliasesCase = await workspaceAliasesCase();
+    await mkdir(join(root, "Dir", "Nested", "keep-empty"), {
+      recursive: true,
+    });
+    await writeFile(join(root, "Dir", "Nested", "a"), "current");
+    await writeFile(join(root, "Dir", "Nested", "same"), "same");
+    const current = await scanRealWorkspace(root);
+    const target = manifest([
+      regularTarget("dir/nested/a", "target"),
+      regularTarget("dir/nested/same", "same"),
+    ]);
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectRegular("dir/nested/a", "target");
+    await expectRegular("dir/nested/same", "same");
+    if (aliasesCase) {
+      expect((await readdir(root)).sort()).toEqual(["dir"]);
+      expect(await readdir(join(root, "dir", "nested"))).toContain(
+        "keep-empty",
+      );
+      expect(prepared.plan.renamed).toEqual([
+        { from: "Dir", to: "dir" },
+        { from: "Dir/Nested", to: "dir/nested" },
+      ]);
+      expect(report.renamed).toEqual(prepared.plan.renamed);
+    } else {
+      // The old spelling has to leave the portability namespace before the
+      // target spelling is created. Empty directories are unmodeled state.
+      expect((await readdir(root)).sort()).toEqual(["dir"]);
+      expect(await readdir(join(root, "dir", "nested"))).not.toContain(
+        "keep-empty",
+      );
+      expect(prepared.plan.renamed).toEqual([]);
+      expect(report.renamed).toEqual([]);
+    }
+    expect(report.deleted).toEqual(["Dir/Nested/a", "Dir/Nested/same"]);
+    expect(report.created).toEqual(["dir/nested/a", "dir/nested/same"]);
+    expect(report.problems).toEqual([]);
+  });
+
+  it("reports a completed directory recase when a later blob write fails", async (context) => {
+    context.skip(
+      !(await workspaceAliasesCase()),
+      "requires a case-insensitive physical namespace",
+    );
+    await mkdir(join(root, "X", "keep-empty"), { recursive: true });
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget("x/new", "target")]);
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.renamed).toEqual([{ from: "X", to: "x" }]);
+
+    const report = await applyTreeToWorkspace(
+      root,
+      target,
+      async () => {
+        throw new Error("injected blob failure");
+      },
+      current,
+    );
+
+    expect(report.created).toEqual([]);
+    expect(report.renamed).toEqual([{ from: "X", to: "x" }]);
+    expect(report.problems).toContainEqual(
+      expect.objectContaining({ path: "x/new", kind: "write-failed" }),
+    );
+    expect(await readdir(root)).toEqual(["x"]);
+    expect(await readdir(join(root, "x"))).toEqual(["keep-empty"]);
+  });
+
+  it("reports a committed directory recase when post-commit validation fails", async (context) => {
+    context.skip(
+      !(await workspaceAliasesCase()),
+      "requires a case-insensitive physical namespace",
+    );
+    await mkdir(join(root, "X", "keep-empty"), { recursive: true });
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget("x/new", "target")]);
+    const originalIncludes = Array.prototype.includes;
+    let exactSpellingChecks = 0;
+    const includes = vi
+      .spyOn(Array.prototype, "includes")
+      .mockImplementation(function (
+        this: unknown[],
+        searchElement: unknown,
+        fromIndex?: number,
+      ): boolean {
+        if (
+          searchElement === "x" &&
+          this.some((entry) => entry === "X" || entry === "x")
+        ) {
+          exactSpellingChecks += 1;
+          if (exactSpellingChecks === 2) {
+            throw new Error("injected post-rename validation failure");
+          }
+        }
+        return originalIncludes.call(this, searchElement, fromIndex);
+      });
+
+    try {
+      const report = await applyTreeToWorkspace(
+        root,
+        target,
+        readBlob,
+        current,
+      );
+
+      expect(exactSpellingChecks).toBe(2);
+      expect(report.created).toEqual([]);
+      expect(report.renamed).toEqual([{ from: "X", to: "x" }]);
+      expect(report.problems).toContainEqual(
+        expect.objectContaining({
+          path: "x",
+          kind: "write-failed",
+          detail: expect.stringContaining("post-commit validation failed"),
+        }),
+      );
+      expect(await readdir(root)).toEqual(["x"]);
+      expect(await readdir(join(root, "x"))).toEqual(["keep-empty"]);
+    } finally {
+      includes.mockRestore();
+    }
+  });
+
+  it("resolves Unicode filesystem aliases through one identity index", async (context) => {
+    context.skip(
+      !(await workspaceAliasesSpellings("Σ", "ς")),
+      "the host does not physically alias these Unicode spellings",
+    );
+    await mkdir(join(root, "Σ"));
+    const targetEntries: TreeEntry[] = [];
+    for (let index = 0; index < 32; index += 1) {
+      const name = `entry-${index}`;
+      await writeFile(join(root, "Σ", name), `current-${index}`);
+      targetEntries.push(regularTarget(`ς/${name}`, `target-${index}`));
+    }
+    const current = await scanRealWorkspace(root);
+    const target = manifest(targetEntries);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.workspaceAliases).toHaveLength(33);
+    expect(prepared.plan.renamed).toEqual([{ from: "Σ", to: "ς" }]);
+
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+    expect(report.renamed).toEqual([{ from: "Σ", to: "ς" }]);
+    expect(report.problems).toEqual([]);
+    expect(await readdir(root)).toEqual(["ς"]);
+    await expectRegular("ς/entry-31", "target-31");
+  });
+
+  it("handles a portable directory alias that becomes a target leaf", async () => {
+    const aliasesCase = await workspaceAliasesCase();
+    await mkdir(join(root, "X", "nested-empty"), { recursive: true });
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget("x", "target")]);
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(
+      prepared.workspaceAliases.some(
+        (alias) =>
+          alias.from === "X" &&
+          alias.to === "x" &&
+          alias.sourceKind === "directory" &&
+          alias.targetExisted === aliasesCase,
+      ),
+    ).toBe(true);
+    expect(prepared.plan.renamed).toEqual([]);
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
+
+    await expectRegular("x", "target");
+    expect(await readdir(root)).toEqual(["x"]);
+    expect(report.renamed).toEqual([]);
+    expect(report.problems).toEqual([]);
+  });
+
+  it("fails closed on coexisting case-distinct leaves from the real scanner", async (context) => {
+    context.skip(
+      await workspaceAliasesCase(),
+      "the host filesystem cannot represent both spellings",
+    );
+    await writeFile(join(root, "X"), "remove");
+    await writeFile(join(root, "x"), "current");
+    const current = await scanRealWorkspace(root);
+    const target = manifest([regularTarget("x", "target")]);
+
+    expect(current.problems).toContainEqual(
+      expect.objectContaining({ kind: "path-collision" }),
+    );
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.workspaceAliases).toEqual([]);
+    await expect(
+      applyTreeToWorkspace(root, target, readBlob, current),
+    ).rejects.toThrow(/incomplete current workspace scan/u);
+
+    await expectRegular("X", "remove");
+    await expectRegular("x", "current");
+  });
+
+  it.each([
+    {
+      name: "an excluded physical alias",
+      policy: "X\n",
+      seed: async () => {
+        await writeFile(join(root, "X"), "ignored");
+      },
+      targetPath: "x",
+      targetEntry: () => regularTarget("x", "target"),
+      blockerPath: "X",
+    },
+    {
+      name: "an excluded descendant of a recased directory",
+      policy: "Dir/hidden\n",
+      seed: async () => {
+        await mkdir(join(root, "Dir"));
+        await writeFile(join(root, "Dir", "managed"), "current");
+        await writeFile(join(root, "Dir", "hidden"), "ignored");
+      },
+      targetPath: "dir",
+      targetEntry: () => regularTarget("dir/managed", "target"),
+      blockerPath: "Dir/hidden",
+    },
+  ])(
+    "previews and preflights $name before mutation",
+    async ({ policy, seed, targetPath, targetEntry, blockerPath }) => {
+      if (!(await workspaceAliasesCase())) return;
+      await writeFile(join(root, "delete-me"), "must survive preflight");
+      await seed();
+      const scope = gitScope({ globalExclude: policy });
+      const current = await scanWorkspaceForScope(root, scope);
+      const target: TreeManifest = {
+        format: TREE_MANIFEST_FORMAT,
+        entries: [targetEntry()],
+        scope,
+      };
+
+      const prepared = await prepareWorkspaceRestorePlan(current, target);
+      expect(prepared.plan.scopeBlockers).toContainEqual({
+        path: blockerPath,
+        targetPath,
+      });
+      await expect(
+        applyTreeToWorkspace(root, target, readBlob, current),
+      ).rejects.toThrow(/unmanaged descendant/u);
+
+      await expectRegular("delete-me", "must survive preflight");
+      if (blockerPath === "X") {
+        await expectRegular("X", "ignored");
+      } else {
+        await expectRegular("Dir/managed", "current");
+        await expectRegular("Dir/hidden", "ignored");
+      }
+    },
+    15_000,
+  );
+
+  it("returns an excluded directory alias blocker without probing omitted descendants", async () => {
+    if (!(await workspaceAliasesCase())) return;
+    await mkdir(join(root, "Dir"));
+    await writeFile(join(root, "Dir", "managed"), "ignored");
+    await writeFile(join(root, "delete-me"), "must survive preflight");
+    const scope = gitScope({ globalExclude: "Dir/\n" });
+    const current = await scanWorkspaceForScope(root, scope);
+    const target: TreeManifest = {
+      format: TREE_MANIFEST_FORMAT,
+      entries: [regularTarget("dir/managed", "target")],
+      scope,
+    };
+
+    const prepared = await prepareWorkspaceRestorePlan(current, target);
+    expect(prepared.plan.scopeBlockers).toContainEqual({
+      path: "Dir",
+      targetPath: "dir",
+    });
+    expect(prepared.plan.problems).toContainEqual(
+      expect.objectContaining({ path: "Dir", kind: "scope-blocker" }),
+    );
+    await expect(
+      applyTreeToWorkspace(root, target, readBlob, current),
+    ).rejects.toThrow(/unmanaged descendant/u);
+
+    await expectRegular("Dir/managed", "ignored");
+    await expectRegular("delete-me", "must survive preflight");
   });
 
   it("replaces an observed empty directory with a regular file", async () => {

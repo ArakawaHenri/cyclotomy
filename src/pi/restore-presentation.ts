@@ -1,17 +1,15 @@
 import type { ApplyProblem } from "../infrastructure/apply.ts";
 import type { WorkspaceRestorePlan } from "../infrastructure/restore-plan.ts";
 import type { ScanProblem } from "../infrastructure/workspace-scan.ts";
+import { portableWorkspacePathKey } from "../infrastructure/workspace-scope.ts";
 
 type RestorePreview = Pick<
   WorkspaceRestorePlan,
-  "created" | "deleted" | "modified" | "problems"
+  "created" | "deleted" | "modified" | "renamed" | "problems"
 >;
 
 export interface RestorePreviewOptions {
-  /** Omit to list every action. */
-  readonly sampleLimit?: number;
   readonly summary: string;
-  readonly omittedNotice: (count: number) => string;
   readonly problemNotice: string;
   readonly problemLabel: (problem: ScanProblem) => string;
   readonly scopeNotice?: string;
@@ -52,58 +50,11 @@ function escapedControl(character: string): string {
   }
 }
 
-function boundedEscape(
+function escapeForDisplay(
   value: string,
-  maxLength: number,
   quote: boolean,
-  preserveTail = false,
+  maxLength?: number,
 ): { readonly text: string; readonly escaped: boolean } {
-  if (preserveTail) {
-    const segments: string[] = [];
-    let escaped = false;
-    let visibleLength = 0;
-    for (const character of value) {
-      let visible = character;
-      if (UNSAFE_DISPLAY_CHARACTER.test(character)) {
-        visible = escapedControl(character);
-        escaped = true;
-      } else if (quote && (character === "\\" || character === '"')) {
-        visible = `\\${character}`;
-        escaped = true;
-      }
-      segments.push(visible);
-      visibleLength += visible.length;
-    }
-    if (visibleLength <= maxLength) {
-      return { text: segments.join(""), escaped };
-    }
-
-    const available = Math.max(0, maxLength - 1);
-    const headBudget = Math.floor(available * 0.4);
-    const tailBudget = available - headBudget;
-    let head = "";
-    let headEnd = 0;
-    while (
-      headEnd < segments.length &&
-      head.length + segments[headEnd]!.length <= headBudget
-    ) {
-      head += segments[headEnd]!;
-      headEnd += 1;
-    }
-    const tail: string[] = [];
-    let tailLength = 0;
-    let tailStart = segments.length;
-    while (
-      tailStart > headEnd &&
-      tailLength + segments[tailStart - 1]!.length <= tailBudget
-    ) {
-      tailStart -= 1;
-      tail.unshift(segments[tailStart]!);
-      tailLength += segments[tailStart]!.length;
-    }
-    return { text: `${head}…${tail.join("")}`, escaped: true };
-  }
-
   let text = "";
   let escaped = false;
   let truncated = false;
@@ -116,7 +67,7 @@ function boundedEscape(
       visible = `\\${character}`;
       escaped = true;
     }
-    if (text.length + visible.length > maxLength) {
+    if (maxLength !== undefined && text.length + visible.length > maxLength) {
       truncated = true;
       break;
     }
@@ -127,7 +78,7 @@ function boundedEscape(
 }
 
 export function formatUiPath(path: string): string {
-  const visible = boundedEscape(path, 96, true, true);
+  const visible = escapeForDisplay(path, true);
   const ambiguousWhitespace = path.length === 0 || path.trim() !== path;
   return visible.escaped || ambiguousWhitespace
     ? `"${visible.text}"`
@@ -136,15 +87,21 @@ export function formatUiPath(path: string): string {
 
 /** Render an untrusted host/filesystem detail as one bounded terminal line. */
 export function formatUiDetail(detail: unknown): string {
-  return boundedEscape(String(detail), 200, false).text;
+  return escapeForDisplay(String(detail), false, 200).text;
 }
 
 export function restoreActionCount(plan: RestorePreview): number {
-  return plan.created.length + plan.modified.length + plan.deleted.length;
+  return (
+    plan.created.length +
+    plan.modified.length +
+    plan.renamed.length +
+    plan.deleted.length
+  );
 }
 
 function isIgnorePolicyPath(path: string): boolean {
-  return path === ".gitignore" || path.endsWith("/.gitignore");
+  const basename = path.slice(path.lastIndexOf("/") + 1);
+  return portableWorkspacePathKey(basename) === ".gitignore";
 }
 
 /** Format the actions that restore would apply, from the target's direction. */
@@ -152,29 +109,40 @@ export function formatWorkspaceRestorePreview(
   plan: RestorePreview,
   options: RestorePreviewOptions,
 ): string {
-  const sampleLimit =
-    options.sampleLimit === undefined
-      ? Number.POSITIVE_INFINITY
-      : Math.max(0, Math.floor(options.sampleLimit));
-  const actionsFor = (paths: readonly string[], symbol: string) =>
+  interface PreviewAction {
+    readonly path: string;
+    readonly symbol: string;
+    readonly to?: string;
+  }
+  const actionsFor = (
+    paths: readonly string[],
+    symbol: string,
+  ): PreviewAction[] =>
     [...paths]
       .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
       .map((path) => ({ path, symbol }));
+  const renames: PreviewAction[] = [...plan.renamed]
+    .sort((left, right) =>
+      left.to < right.to ? -1 : left.to > right.to ? 1 : 0,
+    )
+    .map(({ from, to }) => ({ path: from, to, symbol: ">" }));
   const actions = [
     ...actionsFor(plan.deleted, "-"),
     ...actionsFor(plan.modified, "~"),
+    ...renames,
     ...actionsFor(plan.created, "+"),
   ];
   const lines = options.summary.length === 0 ? [] : [options.summary];
 
-  for (const action of actions.slice(0, sampleLimit)) {
-    lines.push(`${action.symbol} ${formatUiPath(action.path)}`);
+  for (const action of actions) {
+    lines.push(
+      action.to === undefined
+        ? `${action.symbol} ${formatUiPath(action.path)}`
+        : `${action.symbol} ${formatUiPath(action.path)} → ${formatUiPath(
+            action.to,
+          )}`,
+    );
   }
-  const omitted = actions.length - Math.min(actions.length, sampleLimit);
-  if (omitted > 0) {
-    lines.push(options.omittedNotice(omitted));
-  }
-
   if (plan.problems.length > 0) {
     lines.push(`? ${options.problemNotice}`);
     for (const problem of plan.problems.slice(0, 3)) {
@@ -185,7 +153,11 @@ export function formatWorkspaceRestorePreview(
 
   if (
     options.scopeNotice !== undefined &&
-    actions.some((action) => isIgnorePolicyPath(action.path))
+    actions.some(
+      (action) =>
+        isIgnorePolicyPath(action.path) ||
+        (action.to !== undefined && isIgnorePolicyPath(action.to)),
+    )
   ) {
     lines.push(options.scopeNotice);
   }

@@ -1,13 +1,15 @@
 import {
   mkdir,
   mkdtemp,
+  readFile,
   stat,
   symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -18,11 +20,19 @@ import {
 } from "../src/infrastructure/object-gc.ts";
 import { MetadataStore } from "../src/infrastructure/metadata.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
+import { commitTestNodeState } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
 const roots: string[] = [];
 const scope = ALL_MANAGED_SCOPE;
+const publishedV1FixtureRoot = fileURLToPath(
+  new URL("./fixtures/cyclotomy-0.0.1-tree/", import.meta.url),
+);
+const incompatibleV1TreeOid =
+  "a3c2394720cce94c55e5b9d40fdd9a9ced03d42611e0069a61982936f502310d";
+const incompatibleV1BlobOid =
+  "4e8ee7bb37a569f50dcbca3d59db6b6303d2d63a30d691580b5ae856fe059831";
 
 function objectPath(
   root: string,
@@ -104,7 +114,7 @@ describe("object garbage collection", () => {
       ],
       scope,
     );
-    metadata.setState("s1", "e1", treeOid);
+    commitTestNodeState(metadata, "s1", "e1", treeOid);
 
     const old = new Date(Date.now() - 10_000);
     await utimes(objectPath(root, "blobs", blobOid), old, old);
@@ -137,7 +147,7 @@ describe("object garbage collection", () => {
       ],
       scope,
     );
-    metadata.setState("s1", "e1", treeOid);
+    commitTestNodeState(metadata, "s1", "e1", treeOid);
 
     const rootedPath = objectPath(root, "blobs", blobOid);
     await writeFile(rootedPath, "corrupt but still reachable");
@@ -155,6 +165,49 @@ describe("object garbage collection", () => {
 
     expect(report.removedBlobs).toBe(1);
     await expect(stat(rootedPath)).resolves.toBeDefined();
+    await expect(stat(orphanPath)).rejects.toThrow();
+    metadata.close();
+  });
+
+  it("marks the blob closure of a valid v1 tree that portable v2 quarantines", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-v1-"));
+    roots.push(root);
+    const store = await openObjectStore(root);
+    const metadata = new MetadataStore(join(root, "state.db"));
+    for (const [kind, oid, fixture] of [
+      ["blobs", incompatibleV1BlobOid, "incompatible-gitignore.blob"],
+      ["trees", incompatibleV1TreeOid, "incompatible-gitignore.tree"],
+    ] as const) {
+      const path = objectPath(root, kind, oid);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(
+        path,
+        await readFile(join(publishedV1FixtureRoot, fixture)),
+      );
+    }
+    commitTestNodeState(metadata, "legacy", "blocked", incompatibleV1TreeOid);
+
+    const orphanOid = "f".repeat(64);
+    const orphanPath = objectPath(root, "blobs", orphanOid);
+    await mkdir(dirname(orphanPath), { recursive: true });
+    await writeFile(orphanPath, "orphan");
+    const old = new Date(Date.now() - 10_000);
+    await Promise.all([
+      utimes(objectPath(root, "blobs", incompatibleV1BlobOid), old, old),
+      utimes(objectPath(root, "trees", incompatibleV1TreeOid), old, old),
+      utimes(orphanPath, old, old),
+    ]);
+
+    const report = await collectGarbage(root, store, metadata, 1, Date.now());
+
+    expect(report.removedBlobs).toBe(1);
+    expect(report.removedTrees).toBe(0);
+    await expect(
+      stat(objectPath(root, "blobs", incompatibleV1BlobOid)),
+    ).resolves.toBeDefined();
+    await expect(
+      stat(objectPath(root, "trees", incompatibleV1TreeOid)),
+    ).resolves.toBeDefined();
     await expect(stat(orphanPath)).rejects.toThrow();
     metadata.close();
   });

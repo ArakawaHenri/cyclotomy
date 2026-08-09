@@ -21,13 +21,18 @@ import {
   type TreeEntry,
   type TreeManifest,
 } from "./tree-manifest.ts";
-import { planWorkspaceRestore } from "./restore-plan.ts";
+import {
+  prepareWorkspaceRestorePlan,
+  type WorkspacePathAlias,
+} from "./restore-preparation.ts";
+import type { WorkspacePathRename } from "./restore-plan.ts";
 import {
   summarizeScanProblems,
   type WorkspaceEntry,
   type WorkspaceSnapshot,
 } from "./workspace-scan.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
+import { portableWorkspacePathKey } from "./workspace-scope.ts";
 
 export type ApplyProblemKind =
   "write-failed" | "delete-failed" | "mkdir-failed" | "read-failed";
@@ -41,16 +46,18 @@ export interface ApplyProblem {
 /**
  * Diff result of one apply run. The path buckets cover file and symlink
  * paths only: `created` holds target paths absent from the current
- * snapshot, `updated` holds paths whose type, content, or target text changed
- * (including file<->directory migrations), and `deleted` holds
- * current paths the target drops entirely. Pruned directories are implicit
- * structure and are not listed; every per-path failure lands in `problems`
- * without aborting the remaining paths.
+ * snapshot, `updated` holds file/symlink paths whose type, content, or target
+ * text changed (including file<->directory migrations), `deleted` holds
+ * current paths the target drops entirely, and `renamed` records physical
+ * directory spelling changes. Other pruned directories are implicit structure
+ * and are not listed; every per-path failure lands in `problems` without
+ * aborting the remaining paths.
  */
 export interface ApplyReport {
   readonly created: readonly string[];
   readonly updated: readonly string[];
   readonly deleted: readonly string[];
+  readonly renamed: readonly WorkspacePathRename[];
   readonly unchangedCount: number;
   readonly problems: readonly ApplyProblem[];
 }
@@ -109,10 +116,8 @@ function pathDepth(relativePath: string): number {
  */
 function isGitInternalPath(relativePath: string): boolean {
   return relativePath
-    .normalize("NFC")
-    .toLowerCase()
     .split("/")
-    .includes(".git");
+    .some((component) => portableWorkspacePathKey(component) === ".git");
 }
 
 function ancestorDirectories(relativePath: string, into: Set<string>): void {
@@ -434,6 +439,99 @@ async function assertObservedDirectory(
   }
 }
 
+async function hasExactDirectoryEntry(absolute: string): Promise<boolean> {
+  const names = await readdir(dirname(absolute));
+  return names.includes(basename(absolute));
+}
+
+async function assertPreparedDirectoryAlias(
+  workspaceRoot: string,
+  alias: WorkspacePathAlias,
+): Promise<void> {
+  const source = await lstat(join(workspaceRoot, alias.from));
+  if (
+    source.isSymbolicLink() ||
+    !source.isDirectory() ||
+    alias.ino === 0 ||
+    source.dev !== alias.dev ||
+    source.ino !== alias.ino
+  ) {
+    throw new Error("workspace directory alias changed after preflight");
+  }
+  try {
+    const target = await lstat(join(workspaceRoot, alias.to));
+    if (
+      !alias.targetExisted ||
+      target.isSymbolicLink() ||
+      !target.isDirectory() ||
+      target.dev !== alias.dev ||
+      target.ino !== alias.ino
+    ) {
+      throw new Error("workspace directory alias changed after preflight");
+    }
+  } catch (error) {
+    if (
+      !alias.targetExisted &&
+      (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR")
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+class CommittedDirectoryRecaseError extends Error {
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `directory rename committed but post-commit validation failed: ${detail}`,
+      { cause },
+    );
+    this.name = "CommittedDirectoryRecaseError";
+  }
+}
+
+/**
+ * Change one observed directory entry's spelling without rebuilding its
+ * contents. The exact-name check rejects filesystems that accept a case-only
+ * rename as a no-op; apply then fails closed without a second crash window.
+ */
+async function recasePreparedDirectory(
+  workspaceRoot: string,
+  alias: WorkspacePathAlias,
+): Promise<boolean> {
+  const source = join(workspaceRoot, alias.from);
+  const target = join(workspaceRoot, alias.to);
+  await assertPreparedDirectoryAlias(workspaceRoot, alias);
+  if (await hasExactDirectoryEntry(target)) {
+    if (!alias.targetExisted) {
+      throw new Error("target directory spelling appeared after preflight");
+    }
+    return false;
+  }
+
+  await rename(source, target);
+  try {
+    const targetMetadata = await lstat(target);
+    if (
+      targetMetadata.isSymbolicLink() ||
+      !targetMetadata.isDirectory() ||
+      targetMetadata.dev !== alias.dev ||
+      targetMetadata.ino !== alias.ino
+    ) {
+      throw new Error("renamed directory identity changed after commit");
+    }
+    if (!(await hasExactDirectoryEntry(target))) {
+      throw new Error(
+        "filesystem did not preserve the target directory spelling",
+      );
+    }
+  } catch (cause) {
+    throw new CommittedDirectoryRecaseError(cause);
+  }
+  return true;
+}
+
 function observedAncestorPaths(relativePath: string): string[] {
   const result = [""];
   let separator = relativePath.indexOf("/");
@@ -519,8 +617,31 @@ function currentEntryAncestor(
   return undefined;
 }
 
+function physicalAliasAncestor(
+  relativePath: string,
+  aliases: ReadonlyMap<string, WorkspacePathAlias>,
+): WorkspacePathAlias | undefined {
+  let separator = relativePath.lastIndexOf("/");
+  while (separator !== -1) {
+    const alias = aliases.get(relativePath.slice(0, separator));
+    if (alias !== undefined) return alias;
+    separator = relativePath.lastIndexOf("/", separator - 1);
+  }
+  return undefined;
+}
+
 function isAtOrBelow(path: string, root: string): boolean {
   return path === root || path.startsWith(`${root}/`);
+}
+
+function hasPathAtOrAbove(path: string, paths: ReadonlySet<string>): boolean {
+  let candidate = path;
+  while (true) {
+    if (paths.has(candidate)) return true;
+    const separator = candidate.lastIndexOf("/");
+    if (separator === -1) return false;
+    candidate = candidate.slice(0, separator);
+  }
 }
 
 async function assertUnobservedPathAbsent(
@@ -630,12 +751,69 @@ async function preflightReplacementNamespace(
   current: ReadonlyMap<string, WorkspaceEntry>,
   excluded: ReadonlyMap<string, ExcludedObservation>,
   directories: ReadonlyMap<string, DirectoryObservation>,
+  aliasesByTarget: ReadonlyMap<string, WorkspacePathAlias>,
 ): Promise<void> {
   const validatedEntries = new Set<string>();
   const validateEntry = async (entry: WorkspaceEntry): Promise<void> => {
     if (validatedEntries.has(entry.path)) return;
     await assertWorkspaceEntryKindUnchanged(workspaceRoot, entry, directories);
     validatedEntries.add(entry.path);
+  };
+  const validatedAliases = new Set<string>();
+  const inventoriedAliasDirectories = new Set<string>();
+  const validateAlias = async (alias: WorkspacePathAlias): Promise<void> => {
+    if (validatedAliases.has(alias.to)) return;
+    if (alias.sourceKind === "entry") {
+      const source = current.get(alias.from);
+      if (source === undefined) {
+        throw new Error("workspace path alias lost its managed source entry");
+      }
+      await validateEntry(source);
+    } else {
+      const observation = directories.get(alias.from);
+      if (observation === undefined) {
+        throw new Error("workspace path alias lost its source directory");
+      }
+      await assertObservedDirectory(workspaceRoot, observation);
+      const covered = [...inventoriedAliasDirectories].some((root) =>
+        isAtOrBelow(alias.from, root),
+      );
+      if (!covered) {
+        await assertReplacementDirectoryInventory(
+          workspaceRoot,
+          alias.from,
+          current,
+          excluded,
+          directories,
+        );
+        inventoriedAliasDirectories.add(alias.from);
+      }
+    }
+    const sourceNow = await lstat(join(workspaceRoot, alias.from));
+    if (
+      alias.ino === 0 ||
+      sourceNow.dev !== alias.dev ||
+      sourceNow.ino !== alias.ino ||
+      (alias.sourceKind === "directory" &&
+        (sourceNow.isSymbolicLink() || !sourceNow.isDirectory()))
+    ) {
+      throw new Error("workspace path alias changed after restore preparation");
+    }
+    if (alias.targetExisted) {
+      const targetNow = await lstat(join(workspaceRoot, alias.to));
+      if (
+        targetNow.dev !== alias.dev ||
+        targetNow.ino !== alias.ino ||
+        excludedKind(sourceNow) !== excludedKind(targetNow)
+      ) {
+        throw new Error(
+          "workspace path alias changed after restore preparation",
+        );
+      }
+    } else {
+      await assertUnobservedPathAbsent(workspaceRoot, alias.to, directories);
+    }
+    validatedAliases.add(alias.to);
   };
 
   try {
@@ -653,6 +831,13 @@ async function preflightReplacementNamespace(
       const ancestor = currentEntryAncestor(path, current);
       if (ancestor !== undefined) {
         await validateEntry(ancestor);
+        continue;
+      }
+      const alias =
+        aliasesByTarget.get(path) ??
+        physicalAliasAncestor(path, aliasesByTarget);
+      if (alias !== undefined) {
+        await validateAlias(alias);
         continue;
       }
       await assertUnobservedPathAbsent(workspaceRoot, path, directories);
@@ -683,6 +868,13 @@ async function preflightReplacementNamespace(
       const ancestor = currentEntryAncestor(entry.path, current);
       if (ancestor !== undefined) {
         await validateEntry(ancestor);
+        continue;
+      }
+      const alias =
+        aliasesByTarget.get(entry.path) ??
+        physicalAliasAncestor(entry.path, aliasesByTarget);
+      if (alias !== undefined) {
+        await validateAlias(alias);
         continue;
       }
       await assertUnobservedPathAbsent(workspaceRoot, entry.path, directories);
@@ -858,6 +1050,7 @@ export async function applyTreeToWorkspace(
   const created: string[] = [];
   const updated: string[] = [];
   const deleted: string[] = [];
+  const renamed: WorkspacePathRename[] = [];
   let unchangedCount = 0;
   // Directories whose entries changed, relative to the root ("" names the
   // root itself); each is fsynced once after all mutations complete.
@@ -925,7 +1118,25 @@ export async function applyTreeToWorkspace(
       );
     }
   }
-  const restorePlan = planWorkspaceRestore(current, target);
+  let preparedRestore: Awaited<ReturnType<typeof prepareWorkspaceRestorePlan>>;
+  try {
+    preparedRestore = await prepareWorkspaceRestorePlan(current, target);
+  } catch (error) {
+    throw new ApplyError(
+      "workspace replacement namespace changed since the current scan",
+      error,
+    );
+  }
+  const restorePlan = preparedRestore.plan;
+  const aliasesByTarget = new Map(
+    preparedRestore.workspaceAliases.map((alias) => [alias.to, alias] as const),
+  );
+  const aliasesBySource = new Map<string, WorkspacePathAlias[]>();
+  for (const alias of preparedRestore.workspaceAliases) {
+    const aliases = aliasesBySource.get(alias.from) ?? [];
+    aliases.push(alias);
+    aliasesBySource.set(alias.from, aliases);
+  }
   await preflightScopeBlockers(
     workspaceRoot,
     restorePlan.scopeBlockers,
@@ -963,6 +1174,7 @@ export async function applyTreeToWorkspace(
     currentByPath,
     excludedByPath,
     directoryObservations,
+    aliasesByTarget,
   );
 
   const assertCurrentPath = async (entry: WorkspaceEntry): Promise<void> => {
@@ -989,6 +1201,130 @@ export async function applyTreeToWorkspace(
     throw new Error(UNOBSERVED_PATH_DETAIL);
   };
 
+  const blockedDirectoryReplacements = new Set<string>();
+  const directoryAliases = preparedRestore.workspaceAliases
+    .filter((alias) => alias.sourceKind === "directory")
+    .sort(
+      (left, right) =>
+        pathDepth(left.from) - pathDepth(right.from) ||
+        comparePaths(left.from, right.from),
+    );
+  const directoryRecases = directoryAliases.filter(
+    (alias) => alias.canRecaseDirectory && targetKeptDirectories.has(alias.to),
+  );
+  const failedDirectoryAliasSources = new Set<string>();
+  const committedDirectoryRecases: WorkspacePathRename[] = [];
+  const pathAfterCommittedRecases = (path: string): string => {
+    let current = path;
+    for (const recase of committedDirectoryRecases) {
+      if (isAtOrBelow(current, recase.from)) {
+        current = `${recase.to}${current.slice(recase.from.length)}`;
+      }
+    }
+    return current;
+  };
+  const copyDirectoryObservations = (from: string, to: string): void => {
+    for (const observation of [...directoryObservations.values()]) {
+      if (!isAtOrBelow(observation.path, from)) continue;
+      const suffix = observation.path.slice(from.length);
+      const targetPath = `${to}${suffix}`;
+      directoryObservations.set(targetPath, {
+        path: targetPath,
+        dev: observation.dev,
+        ino: observation.ino,
+      });
+    }
+  };
+
+  // Re-spell real directory entries only after every replacement and scope
+  // boundary has passed the shared preflight. Renaming preserves empty
+  // directories, which are deliberately observed for safety but absent from
+  // checkpoint semantics. Keep the source observations as well: current
+  // managed entries still use their scanned spelling for later validation.
+  for (const alias of directoryRecases) {
+    const failedAncestor = [...failedDirectoryAliasSources].some((source) =>
+      isAtOrBelow(alias.from, source),
+    );
+    if (failedAncestor) {
+      failedDirectoryAliasSources.add(alias.from);
+      blockedDirectories.add(alias.to);
+      if (targetByPath.has(alias.to)) {
+        blockedDirectoryReplacements.add(alias.to);
+      }
+      continue;
+    }
+    const effectiveFrom = pathAfterCommittedRecases(alias.from);
+    const effectiveAlias: WorkspacePathAlias =
+      effectiveFrom === alias.from ? alias : { ...alias, from: effectiveFrom };
+    const observation = directoryObservations.get(effectiveFrom);
+    if (observation === undefined) {
+      problems.push({
+        path: alias.to,
+        kind: "write-failed",
+        detail: "workspace directory alias lost its scanned observation",
+      });
+      failedDirectoryAliasSources.add(alias.from);
+      blockedDirectories.add(alias.to);
+      if (targetByPath.has(alias.to)) {
+        blockedDirectoryReplacements.add(alias.to);
+      }
+      continue;
+    }
+    try {
+      await assertObservedAncestors(
+        workspaceRoot,
+        effectiveFrom,
+        directoryObservations,
+      );
+      await assertObservedDirectory(workspaceRoot, observation);
+      if (effectiveFrom === alias.to) {
+        const targetMetadata = await lstat(join(workspaceRoot, alias.to));
+        if (
+          targetMetadata.isSymbolicLink() ||
+          !targetMetadata.isDirectory() ||
+          targetMetadata.dev !== alias.dev ||
+          targetMetadata.ino !== alias.ino ||
+          !(await hasExactDirectoryEntry(join(workspaceRoot, alias.to)))
+        ) {
+          throw new Error(
+            "parent directory recase did not preserve the nested target alias",
+          );
+        }
+        continue;
+      }
+      const changed = await recasePreparedDirectory(
+        workspaceRoot,
+        effectiveAlias,
+      );
+      copyDirectoryObservations(effectiveFrom, alias.to);
+      if (changed) {
+        committedDirectoryRecases.push({
+          from: effectiveFrom,
+          to: alias.to,
+        });
+        renamed.push({ from: alias.from, to: alias.to });
+        markDirty(effectiveFrom);
+        markDirty(alias.to);
+      }
+    } catch (error) {
+      if (error instanceof CommittedDirectoryRecaseError) {
+        renamed.push({ from: alias.from, to: alias.to });
+        markDirty(alias.from);
+        markDirty(alias.to);
+      }
+      problems.push({
+        path: alias.to,
+        kind: "write-failed",
+        detail: errorDetail("rename directory spelling", error),
+      });
+      failedDirectoryAliasSources.add(alias.from);
+      blockedDirectories.add(alias.to);
+      if (targetByPath.has(alias.to)) {
+        blockedDirectoryReplacements.add(alias.to);
+      }
+    }
+  }
+
   // Step 1: unlink current files/symlinks the target does not have. File and
   // symlink replacements remain in place until a prepared sibling can rename
   // over them atomically in a later step.
@@ -997,6 +1333,13 @@ export async function applyTreeToWorkspace(
   );
   for (const currentEntry of currentEntries) {
     const relativePath = currentEntry.path;
+    if (
+      [...failedDirectoryAliasSources].some((source) =>
+        isAtOrBelow(relativePath, source),
+      )
+    ) {
+      continue;
+    }
     if (targetByPath.has(relativePath)) {
       continue;
     }
@@ -1017,6 +1360,10 @@ export async function applyTreeToWorkspace(
         deleted.push(relativePath);
       }
     } catch (error) {
+      for (const alias of aliasesBySource.get(relativePath) ?? []) {
+        blockedDirectories.add(alias.to);
+        blockedDirectoryReplacements.add(alias.to);
+      }
       problems.push({
         path: relativePath,
         kind: "delete-failed",
@@ -1028,7 +1375,13 @@ export async function applyTreeToWorkspace(
   // Step 2: prune directories the target no longer needs, deepest first.
   // A directory that still holds unmanaged content is kept on purpose.
   const prunableDirectories = [...currentDirectories]
-    .filter((relativePath) => !targetKeptDirectories.has(relativePath))
+    .filter(
+      (relativePath) =>
+        !targetKeptDirectories.has(relativePath) &&
+        !directoryAliases.some((alias) =>
+          isAtOrBelow(relativePath, alias.from),
+        ),
+    )
     .sort(
       (left, right) =>
         pathDepth(right) - pathDepth(left) || comparePaths(left, right),
@@ -1070,20 +1423,53 @@ export async function applyTreeToWorkspace(
   // directory. rmdir is atomic with respect to non-emptiness, so ignored
   // content or a raced-in child makes the replacement fail closed instead of
   // being deleted.
-  const blockedDirectoryReplacements = new Set<string>();
-  const directoryReplacementRoots = [...targetByPath.keys()]
-    .filter(
-      (relativePath) =>
-        !currentByPath.has(relativePath) &&
-        directoryObservations.has(relativePath),
-    )
-    .sort(comparePaths);
-  for (const replacementRoot of directoryReplacementRoots) {
+  const directoryReplacementRootsByTarget = new Map<
+    string,
+    { readonly targetPath: string; readonly observedRoot: string }
+  >();
+  const directoryReplacementObservedRoots = new Set<string>();
+  const addDirectoryReplacementRoot = (
+    targetPath: string,
+    observedRoot: string,
+  ): void => {
+    if (directoryReplacementRootsByTarget.has(targetPath)) return;
+    const effectiveObservedRoot = pathAfterCommittedRecases(observedRoot);
+    if (
+      hasPathAtOrAbove(effectiveObservedRoot, directoryReplacementObservedRoots)
+    ) {
+      return;
+    }
+    directoryReplacementRootsByTarget.set(targetPath, {
+      targetPath,
+      observedRoot: effectiveObservedRoot,
+    });
+    directoryReplacementObservedRoots.add(effectiveObservedRoot);
+  };
+  for (const alias of directoryAliases) {
+    if (!alias.canRecaseDirectory) {
+      addDirectoryReplacementRoot(alias.to, alias.from);
+    }
+  }
+  for (const targetPath of targetByPath.keys()) {
+    if (currentByPath.has(targetPath)) continue;
+    if (directoryObservations.has(targetPath)) {
+      addDirectoryReplacementRoot(targetPath, targetPath);
+      continue;
+    }
+    const alias = aliasesByTarget.get(targetPath);
+    if (alias?.sourceKind === "directory") {
+      addDirectoryReplacementRoot(targetPath, alias.from);
+    }
+  }
+  const directoryReplacementRoots = [
+    ...directoryReplacementRootsByTarget.values(),
+  ].sort((left, right) => comparePaths(left.targetPath, right.targetPath));
+  for (const { targetPath, observedRoot } of directoryReplacementRoots) {
     const observedSubtree = [...directoryObservations.keys()]
       .filter(
         (relativePath) =>
-          relativePath === replacementRoot ||
-          relativePath.startsWith(`${replacementRoot}/`),
+          relativePath === observedRoot ||
+          relativePath.startsWith(`${observedRoot}/`),
       )
       .sort(
         (left, right) =>
@@ -1110,7 +1496,8 @@ export async function applyTreeToWorkspace(
           kind: "delete-failed",
           detail: errorDetail("rmdir before type replacement", error),
         });
-        blockedDirectoryReplacements.add(replacementRoot);
+        blockedDirectoryReplacements.add(targetPath);
+        blockedDirectories.add(targetPath);
         break;
       }
     }
@@ -1456,5 +1843,6 @@ export async function applyTreeToWorkspace(
   created.sort(comparePaths);
   updated.sort(comparePaths);
   deleted.sort(comparePaths);
-  return { created, updated, deleted, unchangedCount, problems };
+  renamed.sort((left, right) => comparePaths(left.to, right.to));
+  return { created, updated, deleted, renamed, unchangedCount, problems };
 }

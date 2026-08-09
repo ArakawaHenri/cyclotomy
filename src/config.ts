@@ -8,6 +8,12 @@ import {
   DEFAULT_MAX_TREE_ENTRIES,
   DEFAULT_MAX_TREE_MANIFEST_BYTES,
 } from "./infrastructure/tree-manifest.ts";
+import {
+  ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+} from "./infrastructure/workspace-scope.ts";
 
 export type CyclotomyLocale = "auto" | "en" | "zh-CN";
 
@@ -22,6 +28,10 @@ export interface CyclotomyConfig {
     /** Canonical root plus every directory entry observed before classification. */
     readonly maxEntries: number;
     readonly maxManifestBytes: number;
+    /** Maximum UTF-8 bytes in one workspace-relative path. */
+    readonly maxPathBytes: number;
+    /** Maximum slash-separated components in one workspace-relative path. */
+    readonly maxPathComponents: number;
   };
   readonly lock: {
     readonly timeoutMs: number;
@@ -55,6 +65,8 @@ interface ConfigOverrides {
   readonly maxSnapshotBytes?: number;
   readonly maxEntries?: number;
   readonly maxManifestBytes?: number;
+  readonly maxPathBytes?: number;
+  readonly maxPathComponents?: number;
   readonly lockTimeoutMs?: number;
   readonly autoGcIntervalMs?: number;
   readonly sessionMetadataRetentionMs?: number;
@@ -73,6 +85,8 @@ const ROOT_KEYS = new Set([
   "maxSnapshotMiB",
   "maxEntries",
   "maxManifestMiB",
+  "maxPathBytes",
+  "maxPathComponents",
   "lockTimeoutMs",
   "gc",
   "locale",
@@ -190,6 +204,8 @@ function parseSettings(
     maxSnapshotBytes?: number;
     maxEntries?: number;
     maxManifestBytes?: number;
+    maxPathBytes?: number;
+    maxPathComponents?: number;
     lockTimeoutMs?: number;
     autoGcIntervalMs?: number;
     sessionMetadataRetentionMs?: number;
@@ -239,6 +255,22 @@ function parseSettings(
       );
     }
     parsed.maxManifestBytes = bytes;
+  }
+  if (Object.hasOwn(root, "maxPathBytes")) {
+    parsed.maxPathBytes = boundedPositiveSafeInteger(
+      root.maxPathBytes,
+      ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+      settingsPath,
+      "maxPathBytes",
+    );
+  }
+  if (Object.hasOwn(root, "maxPathComponents")) {
+    parsed.maxPathComponents = boundedPositiveSafeInteger(
+      root.maxPathComponents,
+      ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+      settingsPath,
+      "maxPathComponents",
+    );
   }
   if (Object.hasOwn(root, "lockTimeoutMs")) {
     parsed.lockTimeoutMs = positiveSafeInteger(
@@ -344,6 +376,9 @@ function applyOverrides(
       maxEntries: overrides.maxEntries ?? base.scan.maxEntries,
       maxManifestBytes:
         overrides.maxManifestBytes ?? base.scan.maxManifestBytes,
+      maxPathBytes: overrides.maxPathBytes ?? base.scan.maxPathBytes,
+      maxPathComponents:
+        overrides.maxPathComponents ?? base.scan.maxPathComponents,
     },
     lock: {
       timeoutMs: overrides.lockTimeoutMs ?? base.lock.timeoutMs,
@@ -372,6 +407,8 @@ export function defaultCyclotomyConfig(agentDir: string): CyclotomyConfig {
       maxSnapshotBytes: 2 * 1024 * MIB,
       maxEntries: DEFAULT_MAX_TREE_ENTRIES,
       maxManifestBytes: DEFAULT_MAX_TREE_MANIFEST_BYTES,
+      maxPathBytes: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+      maxPathComponents: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
     },
     lock: {
       timeoutMs: 5_000,

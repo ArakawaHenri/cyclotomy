@@ -15,6 +15,12 @@ export interface RestoreScopeBlocker {
   readonly targetPath: string;
 }
 
+/** Ephemeral physical directory spelling change; never persisted in a tree. */
+export interface WorkspacePathRename {
+  readonly from: string;
+  readonly to: string;
+}
+
 /** One logical restore plan shared by preview, staging, and apply. */
 export interface WorkspaceRestorePlan {
   /** Present in the checkpoint but absent from the current workspace. */
@@ -22,6 +28,8 @@ export interface WorkspaceRestorePlan {
   /** Present now, absent from target, and eligible for deletion by apply. */
   readonly deleted: readonly string[];
   readonly modified: readonly string[];
+  /** Physical directory spelling changes proved by restore preparation. */
+  readonly renamed: readonly WorkspacePathRename[];
   /** Blob objects whose bytes the planned restore may need to write. */
   readonly requiredBlobOids: readonly string[];
   /** Unmanaged descendants that prevent a target type replacement. */
@@ -193,6 +201,7 @@ export function planWorkspaceRestore(
     created,
     deleted,
     modified,
+    renamed: [],
     requiredBlobOids: [...requiredBlobOids].sort(),
     scopeBlockers,
     occupancyChanged,
@@ -205,6 +214,7 @@ export function restorePlanHasChanges(plan: WorkspaceRestorePlan): boolean {
     plan.created.length > 0 ||
     plan.deleted.length > 0 ||
     plan.modified.length > 0 ||
+    plan.renamed.length > 0 ||
     plan.occupancyChanged.length > 0
   );
 }

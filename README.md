@@ -47,12 +47,12 @@ Every destructive restore uses the same preview:
 ```text
 - path/only-in-workspace    delete
 ~ path/with-differences     overwrite
+> path/Old → path/old       rename
 + path/only-in-checkpoint   create
 ```
 
 The safe choice is selected first. Escape cancels and leaves files untouched.
-`/drift` prints the full plan; interactive prompts show a bounded sample so
-large changes remain readable.
+`/drift` and interactive prompts show the full plan.
 
 ## One node, one state
 
@@ -140,9 +140,9 @@ There is no cumulative size quota and no eviction of live checkpoints.
 Long-running sessions can retain substantial data; monitor the storage volume
 or choose another `storageDir` when needed.
 
-Uninstalling or reinstalling Cyclotomy does not remove or migrate the store.
-Before archiving or deleting one, stop every Pi process using that workspace
-and operate on the exact hashed directory as a whole.
+Uninstalling or reinstalling Cyclotomy does not remove the store. Before
+archiving or deleting a store, stop every Pi process using that workspace and
+operate on the exact hashed directory as a whole.
 
 ## Configuration
 
@@ -156,6 +156,8 @@ Configuration is optional. Global settings live at
   "maxSnapshotMiB": 2048,
   "maxEntries": 100000,
   "maxManifestMiB": 64,
+  "maxPathBytes": 65536,
+  "maxPathComponents": 256,
   "lockTimeoutMs": 5000,
   "gc": {
     "intervalMs": 86400000,
@@ -172,6 +174,8 @@ Configuration is optional. Global settings live at
 | `maxSnapshotMiB`        | global/workspace |                  `2048` | Maximum cumulative bytes in one workspace observation.                                                                              |
 | `maxEntries`            | global/workspace |                `100000` | Maximum entries observed in one scan. Hard maximum: `1000000`.                                                                      |
 | `maxManifestMiB`        | global/workspace |                    `64` | Maximum encoded tree manifest, including ignore policy. Hard maximum: `256`.                                                        |
+| `maxPathBytes`          | global/workspace |                 `65536` | Maximum UTF-8 bytes in one workspace-relative path. Hard maximum: `1048576`.                                                        |
+| `maxPathComponents`     | global/workspace |                   `256` | Maximum slash-separated components in one workspace-relative path. Hard maximum: `4096`.                                            |
 | `lockTimeoutMs`         | global/workspace |                  `5000` | Workspace-lock timeout.                                                                                                             |
 | `gc.intervalMs`         | global/workspace |              `86400000` | Minimum interval between automatic GC runs; `0` disables them.                                                                      |
 | `gc.sessionRetentionMs` | global/workspace |            `2592000000` | Retention period for persistently deleted Pi sessions.                                                                              |

@@ -4,6 +4,7 @@ import {
 } from "./git-ignore-oracle.ts";
 import { TreeManifestError, type TreeManifest } from "./tree-manifest.ts";
 import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
   workspaceLocalGitignorePath,
   workspaceScopePathKey,
 } from "./workspace-scope.ts";
@@ -31,14 +32,22 @@ export async function validateTreeEntriesAgainstScope(
   }
   const pathsByKey = new Map<string, ValidationPath>(
     manifest.entries.map(({ path }) => [
-      workspaceScopePathKey(scope, path),
+      workspaceScopePathKey(scope, path, ABSOLUTE_WORKSPACE_PATH_LIMITS),
       { path, isEntry: true, isLocalIgnoreSource: false },
     ]),
   );
   for (const source of scope.gitignoreSources) {
-    const localPath = workspaceLocalGitignorePath(scope, source.path);
+    const localPath = workspaceLocalGitignorePath(
+      scope,
+      source.path,
+      ABSOLUTE_WORKSPACE_PATH_LIMITS,
+    );
     if (localPath === undefined) continue;
-    const key = workspaceScopePathKey(scope, localPath);
+    const key = workspaceScopePathKey(
+      scope,
+      localPath,
+      ABSOLUTE_WORKSPACE_PATH_LIMITS,
+    );
     const existing = pathsByKey.get(key);
     pathsByKey.set(key, {
       path: existing?.path ?? localPath,
@@ -51,7 +60,10 @@ export async function validateTreeEntriesAgainstScope(
 
   let oracle: Awaited<ReturnType<typeof createSyntheticGitIgnoreOracle>>;
   try {
-    oracle = await createSyntheticGitIgnoreOracle(scope, scratchOptions);
+    oracle = await createSyntheticGitIgnoreOracle(scope, {
+      ...scratchOptions,
+      pathLimits: ABSOLUTE_WORKSPACE_PATH_LIMITS,
+    });
   } catch (error) {
     throw new TreeManifestError(
       "object-integrity",

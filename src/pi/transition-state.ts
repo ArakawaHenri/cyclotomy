@@ -15,7 +15,13 @@ export type NavigationTargetPlan =
       readonly node: NodeKey;
       readonly resolution: ResolvedNodeState;
     }
+  | {
+      /** Pi stayed on the same stable anchor or created a wrapper below it. */
+      readonly kind: "same-location";
+      readonly node: NodeKey;
+    }
   | { readonly kind: "materialize-missing"; readonly node: NodeKey }
+  | { readonly kind: "protected-missing"; readonly node: NodeKey }
   | { readonly kind: "no-node" };
 
 export interface PendingNavigation {
@@ -24,7 +30,8 @@ export interface PendingNavigation {
   readonly expectedOldLeafId: string | null;
   /** Pi's effective selected landing before an optional summary wrapper. */
   readonly expectedDestinationId: string | null;
-  readonly previewSnapshot: WorkspaceSnapshot;
+  /** Present only when arrival must authenticate a restore/inheritance preview. */
+  readonly previewSnapshot: WorkspaceSnapshot | undefined;
   readonly target: NavigationTargetPlan;
 }
 
@@ -56,15 +63,23 @@ export class TransitionState {
     return value;
   }
 
+  hasNavigation(): boolean {
+    return this.#navigation !== undefined;
+  }
+
   /**
    * Pi has no post-cancel event when a later extension vetoes a before hook.
    * A navigation plan left behind while no preparation is active is therefore
    * known to be orphaned. Its source was already committed in before_tree, so
    * retiring it is safe and must not force another user-visible cancellation.
    */
+  retireOrphanedNavigation(): void {
+    if (this.#preparing === undefined) this.#navigation = undefined;
+  }
+
   rejectConflict(): boolean {
     if (this.#preparing === undefined) {
-      this.#navigation = undefined;
+      this.retireOrphanedNavigation();
       return false;
     }
     return true;

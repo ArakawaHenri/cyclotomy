@@ -17,6 +17,7 @@ import {
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
+import { commitTestNodeState } from "./metadata-fixture.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -319,6 +320,7 @@ describe("captureNodeState", () => {
       readBlob: (oid) => baseStore.readBlob(oid),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
+      migrateLegacyTree: (oid) => baseStore.migrateLegacyTree(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
     };
 
@@ -349,14 +351,11 @@ describe("captureNodeState", () => {
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
     const concurrent = "f".repeat(64);
-    deps.metadata.setState("s1", "e1", concurrent);
+    commitTestNodeState(deps.metadata, "s1", "e1", concurrent);
 
-    const committed = await commitPreparedNodeState(
-      deps,
-      node,
-      prepared.value,
-      { treeOid: initial.value.treeOid },
-    );
+    const committed = commitPreparedNodeState(deps, node, prepared.value, {
+      treeOid: initial.value.treeOid,
+    });
 
     expect(committed).toMatchObject({
       ok: false,

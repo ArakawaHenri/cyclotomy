@@ -102,7 +102,7 @@ describe("pure workspace restore", () => {
     await expect(stat(targetPath)).rejects.toThrow();
   });
 
-  it("rejects a forged file at a synthetic policy-directory path", async () => {
+  it("rejects a forged file at a synthetic policy-directory path before publication", async () => {
     const store = await openObjectStore(storeRoot);
     const targetPath = join(root, "a");
     const targetBytes = Buffer.from("forged target", "utf8");
@@ -121,35 +121,20 @@ describe("pure workspace restore", () => {
         { path: "a/.gitignore", contents: "" },
       ],
     });
-    const treeOid = await publication.publishTree(
-      [
-        {
-          path: "a",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ],
-      scope,
-    );
-    await writeFile(targetPath, "unmanaged current bytes");
-    const node = { sessionId: "s", entryId: "forged-policy-directory" };
-
-    const outcome = await restoreWorkspace(
-      { store },
-      root,
-      { treeOid, foundAt: node },
-      { current: await scanWorkspaceForScope(root, scope) },
-    );
-
-    expect(outcome).toMatchObject({
-      kind: "checkpoint-unreadable",
-      treeOid,
-      message: expect.stringContaining(
-        "tree entry is excluded by its archived workspace scope: a",
+    await expect(
+      publication.publishTree(
+        [
+          {
+            path: "a",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        scope,
       ),
-    });
-    expect(await readFile(targetPath, "utf8")).toBe("unmanaged current bytes");
+    ).rejects.toThrow("policy directory collides with tree path a");
+    expect(await readFile(targetPath, "utf8")).toBe("forged target");
   });
 
   it("rejects omission of a managed archived .gitignore before it can be deleted", async () => {
@@ -409,6 +394,66 @@ describe("pure workspace restore", () => {
       "current bytes",
     );
     expect(setup.metadata.getState("s", "target")).toEqual(setup.state);
+    setup.metadata.close();
+  });
+
+  it("installs protection immediately before the first workspace mutation", async () => {
+    await writeFile(join(root, "target.txt"), "target bytes");
+    const setup = await setupTarget();
+    await writeFile(join(root, "target.txt"), "current bytes");
+    let protectionAttempted = false;
+
+    const outcome = await restoreWorkspace(
+      { store: setup.store },
+      root,
+      setup.resolution,
+      {
+        current: await scanWorkspace(root),
+        beforeMutation: () => {
+          protectionAttempted = true;
+          throw new Error("injected protection failure");
+        },
+      },
+    );
+
+    expect(protectionAttempted).toBe(true);
+    expect(outcome).toMatchObject({
+      kind: "failed",
+      stage: "apply",
+      message: "injected protection failure",
+    });
+    expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
+      "current bytes",
+    );
+    setup.metadata.close();
+  });
+
+  it("enters apply without awaiting a before-mutation return value", async () => {
+    await writeFile(join(root, "target.txt"), "target bytes");
+    const setup = await setupTarget();
+    await writeFile(join(root, "target.txt"), "current bytes");
+    let callbackReturnObserved = false;
+
+    const outcome = await restoreWorkspace(
+      { store: setup.store },
+      root,
+      setup.resolution,
+      {
+        current: await scanWorkspace(root),
+        beforeMutation: () => ({
+          then: () => {
+            callbackReturnObserved = true;
+            throw new Error("before-mutation return value was awaited");
+          },
+        }),
+      },
+    );
+
+    expect(callbackReturnObserved).toBe(false);
+    expect(outcome.kind).toBe("restored");
+    expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
+      "target bytes",
+    );
     setup.metadata.close();
   });
 

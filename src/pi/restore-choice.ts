@@ -52,7 +52,7 @@ export async function requestRestoreChoice(
   signal?: AbortSignal,
 ): Promise<boolean> {
   const copy = choiceCopy(runtime, mode);
-  const preview = runtime.i18n.formatRestorePreview(plan, 3);
+  const preview = runtime.i18n.formatRestorePreview(plan);
   const prompt = [copy.title, copy.intro, "", preview].join("\n");
   const selected = await context.ui.select(
     prompt,

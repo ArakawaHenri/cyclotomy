@@ -126,6 +126,7 @@ export async function collectSessionMetadataGarbage(
   const cutoff = now - retentionMs;
   let removedSessions = 0;
   let removedNodeStates = 0;
+  let removedNodeWriteGuards = 0;
   let removedMetadataRows = 0;
   for (const session of metadata.listRegisteredSessions()) {
     const inspection = inspections.get(session.sessionId);
@@ -156,6 +157,7 @@ export async function collectSessionMetadataGarbage(
       });
       removedSessions += pruned.removedSessions;
       removedNodeStates += pruned.removedNodeStates;
+      removedNodeWriteGuards += pruned.removedNodeWriteGuards;
       removedMetadataRows += pruned.removedMetadataRows;
       if (pruned.removedSessions === 0) staleObservations += 1;
       continue;
@@ -197,6 +199,7 @@ export async function collectSessionMetadataGarbage(
   return {
     removedSessions,
     removedNodeStates,
+    removedNodeWriteGuards,
     removedMetadataRows,
     inspectedSessions: registered.length,
     presentSessions,

@@ -8,11 +8,14 @@ import type { WorkspaceScope } from "./workspace-scope.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
 import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
+  ABSOLUTE_TREE_MANIFEST_LIMITS,
   assertTreeManifestLimits,
   canonicalizeTreeManifest,
   DEFAULT_TREE_MANIFEST_LIMITS,
   encodeTreeManifest,
+  migrateTreeManifestToCurrent,
   parseCanonicalTreeManifest,
+  PUBLISHED_TREE_MANIFEST_FORMAT,
   TreeManifestError,
   type TreeEntry,
   type TreeManifest,
@@ -20,6 +23,7 @@ import {
 } from "./tree-manifest.ts";
 
 export {
+  PUBLISHED_TREE_MANIFEST_FORMAT,
   TREE_MANIFEST_FORMAT,
   type FileRecreationMode,
   type SymlinkKind,
@@ -33,6 +37,7 @@ export type ObjectStoreErrorCode =
   | "invalid-blob"
   | "invalid-object-id"
   | "invalid-tree-manifest"
+  | "legacy-incompatible"
   | "missing-object"
   | "object-integrity"
   | "storage-failure";
@@ -91,6 +96,11 @@ export interface ObjectStore {
    * first workspace mutation.
    */
   readTreeManifest(treeOid: string): Promise<TreeManifest>;
+  /**
+   * Publish the deterministic v2 equivalent of one authenticated v1 tree.
+   * The caller owns metadata reference replacement and the workspace lock.
+   */
+  migrateLegacyTree(treeOid: string): Promise<TreeMigrationResult>;
   /** Authenticate exactly the supplied blob ids with bounded concurrency. */
   verifyBlobs(blobOids: readonly string[]): Promise<void>;
 }
@@ -98,7 +108,22 @@ export interface ObjectStore {
 export interface OpenObjectStoreOptions {
   readonly maxEntries?: number;
   readonly maxManifestBytes?: number;
+  readonly maxPathBytes?: number;
+  readonly maxPathComponents?: number;
 }
+
+export type TreeMigrationResult =
+  | { readonly kind: "current"; readonly treeOid: string }
+  | {
+      readonly kind: "migrated";
+      readonly oldTreeOid: string;
+      readonly treeOid: string;
+    }
+  | {
+      readonly kind: "legacy-incompatible";
+      readonly treeOid: string;
+      readonly message: string;
+    };
 
 type ObjectKind = "blob" | "tree";
 
@@ -660,9 +685,10 @@ class FileObjectStore implements ObjectStore {
   async #publishPreparedTree(
     entries: readonly TreeEntry[],
     scope: WorkspaceScope,
+    limits: TreeManifestLimits = this.#manifestLimits,
   ): Promise<string> {
     try {
-      const encoded = encodeTreeManifest(entries, scope, this.#manifestLimits);
+      const encoded = encodeTreeManifest(entries, scope, limits);
       const oid = sha256(encoded);
       await this.#publishObject("tree", oid, encoded);
       return oid;
@@ -710,6 +736,61 @@ class FileObjectStore implements ObjectStore {
       return parseCanonicalTreeManifest(encoded);
     } catch (error) {
       throw asStoreError("tree read", error);
+    }
+  }
+
+  async migrateLegacyTree(treeOid: string): Promise<TreeMigrationResult> {
+    assertOid(treeOid);
+    try {
+      // Authenticate both the historical manifest and its complete blob
+      // closure before publishing an object that metadata may later root.
+      const legacy = await this.readTree(treeOid);
+      if (legacy.format !== PUBLISHED_TREE_MANIFEST_FORMAT) {
+        return { kind: "current", treeOid };
+      }
+
+      let current: ReturnType<typeof migrateTreeManifestToCurrent>;
+      try {
+        current = migrateTreeManifestToCurrent(legacy, {
+          maxPathBytes: this.#manifestLimits.maxPathBytes,
+          maxPathComponents: this.#manifestLimits.maxPathComponents,
+        });
+      } catch (error) {
+        if (
+          error instanceof TreeManifestError &&
+          error.kind === "legacy-incompatible"
+        ) {
+          return {
+            kind: "legacy-incompatible",
+            treeOid,
+            message: error.message,
+          };
+        }
+        throw error;
+      }
+
+      // Migration is a schema conversion, not a new capture. Use the parser's
+      // absolute published limits so a user's subsequently lowered capture
+      // quota cannot strand an otherwise compatible historical checkpoint.
+      const migratedOid = await this.#publishPreparedTree(
+        current.entries,
+        current.scope,
+        ABSOLUTE_TREE_MANIFEST_LIMITS,
+      );
+      const verified = await this.readTree(migratedOid);
+      if (verified.format === PUBLISHED_TREE_MANIFEST_FORMAT) {
+        throw new ObjectStoreError(
+          "object-integrity",
+          "tree migration published a legacy-format object",
+        );
+      }
+      return {
+        kind: "migrated",
+        oldTreeOid: treeOid,
+        treeOid: migratedOid,
+      };
+    } catch (error) {
+      throw asStoreError("tree migration", error);
     }
   }
 
@@ -1051,6 +1132,11 @@ export async function openObjectStore(
     maxEntries: options.maxEntries ?? DEFAULT_TREE_MANIFEST_LIMITS.maxEntries,
     maxManifestBytes:
       options.maxManifestBytes ?? DEFAULT_TREE_MANIFEST_LIMITS.maxManifestBytes,
+    maxPathBytes:
+      options.maxPathBytes ?? DEFAULT_TREE_MANIFEST_LIMITS.maxPathBytes,
+    maxPathComponents:
+      options.maxPathComponents ??
+      DEFAULT_TREE_MANIFEST_LIMITS.maxPathComponents,
   };
 
   try {

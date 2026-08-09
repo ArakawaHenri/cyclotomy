@@ -8,16 +8,29 @@ import {
   prepareObservedNodeState,
   type CaptureSuccess,
 } from "../application/capture.ts";
-import { restoreWorkspace } from "../application/restore.ts";
+import {
+  restoreWorkspace,
+  type RestoreOutcome,
+} from "../application/restore.ts";
 import type { NodeKey } from "../domain/model.ts";
 import {
   planWorkspaceRestore,
   restorePlanHasChanges,
   workspaceSnapshotAsManifest,
 } from "../infrastructure/restore-plan.ts";
+import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
 import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
+import {
+  checkpointInitializationConflict,
+  postMutationControlFailure,
+  protectCurrentArrivalInWorkspaceLock,
+} from "./post-mutation.ts";
 import { requestRestoreChoice } from "./restore-choice.ts";
-import { notifyRestoreOutcome } from "./restore-outcome.ts";
+import {
+  notifyCheckpointInitializationConflict,
+  notifyPostMutationConflict,
+  notifyRestoreOutcome,
+} from "./restore-outcome.ts";
 import { CyclotomyRuntime, messageOf } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 import type {
@@ -108,6 +121,44 @@ function targetWillInheritSource(
     );
 }
 
+function sameNode(
+  left: NodeKey | undefined,
+  right: NodeKey | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.sessionId === right.sessionId &&
+    left.entryId === right.entryId
+  );
+}
+
+function classifyTarget(
+  runtime: CyclotomyRuntime,
+  view: SessionView,
+  source: NodeKey | undefined,
+  target: NodeKey | undefined,
+  sourceKind: "capture" | "protected" | "no-node",
+  hasResolution: boolean,
+): NavigationTargetPlan["kind"] {
+  if (target === undefined) return "no-node";
+  if (sameNode(source, target)) return "same-location";
+  if (runtime.metadata.isNodeWriteProtected(target.sessionId, target.entryId)) {
+    return hasResolution ? "restore" : "protected-missing";
+  }
+  if (
+    sourceKind === "capture" &&
+    targetWillInheritSource(runtime, view, source, target)
+  ) {
+    return "inherit-source";
+  }
+  if (hasResolution) return "restore";
+  if (sourceKind === "protected") {
+    return "protected-missing";
+  }
+  return "materialize-missing";
+}
+
 /** Register the two-phase Pi tree-navigation protocol. */
 export function registerNavigationLifecycle(
   pi: ExtensionAPI,
@@ -181,47 +232,68 @@ export function registerNavigationLifecycle(
 
       const prepared = await runtime
         .enqueueWorkspace("tree-prepare", async () => {
-          const sourceSnapshot: WorkspaceSnapshot =
-            await runtime.scanCurrentWorkspace(view.cwd);
-          if (sourceSnapshot.problems.length > 0) {
+          const sourceAdmission = runtime.captureAdmission(view, source);
+          if (sourceAdmission.kind === "blocked") {
             return {
-              kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(sourceSnapshot.problems),
+              kind: "source-blocked" as const,
+              message: "source location is not admitted for checkpointing",
             };
           }
+          let sourceSnapshot: WorkspaceSnapshot | undefined;
+          if (sourceAdmission.kind === "capture") {
+            sourceSnapshot = await runtime.scanCurrentWorkspace(view.cwd);
+            if (sourceSnapshot.problems.length > 0) {
+              return {
+                kind: "scan-incomplete" as const,
+                message: runtime.i18n.formatScanProblems(
+                  sourceSnapshot.problems,
+                ),
+              };
+            }
+          }
 
-          const targetFollowsSource = targetWillInheritSource(
+          const targetKind = classifyTarget(
             runtime,
             view,
             source,
             target,
+            sourceAdmission.kind,
+            false,
           );
-          if (target === undefined) {
+          if (
+            targetKind === "no-node" ||
+            targetKind === "same-location" ||
+            targetKind === "inherit-source"
+          ) {
             return {
               kind: "ready" as const,
+              sourceKind: sourceAdmission.kind,
               sourceSnapshot,
-              restoreSnapshot: sourceSnapshot,
+              restoreSnapshot: undefined,
               resolution: undefined,
-              targetKind: "no-node" as const,
+              targetKind,
             };
           }
-          if (targetFollowsSource) {
-            return {
-              kind: "ready" as const,
-              sourceSnapshot,
-              restoreSnapshot: sourceSnapshot,
-              resolution: undefined,
-              targetKind: "inherit-source" as const,
-            };
+          if (target === undefined) {
+            throw new Error("classified navigation target is missing");
           }
           const readable = await runtime.resolveReadableTreeIn(view, target);
           if (readable === undefined) {
+            const missingKind = classifyTarget(
+              runtime,
+              view,
+              source,
+              target,
+              sourceAdmission.kind,
+              false,
+            );
             return {
               kind: "ready" as const,
+              sourceKind: sourceAdmission.kind,
               sourceSnapshot,
-              restoreSnapshot: sourceSnapshot,
+              restoreSnapshot: undefined,
               resolution: undefined,
-              targetKind: "materialize-missing" as const,
+              targetKind: missingKind,
             };
           }
           const { resolution, manifest } = readable;
@@ -237,7 +309,9 @@ export function registerNavigationLifecycle(
               ),
             };
           }
-          const drift = planWorkspaceRestore(restoreSnapshot, manifest);
+          const drift = (
+            await prepareWorkspaceRestorePlan(restoreSnapshot, manifest)
+          ).plan;
           if (drift.problems.length > 0) {
             return {
               kind: "scan-incomplete" as const,
@@ -246,6 +320,7 @@ export function registerNavigationLifecycle(
           }
           return {
             kind: "ready" as const,
+            sourceKind: sourceAdmission.kind,
             sourceSnapshot,
             restoreSnapshot,
             resolution,
@@ -265,6 +340,19 @@ export function registerNavigationLifecycle(
             message: prepared.message,
           }),
           "warning",
+        );
+        return { cancel: true };
+      }
+      if (prepared.kind === "source-blocked") {
+        runtime.notify(
+          context,
+          withDetail(
+            runtime.i18n.t("sourceCaptureFailed"),
+            runtime.i18n.t("captureFailureDetail", {
+              message: prepared.message,
+            }),
+          ),
+          "error",
         );
         return { cancel: true };
       }
@@ -325,69 +413,59 @@ export function registerNavigationLifecycle(
           ) {
             return { kind: "location-changed" as const };
           }
-          const sourceCurrent = await runtime.scanCurrentWorkspace(view.cwd);
-          if (sourceCurrent.problems.length > 0) {
+          const sourceAdmission = runtime.captureAdmission(view, source);
+          if (sourceAdmission.kind === "blocked") {
             return {
-              kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(sourceCurrent.problems),
+              kind: "capture-failed" as const,
+              message: "source location is not admitted for checkpointing",
             };
           }
-          if (sourceCurrent.rootPath !== prepared.sourceSnapshot.rootPath) {
-            return { kind: "location-changed" as const };
+          if (sourceAdmission.kind !== prepared.sourceKind) {
+            return { kind: "target-changed" as const };
           }
-          const sourceGap = planWorkspaceRestore(
-            sourceCurrent,
-            workspaceSnapshotAsManifest(prepared.sourceSnapshot),
-          );
-          if (
-            sourceGap.problems.length > 0 ||
-            restorePlanHasChanges(sourceGap)
-          ) {
-            return { kind: "preview-stale" as const };
+          let sourceCurrent: WorkspaceSnapshot | undefined;
+          if (sourceAdmission.kind === "capture") {
+            if (prepared.sourceSnapshot === undefined) {
+              return { kind: "target-changed" as const };
+            }
+            sourceCurrent = await runtime.scanCurrentWorkspace(view.cwd);
+            if (sourceCurrent.problems.length > 0) {
+              return {
+                kind: "scan-incomplete" as const,
+                message: runtime.i18n.formatScanProblems(
+                  sourceCurrent.problems,
+                ),
+              };
+            }
+            if (sourceCurrent.rootPath !== prepared.sourceSnapshot.rootPath) {
+              return { kind: "location-changed" as const };
+            }
+            const sourceGap = planWorkspaceRestore(
+              sourceCurrent,
+              workspaceSnapshotAsManifest(prepared.sourceSnapshot),
+            );
+            if (
+              sourceGap.problems.length > 0 ||
+              restorePlanHasChanges(sourceGap)
+            ) {
+              return { kind: "preview-stale" as const };
+            }
           }
-          const restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
-            view.cwd,
-            prepared.restoreSnapshot.scope,
-          );
-          if (restoreCurrent.problems.length > 0) {
-            return {
-              kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(restoreCurrent.problems),
-            };
-          }
-          if (restoreCurrent.rootPath !== prepared.restoreSnapshot.rootPath) {
-            return { kind: "location-changed" as const };
-          }
-          const restoreGap = planWorkspaceRestore(
-            restoreCurrent,
-            workspaceSnapshotAsManifest(prepared.restoreSnapshot),
-          );
-          if (
-            restoreGap.problems.length > 0 ||
-            restorePlanHasChanges(restoreGap)
-          ) {
-            return { kind: "preview-stale" as const };
-          }
-          const targetFollowsSource = targetWillInheritSource(
+          const targetKind = classifyTarget(
             runtime,
             view,
             source,
             target,
+            sourceAdmission.kind,
+            prepared.resolution !== undefined,
           );
-          const targetKind =
-            target === undefined
-              ? "no-node"
-              : targetFollowsSource
-                ? "inherit-source"
-                : prepared.resolution === undefined
-                  ? "materialize-missing"
-                  : "restore";
           if (targetKind !== prepared.targetKind) {
             return { kind: "target-changed" as const };
           }
           if (
             target !== undefined &&
-            !targetFollowsSource &&
+            targetKind !== "inherit-source" &&
+            targetKind !== "same-location" &&
             !runtime.resolutionStillAuthoritative(
               view,
               target,
@@ -399,11 +477,64 @@ export function registerNavigationLifecycle(
           // The preview phase may have crossed an interactive confirmation.
           // Authenticate the unchanged target closure once more before Pi is
           // allowed to leave the source location.
-          if (prepared.resolution !== undefined && !targetFollowsSource) {
+          if (prepared.resolution !== undefined && targetKind === "restore") {
             await runtime.store.readTree(prepared.resolution.treeOid);
           }
+          let restoreCurrent: WorkspaceSnapshot | undefined;
+          if (targetKind === "restore") {
+            if (prepared.restoreSnapshot === undefined) {
+              return { kind: "target-changed" as const };
+            }
+            restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
+              view.cwd,
+              prepared.restoreSnapshot.scope,
+            );
+            if (restoreCurrent.problems.length > 0) {
+              return {
+                kind: "scan-incomplete" as const,
+                message: runtime.i18n.formatScanProblems(
+                  restoreCurrent.problems,
+                ),
+              };
+            }
+            if (restoreCurrent.rootPath !== prepared.restoreSnapshot.rootPath) {
+              return { kind: "location-changed" as const };
+            }
+            const restoreGap = planWorkspaceRestore(
+              restoreCurrent,
+              workspaceSnapshotAsManifest(prepared.restoreSnapshot),
+            );
+            if (
+              restoreGap.problems.length > 0 ||
+              restorePlanHasChanges(restoreGap)
+            ) {
+              return { kind: "preview-stale" as const };
+            }
+          } else if (targetKind === "inherit-source") {
+            if (sourceCurrent === undefined) {
+              return { kind: "target-changed" as const };
+            }
+            restoreCurrent = sourceCurrent;
+          }
           let preparedSource: CaptureSuccess | undefined;
-          if (source !== undefined) {
+          if (sourceAdmission.kind === "capture" && source !== undefined) {
+            if (sourceCurrent === undefined) {
+              return { kind: "target-changed" as const };
+            }
+            const currentView = readSessionView(context);
+            if (
+              !runtime.captureLeaseIsCurrent(
+                sourceAdmission.lease,
+                currentView,
+                source,
+              )
+            ) {
+              return {
+                kind: "capture-failed" as const,
+                message:
+                  "source location changed before checkpoint publication",
+              };
+            }
             const expectedSourceTreeOid = runtime.metadata.getState(
               source.sessionId,
               source.entryId,
@@ -419,13 +550,32 @@ export function registerNavigationLifecycle(
               };
             }
             preparedSource = published.value;
-            const sourceCommitted = await commitPreparedNodeState(
+            const validatedView = readSessionView(context);
+            if (
+              !stillAt(context, view.sessionId, view.leafId, view.cwd) ||
+              !(await runtime.workspaceStillBound(view.cwd)) ||
+              !runtime.captureLeaseIsCurrent(
+                sourceAdmission.lease,
+                validatedView,
+                source,
+              )
+            ) {
+              return {
+                kind: "capture-failed" as const,
+                message:
+                  "source location changed during checkpoint publication",
+              };
+            }
+            const sourceCommitted = commitPreparedNodeState(
               runtime.checkpointDeps(),
               source,
               preparedSource,
               { treeOid: expectedSourceTreeOid },
             );
             if (!sourceCommitted.ok) {
+              if (sourceCommitted.error.kind === "write-protected") {
+                runtime.protectNode(view, source);
+              }
               return {
                 kind: "capture-failed" as const,
                 message: sourceCommitted.error.message,
@@ -442,6 +592,18 @@ export function registerNavigationLifecycle(
                 return { kind: "target-changed" as const };
               }
               targetPlan = { kind: "materialize-missing", node: target };
+              break;
+            case "protected-missing":
+              if (target === undefined) {
+                return { kind: "target-changed" as const };
+              }
+              targetPlan = { kind: "protected-missing", node: target };
+              break;
+            case "same-location":
+              if (target === undefined) {
+                return { kind: "target-changed" as const };
+              }
+              targetPlan = { kind: "same-location", node: target };
               break;
             case "inherit-source":
               if (
@@ -502,14 +664,14 @@ export function registerNavigationLifecycle(
           case "preview-stale":
             runtime.notify(
               context,
-              runtime.i18n.t("commandPreviewStale"),
+              runtime.i18n.t("navigationChangedBeforeDeparture"),
               "warning",
             );
             break;
           case "target-changed":
             runtime.notify(
               context,
-              runtime.i18n.t("commandTargetChanged"),
+              runtime.i18n.t("navigationChangedBeforeDeparture"),
               "warning",
             );
             break;
@@ -583,7 +745,21 @@ export function registerNavigationLifecycle(
       if (plan !== undefined) attentionStatus();
       return;
     }
+    const protectCurrentArrival = async (): Promise<void> => {
+      try {
+        const protection = await runtime.enqueueWorkspace(
+          "tree-arrival-protect",
+          () => protectCurrentArrivalInWorkspaceLock(runtime, context),
+        );
+        if (protection.kind === "unavailable") {
+          runtime.notifyCaptureResult(context, false, protection.message);
+        }
+      } catch (error) {
+        runtime.notifyCaptureResult(context, false, messageOf(error));
+      }
+    };
     if (plan === undefined || !arrivalMatches(plan, event, view)) {
+      await protectCurrentArrival();
       runtime.notify(
         context,
         runtime.i18n.t("navigationPlanMismatch"),
@@ -600,6 +776,29 @@ export function registerNavigationLifecycle(
       return;
     }
 
+    let actualAnchor: NodeKey | undefined;
+    try {
+      actualAnchor = runtime.captureAnchor(view);
+      if (
+        plan.target.kind === "same-location" &&
+        sameNode(actualAnchor, plan.target.node)
+      ) {
+        if (!runtime.carryAdmission(view, actualAnchor)) {
+          await protectCurrentArrival();
+          attentionStatus();
+        } else {
+          runtime.setStatus(context, undefined);
+        }
+        return;
+      }
+      runtime.beginAdmission(view);
+    } catch (error) {
+      await protectCurrentArrival();
+      runtime.notifyCaptureResult(context, false, messageOf(error));
+      attentionStatus();
+      return;
+    }
+
     runtime.setStatus(
       context,
       runtime.i18n.t(
@@ -608,6 +807,9 @@ export function registerNavigationLifecycle(
           : "checkingWorkspace",
       ),
     );
+    let initializedCheckpointCommitted = false;
+    let mutationStarted = false;
+    let mutationOutcome: RestoreOutcome | undefined;
     const execution = await runtime
       .enqueueWorkspace("tree-arrival", async () => {
         if (!stillAt(context, view.sessionId, view.leafId, view.cwd)) {
@@ -615,6 +817,11 @@ export function registerNavigationLifecycle(
         }
         if (!(await runtime.workspaceStillBound(view.cwd))) {
           return { kind: "location-changed" as const };
+        }
+
+        if (plan.target.kind === "protected-missing") {
+          runtime.protectLocation(view);
+          return { kind: "protected" as const };
         }
 
         const authenticatedRootSummary =
@@ -628,12 +835,23 @@ export function registerNavigationLifecycle(
                 entryId: event.summaryEntry.id,
               }
             : undefined;
+        const sameLocationSummary =
+          plan.target.kind === "same-location" &&
+          actualAnchor !== undefined &&
+          runtime
+            .ancestryIds(view, actualAnchor.entryId)
+            .includes(plan.target.node.entryId)
+            ? actualAnchor
+            : undefined;
         const missingTarget =
           plan.target.kind === "materialize-missing"
             ? plan.target.node
-            : authenticatedRootSummary;
+            : (authenticatedRootSummary ?? sameLocationSummary);
 
         if (plan.target.kind === "no-node" && missingTarget === undefined) {
+          if (!runtime.admitLocation(view)) {
+            return { kind: "target-changed" as const };
+          }
           return { kind: "no-node" as const };
         }
 
@@ -643,6 +861,16 @@ export function registerNavigationLifecycle(
           // a null logical destination; a wrapping label never owns state.
           const targetNode = missingTarget;
           if (
+            runtime.metadata.isNodeWriteProtected(
+              targetNode.sessionId,
+              targetNode.entryId,
+            )
+          ) {
+            runtime.protectLocation(view);
+            return { kind: "protected" as const };
+          }
+          if (
+            sameLocationSummary === undefined &&
             !runtime.resolutionStillAuthoritative(view, targetNode, undefined)
           ) {
             return { kind: "target-changed" as const };
@@ -683,29 +911,75 @@ export function registerNavigationLifecycle(
             return { kind: "location-changed" as const };
           }
           if (
-            !runtime.resolutionStillAuthoritative(view, targetNode, undefined)
+            runtime.metadata.isNodeWriteProtected(
+              targetNode.sessionId,
+              targetNode.entryId,
+            ) ||
+            (sameLocationSummary === undefined &&
+              !runtime.resolutionStillAuthoritative(
+                view,
+                targetNode,
+                undefined,
+              ))
           ) {
             return { kind: "target-changed" as const };
           }
-          const committedTarget = await commitPreparedNodeState(
+          const committedTarget = commitPreparedNodeState(
             runtime.checkpointDeps(),
             targetNode,
             preparedTarget.value,
             { treeOid: undefined },
           );
           if (!committedTarget.ok) {
+            if (committedTarget.error.kind === "write-protected") {
+              runtime.protectLocation(view);
+              return { kind: "protected" as const };
+            }
             return {
               kind: "capture-failed" as const,
               message: committedTarget.error.message,
             };
+          }
+          initializedCheckpointCommitted = true;
+          try {
+            const current = readSessionView(context);
+            const currentAnchor = runtime.captureAnchor(current);
+            if (
+              !runtime.sessionIsUsable(current) ||
+              current.sessionId !== view.sessionId ||
+              current.sessionFile !== view.sessionFile ||
+              current.leafId !== view.leafId ||
+              current.cwd !== view.cwd ||
+              !sameNode(currentAnchor, actualAnchor)
+            ) {
+              return checkpointInitializationConflict(
+                runtime,
+                context,
+                "active location changed after checkpoint initialization",
+              );
+            }
+            if (!runtime.admitLocation(current, preparedTarget.value.treeOid)) {
+              return checkpointInitializationConflict(
+                runtime,
+                context,
+                "checkpoint admission changed after initialization",
+              );
+            }
+          } catch (error) {
+            return checkpointInitializationConflict(runtime, context, error);
           }
           return { kind: "materialized" as const };
         }
 
         if (
           plan.target.kind === "no-node" ||
-          plan.target.kind === "materialize-missing"
+          plan.target.kind === "materialize-missing" ||
+          plan.target.kind === "same-location"
         ) {
+          return { kind: "target-changed" as const };
+        }
+        const previewSnapshot = plan.previewSnapshot;
+        if (previewSnapshot === undefined) {
           return { kind: "target-changed" as const };
         }
 
@@ -713,7 +987,7 @@ export function registerNavigationLifecycle(
         try {
           restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
             view.cwd,
-            plan.previewSnapshot.scope,
+            previewSnapshot.scope,
           );
         } catch (error) {
           return {
@@ -727,14 +1001,14 @@ export function registerNavigationLifecycle(
             message: runtime.i18n.formatScanProblems(restoreCurrent.problems),
           };
         }
-        if (restoreCurrent.rootPath !== plan.previewSnapshot.rootPath) {
+        if (restoreCurrent.rootPath !== previewSnapshot.rootPath) {
           return {
             kind: "location-changed" as const,
           };
         }
         const gap = planWorkspaceRestore(
           restoreCurrent,
-          workspaceSnapshotAsManifest(plan.previewSnapshot),
+          workspaceSnapshotAsManifest(previewSnapshot),
         );
         if (gap.problems.length > 0 || restorePlanHasChanges(gap)) {
           return { kind: "preview-stale" as const };
@@ -749,25 +1023,160 @@ export function registerNavigationLifecycle(
           return { kind: "target-changed" as const };
         }
         if (plan.target.kind === "inherit-source") {
+          if (!runtime.admitLocation(view, plan.target.resolution.treeOid)) {
+            return { kind: "target-changed" as const };
+          }
           return { kind: "inherited" as const };
         }
+        const restoreResolution = plan.target.resolution;
+        let preMutationConflict:
+          "location-changed" | "target-changed" | undefined;
+        const outcome = await restoreWorkspace(
+          runtime.restoreDeps(),
+          view.cwd,
+          restoreResolution,
+          {
+            current: restoreCurrent,
+            beforeMutation: () => {
+              const currentView = readSessionView(context);
+              const currentAnchor = runtime.captureAnchor(currentView);
+              if (
+                !stillAt(context, view.sessionId, view.leafId, view.cwd) ||
+                !sameNode(currentAnchor, actualAnchor)
+              ) {
+                preMutationConflict = "location-changed";
+                throw new Error(
+                  "navigation target changed before restore mutation",
+                );
+              }
+              if (!runtime.protectLocation(currentView, restoreResolution)) {
+                preMutationConflict = "target-changed";
+                throw new Error(
+                  "navigation checkpoint changed while restore protection was installed",
+                );
+              }
+              mutationStarted = true;
+            },
+          },
+        );
+        if (mutationStarted) mutationOutcome = outcome;
+        if (!mutationStarted && preMutationConflict !== undefined) {
+          return { kind: preMutationConflict };
+        }
+
+        if (mutationStarted) {
+          let currentView: SessionView | undefined;
+          let currentAnchor: NodeKey | undefined;
+          let locationMatches = false;
+          try {
+            currentView = readSessionView(context);
+            currentAnchor = runtime.captureAnchor(currentView);
+            locationMatches =
+              runtime.sessionIsUsable(currentView) &&
+              currentView.sessionId === view.sessionId &&
+              currentView.sessionFile === view.sessionFile &&
+              currentView.leafId === view.leafId &&
+              currentView.cwd === view.cwd &&
+              sameNode(currentAnchor, actualAnchor);
+          } catch {
+            // The shared protection helper reports the actionable failure.
+          }
+          if (!locationMatches) {
+            return {
+              kind: "post-mutation-conflict" as const,
+              reason: "location-changed" as const,
+              outcome,
+              arrivalProtection: await protectCurrentArrivalInWorkspaceLock(
+                runtime,
+                context,
+              ),
+            };
+          }
+          if (
+            currentView === undefined ||
+            currentAnchor === undefined ||
+            !runtime.resolutionStillAuthoritative(currentView, currentAnchor, {
+              treeOid: restoreResolution.treeOid,
+              foundAt: currentAnchor,
+            })
+          ) {
+            return {
+              kind: "post-mutation-conflict" as const,
+              reason: "target-changed" as const,
+              outcome,
+              arrivalProtection: await protectCurrentArrivalInWorkspaceLock(
+                runtime,
+                context,
+              ),
+            };
+          }
+          if (outcome.kind !== "restored") {
+            return { kind: "outcome" as const, outcome };
+          }
+          if (!runtime.admitLocation(currentView, restoreResolution.treeOid)) {
+            return {
+              kind: "post-mutation-conflict" as const,
+              reason: "target-changed" as const,
+              outcome,
+              arrivalProtection: await protectCurrentArrivalInWorkspaceLock(
+                runtime,
+                context,
+              ),
+            };
+          }
+          return { kind: "outcome" as const, outcome };
+        }
+
+        if (outcome.kind !== "restored") {
+          return { kind: "outcome" as const, outcome };
+        }
         return {
-          kind: "outcome" as const,
-          outcome: await restoreWorkspace(
-            runtime.restoreDeps(),
-            view.cwd,
-            plan.target.resolution,
-            { current: restoreCurrent },
+          kind: "post-mutation-conflict" as const,
+          reason: "target-changed" as const,
+          outcome,
+          arrivalProtection: await protectCurrentArrivalInWorkspaceLock(
+            runtime,
+            context,
           ),
         };
       })
-      .catch((error: unknown) => ({
-        kind: "failed" as const,
-        message: messageOf(error),
-      }));
+      // `async` intentionally normalizes the two helper promises and the
+      // immediate pre-mutation failure into one resolved execution union.
+      .catch(async (error: unknown) => {
+        if (mutationStarted) {
+          return postMutationControlFailure(
+            runtime,
+            context,
+            error,
+            mutationOutcome,
+            "tree-restore-post-failure-protect",
+          );
+        }
+        if (initializedCheckpointCommitted) {
+          return checkpointInitializationConflict(
+            runtime,
+            context,
+            error,
+            "tree-initialize-post-failure-protect",
+          );
+        }
+        return {
+          kind: "failed" as const,
+          message: messageOf(error),
+        };
+      });
 
     switch (execution.kind) {
+      case "initialization-conflict":
+        notifyCheckpointInitializationConflict(runtime, context, execution);
+        attentionStatus();
+        break;
+      case "post-mutation-conflict":
+        notifyPostMutationConflict(runtime, context, execution);
+        attentionStatus();
+        break;
       case "location-changed":
+        await protectCurrentArrival();
         runtime.notify(
           context,
           runtime.i18n.t("commandLocationChanged"),
@@ -776,6 +1185,7 @@ export function registerNavigationLifecycle(
         attentionStatus();
         break;
       case "scan-incomplete":
+        await protectCurrentArrival();
         runtime.notify(
           context,
           runtime.i18n.t("navigationScanIncomplete", {
@@ -786,6 +1196,7 @@ export function registerNavigationLifecycle(
         attentionStatus();
         break;
       case "preview-stale":
+        await protectCurrentArrival();
         runtime.notify(
           context,
           runtime.i18n.t("navigationChangedAfterPreview"),
@@ -798,11 +1209,21 @@ export function registerNavigationLifecycle(
       case "materialized":
         runtime.setStatus(context, undefined);
         break;
+      case "protected":
+        runtime.notify(
+          context,
+          runtime.i18n.t("sessionMissingProtected"),
+          "warning",
+        );
+        attentionStatus();
+        break;
       case "capture-failed":
+        await protectCurrentArrival();
         runtime.notifyCaptureResult(context, false, execution.message);
         attentionStatus();
         break;
       case "target-changed":
+        await protectCurrentArrival();
         runtime.notify(
           context,
           runtime.i18n.t("commandTargetChanged"),
@@ -811,6 +1232,7 @@ export function registerNavigationLifecycle(
         attentionStatus();
         break;
       case "failed":
+        await protectCurrentArrival();
         runtime.notify(
           context,
           runtime.i18n.t("restoreFailed", { message: execution.message }),
@@ -820,6 +1242,7 @@ export function registerNavigationLifecycle(
         break;
       case "outcome": {
         const restoreNeedsAttention = execution.outcome.kind !== "restored";
+        if (restoreNeedsAttention) await protectCurrentArrival();
         notifyRestoreOutcome(runtime, context, execution.outcome, {
           announceSuccess: false,
         });

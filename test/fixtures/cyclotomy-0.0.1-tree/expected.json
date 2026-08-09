@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "npmShasum": "a6b62a4ca006bdd9ad9d49a208a78dec22eacefc",
+    "npmIntegrity": "sha512-Mf5ETfsOl3gC4fGb+i7/J5SjBkaBJxzWWT1tWzX5xMkwk1AaBvs4u9A2Ba0LXrwCKTJ+lSkcoV+go3YpiJxh7A==",
+    "gitHead": "1cc897c6f9ff30614393a2b6e88d8ef3739daf83",
+    "treeManifestSourceSha256": "5210d4ca7de2a005fb3841c5c0c7b82d42a922d7f648b4fc203b8922183d1b7a",
+    "workspaceScopeSourceSha256": "4017fca882620d0e03a5f59d07bcb638aea6151664b2453cb5b182a7057660a3"
+  },
+  "compatible": {
+    "blobBytes": 25,
+    "blobOid": "657ac5c3ed8157bd26ba717404992b3a2e7eb771d53dd299c631c637a8aa3f33",
+    "treeBytes": 291,
+    "treeOid": "0c53042c58202208b41f5cf8fd2b96f7c9f275ba2a38fb4d884831eae5ed5557",
+    "migratedTreeOid": "0500eb0932f28766eda94dfb32673db387e463cb3b56e1eaf6dfb89b1c794568"
+  },
+  "incompatibleGitignore": {
+    "blobBytes": 31,
+    "blobOid": "4e8ee7bb37a569f50dcbca3d59db6b6303d2d63a30d691580b5ae856fe059831",
+    "treeBytes": 314,
+    "treeOid": "a3c2394720cce94c55e5b9d40fdd9a9ced03d42611e0069a61982936f502310d"
+  },
+  "incompatibleScopePrefix": {
+    "blobBytes": 11,
+    "blobOid": "6133d5f1a56d831b550db61992dea685026250835e881ae2fa3c7e5b45a2dcbf",
+    "treeBytes": 825,
+    "treeOid": "0710a1570a1f0b2df4eec7e75d8733284310a0afb0a8c8b77e710128a6cb1102"
+  }
+}

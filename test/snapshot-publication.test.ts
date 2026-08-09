@@ -222,6 +222,7 @@ describe("snapshot publication", () => {
       readBlob: (oid) => baseStore.readBlob(oid),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
+      migrateLegacyTree: (oid) => baseStore.migrateLegacyTree(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
     };
 
@@ -288,6 +289,7 @@ describe("snapshot publication", () => {
       readBlob: (oid) => store.readBlob(oid),
       readTree: (oid) => store.readTree(oid),
       readTreeManifest: (oid) => store.readTreeManifest(oid),
+      migrateLegacyTree: (oid) => store.migrateLegacyTree(oid),
       verifyBlobs: (oids) => store.verifyBlobs(oids),
     };
 

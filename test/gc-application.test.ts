@@ -10,6 +10,7 @@ import {
 } from "../src/application/gc.ts";
 import { MetadataStore } from "../src/infrastructure/metadata.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
+import { commitTestNodeState } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
@@ -32,7 +33,7 @@ describe("session metadata garbage collection", () => {
   it("requires a retained second missing-file observation before pruning", async () => {
     const sessionFile = join(directory, "deleted-session.jsonl");
     metadata.touchSession("s1", sessionFile);
-    metadata.setState("s1", "e1", oidA);
+    commitTestNodeState(metadata, "s1", "e1", oidA);
 
     const first = await collectSessionMetadataGarbage(metadata, {
       now: 100,
@@ -63,7 +64,7 @@ describe("session metadata garbage collection", () => {
   it("cancels missing state when the session file reappears", async () => {
     const sessionFile = join(directory, "reappeared-session.jsonl");
     metadata.touchSession("s1", sessionFile);
-    metadata.setState("s1", "e1", oidA);
+    commitTestNodeState(metadata, "s1", "e1", oidA);
 
     await collectSessionMetadataGarbage(metadata, {
       now: 100,
@@ -98,7 +99,7 @@ describe("session metadata garbage collection", () => {
   it("re-probes an eligible session immediately before destructive pruning", async () => {
     const sessionFile = join(directory, "racing-resume.jsonl");
     metadata.touchSession("s1", sessionFile);
-    metadata.setState("s1", "e1", oidA);
+    commitTestNodeState(metadata, "s1", "e1", oidA);
     await collectSessionMetadataGarbage(metadata, {
       now: 100,
       retentionMs: 10,
@@ -166,8 +167,8 @@ describe("session metadata garbage collection", () => {
     const secondFile = join(directory, "second.jsonl");
     metadata.touchSession("s1", firstFile);
     metadata.touchSession("s2", secondFile);
-    metadata.setState("s1", "e1", oidA);
-    metadata.setState("s2", "e2", oidA);
+    commitTestNodeState(metadata, "s1", "e1", oidA);
+    commitTestNodeState(metadata, "s2", "e2", oidA);
     await collectSessionMetadataGarbage(metadata, {
       now: 100,
       retentionMs: 10,
@@ -206,7 +207,7 @@ describe("session metadata garbage collection", () => {
 
   it("preserves rows when probing is inconclusive", async () => {
     metadata.touchSession("s1", "/unreadable/session.jsonl");
-    metadata.setState("s1", "e1", oidA);
+    commitTestNodeState(metadata, "s1", "e1", oidA);
     const report = await collectSessionMetadataGarbage(metadata, {
       now: 1_000,
       retentionMs: 0,
@@ -237,7 +238,7 @@ describe("session metadata garbage collection", () => {
       ALL_MANAGED_SCOPE,
     );
     metadata.touchSession("s1", sessionFile);
-    metadata.setState("s1", "e1", treeOid);
+    commitTestNodeState(metadata, "s1", "e1", treeOid);
     metadata.observeSessionMissing("s1", sessionFile, 10);
 
     const report = await collectCyclotomyGarbage(directory, store, metadata, {

@@ -4,9 +4,28 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import type { NodeKey } from "../domain/model.ts";
-import { notifyRestoreOutcome } from "./restore-outcome.ts";
+import type { ResolvedNodeState } from "../application/resolve.ts";
+import {
+  restorePlanHasChanges,
+  type WorkspaceRestorePlan,
+} from "../infrastructure/restore-plan.ts";
+import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
+import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
+import {
+  checkpointInitializationConflict,
+  protectCurrentArrivalInWorkspaceLock,
+} from "./post-mutation.ts";
+import {
+  notifyCheckpointInitializationConflict,
+  notifyPostMutationConflict,
+  notifyRestoreOutcome,
+} from "./restore-outcome.ts";
 import { registerNavigationLifecycle } from "./navigation-lifecycle.ts";
-import { CyclotomyRuntime, messageOf } from "./runtime.ts";
+import {
+  CyclotomyRuntime,
+  messageOf,
+  type ResolvedReadableTree,
+} from "./runtime.ts";
 import { runConfirmedRestore } from "./confirmed-restore.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 
@@ -49,14 +68,18 @@ async function captureSourceOrCancel(
   context: ExtensionContext,
   view: SessionView,
   entryId: string | null,
-): Promise<boolean> {
-  if (entryId === null) return true;
+): Promise<
+  | { readonly kind: "captured" | "protected" | "no-node" }
+  | { readonly kind: "failed"; readonly message: string }
+> {
+  // Any independent source-capture boundary proves that an unconsumed tree
+  // plan is no longer attributable to a future session_tree event. This is a
+  // no-op while a before hook is actively preparing its own transition.
+  runtime.transitions.retireOrphanedNavigation();
   let detail: string | undefined;
-  let node: NodeKey;
+  let node: NodeKey | undefined;
   try {
-    const anchor = runtime.captureAnchor(view, entryId);
-    if (anchor === undefined) throw new Error("source capture node is missing");
-    node = anchor;
+    node = runtime.captureAnchor(view, entryId);
   } catch (error) {
     detail = messageOf(error);
     runtime.notify(
@@ -67,63 +90,116 @@ async function captureSourceOrCancel(
       ),
       "error",
     );
-    return false;
+    return { kind: "failed", message: detail };
   }
-  const captured = await runtime
+  const result = await runtime
     .enqueueWorkspace("capture-before-transition", async () => {
-      if (!stillAt(context, view.sessionId, entryId, view.cwd)) return false;
+      if (!stillAt(context, view.sessionId, entryId, view.cwd)) {
+        return {
+          kind: "failed" as const,
+          message: "active location changed before source capture",
+        };
+      }
+      const admission = runtime.captureAdmission(view, node);
+      if (admission.kind === "no-node") return admission;
+      if (admission.kind === "protected") return admission;
+      if (admission.kind === "blocked" || node === undefined) {
+        return {
+          kind: "failed" as const,
+          message: "source location is not admitted for checkpointing",
+        };
+      }
       const expectedTreeOid = runtime.metadata.getState(
         node.sessionId,
         node.entryId,
       )?.treeOid;
       const prepared = await runtime.prepareCaptureResult(view);
       if (!prepared.ok) {
-        detail = prepared.error.message;
-        return false;
+        return {
+          kind: "failed" as const,
+          message: prepared.error.message,
+        };
       }
+      const current = readSessionView(context);
       if (
         !stillAt(context, view.sessionId, entryId, view.cwd) ||
-        !(await runtime.workspaceStillBound(view.cwd))
+        !(await runtime.workspaceStillBound(view.cwd)) ||
+        !runtime.captureLeaseIsCurrent(admission.lease, current, node)
       ) {
-        detail = "active location changed during source capture";
-        return false;
+        return {
+          kind: "failed" as const,
+          message: "active location changed during source capture",
+        };
       }
-      const committed = await runtime.commitPreparedCapture({
+      const committed = runtime.commitPreparedCapture({
         source: node,
         prepared: prepared.value,
         expectedTreeOid,
       });
-      if (!committed.ok) detail = committed.error.message;
-      return committed.ok;
+      if (!committed.ok) {
+        if (committed.error.kind === "write-protected") {
+          runtime.protectNode(view, node);
+          return { kind: "protected" as const };
+        }
+        return {
+          kind: "failed" as const,
+          message: committed.error.message,
+        };
+      }
+      return { kind: "captured" as const };
     })
-    .catch((error: unknown) => {
-      detail = messageOf(error);
-      return false;
-    });
-  if (!captured) {
+    .catch((error: unknown) => ({
+      kind: "failed" as const,
+      message: messageOf(error),
+    }));
+  if (result.kind === "failed") {
     runtime.notify(
       context,
       withDetail(
         runtime.i18n.t("sourceCaptureFailed"),
         runtime.i18n.t("captureFailureDetail", {
-          message: detail ?? "unknown capture failure",
+          message: result.message,
         }),
       ),
       "error",
     );
-  } else {
+  } else if (result.kind === "captured" || result.kind === "no-node") {
     runtime.setStatus(context, undefined);
   }
-  return captured;
+  return result;
 }
+
+const SESSION_PENDING_NODE_GUARD = "pending-node-guard" as const;
+const SESSION_RECONCILED = "reconciled" as const;
+const RELOAD_PROTECTED_MISSING = "protected-missing" as const;
+const RELOAD_PROTECTED = "reload-protected" as const;
+type SessionReconciliation =
+  typeof SESSION_RECONCILED | typeof SESSION_PENDING_NODE_GUARD;
 
 async function reconcileLoadedSession(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
   view: SessionView,
+): Promise<SessionReconciliation> {
+  const node = runtime.captureAnchor(view);
+  if (node === undefined) {
+    if (runtime.pendingNodeGuard(view) !== false) {
+      runtime.quarantineAdmission();
+      return SESSION_PENDING_NODE_GUARD;
+    }
+    runtime.admitLocation(view);
+    return SESSION_RECONCILED;
+  }
+  await reconcileLoadedConcreteSession(runtime, context, view, node);
+  return SESSION_RECONCILED;
+}
+
+async function reconcileLoadedConcreteSession(
+  runtime: CyclotomyRuntime,
+  context: ExtensionContext,
+  view: SessionView,
+  node: NodeKey,
 ): Promise<void> {
-  const node = runtime.currentNode(view);
-  if (node === undefined) return;
   const result = await runConfirmedRestore(
     runtime,
     context,
@@ -133,6 +209,12 @@ async function reconcileLoadedSession(
   );
 
   switch (result.kind) {
+    case "initialization-conflict":
+      notifyCheckpointInitializationConflict(runtime, context, result);
+      return;
+    case "post-mutation-conflict":
+      notifyPostMutationConflict(runtime, context, result);
+      return;
     case "missing": {
       let anchor: NodeKey | undefined;
       try {
@@ -142,6 +224,7 @@ async function reconcileLoadedSession(
         return;
       }
       if (anchor === undefined) return;
+      let initializedCheckpointCommitted = false;
       const initialized = await runtime
         .enqueueWorkspace("initialize-missing-session", async () => {
           if (
@@ -176,26 +259,89 @@ async function reconcileLoadedSession(
           if (!runtime.resolutionStillAuthoritative(view, anchor, undefined)) {
             return { kind: "target-changed" as const };
           }
-          const committed = await runtime.commitPreparedCapture({
-            source: anchor,
-            prepared: prepared.value,
-            expectedTreeOid: undefined,
-          });
-          return committed.ok
-            ? { kind: "materialized" as const }
+          const committed = runtime.commitPreparedMissingCapture(
+            anchor,
+            prepared.value,
+            "initialize-fresh",
+          );
+          if (!committed.ok) {
+            if (
+              committed.error.kind === "state-changed" &&
+              runtime.metadata.getState(anchor.sessionId, anchor.entryId) ===
+                undefined &&
+              runtime.metadata.isNodeWriteProtected(
+                anchor.sessionId,
+                anchor.entryId,
+              )
+            ) {
+              runtime.protectNode(view, anchor);
+              return { kind: "protected" as const };
+            }
+            return {
+              kind: "capture-failed" as const,
+              message: committed.error.message,
+            };
+          }
+          initializedCheckpointCommitted = true;
+          try {
+            const current = readSessionView(context);
+            const currentAnchor = runtime.captureAnchor(current);
+            if (
+              !runtime.sessionIsUsable(current) ||
+              current.sessionId !== view.sessionId ||
+              current.sessionFile !== view.sessionFile ||
+              current.leafId !== view.leafId ||
+              current.cwd !== view.cwd ||
+              currentAnchor?.sessionId !== anchor.sessionId ||
+              currentAnchor.entryId !== anchor.entryId
+            ) {
+              return checkpointInitializationConflict(
+                runtime,
+                context,
+                "active location changed after checkpoint initialization",
+              );
+            }
+            if (!runtime.admitLocation(current, prepared.value.treeOid)) {
+              return checkpointInitializationConflict(
+                runtime,
+                context,
+                "checkpoint admission changed after initialization",
+              );
+            }
+          } catch (error) {
+            return checkpointInitializationConflict(runtime, context, error);
+          }
+          return { kind: "materialized" as const };
+        })
+        // `async` normalizes the helper promise and immediate capture failure
+        // into the one execution union consumed below.
+        .catch(async (error: unknown) =>
+          initializedCheckpointCommitted
+            ? checkpointInitializationConflict(
+                runtime,
+                context,
+                error,
+                "initialize-missing-post-failure-protect",
+              )
             : {
                 kind: "capture-failed" as const,
-                message: committed.error.message,
-              };
-        })
-        .catch((error: unknown) => ({
-          kind: "capture-failed" as const,
-          message: messageOf(error),
-        }));
+                message: messageOf(error),
+              },
+        );
 
       switch (initialized.kind) {
+        case "initialization-conflict":
+          notifyCheckpointInitializationConflict(runtime, context, initialized);
+          break;
         case "materialized":
           runtime.notifyCaptureResult(context, true);
+          break;
+        case "protected":
+          runtime.notify(
+            context,
+            runtime.i18n.t("sessionMissingProtected"),
+            "warning",
+          );
           break;
         case "location-changed":
           runtime.notify(
@@ -217,6 +363,14 @@ async function reconcileLoadedSession(
       }
       return;
     }
+    case "protected-missing":
+      runtime.notify(
+        context,
+        runtime.i18n.t("sessionMissingProtected"),
+        "warning",
+      );
+      return;
+    case "initialized":
     case "matches":
       return;
     case "needs-ui":
@@ -272,8 +426,176 @@ async function reconcileLoadedSession(
       break;
     case "outcome":
       notifyRestoreOutcome(runtime, context, result.outcome);
-      break;
+      return;
   }
+}
+
+/**
+ * Reload preserves the live workspace but cannot trust an absent guard as a
+ * cross-runtime handoff (the previous runtime may have been disabled). Match
+ * the existing checkpoint without capturing, prompting, or restoring; any
+ * uncertainty leaves the node protected.
+ */
+async function reconcileReloadedSession(
+  runtime: CyclotomyRuntime,
+  context: ExtensionContext,
+  view: SessionView,
+): Promise<SessionReconciliation> {
+  const node = runtime.captureAnchor(view);
+  if (node === undefined) {
+    const reconciled = await runtime.enqueueWorkspace(
+      "reload-empty-session",
+      async () => {
+        if (!registeredSessionStillAt(runtime, context, view)) return false;
+        const current = readSessionView(context);
+        if (
+          runtime.captureAnchor(current) !== undefined ||
+          !runtime.clearPendingNodeGuard(current)
+        ) {
+          return false;
+        }
+        return runtime.admitLocation(current);
+      },
+    );
+    if (!reconciled) {
+      runtime.quarantineAdmission();
+      return SESSION_PENDING_NODE_GUARD;
+    }
+    return SESSION_RECONCILED;
+  }
+
+  const reconciliation = await runtime
+    .enqueueWorkspace("reload-reconcile", async () => {
+      const stillCurrent = (): SessionView | undefined => {
+        const current = readSessionView(context);
+        if (
+          !runtime.sessionIsUsable(current) ||
+          current.sessionId !== view.sessionId ||
+          current.sessionFile !== view.sessionFile ||
+          current.leafId !== view.leafId ||
+          current.cwd !== view.cwd
+        ) {
+          return undefined;
+        }
+        const anchor = runtime.captureAnchor(current);
+        return anchor?.sessionId === node.sessionId &&
+          anchor.entryId === node.entryId
+          ? current
+          : undefined;
+      };
+      const protectCurrent = async (
+        resolution?: ResolvedNodeState,
+        missing = false,
+      ): Promise<
+        | SessionReconciliation
+        | typeof RELOAD_PROTECTED
+        | typeof RELOAD_PROTECTED_MISSING
+      > => {
+        const current = stillCurrent();
+        if (current === undefined) {
+          const protection = await protectCurrentArrivalInWorkspaceLock(
+            runtime,
+            context,
+          );
+          if (protection.kind === "protected") return RELOAD_PROTECTED;
+          if (protection.kind === "pending-node-guard") {
+            return SESSION_PENDING_NODE_GUARD;
+          }
+          runtime.notifyCaptureResult(context, false, protection.message);
+          return SESSION_RECONCILED;
+        }
+        // A stale inherited pin returns false while still installing the exact
+        // guard. Notification follows the durable fact, not the pin outcome.
+        runtime.protectNode(current, node, resolution);
+        if (
+          !runtime.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
+        ) {
+          return SESSION_RECONCILED;
+        }
+        return missing ? RELOAD_PROTECTED_MISSING : RELOAD_PROTECTED;
+      };
+
+      if (stillCurrent() === undefined) return protectCurrent();
+      if (!(await runtime.workspaceStillBound(view.cwd))) {
+        return protectCurrent();
+      }
+
+      let readable: ResolvedReadableTree | undefined;
+      try {
+        readable = await runtime.resolveReadableTreeIn(view, node);
+      } catch {
+        return protectCurrent();
+      }
+      if (readable === undefined) {
+        if (
+          runtime.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
+        ) {
+          return protectCurrent(undefined, true);
+        }
+        const current = stillCurrent();
+        if (
+          current !== undefined &&
+          runtime.resolutionStillAuthoritative(current, node, undefined) &&
+          runtime.admitLocation(current)
+        ) {
+          return SESSION_RECONCILED;
+        }
+        return protectCurrent(undefined, true);
+      }
+
+      let snapshot: WorkspaceSnapshot;
+      try {
+        snapshot = await runtime.scanCurrentWorkspaceForScope(
+          view.cwd,
+          readable.manifest.scope,
+        );
+      } catch {
+        return protectCurrent(readable.resolution);
+      }
+      if (snapshot.problems.length > 0) {
+        return protectCurrent(readable.resolution);
+      }
+      let drift: WorkspaceRestorePlan;
+      try {
+        drift = (await prepareWorkspaceRestorePlan(snapshot, readable.manifest))
+          .plan;
+      } catch {
+        return protectCurrent(readable.resolution);
+      }
+      const current = stillCurrent();
+      if (current === undefined) return protectCurrent(readable.resolution);
+      const authoritative = runtime.resolutionStillAuthoritative(
+        current,
+        node,
+        readable.resolution,
+      );
+      if (
+        drift.problems.length === 0 &&
+        !restorePlanHasChanges(drift) &&
+        authoritative &&
+        runtime.admitLocation(current, readable.resolution.treeOid)
+      ) {
+        return SESSION_RECONCILED;
+      }
+      return protectCurrent(authoritative ? readable.resolution : undefined);
+    })
+    .catch((error: unknown) => {
+      runtime.quarantineAdmission();
+      runtime.notifyCaptureResult(context, false, messageOf(error));
+      return SESSION_RECONCILED;
+    });
+  if (reconciliation === RELOAD_PROTECTED_MISSING) {
+    runtime.notify(
+      context,
+      runtime.i18n.t("sessionMissingProtected"),
+      "warning",
+    );
+  } else if (reconciliation === RELOAD_PROTECTED) {
+    runtime.notify(context, runtime.i18n.t("reloadProtected"), "warning");
+  } else if (reconciliation === SESSION_PENDING_NODE_GUARD) {
+    return SESSION_PENDING_NODE_GUARD;
+  }
+  return SESSION_RECONCILED;
 }
 
 function blockedBashResult(message: string) {
@@ -296,6 +618,7 @@ export function registerCyclotomyLifecycle(
   const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
     try {
       await runtime.maybeRunAutomaticGc();
+      automaticGcFailureNotified = false;
     } catch (error) {
       if (automaticGcFailureNotified) return;
       automaticGcFailureNotified = true;
@@ -343,19 +666,70 @@ export function registerCyclotomyLifecycle(
       });
     if (!registered) return;
     runtime.completeSessionRegistration(view);
+    try {
+      runtime.beginAdmission(view);
+    } catch (error) {
+      runtime.notifyCaptureResult(context, false, messageOf(error));
+      return;
+    }
 
-    // Loading an existing location never overwrites differing files silently.
-    // Declining leaves both realities untouched; the normal next capture is
-    // the model's only way to accept the current files into this node.
-    if (
-      event.reason === "startup" ||
-      event.reason === "new" ||
-      event.reason === "resume" ||
-      event.reason === "fork"
-    ) {
-      await reconcileLoadedSession(runtime, context, view);
+    const reconciliation =
+      event.reason === "reload"
+        ? await reconcileReloadedSession(runtime, context, view)
+        : await reconcileLoadedSession(runtime, context, view);
+    if (reconciliation === SESSION_PENDING_NODE_GUARD) {
+      runtime.notify(
+        context,
+        runtime.i18n.t("sessionPendingNodeGuard"),
+        "warning",
+      );
     }
     await runAutomaticGc(context);
+  });
+
+  // A custom trigger can bypass the cancellable input hook and persist its
+  // first concrete message before Pi builds provider context. Consume a
+  // pending session-level guard at that earliest post-persistence hook. The
+  // durable flag remains authoritative if the process stops before this event.
+  pi.on("context", async (_event, context) => {
+    let view: SessionView;
+    try {
+      view = readSessionView(context);
+      if (!runtime.sessionIsUsable(view)) return;
+      const node = runtime.captureAnchor(view);
+      if (node === undefined || runtime.pendingNodeGuard(view) !== true) return;
+      if (!(await runtime.ensureStore(view.cwd))) {
+        runtime.notifyInitFailure(context);
+        return;
+      }
+      await runtime.enqueueWorkspace("protect-pending-node", async () => {
+        const current = readSessionView(context);
+        const currentNode = runtime.captureAnchor(current);
+        if (
+          !runtime.sessionIsUsable(current) ||
+          runtime.pendingNodeGuard(current) !== true ||
+          current.sessionId !== view.sessionId ||
+          current.sessionFile !== view.sessionFile ||
+          current.cwd !== view.cwd ||
+          current.leafId !== view.leafId ||
+          currentNode?.sessionId !== node.sessionId ||
+          currentNode.entryId !== node.entryId
+        ) {
+          return;
+        }
+        runtime.captureAdmission(current, currentNode);
+        if (
+          !runtime.metadata.isNodeWriteProtected(
+            currentNode.sessionId,
+            currentNode.entryId,
+          )
+        ) {
+          throw new Error("pending checkpoint guard was not installed");
+        }
+      });
+    } catch (error) {
+      runtime.notifyCaptureResult(context, false, messageOf(error));
+    }
   });
 
   pi.on("turn_end", async (_event, context) => {
@@ -374,12 +748,21 @@ export function registerCyclotomyLifecycle(
       runtime.notifyInitFailure(context);
       return;
     }
-    let detail: string | undefined;
-    const captured = await runtime
+    const result = await runtime
       .enqueueWorkspace("capture-turn", async () => {
         if (!registeredSessionStillAt(runtime, context, view)) {
-          detail = "active location changed before turn capture";
-          return false;
+          return {
+            kind: "failed" as const,
+            message: "active location changed before turn capture",
+          };
+        }
+        const admission = runtime.captureAdmission(view, node);
+        if (admission.kind === "protected") return admission;
+        if (admission.kind !== "capture") {
+          return {
+            kind: "failed" as const,
+            message: "turn location is not admitted for checkpointing",
+          };
         }
         const expectedTreeOid = runtime.metadata.getState(
           node.sessionId,
@@ -387,33 +770,49 @@ export function registerCyclotomyLifecycle(
         )?.treeOid;
         const prepared = await runtime.prepareCaptureResult(view);
         if (!prepared.ok) {
-          detail = prepared.error.message;
-          return false;
+          return {
+            kind: "failed" as const,
+            message: prepared.error.message,
+          };
         }
+        const current = readSessionView(context);
         if (
           !(await runtime.workspaceStillBound(view.cwd)) ||
-          !registeredSessionStillAt(runtime, context, view)
+          !registeredSessionStillAt(runtime, context, view) ||
+          !runtime.captureLeaseIsCurrent(admission.lease, current, node)
         ) {
-          detail = "active location changed during turn capture";
-          return false;
+          return {
+            kind: "failed" as const,
+            message: "active location changed during turn capture",
+          };
         }
-        const committed = await runtime.commitPreparedCapture({
+        const committed = runtime.commitPreparedCapture({
           source: node,
           prepared: prepared.value,
           expectedTreeOid,
         });
         if (!committed.ok) {
-          detail = committed.error.message;
-          return false;
+          if (committed.error.kind === "write-protected") {
+            runtime.protectNode(view, node);
+            return { kind: "protected" as const };
+          }
+          return {
+            kind: "failed" as const,
+            message: committed.error.message,
+          };
         }
         runtime.touchCapturedSession(view);
-        return true;
+        return { kind: "captured" as const };
       })
-      .catch((error: unknown) => {
-        detail = messageOf(error);
-        return false;
-      });
-    runtime.notifyCaptureResult(context, captured, detail);
+      .catch((error: unknown) => ({
+        kind: "failed" as const,
+        message: messageOf(error),
+      }));
+    if (result.kind === "captured") {
+      runtime.notifyCaptureResult(context, true);
+    } else if (result.kind === "failed") {
+      runtime.notifyCaptureResult(context, false, result.message);
+    }
     // GC runs only after the turn's authoritative checkpoint is durable. Its
     // interval gate makes this cheap; failure is hygiene-only and never turns
     // a successful agent turn into a failed one.
@@ -444,13 +843,13 @@ export function registerCyclotomyLifecycle(
           runtime.notifyInitFailure(context);
           return { action: "handled" as const };
         }
-        const captured = await captureSourceOrCancel(
+        const capture = await captureSourceOrCancel(
           runtime,
           context,
           view,
           view.leafId,
         );
-        if (captured && context.isIdle()) {
+        if (capture.kind !== "failed" && context.isIdle()) {
           return { action: "continue" as const };
         }
         runtime.notify(context, runtime.i18n.t("inputCaptureFailed"), "error");
@@ -511,13 +910,13 @@ export function registerCyclotomyLifecycle(
         runtime.notifyInitFailure(context);
         return blockedBashResult(runtime.i18n.t("initFailure"));
       }
-      const captured = await captureSourceOrCancel(
+      const capture = await captureSourceOrCancel(
         runtime,
         context,
         view,
         view.leafId,
       );
-      if (!captured || !context.isIdle()) {
+      if (capture.kind === "failed" || !context.isIdle()) {
         return blockedBashResult(runtime.i18n.t("sourceCaptureFailed"));
       }
       if (!hadConflict) return undefined;
@@ -556,13 +955,13 @@ export function registerCyclotomyLifecycle(
         runtime.notifyInitFailure(context);
         return { cancel: true };
       }
-      const captured = await captureSourceOrCancel(
+      const capture = await captureSourceOrCancel(
         runtime,
         context,
         view,
         view.leafId,
       );
-      if (!captured) return { cancel: true };
+      if (capture.kind === "failed") return { cancel: true };
       return undefined;
     } catch (error) {
       runtime.notify(
@@ -575,6 +974,20 @@ export function registerCyclotomyLifecycle(
       return { cancel: true };
     } finally {
       runtime.transitions.finish("compaction");
+    }
+  });
+
+  pi.on("session_compact", async (_event, context) => {
+    try {
+      const view = readSessionView(context);
+      if (!runtime.sessionIsUsable(view)) return;
+      if (!(await runtime.ensureStore(view.cwd))) {
+        runtime.notifyInitFailure(context);
+        return;
+      }
+      await captureSourceOrCancel(runtime, context, view, view.leafId);
+    } catch (error) {
+      runtime.notifyCaptureResult(context, false, messageOf(error));
     }
   });
 
@@ -607,13 +1020,13 @@ export function registerCyclotomyLifecycle(
         runtime.notifyInitFailure(context);
         return { cancel: true };
       }
-      const captured = await captureSourceOrCancel(
+      const capture = await captureSourceOrCancel(
         runtime,
         context,
         view,
         view.leafId,
       );
-      if (!captured) return { cancel: true };
+      if (capture.kind === "failed") return { cancel: true };
       if (
         !context.isIdle() ||
         !stillAt(context, view.sessionId, view.leafId, view.cwd)
@@ -663,13 +1076,13 @@ export function registerCyclotomyLifecycle(
         runtime.notifyInitFailure(context);
         return { cancel: true };
       }
-      const captured = await captureSourceOrCancel(
+      const capture = await captureSourceOrCancel(
         runtime,
         context,
         view,
         view.leafId,
       );
-      if (!captured) return { cancel: true };
+      if (capture.kind === "failed") return { cancel: true };
       if (
         !context.isIdle() ||
         !stillAt(context, view.sessionId, view.leafId, view.cwd)
@@ -691,10 +1104,7 @@ export function registerCyclotomyLifecycle(
     }
   });
 
-  pi.on("session_shutdown", async () => {
-    // switch/fork sources are already durable before Pi may replace cwd or the
-    // session manager. Reload has no cancellable precursor and must not scan a
-    // potentially replaced workspace during shutdown.
+  pi.on("session_shutdown", () => {
     runtime.close();
   });
 }

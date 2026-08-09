@@ -20,16 +20,18 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
+  DEFAULT_WORKSPACE_PATH_LIMITS,
   MAX_GITIGNORE_POLICY_BYTES,
   MAX_GITIGNORE_SOURCES,
   MAX_GITIGNORE_SOURCE_BYTES,
   canonicalWorkspaceRelativePath,
   canonicalizeWorkspaceScope,
+  portableWorkspacePathKey,
   workspaceGitignoreSource,
-  workspaceScopePathKey,
   workspaceScopeBytes,
   type GitWorkspaceScope,
   type WorkspaceGitignoreSource,
+  type WorkspacePathLimits,
   type WorkspaceScope,
 } from "./workspace-scope.ts";
 
@@ -67,6 +69,8 @@ export interface SyntheticGitIgnoreScratchOptions {
   readonly scratchParent?: string;
   /** Roots under which synthetic policy bytes must never be materialized. */
   readonly forbiddenRoots?: readonly string[];
+  /** Path limits used to authenticate scope and oracle queries. */
+  readonly pathLimits?: WorkspacePathLimits;
 }
 
 /**
@@ -76,11 +80,16 @@ export interface SyntheticGitIgnoreScratchOptions {
  */
 export class WorkspaceGitPolicyBudget {
   readonly #sourceBytes = new Map<string, number>();
+  readonly #pathLimits: WorkspacePathLimits;
   #totalBytes = 0;
 
-  constructor(scope?: WorkspaceScope) {
+  constructor(
+    scope?: WorkspaceScope,
+    pathLimits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
+  ) {
+    this.#pathLimits = pathLimits;
     if (scope === undefined) return;
-    const canonical = canonicalizeWorkspaceScope(scope);
+    const canonical = canonicalizeWorkspaceScope(scope, pathLimits);
     if (canonical.kind === "all-managed") return;
     for (const source of canonical.gitignoreSources) {
       this.upsertGitignoreSource(source);
@@ -96,7 +105,11 @@ export class WorkspaceGitPolicyBudget {
   }
 
   upsertGitignoreSource(source: WorkspaceGitignoreSource): void {
-    const path = canonicalWorkspaceRelativePath(source.path, false);
+    const path = canonicalWorkspaceRelativePath(
+      source.path,
+      false,
+      this.#pathLimits,
+    );
     const byteLength = workspaceScopeBytes(source.contentsBase64).byteLength;
     const previousBytes = this.#sourceBytes.get(path);
     const sourceCount =
@@ -142,6 +155,7 @@ export interface DiscoveredWorkspaceScope {
   readonly repositoryRoot?: string;
   /** Ancestor `.gitignore` plus external sources; nested sources are appended by the scanner. */
   readonly scope: WorkspaceScope;
+  readonly pathLimits: WorkspacePathLimits;
 }
 
 interface GitCommandResult {
@@ -266,6 +280,7 @@ function decodeSingleLine(bytes: Buffer, label: string): string {
 
 async function locateGitWorktree(
   root: string,
+  pathLimits: WorkspacePathLimits,
 ): Promise<GitWorktreeContext | undefined> {
   let workspaceRoot: string;
   try {
@@ -318,6 +333,7 @@ async function locateGitWorktree(
   const repositoryPrefix = canonicalWorkspaceRelativePath(
     nativePrefix === "" ? "" : nativePrefix.split(sep).join("/"),
     true,
+    pathLimits,
   );
   return { workspaceRoot, repositoryRoot, repositoryPrefix, env };
 }
@@ -510,8 +526,9 @@ function ancestorGitignorePaths(repositoryPrefix: string): readonly string[] {
  */
 export async function discoverWorkspaceScope(
   root: string,
+  pathLimits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): Promise<DiscoveredWorkspaceScope> {
-  const context = await locateGitWorktree(root);
+  const context = await locateGitWorktree(root, pathLimits);
   if (context === undefined) {
     let workspaceRoot: string;
     try {
@@ -521,11 +538,15 @@ export async function discoverWorkspaceScope(
         cause,
       });
     }
-    return { workspaceRoot, scope: { kind: "all-managed" } };
+    return {
+      workspaceRoot,
+      scope: { kind: "all-managed" },
+      pathLimits,
+    };
   }
 
   const sources: WorkspaceGitignoreSource[] = [];
-  const policyBudget = new WorkspaceGitPolicyBudget();
+  const policyBudget = new WorkspaceGitPolicyBudget(undefined, pathLimits);
   for (const path of ancestorGitignorePaths(context.repositoryPrefix)) {
     const contents = await readOptionalPolicyFile(
       join(context.repositoryRoot, ...path.split("/")),
@@ -533,7 +554,7 @@ export async function discoverWorkspaceScope(
       false,
     );
     if (contents !== undefined) {
-      const source = workspaceGitignoreSource(path, contents);
+      const source = workspaceGitignoreSource(path, contents, pathLimits);
       policyBudget.upsertGitignoreSource(source);
       sources.push(source);
     }
@@ -554,18 +575,24 @@ export async function discoverWorkspaceScope(
     globalExclude ?? Buffer.alloc(0),
     "Git global excludes file",
   );
-  const scope = canonicalizeWorkspaceScope({
-    kind: "git",
-    repositoryPrefix: context.repositoryPrefix,
-    ignoreCase: await gitBoolean(context, "core.ignoreCase"),
-    gitignoreSources: sources,
-    infoExcludeBase64: (infoExclude ?? Buffer.alloc(0)).toString("base64"),
-    globalExcludeBase64: (globalExclude ?? Buffer.alloc(0)).toString("base64"),
-  });
+  const scope = canonicalizeWorkspaceScope(
+    {
+      kind: "git",
+      repositoryPrefix: context.repositoryPrefix,
+      ignoreCase: await gitBoolean(context, "core.ignoreCase"),
+      gitignoreSources: sources,
+      infoExcludeBase64: (infoExclude ?? Buffer.alloc(0)).toString("base64"),
+      globalExcludeBase64: (globalExclude ?? Buffer.alloc(0)).toString(
+        "base64",
+      ),
+    },
+    pathLimits,
+  );
   return {
     workspaceRoot: context.workspaceRoot,
     repositoryRoot: context.repositoryRoot,
     scope,
+    pathLimits,
   };
 }
 
@@ -574,10 +601,14 @@ export async function readWorkspaceGitignoreSource(
   discovery: DiscoveredWorkspaceScope,
   workspaceRelativeDirectory: string,
 ): Promise<WorkspaceGitignoreSource | undefined> {
-  const scope = canonicalizeWorkspaceScope(discovery.scope);
+  const scope = canonicalizeWorkspaceScope(
+    discovery.scope,
+    discovery.pathLimits,
+  );
   const relativeDirectory = canonicalWorkspaceRelativePath(
     workspaceRelativeDirectory,
     true,
+    discovery.pathLimits,
   );
   if (scope.kind === "all-managed") return undefined;
   if (
@@ -599,12 +630,20 @@ export async function readWorkspaceGitignoreSource(
   );
   return contents === undefined
     ? undefined
-    : workspaceGitignoreSource(sourcePath, contents);
+    : workspaceGitignoreSource(sourcePath, contents, discovery.pathLimits);
 }
 
 class AllManagedOracle implements GitIgnoreOracle {
+  readonly #pathLimits: WorkspacePathLimits;
+
+  constructor(pathLimits: WorkspacePathLimits) {
+    this.#pathLimits = pathLimits;
+  }
+
   async managed(paths: readonly GitIgnorePath[]): Promise<readonly boolean[]> {
-    for (const item of paths) canonicalWorkspaceRelativePath(item.path, false);
+    for (const item of paths) {
+      canonicalWorkspaceRelativePath(item.path, false, this.#pathLimits);
+    }
     return paths.map(() => true);
   }
 
@@ -817,6 +856,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   readonly #allowBoundedDiagnostics: boolean;
   readonly #syntheticPolicyDirectories: ReadonlySet<string> | undefined;
   readonly #syntheticScope: GitWorkspaceScope | undefined;
+  readonly #pathLimits: WorkspacePathLimits;
   #stdout = Buffer.alloc(0);
   #diagnosticBytes = 0;
   #pending: PendingQuery | undefined;
@@ -836,12 +876,14 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     allowBoundedDiagnostics = false,
     syntheticPolicyDirectories?: ReadonlySet<string>,
     syntheticScope?: GitWorkspaceScope,
+    pathLimits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
   ) {
     this.#repositoryPrefix = repositoryPrefix;
     this.#cleanupRoot = cleanupRoot;
     this.#allowBoundedDiagnostics = allowBoundedDiagnostics;
     this.#syntheticPolicyDirectories = syntheticPolicyDirectories;
     this.#syntheticScope = syntheticScope;
+    this.#pathLimits = pathLimits;
     this.#child = spawn(
       "git",
       [
@@ -915,11 +957,18 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     try {
       for (let index = 0; index < paths.length; index += 1) {
         const item = paths[index]!;
-        const local = canonicalWorkspaceRelativePath(item.path, false);
-        const repositoryPath =
+        const local = canonicalWorkspaceRelativePath(
+          item.path,
+          false,
+          this.#pathLimits,
+        );
+        const repositoryPath = canonicalWorkspaceRelativePath(
           this.#repositoryPrefix === ""
             ? local
-            : `${this.#repositoryPrefix}/${local}`;
+            : `${this.#repositoryPrefix}/${local}`,
+          false,
+          this.#pathLimits,
+        );
         const pathname = Buffer.from(
           `${repositoryPath}${item.isDirectory ? "/" : ""}`,
           "utf8",
@@ -934,7 +983,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
           !item.isDirectory &&
           this.#syntheticScope !== undefined &&
           this.#syntheticPolicyDirectories?.has(
-            workspaceScopePathKey(this.#syntheticScope, repositoryPath),
+            portableWorkspacePathKey(repositoryPath),
           ) === true
         ) {
           // Nested archived sources need real parent directories in the
@@ -1126,10 +1175,13 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
 export async function createLiveGitIgnoreOracle(
   root: string,
   scope: WorkspaceScope,
+  pathLimits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): Promise<GitIgnoreOracle> {
-  const canonical = canonicalizeWorkspaceScope(scope);
-  if (canonical.kind === "all-managed") return new AllManagedOracle();
-  const context = await locateGitWorktree(root);
+  const canonical = canonicalizeWorkspaceScope(scope, pathLimits);
+  if (canonical.kind === "all-managed") {
+    return new AllManagedOracle(pathLimits);
+  }
+  const context = await locateGitWorktree(root, pathLimits);
   if (context === undefined) {
     throw new GitIgnoreOracleError(
       "checkpoint expects Git but workspace is not a Git worktree",
@@ -1146,6 +1198,9 @@ export async function createLiveGitIgnoreOracle(
     context.env,
     undefined,
     true,
+    undefined,
+    undefined,
+    pathLimits,
   );
 }
 
@@ -1154,8 +1209,11 @@ export async function createSyntheticGitIgnoreOracle(
   scope: WorkspaceScope,
   options: SyntheticGitIgnoreScratchOptions = {},
 ): Promise<GitIgnoreOracle> {
-  const canonical = canonicalizeWorkspaceScope(scope);
-  if (canonical.kind === "all-managed") return new AllManagedOracle();
+  const pathLimits = options.pathLimits ?? DEFAULT_WORKSPACE_PATH_LIMITS;
+  const canonical = canonicalizeWorkspaceScope(scope, pathLimits);
+  if (canonical.kind === "all-managed") {
+    return new AllManagedOracle(pathLimits);
+  }
   const scratch = await createSyntheticScratchRoot(options);
   const scratchRoot = scratch.path;
   try {
@@ -1173,7 +1231,7 @@ export async function createSyntheticGitIgnoreOracle(
       let directory = "";
       for (const component of components) {
         directory = directory === "" ? component : `${directory}/${component}`;
-        policyDirectories.add(workspaceScopePathKey(canonical, directory));
+        policyDirectories.add(portableWorkspacePathKey(directory));
       }
       const path = join(repositoryRoot, ...source.path.split("/"));
       await mkdir(dirname(path), { recursive: true });
@@ -1240,6 +1298,7 @@ export async function createSyntheticGitIgnoreOracle(
       false,
       policyDirectories,
       canonical,
+      pathLimits,
     );
   } catch (cause) {
     let cleanupFailure: unknown;

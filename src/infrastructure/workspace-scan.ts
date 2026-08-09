@@ -31,9 +31,17 @@ import {
   type GitIgnorePath,
 } from "./git-ignore-oracle.ts";
 import {
+  ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
+  canonicalWorkspaceRelativePath,
   canonicalizeWorkspaceScope,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+  portableWorkspacePathKey,
   workspaceScopesEqual,
   type WorkspaceGitignoreSource,
+  type WorkspacePathLimits,
   type WorkspaceScope,
 } from "./workspace-scope.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
@@ -156,6 +164,10 @@ export interface ScanOptions {
   readonly maxEntries?: number;
   /** Estimated canonical durable tree-manifest byte ceiling. */
   readonly maxManifestBytes?: number;
+  /** UTF-8 byte ceiling for one workspace-relative path. */
+  readonly maxPathBytes?: number;
+  /** Slash-separated component ceiling for one workspace-relative path. */
+  readonly maxPathComponents?: number;
   /**
    * Existing private parent for operation-local synthetic Git state. Pi uses
    * its authenticated object-store root; standalone scans default to TMPDIR
@@ -177,11 +189,7 @@ const DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024 ** 3;
 // --- path and entry helpers ------------------------------------------------
 
 function isGitComponent(name: string): boolean {
-  return name.normalize("NFC").toLocaleLowerCase("en-US") === ".git";
-}
-
-function canonicalPathKey(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase("en-US");
+  return portableWorkspacePathKey(name) === ".git";
 }
 
 function comparePathBytes(left: string, right: string): number {
@@ -291,7 +299,11 @@ export function workspaceSnapshotsEqual(
 ): boolean {
   return (
     left.rootPath === right.rootPath &&
-    workspaceScopesEqual(left.scope, right.scope) &&
+    workspaceScopesEqual(
+      left.scope,
+      right.scope,
+      ABSOLUTE_WORKSPACE_PATH_LIMITS,
+    ) &&
     entriesEqual(left.entries, right.entries) &&
     excludedOccupanciesEqual(
       left.excludedOccupancies,
@@ -399,11 +411,7 @@ export async function scanWorkspaceForScope(
   targetScope: WorkspaceScope,
   options: ScanOptions = {},
 ): Promise<WorkspaceSnapshot> {
-  return scanWorkspaceWithScope(
-    root,
-    options,
-    canonicalizeWorkspaceScope(targetScope),
-  );
+  return scanWorkspaceWithScope(root, options, targetScope);
 }
 
 /**
@@ -425,17 +433,33 @@ async function scanWorkspaceWithScope(
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_TREE_ENTRIES;
   const maxManifestBytes =
     options.maxManifestBytes ?? DEFAULT_MAX_TREE_MANIFEST_BYTES;
+  const maxPathBytes =
+    options.maxPathBytes ?? DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES;
+  const maxPathComponents =
+    options.maxPathComponents ?? DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS;
+  const pathLimits: WorkspacePathLimits = {
+    maxPathBytes,
+    maxPathComponents,
+  };
   if (
+    !Number.isSafeInteger(maxFileBytes) ||
+    maxFileBytes <= 0 ||
+    !Number.isSafeInteger(maxSnapshotBytes) ||
+    maxSnapshotBytes <= 0 ||
     !Number.isSafeInteger(maxEntries) ||
     maxEntries <= 0 ||
     maxEntries > ABSOLUTE_MAX_TREE_ENTRIES ||
     !Number.isSafeInteger(maxManifestBytes) ||
     maxManifestBytes <= 0 ||
-    maxManifestBytes > ABSOLUTE_MAX_TREE_MANIFEST_BYTES
+    maxManifestBytes > ABSOLUTE_MAX_TREE_MANIFEST_BYTES ||
+    !Number.isSafeInteger(maxPathBytes) ||
+    maxPathBytes <= 0 ||
+    maxPathBytes > ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES ||
+    !Number.isSafeInteger(maxPathComponents) ||
+    maxPathComponents <= 0 ||
+    maxPathComponents > ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS
   ) {
-    throw new ScanError(
-      "scan entry or manifest limits are outside the supported range",
-    );
+    throw new ScanError("scan limits are outside the supported range");
   }
 
   const requestedRoot = resolve(root);
@@ -460,22 +484,26 @@ async function scanWorkspaceWithScope(
   }
   const discovery =
     targetScope === undefined
-      ? await discoverWorkspaceScope(workspaceRoot)
+      ? await discoverWorkspaceScope(workspaceRoot, pathLimits)
       : undefined;
   if (discovery !== undefined && discovery.workspaceRoot !== workspaceRoot) {
     throw new ScanError("Git discovery changed the canonical workspace root");
   }
-  const initialScope = targetScope ?? discovery!.scope;
-  const policyBudget = new WorkspaceGitPolicyBudget(initialScope);
+  const initialScope =
+    targetScope === undefined
+      ? discovery!.scope
+      : canonicalizeWorkspaceScope(targetScope, pathLimits);
+  const policyBudget = new WorkspaceGitPolicyBudget(initialScope, pathLimits);
   const syntheticScratch = {
     forbiddenRoots: [workspaceRoot],
     ...(options.gitIgnoreScratchParent === undefined
       ? {}
       : { scratchParent: options.gitIgnoreScratchParent }),
+    pathLimits,
   };
   const oracle =
     targetScope === undefined
-      ? await createLiveGitIgnoreOracle(workspaceRoot, initialScope)
+      ? await createLiveGitIgnoreOracle(workspaceRoot, initialScope, pathLimits)
       : await createSyntheticGitIgnoreOracle(initialScope, syntheticScratch);
 
   const entries: WorkspaceEntry[] = [];
@@ -643,6 +671,16 @@ async function scanWorkspaceWithScope(
       }
       const relativePath =
         relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
+      try {
+        canonicalWorkspaceRelativePath(relativePath, false, pathLimits);
+      } catch (cause) {
+        problems.push({
+          path: relativePath,
+          kind: "unsupported",
+          detail: errorDetail(cause),
+        });
+        continue;
+      }
       const absolutePath = join(absoluteDirectory, name);
       let stat: Stats;
       try {
@@ -683,13 +721,13 @@ async function scanWorkspaceWithScope(
           });
           continue;
         }
-        const canonical = canonicalPathKey(relativePath);
+        const canonical = portableWorkspacePathKey(relativePath);
         const previous = canonicalOwners.get(canonical);
         if (previous !== undefined) {
           problems.push({
             path: relativePath,
             kind: "path-collision",
-            detail: `collides with "${previous}" after NFC + lowercase normalization`,
+            detail: `collides with "${previous}" after portable case normalization`,
           });
           continue;
         }
@@ -706,13 +744,13 @@ async function scanWorkspaceWithScope(
         continue;
       }
 
-      const canonical = canonicalPathKey(relativePath);
+      const canonical = portableWorkspacePathKey(relativePath);
       const previous = canonicalOwners.get(canonical);
       if (previous !== undefined) {
         problems.push({
           path: relativePath,
           kind: "path-collision",
-          detail: `collides with "${previous}" after NFC + lowercase normalization`,
+          detail: `collides with "${previous}" after portable case normalization`,
         });
         continue;
       }
@@ -862,8 +900,13 @@ async function scanWorkspaceWithScope(
   );
   let scope = initialScope;
   if (discovery !== undefined) {
-    const rediscovered = await discoverWorkspaceScope(workspaceRoot);
-    if (!workspaceScopesEqual(discovery.scope, rediscovered.scope)) {
+    const rediscovered = await discoverWorkspaceScope(
+      workspaceRoot,
+      pathLimits,
+    );
+    if (
+      !workspaceScopesEqual(discovery.scope, rediscovered.scope, pathLimits)
+    ) {
       throw new ScanError(
         "Git ignore policy changed while the workspace was scanned",
       );
@@ -882,6 +925,7 @@ async function scanWorkspaceWithScope(
       );
       const finalPolicyBudget = new WorkspaceGitPolicyBudget(
         rediscovered.scope,
+        pathLimits,
       );
       for (const directory of reachedDirectories) {
         const source = await readWorkspaceGitignoreSource(
@@ -893,15 +937,21 @@ async function scanWorkspaceWithScope(
           finalSources.set(source.path, source);
         }
       }
-      const observedScope = canonicalizeWorkspaceScope({
-        ...discovery.scope,
-        gitignoreSources: [...policySources.values()],
-      });
-      const finalScope = canonicalizeWorkspaceScope({
-        ...rediscovered.scope,
-        gitignoreSources: [...finalSources.values()],
-      });
-      if (!workspaceScopesEqual(observedScope, finalScope)) {
+      const observedScope = canonicalizeWorkspaceScope(
+        {
+          ...discovery.scope,
+          gitignoreSources: [...policySources.values()],
+        },
+        pathLimits,
+      );
+      const finalScope = canonicalizeWorkspaceScope(
+        {
+          ...rediscovered.scope,
+          gitignoreSources: [...finalSources.values()],
+        },
+        pathLimits,
+      );
+      if (!workspaceScopesEqual(observedScope, finalScope, pathLimits)) {
         throw new ScanError(
           "Git ignore policy changed while the workspace was scanned",
         );
@@ -944,7 +994,7 @@ async function scanWorkspaceWithScope(
       canonicalizeTreeManifest(
         entries.map(treeEntryForManifestEstimate),
         scope,
-        { maxEntries, maxManifestBytes },
+        { maxEntries, maxManifestBytes, ...pathLimits },
       );
     } catch (cause) {
       throw new ScanError(

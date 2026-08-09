@@ -50,6 +50,8 @@ describe("Cyclotomy configuration", () => {
         maxSnapshotBytes: 2 * 1024 ** 3,
         maxEntries: 100_000,
         maxManifestBytes: 64 * 1024 * 1024,
+        maxPathBytes: 64 * 1024,
+        maxPathComponents: 256,
       },
       lock: {
         timeoutMs: 5_000,
@@ -78,6 +80,8 @@ describe("Cyclotomy configuration", () => {
       maxSnapshotMiB: 50,
       maxEntries: 25_000,
       maxManifestMiB: 16,
+      maxPathBytes: 96 * 1024,
+      maxPathComponents: 512,
       lockTimeoutMs: 12_000,
       gc: {
         intervalMs: 0,
@@ -94,6 +98,8 @@ describe("Cyclotomy configuration", () => {
       maxSnapshotBytes: 50 * 1024 * 1024,
       maxEntries: 25_000,
       maxManifestBytes: 16 * 1024 * 1024,
+      maxPathBytes: 96 * 1024,
+      maxPathComponents: 512,
     });
     expect(config.lock.timeoutMs).toBe(12_000);
     expect(config.autoGcIntervalMs).toBe(0);
@@ -143,6 +149,8 @@ describe("Cyclotomy configuration", () => {
       maxSnapshotMiB: 64,
       maxEntries: 20_000,
       maxManifestMiB: 8,
+      maxPathBytes: 80 * 1024,
+      maxPathComponents: 384,
       lockTimeoutMs: 7_000,
       gc: { intervalMs: 90_000, sessionRetentionMs: 200_000 },
       locale: "en",
@@ -152,6 +160,7 @@ describe("Cyclotomy configuration", () => {
     await writeSettings(join(storeRoot, "settings.json"), {
       maxFileMiB: 4,
       maxEntries: 10_000,
+      maxPathComponents: 320,
       gc: { intervalMs: 0 },
     });
 
@@ -162,6 +171,8 @@ describe("Cyclotomy configuration", () => {
       maxSnapshotBytes: 64 * 1024 * 1024,
       maxEntries: 10_000,
       maxManifestBytes: 8 * 1024 * 1024,
+      maxPathBytes: 80 * 1024,
+      maxPathComponents: 320,
     });
     expect(config.lock.timeoutMs).toBe(7_000);
     expect(config.autoGcIntervalMs).toBe(0);
@@ -208,6 +219,10 @@ describe("Cyclotomy configuration", () => {
     [{ maxEntries: 0 }, "maxEntries"],
     [{ maxEntries: 1_000_001 }, "maxEntries"],
     [{ maxManifestMiB: 257 }, "maxManifestMiB"],
+    [{ maxPathBytes: 0 }, "maxPathBytes"],
+    [{ maxPathBytes: 1024 * 1024 + 1 }, "maxPathBytes"],
+    [{ maxPathComponents: 0 }, "maxPathComponents"],
+    [{ maxPathComponents: 4_097 }, "maxPathComponents"],
     [{ lockTimeoutMs: 1.5 }, "lockTimeoutMs"],
     [{ gc: { intervalMs: -1 } }, "gc.intervalMs"],
     [{ gc: { sessionRetentionMs: 0 } }, "gc.sessionRetentionMs"],

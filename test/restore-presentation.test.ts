@@ -2,13 +2,16 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
+import { notifyPostMutationConflict } from "../src/pi/restore-outcome.ts";
 import { formatUiDetail } from "../src/pi/restore-presentation.ts";
+import type { CyclotomyRuntime } from "../src/pi/runtime.ts";
 
 function plan(
   value: Pick<WorkspaceRestorePlan, "created" | "deleted" | "modified"> &
     Partial<WorkspaceRestorePlan>,
 ): WorkspaceRestorePlan {
   return {
+    renamed: [],
     requiredBlobOids: [],
     scopeBlockers: [],
     occupancyChanged: [],
@@ -17,8 +20,8 @@ function plan(
   };
 }
 
-function preview(value: WorkspaceRestorePlan, sampleLimit?: number): string {
-  return new CyclotomyI18n("en").formatRestorePreview(value, sampleLimit);
+function preview(value: WorkspaceRestorePlan): string {
+  return new CyclotomyI18n("en").formatRestorePreview(value);
 }
 
 describe("restore presentation", () => {
@@ -28,12 +31,19 @@ describe("restore presentation", () => {
         created: Array.from({ length: 13 }, (_, index) => `a/new-${index}.txt`),
         deleted: ["z/old file.txt"],
         modified: ["y/main.ts"],
+        renamed: [{ from: "x/Old", to: "x/old" }],
       }),
     );
 
     const lines = result.split("\n");
-    expect(lines[0]).toBe("15 paths · -1 delete · ~1 overwrite · +13 create");
-    expect(lines.slice(1, 3)).toEqual(["- z/old file.txt", "~ y/main.ts"]);
+    expect(lines[0]).toBe(
+      "16 paths · -1 delete · ~1 overwrite · >1 rename · +13 create",
+    );
+    expect(lines.slice(1, 4)).toEqual([
+      "- z/old file.txt",
+      "~ y/main.ts",
+      "> x/Old → x/old",
+    ]);
     expect(lines).toContain("+ a/new-12.txt");
     expect(result).not.toContain("more");
   });
@@ -68,22 +78,7 @@ describe("restore presentation", () => {
     expect(result).not.toMatch(/[\u001b\u009b\u202e\u200b]/u);
   });
 
-  it("reports the exact omitted action count", () => {
-    const result = preview(
-      plan({
-        created: ["b", "c"],
-        deleted: ["a"],
-        modified: [],
-      }),
-      1,
-    );
-
-    expect(result).toContain("- a");
-    expect(result).not.toContain("+ b");
-    expect(result).toContain("… 2 more");
-  });
-
-  it("keeps both ends of long paths visible", () => {
+  it("shows complete long paths while escaping unsafe characters", () => {
     const longAscii = `src/${"nested/".repeat(24)}important-file.ts`;
     const longUnicode = `${"目录/".repeat(40)}最终文件.ts`;
     const result = preview(
@@ -94,12 +89,22 @@ describe("restore presentation", () => {
       }),
     );
 
-    expect(result).toContain('"src/nested/');
-    expect(result).toContain("…");
-    expect(result).toContain('important-file.ts"');
-    expect(result).toContain("最终文件.ts\\nunsafe-tail");
+    expect(result).toContain(`+ ${longAscii}`);
+    expect(result).toContain(`+ "${longUnicode}\\nunsafe-tail"`);
     expect(result).not.toMatch(/\nunsafe-tail/u);
-    expect(result).not.toContain(longAscii);
+    expect(result).not.toContain("…");
+  });
+
+  it("flags portable case aliases of an ignore-policy path", () => {
+    const result = preview(
+      plan({
+        created: ["nested/.GITIGNORE"],
+        deleted: [],
+        modified: [],
+      }),
+    );
+
+    expect(result).toContain("ignore rules will also be restored");
   });
 
   it("marks incomplete previews and sanitizes host details", () => {
@@ -123,5 +128,136 @@ describe("restore presentation", () => {
     expect(formatUiDetail("failed\n\u001b[31m\u202eunsafe")).toBe(
       "failed\\n\\u001b[31m\\u202eunsafe",
     );
+  });
+
+  it("reports verify-failed mutations before a late target conflict", () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: "info" | "warning" | "error";
+    }> = [];
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (
+        _context: unknown,
+        message: string,
+        level: "info" | "warning" | "error",
+      ) => notifications.push({ message, level }),
+    } as unknown as CyclotomyRuntime;
+
+    notifyPostMutationConflict(runtime, {} as never, {
+      kind: "post-mutation-conflict",
+      reason: "target-changed",
+      outcome: {
+        kind: "verify-failed",
+        reason: "mismatch",
+        treeOid: "a".repeat(64),
+        report: {
+          created: [],
+          updated: ["changed.txt"],
+          deleted: [],
+          renamed: [],
+          unchangedCount: 0,
+          problems: [],
+        },
+      },
+      arrivalProtection: { kind: "protected" },
+    });
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0]).toMatchObject({ level: "error" });
+    expect(notifications[0]?.message).toContain("Files changed");
+    expect(notifications[0]?.message).toContain("~ changed.txt");
+    expect(notifications[1]).toMatchObject({ level: "warning" });
+    expect(notifications[1]?.message).toContain(
+      "entered the file-application phase before the checkpoint target changed",
+    );
+    expect(
+      notifications.map(({ message }) => message).join("\n"),
+    ).not.toContain("Nothing was applied");
+  });
+
+  it("sanitizes both control and protection failures in post-mutation notifications", () => {
+    const notifications: string[] = [];
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyPostMutationConflict(runtime, {} as never, {
+      kind: "post-mutation-conflict",
+      reason: "control-failed",
+      outcome: {
+        kind: "failed",
+        stage: "apply",
+        message: "apply stopped",
+      },
+      message: "control\n\u001b[31mforged",
+      arrivalProtection: {
+        kind: "unavailable",
+        message: "protect\n\u001b[32mforged",
+      },
+    });
+
+    const output = notifications.join("\n");
+    expect(output).toContain("control\\n\\u001b[31mforged");
+    expect(output).toContain("protect\\n\\u001b[32mforged");
+    expect(output).not.toMatch(/[\u001b]/u);
+    expect(output.split("\n")).not.toContain("forged");
+  });
+
+  it("reports a durable pending node guard without claiming a node was protected", () => {
+    const notifications: string[] = [];
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyPostMutationConflict(runtime, {} as never, {
+      kind: "post-mutation-conflict",
+      reason: "location-changed",
+      outcome: {
+        kind: "restored",
+        treeOid: "a".repeat(64),
+        report: {
+          created: [],
+          updated: [],
+          deleted: [],
+          renamed: [],
+          unchangedCount: 1,
+          problems: [],
+        },
+      },
+      arrivalProtection: { kind: "pending-node-guard" },
+    });
+
+    const output = notifications.join("\n");
+    expect(output).toContain("pending checkpoint guard");
+    expect(output).toContain("/reload");
+    expect(output).not.toContain("write-protected the current arrival");
+  });
+
+  it("lists every applied mutation by destructive priority including directory renames", () => {
+    const i18n = new CyclotomyI18n("en");
+    const report = {
+      created: Array.from({ length: 13 }, (_, index) => `new-${index}`),
+      updated: ["overwrite"],
+      deleted: ["delete"],
+      renamed: [{ from: "Old", to: "old" }],
+      unchangedCount: 0,
+      problems: [],
+    };
+
+    const applied = i18n.formatAppliedMutations(report);
+    const lines = applied.split("\n").slice(1);
+    expect(lines.slice(0, 3)).toEqual([
+      "- delete",
+      "~ overwrite",
+      "> Old → old",
+    ]);
+    expect(lines).toContain("+ new-12");
+    expect(applied).not.toContain("more");
+    expect(i18n.formatRestoreSuccess(report)).toContain("16 paths changed");
   });
 });

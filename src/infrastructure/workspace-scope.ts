@@ -29,12 +29,61 @@ export type WorkspaceScope = AllManagedWorkspaceScope | GitWorkspaceScope;
 export const MAX_GITIGNORE_SOURCES = 100_000;
 export const MAX_GITIGNORE_SOURCE_BYTES = 256 * 1024;
 export const MAX_GITIGNORE_POLICY_BYTES = 16 * 1024 * 1024;
+/**
+ * Defaults for newly observed/published paths. Configuration may lower or
+ * raise them within the absolute parser ceilings below.
+ */
+export const DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES = 64 * 1024;
+export const DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS = 256;
+
+/**
+ * Absolute parser ceilings. They remain finite so an untrusted manifest cannot
+ * turn path normalization or ancestor enumeration into an unbounded operation,
+ * while leaving ample room above every practical native filesystem limit.
+ */
+export const ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES = 1024 * 1024;
+export const ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS = 4_096;
+
+export interface WorkspacePathLimits {
+  readonly maxPathBytes: number;
+  readonly maxPathComponents: number;
+}
+
+export const DEFAULT_WORKSPACE_PATH_LIMITS: WorkspacePathLimits = {
+  maxPathBytes: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  maxPathComponents: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+};
+
+export const ABSOLUTE_WORKSPACE_PATH_LIMITS: WorkspacePathLimits = {
+  maxPathBytes: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+  maxPathComponents: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+};
 
 export class WorkspaceScopeError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "WorkspaceScopeError";
   }
+}
+
+/**
+ * Conservative key for one physical workspace namespace.
+ *
+ * This is not a Git matcher: Git ownership continues to use
+ * `workspaceScopePathKey`. The second fixed case-normalization pass closes the
+ * capital-sharp-s mapping exposed by case-insensitive APFS while keeping this
+ * structural check deterministic and fixed-pass.
+ */
+export function portableWorkspacePathKey(path: string): string {
+  const once = path
+    .normalize("NFC")
+    .toLocaleUpperCase("en-US")
+    .toLocaleLowerCase("en-US")
+    .normalize("NFC");
+  return once
+    .toLocaleUpperCase("en-US")
+    .toLocaleLowerCase("en-US")
+    .normalize("NFC");
 }
 
 function invalidScope(message: string): never {
@@ -61,11 +110,28 @@ function comparePathBytes(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
-/** Validate one portable, normalized repository-relative path. */
-export function canonicalWorkspaceRelativePath(
+type WorkspacePathRules = "published-v1" | "portable-v2";
+
+export function assertWorkspacePathLimits(limits: WorkspacePathLimits): void {
+  if (
+    !Number.isSafeInteger(limits.maxPathBytes) ||
+    limits.maxPathBytes <= 0 ||
+    limits.maxPathBytes > ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES ||
+    !Number.isSafeInteger(limits.maxPathComponents) ||
+    limits.maxPathComponents <= 0 ||
+    limits.maxPathComponents > ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS
+  ) {
+    invalidScope("workspace path limits are outside the supported range");
+  }
+}
+
+function canonicalWorkspaceRelativePathWithRules(
   value: unknown,
   allowRoot: boolean,
+  rules: WorkspacePathRules,
+  limits: WorkspacePathLimits,
 ): string {
+  if (rules === "portable-v2") assertWorkspacePathLimits(limits);
   if (
     typeof value !== "string" ||
     !isExactUtf8String(value) ||
@@ -77,18 +143,57 @@ export function canonicalWorkspaceRelativePath(
   ) {
     return invalidScope("scope contains an unsafe or noncanonical path");
   }
+  if (
+    rules === "portable-v2" &&
+    Buffer.byteLength(value, "utf8") > limits.maxPathBytes
+  ) {
+    return invalidScope("scope path exceeds the portable byte limit");
+  }
   if (value === "" && allowRoot) return value;
-  for (const component of value.split("/")) {
+  const components = value.split("/");
+  if (rules === "portable-v2" && components.length > limits.maxPathComponents) {
+    return invalidScope("scope path exceeds the portable component limit");
+  }
+  for (const component of components) {
     if (
       component.length === 0 ||
       component === "." ||
       component === ".." ||
-      component.toLocaleLowerCase("en-US") === ".git"
+      (rules === "portable-v2"
+        ? portableWorkspacePathKey(component)
+        : component.toLocaleLowerCase("en-US")) === ".git"
     ) {
       return invalidScope("scope contains an unsafe or noncanonical path");
     }
   }
   return value;
+}
+
+/** Validate one portable-v2, normalized repository-relative path. */
+export function canonicalWorkspaceRelativePath(
+  value: unknown,
+  allowRoot: boolean,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
+): string {
+  return canonicalWorkspaceRelativePathWithRules(
+    value,
+    allowRoot,
+    "portable-v2",
+    limits,
+  );
+}
+
+/** Frozen path contract shipped by cyclotomy@0.0.1. */
+export function canonicalPublishedV1WorkspaceRelativePath(
+  value: unknown,
+  allowRoot: boolean,
+): string {
+  return canonicalWorkspaceRelativePathWithRules(
+    value,
+    allowRoot,
+    "published-v1",
+    DEFAULT_WORKSPACE_PATH_LIMITS,
+  );
 }
 
 function decodeCanonicalBase64(value: unknown, label: string): Buffer {
@@ -148,9 +253,10 @@ function sourceIsRelevant(path: string, repositoryPrefix: string): boolean {
 export function workspaceGitignoreSource(
   path: string,
   contents: Uint8Array,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): WorkspaceGitignoreSource {
   return {
-    path: canonicalWorkspaceRelativePath(path, false),
+    path: canonicalWorkspaceRelativePath(path, false, limits),
     contentsBase64: Buffer.from(contents).toString("base64"),
   };
 }
@@ -159,24 +265,71 @@ export function workspaceGitignoreSource(
 export function workspaceLocalGitignorePath(
   scope: GitWorkspaceScope,
   repositoryPath: string,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): string | undefined {
-  const path = canonicalWorkspaceRelativePath(repositoryPath, false);
+  return workspaceLocalGitignorePathWithRules(
+    scope,
+    repositoryPath,
+    "portable-v2",
+    limits,
+  );
+}
+
+function workspaceLocalGitignorePathWithRules(
+  scope: GitWorkspaceScope,
+  repositoryPath: string,
+  rules: WorkspacePathRules,
+  limits: WorkspacePathLimits,
+): string | undefined {
+  const path = canonicalWorkspaceRelativePathWithRules(
+    repositoryPath,
+    false,
+    rules,
+    limits,
+  );
   if (scope.repositoryPrefix === "") return path;
   const prefix = `${scope.repositoryPrefix}/`;
   return path.startsWith(prefix) ? path.slice(prefix.length) : undefined;
+}
+
+/** Frozen local-policy mapping shipped by cyclotomy@0.0.1. */
+export function publishedV1WorkspaceLocalGitignorePath(
+  scope: GitWorkspaceScope,
+  repositoryPath: string,
+): string | undefined {
+  return workspaceLocalGitignorePathWithRules(
+    scope,
+    repositoryPath,
+    "published-v1",
+    DEFAULT_WORKSPACE_PATH_LIMITS,
+  );
 }
 
 /** Canonical key for paths whose Git policy comparison is case-insensitive. */
 export function workspaceScopePathKey(
   scope: GitWorkspaceScope,
   workspacePath: string,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): string {
-  const path = canonicalWorkspaceRelativePath(workspacePath, false);
+  const path = canonicalWorkspaceRelativePath(workspacePath, false, limits);
   return scope.ignoreCase ? path.toLocaleLowerCase("en-US") : path;
 }
 
-/** Validate untrusted scope data and rebuild its canonical byte-sorted form. */
-export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
+/** Frozen Git-scope key shipped by cyclotomy@0.0.1. */
+export function publishedV1WorkspaceScopePathKey(
+  scope: GitWorkspaceScope,
+  workspacePath: string,
+): string {
+  const path = canonicalPublishedV1WorkspaceRelativePath(workspacePath, false);
+  return scope.ignoreCase ? path.toLocaleLowerCase("en-US") : path;
+}
+
+function canonicalizeWorkspaceScopeWithRules(
+  value: unknown,
+  rules: WorkspacePathRules,
+  limits: WorkspacePathLimits,
+): WorkspaceScope {
+  if (rules === "portable-v2") assertWorkspacePathLimits(limits);
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return invalidScope("workspace scope must be an object");
   }
@@ -206,9 +359,11 @@ export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
     return invalidScope("Git workspace scope has too many ignore sources");
   }
 
-  const repositoryPrefix = canonicalWorkspaceRelativePath(
+  const repositoryPrefix = canonicalWorkspaceRelativePathWithRules(
     candidate.repositoryPrefix,
     true,
+    rules,
+    limits,
   );
   let totalBytes = 0;
   const decodeBudgeted = (encoded: unknown, label: string): string => {
@@ -235,7 +390,12 @@ export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
     if (!exactKeys(record, ["path", "contentsBase64"])) {
       return invalidScope("Git ignore source has an invalid shape");
     }
-    const path = canonicalWorkspaceRelativePath(record.path, false);
+    const path = canonicalWorkspaceRelativePathWithRules(
+      record.path,
+      false,
+      rules,
+      limits,
+    );
     if (!sourceIsRelevant(path, repositoryPrefix)) {
       return invalidScope("Git ignore source is unrelated to the workspace");
     }
@@ -274,6 +434,25 @@ export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
   };
 }
 
+/** Validate untrusted scope data and rebuild its canonical byte-sorted form. */
+export function canonicalizeWorkspaceScope(
+  value: unknown,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
+): WorkspaceScope {
+  return canonicalizeWorkspaceScopeWithRules(value, "portable-v2", limits);
+}
+
+/** Frozen scope contract shipped by cyclotomy@0.0.1. */
+export function canonicalizePublishedV1WorkspaceScope(
+  value: unknown,
+): WorkspaceScope {
+  return canonicalizeWorkspaceScopeWithRules(
+    value,
+    "published-v1",
+    DEFAULT_WORKSPACE_PATH_LIMITS,
+  );
+}
+
 /** Decode policy bytes only at the Git process/file boundary. */
 export function workspaceScopeBytes(encoded: string): Buffer {
   return decodeCanonicalBase64(encoded, "workspace policy bytes");
@@ -283,9 +462,10 @@ export function workspaceScopeBytes(encoded: string): Buffer {
 export function workspaceScopesEqual(
   left: WorkspaceScope,
   right: WorkspaceScope,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): boolean {
   return (
-    JSON.stringify(canonicalizeWorkspaceScope(left)) ===
-    JSON.stringify(canonicalizeWorkspaceScope(right))
+    JSON.stringify(canonicalizeWorkspaceScope(left, limits)) ===
+    JSON.stringify(canonicalizeWorkspaceScope(right, limits))
   );
 }
