@@ -39,7 +39,3 @@ jobs:
 
       - name: Publish package
         run: npm publish --access public --provenance
-        env:
-          # NPM_TOKEN bootstraps v0.0.1. Once npm trusts this workflow,
-          # the CLI uses OIDC first and this repository secret can be deleted.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

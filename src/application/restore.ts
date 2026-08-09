@@ -80,7 +80,7 @@ export type RestoreOutcome =
     }
   | {
       readonly kind: "failed";
-    readonly stage: "current-scan" | "staging" | "apply" | "verification";
+      readonly stage: "current-scan" | "staging" | "apply" | "verification";
       readonly message: string;
       readonly scanProblems?: readonly ScanProblem[];
     };

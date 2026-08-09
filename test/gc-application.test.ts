@@ -130,6 +130,37 @@ describe("session metadata garbage collection", () => {
     });
   });
 
+  it("reports only the final classification after an eligible re-probe", async () => {
+    const sessionFile = join(directory, "inconclusive-session.jsonl");
+    metadata.touchSession("s1", sessionFile);
+    metadata.observeSessionMissing("s1", sessionFile, 100);
+    metadata.observeSessionMissing("s1", sessionFile, 101);
+
+    let probes = 0;
+    const report = await collectSessionMetadataGarbage(metadata, {
+      now: 200,
+      retentionMs: 50,
+      probeSessionFile: async () => {
+        probes += 1;
+        return probes === 1 ? "unknown" : "present";
+      },
+    });
+
+    expect(probes).toBe(2);
+    expect(report).toMatchObject({
+      inspectedSessions: 1,
+      presentSessions: 1,
+      newlyMissingSessions: 0,
+      stillMissingSessions: 0,
+      unknownSessions: 0,
+      removedSessions: 0,
+    });
+    expect(metadata.listRegisteredSessions()[0]).toMatchObject({
+      missingSince: null,
+      missingObservedAt: null,
+    });
+  });
+
   it("prunes each exact observation synchronously after its final probe", async () => {
     const firstFile = join(directory, "first.jsonl");
     const secondFile = join(directory, "second.jsonl");

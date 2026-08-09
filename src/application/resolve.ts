@@ -37,7 +37,7 @@ export class ResolutionTraversalError extends Error {
   }
 }
 
-export interface AsyncResolveOptions {
+export interface ResolutionTraversalOptions {
   readonly maxHops?: number;
 }
 
@@ -50,7 +50,7 @@ export interface AsyncResolveOptions {
 export function* walkNodeAncestry(
   node: NodeKey,
   parentOf: (node: NodeKey) => NodeKey | undefined,
-  options: AsyncResolveOptions = {},
+  options: ResolutionTraversalOptions = {},
 ): Generator<NodeKey> {
   const maxHops = options.maxHops ?? DEFAULT_MAX_HOPS;
   if (!Number.isSafeInteger(maxHops) || maxHops <= 0) {
@@ -88,7 +88,7 @@ export async function resolveReadableNodeState(
   parentOf: (node: NodeKey) => NodeKey | undefined,
   getState: (node: NodeKey) => NodeState | undefined,
   validate: (state: NodeState, node: NodeKey) => Promise<void>,
-  options: AsyncResolveOptions = {},
+  options: ResolutionTraversalOptions = {},
 ): Promise<ResolvedNodeState | undefined> {
   for (const current of walkNodeAncestry(node, parentOf, options)) {
     const state = getState(current);

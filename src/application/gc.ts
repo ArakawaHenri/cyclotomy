@@ -44,6 +44,17 @@ export interface CyclotomyGcReport extends GcReport {
   readonly metadata: SessionMetadataGcReport;
 }
 
+type SessionClassification =
+  | "present"
+  | "newly-missing"
+  | "still-missing"
+  | "unknown";
+
+interface SessionInspection {
+  readonly sessionFile: string;
+  classification: SessionClassification | undefined;
+}
+
 function isMissingError(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) {
     return false;
@@ -78,19 +89,20 @@ export async function collectSessionMetadataGarbage(
     options.retentionMs ?? DEFAULT_SESSION_METADATA_RETENTION_MS;
   const probe = options.probeSessionFile ?? defaultProbeSessionFile;
   const registered = metadata.listRegisteredSessions();
-
-  let presentSessions = 0;
-  let newlyMissingSessions = 0;
-  let stillMissingSessions = 0;
-  let unknownSessions = 0;
+  const inspections = new Map<string, SessionInspection>();
   let staleObservations = 0;
 
   for (const session of registered) {
+    const inspection: SessionInspection = {
+      sessionFile: session.sessionFile,
+      classification: undefined,
+    };
+    inspections.set(session.sessionId, inspection);
     const state = await probe(session.sessionFile).catch(
       (): "unknown" => "unknown",
     );
     if (state === "unknown") {
-      unknownSessions += 1;
+      inspection.classification = "unknown";
       continue;
     }
     const applied =
@@ -109,11 +121,11 @@ export async function collectSessionMetadataGarbage(
       continue;
     }
     if (state === "present") {
-      presentSessions += 1;
+      inspection.classification = "present";
     } else if (session.missingSince === null) {
-      newlyMissingSessions += 1;
+      inspection.classification = "newly-missing";
     } else {
-      stillMissingSessions += 1;
+      inspection.classification = "still-missing";
     }
   }
 
@@ -127,7 +139,12 @@ export async function collectSessionMetadataGarbage(
   let removedNodeStates = 0;
   let removedMetadataRows = 0;
   for (const session of metadata.listRegisteredSessions()) {
+    const inspection = inspections.get(session.sessionId);
+    // Concurrently added, replaced, or stale rows wait for the next GC cycle.
     if (
+      inspection === undefined ||
+      inspection.sessionFile !== session.sessionFile ||
+      inspection.classification === undefined ||
       session.missingSince === null ||
       session.missingObservedAt === null ||
       session.missingSince > cutoff ||
@@ -139,6 +156,7 @@ export async function collectSessionMetadataGarbage(
       (): "unknown" => "unknown",
     );
     if (state === "missing") {
+      inspection.classification = "still-missing";
       const pruned = metadata.pruneMissingSession({
         expectedSessionId: session.sessionId,
         expectedSessionFile: session.sessionFile,
@@ -154,15 +172,38 @@ export async function collectSessionMetadataGarbage(
       continue;
     }
     if (state === "present") {
-      metadata.observeSessionPresent(
+      const applied = metadata.observeSessionPresent(
         session.sessionId,
         session.sessionFile,
       );
-      presentSessions += 1;
+      if (!applied) staleObservations += 1;
+      inspection.classification = "present";
     } else {
-      unknownSessions += 1;
+      inspection.classification = "unknown";
     }
-    stillMissingSessions = Math.max(0, stillMissingSessions - 1);
+  }
+
+  let presentSessions = 0;
+  let newlyMissingSessions = 0;
+  let stillMissingSessions = 0;
+  let unknownSessions = 0;
+  for (const inspection of inspections.values()) {
+    switch (inspection.classification) {
+      case "present":
+        presentSessions += 1;
+        break;
+      case "newly-missing":
+        newlyMissingSessions += 1;
+        break;
+      case "still-missing":
+        stillMissingSessions += 1;
+        break;
+      case "unknown":
+        unknownSessions += 1;
+        break;
+      case undefined:
+        break;
+    }
   }
   return {
     removedSessions,
