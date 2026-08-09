@@ -2,9 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
-import {
-  formatUiDetail,
-} from "../src/pi/restore-presentation.ts";
+import { formatUiDetail } from "../src/pi/restore-presentation.ts";
 
 function plan(
   value: Pick<WorkspaceRestorePlan, "created" | "deleted" | "modified"> &

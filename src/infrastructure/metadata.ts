@@ -80,7 +80,7 @@ export interface PruneMissingSessionOptions {
   readonly retentionMs: number;
 }
 
-export interface PruneMissingSessionsReport {
+export interface SessionMetadataRemovalReport {
   readonly removedSessions: number;
   readonly removedNodeStates: number;
   /** Includes node-state and registry rows. */
@@ -651,7 +651,7 @@ export class MetadataStore {
    */
   pruneMissingSession(
     options: PruneMissingSessionOptions,
-  ): PruneMissingSessionsReport {
+  ): SessionMetadataRemovalReport {
     const expectedSessionId = requireNonEmpty(
       options.expectedSessionId,
       "expected session id",

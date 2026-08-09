@@ -143,7 +143,9 @@ describe("workspace scanner", () => {
 
     await expect(
       scanWorkspace(join(root, "missing")),
-    ).rejects.toThrow(ScanError);
+    ).rejects.toMatchObject({
+      name: "ScanError",
+    });
     await expect(
       scanWorkspace(join(root, "file")),
     ).rejects.toThrow(ScanError);

@@ -540,9 +540,7 @@ export function registerCyclotomyLifecycle(
       return blockedBashResult(runtime.i18n.t("bashWhileBusy"));
     } catch (error) {
       runtime.notifyCaptureResult(context, false, messageOf(error));
-      return blockedBashResult(
-        "Cyclotomy could not checkpoint safely; command blocked.",
-      );
+      return blockedBashResult(runtime.i18n.t("sourceCaptureFailed"));
     }
   });
 

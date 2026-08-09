@@ -276,18 +276,18 @@ export async function collectGarbage(
     }
     const [storeNow, objectsNow, namespaceNow, shardNow, entryNow] =
       await Promise.all([
-      observeRealDirectory(candidate.storeRoot),
-      observeRealDirectory(candidate.objectsRoot),
-      observeRealDirectory(candidate.namespace),
-      observeRealDirectory(candidate.shardDir),
-      lstat(candidate.path).catch((error: unknown) => {
-        throw new GarbageCollectionNamespaceError(
-          candidate.path,
-          "cannot revalidate object before removal",
-          error,
-        );
-      }),
-    ]);
+        observeRealDirectory(candidate.storeRoot),
+        observeRealDirectory(candidate.objectsRoot),
+        observeRealDirectory(candidate.namespace),
+        observeRealDirectory(candidate.shardDir),
+        lstat(candidate.path).catch((error: unknown) => {
+          throw new GarbageCollectionNamespaceError(
+            candidate.path,
+            "cannot revalidate object before removal",
+            error,
+          );
+        }),
+      ]);
     if (
       storeNow === undefined ||
       objectsNow === undefined ||

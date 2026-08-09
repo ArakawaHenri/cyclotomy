@@ -1,11 +1,9 @@
-import type {
-  TreeEntry,
-  TreeManifest,
-} from "./tree-manifest.ts";
-import { TREE_MANIFEST_FORMAT } from "./tree-manifest.ts";
 import {
-  workspaceScopesEqual,
-} from "./workspace-scope.ts";
+  TREE_MANIFEST_FORMAT,
+  type TreeEntry,
+  type TreeManifest,
+} from "./tree-manifest.ts";
+import { workspaceScopesEqual } from "./workspace-scope.ts";
 import type {
   ExcludedWorkspaceOccupancy,
   ScanProblem,

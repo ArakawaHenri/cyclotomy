@@ -1,8 +1,6 @@
 import { isAbsolute, join } from "node:path";
 
-import type {
-  TreeEntry,
-} from "./tree-manifest.ts";
+import type { TreeEntry } from "./tree-manifest.ts";
 import type { ObjectStore } from "./object-store.ts";
 import {
   summarizeScanProblems,

@@ -11,10 +11,6 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-import type {
-  FileRecreationMode,
-  SymlinkKind,
-} from "./tree-manifest.ts";
 import {
   ABSOLUTE_MAX_TREE_ENTRIES,
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
@@ -22,6 +18,8 @@ import {
   DEFAULT_MAX_TREE_MANIFEST_BYTES,
   TREE_MANIFEST_FORMAT,
   canonicalizeTreeManifest,
+  type FileRecreationMode,
+  type SymlinkKind,
   type TreeEntry,
 } from "./tree-manifest.ts";
 import {
@@ -167,7 +165,12 @@ export interface ScanOptions {
   readonly gitIgnoreScratchParent?: string;
 }
 
-export class ScanError extends Error {}
+export class ScanError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ScanError";
+  }
+}
 
 const DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024 ** 3;

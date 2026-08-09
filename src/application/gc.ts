@@ -6,7 +6,7 @@ import {
 } from "../infrastructure/object-gc.ts";
 import type {
   MetadataStore,
-  PruneMissingSessionsReport,
+  SessionMetadataRemovalReport,
 } from "../infrastructure/metadata.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 
@@ -26,7 +26,7 @@ export interface SessionMetadataGcOptions {
 }
 
 export interface SessionMetadataGcReport
-  extends PruneMissingSessionsReport {
+  extends SessionMetadataRemovalReport {
   readonly inspectedSessions: number;
   readonly presentSessions: number;
   readonly newlyMissingSessions: number;

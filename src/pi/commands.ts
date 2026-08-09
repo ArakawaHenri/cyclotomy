@@ -200,9 +200,7 @@ async function runCommand(
     if (!runtime.sessionIsUsable(view)) {
       runtime.notify(
         context,
-        runtime.i18n.t("sessionRegistrationFailed", {
-          message: "session identity is blocked",
-        }),
+        runtime.i18n.t("sessionIdentityUnavailable"),
         "warning",
       );
       return;

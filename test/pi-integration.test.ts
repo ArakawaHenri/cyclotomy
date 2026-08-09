@@ -225,7 +225,7 @@ describe("single-state Pi lifecycle", () => {
       await pi.runCommand("restore");
       expect(pi.notifications).toHaveLength(2);
       expect(notifiedVerbatim(pi, "maxFileMiB")).toBe(true);
-      expect(notifiedVerbatim(pi, "session identity is blocked")).toBe(false);
+      expect(notified(pi, "sessionIdentityUnavailable")).toBe(false);
 
       expect(await readFile(join(workspace, "user.txt"), "utf8"))
         .toBe("untouched");

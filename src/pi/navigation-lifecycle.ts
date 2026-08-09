@@ -15,9 +15,7 @@ import {
   restorePlanHasChanges,
   workspaceSnapshotAsManifest,
 } from "../infrastructure/restore-plan.ts";
-import {
-  type WorkspaceSnapshot,
-} from "../infrastructure/workspace-scan.ts";
+import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
 import { requestRestoreChoice } from "./restore-choice.ts";
 import { notifyRestoreOutcome } from "./restore-outcome.ts";
 import {

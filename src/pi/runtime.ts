@@ -691,16 +691,16 @@ export class CyclotomyRuntime {
     );
   }
 
-  async prepareCaptureResult(
+  prepareCaptureResult(
     view: SessionView,
-  ): Promise<Awaited<ReturnType<typeof prepareNodeState>>> {
+  ): ReturnType<typeof prepareNodeState> {
     return prepareNodeState(this.checkpointDeps(), view.cwd);
   }
 
-  async commitPreparedCapture(
+  commitPreparedCapture(
     capture: PendingSourceCapture,
   ): ReturnType<typeof commitPreparedNodeState> {
-    return await commitPreparedNodeState(
+    return commitPreparedNodeState(
       this.checkpointDeps(),
       capture.source,
       capture.prepared,

@@ -42,6 +42,8 @@ const EN = {
     "Cyclotomy refused this operation because another session transition is still in progress.",
   sessionRegistrationFailed:
     "Cyclotomy disabled checkpoints for this session because its persisted identity could not be registered safely ({{message}}).",
+  sessionIdentityUnavailable:
+    "Cyclotomy cannot verify this session's persisted identity, so it will not checkpoint or restore the workspace.",
   memorySessionUnsupported:
     "Cyclotomy requires a persisted Pi session. Checkpoints are disabled for --no-session/in-memory sessions.",
   forkImportFailed:
@@ -73,9 +75,9 @@ const EN = {
   restoreNeedsUi:
     "Restore needs an interactive choice. Current files were kept.",
   commandPreviewStale:
-    "Cyclotomy: the workspace changed after the preview. Nothing was applied; run restore again.",
+    "Cyclotomy: the workspace changed after the preview. Nothing was applied; run /restore again.",
   commandTargetChanged:
-    "Cyclotomy: the checkpoint target changed after the preview. Nothing was applied; run restore again.",
+    "Cyclotomy: the checkpoint target changed after the preview. Nothing was applied; run /restore again.",
   commandLocationChanged:
     "Cyclotomy: the active session, node, or workspace changed after the preview. Nothing was applied.",
   restoreAlreadyMatches: "Workspace already matches this checkpoint.",
@@ -170,6 +172,8 @@ const ZH_CN: Record<MessageKey, string> = {
     "另一项会话切换尚未完成，Cyclotomy 没有执行本次操作。",
   sessionRegistrationFailed:
     "Cyclotomy 无法安全登记此会话（{{message}}），因此不会为它保存或恢复工作区。",
+  sessionIdentityUnavailable:
+    "Cyclotomy 无法确认此会话的持久化身份，因此不会为它保存或恢复工作区。",
   memorySessionUnsupported:
     "Cyclotomy 需要持久化的 Pi 会话；--no-session 和内存会话不会建立保存状态。",
   forkImportFailed:
@@ -200,7 +204,7 @@ const ZH_CN: Record<MessageKey, string> = {
     "Cyclotomy 因工作区扫描不完整而拒绝恢复：{{message}}",
   restoreNeedsUi: "恢复需要交互式选择；当前文件已保留。",
   commandPreviewStale:
-    "Cyclotomy：预览后工作区发生了变化；没有应用任何内容，请重新执行 restore。",
+    "Cyclotomy：预览后工作区发生了变化；没有应用任何内容，请重新执行 /restore。",
   commandTargetChanged:
     "Cyclotomy：预览后目标保存状态发生了变化；没有应用任何内容，请重新执行 /restore。",
   commandLocationChanged:

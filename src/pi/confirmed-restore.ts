@@ -12,9 +12,7 @@ import {
 } from "../application/restore.ts";
 import type { ResolvedNodeState } from "../application/resolve.ts";
 import type { NodeKey } from "../domain/model.ts";
-import {
-  type WorkspaceSnapshot,
-} from "../infrastructure/workspace-scan.ts";
+import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
 import { requestRestoreChoice } from "./restore-choice.ts";
 import { messageOf, type CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";

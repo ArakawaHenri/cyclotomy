@@ -30,6 +30,19 @@ describe("Cyclotomy Pi localization", () => {
     expect(zh.t("driftCommandDescription")).toContain("/restore");
   });
 
+  it("keeps command references and session-identity failures localized", () => {
+    const en = new CyclotomyI18n("en");
+    const zh = new CyclotomyI18n("zh-CN");
+
+    expect(en.t("commandPreviewStale")).toContain("/restore");
+    expect(en.t("commandTargetChanged")).toContain("/restore");
+    expect(zh.t("commandPreviewStale")).toContain("/restore");
+    expect(zh.t("commandTargetChanged")).toContain("/restore");
+    expect(zh.t("sessionIdentityUnavailable")).toBe(
+      "Cyclotomy 无法确认此会话的持久化身份，因此不会为它保存或恢复工作区。",
+    );
+  });
+
   it("resolves auto from process locale before the host locale", () => {
     expect(resolveCyclotomyLocale("zh-CN", {}, "en-US")).toBe("zh-CN");
     expect(resolveCyclotomyLocale("en", { LANG: "zh_CN.UTF-8" }, "zh-CN"))

@@ -228,8 +228,8 @@ function runGit(
 function failureStderr(cause: unknown): string {
   if (typeof cause !== "object" || cause === null) return "";
   const stderr = Reflect.get(cause, "stderr");
-  return Buffer.isBuffer(stderr) ? stderr.toString("utf8") :
-    typeof stderr === "string" ? stderr : "";
+  if (Buffer.isBuffer(stderr)) return stderr.toString("utf8");
+  return typeof stderr === "string" ? stderr : "";
 }
 
 function failureCode(cause: unknown): number | string | undefined {
@@ -305,7 +305,10 @@ async function locateGitWorktree(
   return { workspaceRoot, repositoryRoot, repositoryPrefix, env };
 }
 
-function sameFile(left: Awaited<ReturnType<FileHandle["stat"]>>, right: Awaited<ReturnType<FileHandle["stat"]>>): boolean {
+function sameFile(
+  left: Awaited<ReturnType<FileHandle["stat"]>>,
+  right: Awaited<ReturnType<FileHandle["stat"]>>,
+): boolean {
   return left.dev === right.dev &&
     left.ino === right.ino &&
     left.size === right.size &&
@@ -319,7 +322,9 @@ async function readHandleBounded(handle: FileHandle, label: string): Promise<Buf
   let total = 0;
   let position = 0;
   while (true) {
-    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_GITIGNORE_SOURCE_BYTES + 1 - total));
+    const chunk = Buffer.allocUnsafe(
+      Math.min(64 * 1024, MAX_GITIGNORE_SOURCE_BYTES + 1 - total),
+    );
     const read = await handle.read(chunk, 0, chunk.byteLength, position);
     if (read.bytesRead === 0) break;
     chunks.push(chunk.subarray(0, read.bytesRead));
@@ -823,7 +828,11 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   }
 
   managed(paths: readonly GitIgnorePath[]): Promise<readonly boolean[]> {
-    if (this.#closed) return Promise.reject(new GitIgnoreOracleError("Git ignore oracle is closed"));
+    if (this.#closed) {
+      return Promise.reject(
+        new GitIgnoreOracleError("Git ignore oracle is closed"),
+      );
+    }
     if (paths.length === 0) return Promise.resolve([]);
     if (paths.length > MAX_ORACLE_BATCH_PATHS) {
       return Promise.reject(new GitIgnoreOracleError("Git ignore query has too many paths"));
