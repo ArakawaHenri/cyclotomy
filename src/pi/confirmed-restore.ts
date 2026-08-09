@@ -118,10 +118,7 @@ export async function runConfirmedRestore(
   // while loading the session would therefore wait for a response the client
   // cannot send yet. Manual RPC /restore runs after startup and remains fully
   // interactive.
-  if (
-    !context.hasUI ||
-    (mode === "loaded-session" && context.mode === "rpc")
-  ) {
+  if (!context.hasUI || (mode === "loaded-session" && context.mode === "rpc")) {
     return { kind: "needs-ui" };
   }
   let confirmed: boolean;
@@ -155,11 +152,9 @@ export async function runConfirmedRestore(
         if (!stillAtNode(context, node, view.cwd)) {
           return { kind: "location-changed" };
         }
-        if (!runtime.resolutionStillAuthoritative(
-          view,
-          node,
-          prepared.resolution,
-        )) {
+        if (
+          !runtime.resolutionStillAuthoritative(view, node, prepared.resolution)
+        ) {
           return { kind: "target-changed" };
         }
         const current = await runtime.scanCurrentWorkspaceForScope(

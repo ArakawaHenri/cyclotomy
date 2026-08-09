@@ -71,14 +71,17 @@ describe("pure workspace restore", () => {
       targetBytes.byteLength,
     );
     const scope = gitScope({ globalExclude: "ignored/\n" });
-    const treeOid = await publication.publishTree([
-      {
-        path: "ignored/secret.txt",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o600,
-      },
-    ], scope);
+    const treeOid = await publication.publishTree(
+      [
+        {
+          path: "ignored/secret.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o600,
+        },
+      ],
+      scope,
+    );
     await unlink(targetPath);
     const node = { sessionId: "s", entryId: "forged" };
 
@@ -118,14 +121,17 @@ describe("pure workspace restore", () => {
         { path: "a/.gitignore", contents: "" },
       ],
     });
-    const treeOid = await publication.publishTree([
-      {
-        path: "a",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o600,
-      },
-    ], scope);
+    const treeOid = await publication.publishTree(
+      [
+        {
+          path: "a",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o600,
+        },
+      ],
+      scope,
+    );
     await writeFile(targetPath, "unmanaged current bytes");
     const node = { sessionId: "s", entryId: "forged-policy-directory" };
 
@@ -156,10 +162,9 @@ describe("pure workspace restore", () => {
     });
     // Structurally canonical but impossible for the scanner to produce: the
     // archived source is managed and therefore cannot be absent from entries.
-    const treeOid = await store.beginSnapshotPublication().publishTree(
-      [],
-      scope,
-    );
+    const treeOid = await store
+      .beginSnapshotPublication()
+      .publishTree([], scope);
     const node = { sessionId: "s", entryId: "omitted-ignore" };
 
     const outcome = await restoreWorkspace(
@@ -187,10 +192,9 @@ describe("pure workspace restore", () => {
     const scope = gitScope({
       gitignoreSources: [{ path: ".gitignore", contents: ignoreBytes }],
     });
-    const treeOid = await store.beginSnapshotPublication().publishTree(
-      [],
-      scope,
-    );
+    const treeOid = await store
+      .beginSnapshotPublication()
+      .publishTree([], scope);
     const node = { sessionId: "s", entryId: "ignored-ignore" };
 
     const outcome = await restoreWorkspace(
@@ -267,21 +271,23 @@ describe("pure workspace restore", () => {
     const setup = await setupTarget();
 
     await chmod(path, 0o640);
-    expect((await restoreWorkspace(
-      { store: setup.store },
-      root,
-      setup.resolution,
-      { current: await scanWorkspace(root) },
-    )).kind).toBe("restored");
+    expect(
+      (
+        await restoreWorkspace({ store: setup.store }, root, setup.resolution, {
+          current: await scanWorkspace(root),
+        })
+      ).kind,
+    ).toBe("restored");
     expect((await stat(path)).mode & 0o777).toBe(0o640);
 
     await unlink(path);
-    expect((await restoreWorkspace(
-      { store: setup.store },
-      root,
-      setup.resolution,
-      { current: await scanWorkspace(root) },
-    )).kind).toBe("restored");
+    expect(
+      (
+        await restoreWorkspace({ store: setup.store }, root, setup.resolution, {
+          current: await scanWorkspace(root),
+        })
+      ).kind,
+    ).toBe("restored");
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     setup.metadata.close();
   });
@@ -301,12 +307,13 @@ describe("pure workspace restore", () => {
     const setup = await setupTarget();
     await unlink(path);
 
-    expect((await restoreWorkspace(
-      { store: setup.store },
-      root,
-      setup.resolution,
-      { current: await scanWorkspace(root) },
-    )).kind).toBe("restored");
+    expect(
+      (
+        await restoreWorkspace({ store: setup.store }, root, setup.resolution, {
+          current: await scanWorkspace(root),
+        })
+      ).kind,
+    ).toBe("restored");
     expect((await stat(path)).mode & 0o7777).toBe(wanted);
     setup.metadata.close();
   });
@@ -319,13 +326,15 @@ describe("pure workspace restore", () => {
     );
     const blob = manifest.entries.find((entry) => entry.type === "regular");
     if (blob?.type !== "regular") throw new Error("fixture blob missing");
-    await unlink(join(
-      storeRoot,
-      "objects",
-      "blobs",
-      blob.blobOid.slice(0, 2),
-      blob.blobOid.slice(2),
-    ));
+    await unlink(
+      join(
+        storeRoot,
+        "objects",
+        "blobs",
+        blob.blobOid.slice(0, 2),
+        blob.blobOid.slice(2),
+      ),
+    );
     await writeFile(join(root, "target.txt"), "current bytes");
     await writeFile(join(root, "keep.txt"), "must survive");
 
@@ -337,8 +346,9 @@ describe("pure workspace restore", () => {
     );
 
     expect(outcome.kind).toBe("checkpoint-unreadable");
-    expect(await readFile(join(root, "target.txt"), "utf8"))
-      .toBe("current bytes");
+    expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
+      "current bytes",
+    );
     expect(await readFile(join(root, "keep.txt"), "utf8")).toBe("must survive");
     expect(setup.metadata.getState("s", "target")).toEqual(setup.state);
     setup.metadata.close();
@@ -351,17 +361,19 @@ describe("pure workspace restore", () => {
     const manifest = await setup.store.readTreeManifest(
       setup.resolution.treeOid,
     );
-    const missing = manifest.entries.find((entry) =>
-      entry.type === "regular" && entry.path === "b.txt"
+    const missing = manifest.entries.find(
+      (entry) => entry.type === "regular" && entry.path === "b.txt",
     );
     if (missing?.type !== "regular") throw new Error("fixture blob missing");
-    await unlink(join(
-      storeRoot,
-      "objects",
-      "blobs",
-      missing.blobOid.slice(0, 2),
-      missing.blobOid.slice(2),
-    ));
+    await unlink(
+      join(
+        storeRoot,
+        "objects",
+        "blobs",
+        missing.blobOid.slice(0, 2),
+        missing.blobOid.slice(2),
+      ),
+    );
 
     const outcome = await restoreWorkspace(
       { store: setup.store },
@@ -393,8 +405,9 @@ describe("pure workspace restore", () => {
     );
 
     expect(outcome).toMatchObject({ kind: "failed", stage: "staging" });
-    expect(await readFile(join(root, "target.txt"), "utf8"))
-      .toBe("current bytes");
+    expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
+      "current bytes",
+    );
     expect(setup.metadata.getState("s", "target")).toEqual(setup.state);
     setup.metadata.close();
   });
@@ -435,11 +448,13 @@ describe("pure workspace restore", () => {
     const current = await scanWorkspace(root);
     const incomplete = {
       ...current,
-      problems: [{
-        path: "blocked",
-        kind: "read-failed" as const,
-        detail: "injected",
-      }],
+      problems: [
+        {
+          path: "blocked",
+          kind: "read-failed" as const,
+          detail: "injected",
+        },
+      ],
     };
 
     const outcome = await restoreWorkspace(

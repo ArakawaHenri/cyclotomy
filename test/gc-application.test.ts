@@ -184,9 +184,7 @@ describe("session metadata garbage collection", () => {
       now: 200,
       retentionMs: 10,
       probeSessionFile: async (sessionFile) => {
-        events.push(
-          `probe:${sessionFile === firstFile ? "s1" : "s2"}`,
-        );
+        events.push(`probe:${sessionFile === firstFile ? "s1" : "s2"}`);
         return "missing";
       },
     });
@@ -226,28 +224,27 @@ describe("session metadata garbage collection", () => {
     const sessionFile = join(directory, "deleted.jsonl");
     const store = await openObjectStore(directory);
     const blobOid = await publishTestBlob(store, Buffer.from("rooted"));
-    const treeOid = await publishTestTree(store, [
-      {
-        path: "rooted.txt",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o644,
-      },
-    ], ALL_MANAGED_SCOPE);
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "rooted.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o644,
+        },
+      ],
+      ALL_MANAGED_SCOPE,
+    );
     metadata.touchSession("s1", sessionFile);
     metadata.setState("s1", "e1", treeOid);
     metadata.observeSessionMissing("s1", sessionFile, 10);
 
-    const report = await collectCyclotomyGarbage(
-      directory,
-      store,
-      metadata,
-      {
-        now: 20,
-        retentionMs: 0,
-        objectGraceMs: 0,
-      },
-    );
+    const report = await collectCyclotomyGarbage(directory, store, metadata, {
+      now: 20,
+      retentionMs: 0,
+      objectGraceMs: 0,
+    });
     expect(report).toMatchObject({
       removedTrees: 0,
       removedBlobs: 0,

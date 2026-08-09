@@ -33,7 +33,7 @@ export function gitScope(
     repositoryPrefix: options.repositoryPrefix ?? "",
     ignoreCase: options.ignoreCase ?? false,
     gitignoreSources: (options.gitignoreSources ?? []).map((source) =>
-      workspaceGitignoreSource(source.path, bytes(source.contents))
+      workspaceGitignoreSource(source.path, bytes(source.contents)),
     ),
     infoExcludeBase64: bytes(options.infoExclude).toString("base64"),
     globalExcludeBase64: bytes(options.globalExclude).toString("base64"),

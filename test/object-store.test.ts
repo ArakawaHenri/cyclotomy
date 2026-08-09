@@ -19,18 +19,8 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import {
-  join,
-  parse as parsePath,
-} from "node:path";
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { join, parse as parsePath } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   openObjectStore,
@@ -44,16 +34,11 @@ import {
   publishTestBlobInPublication,
   publishTestTree,
 } from "./object-store-fixture.ts";
-import {
-  ALL_MANAGED_SCOPE,
-  gitScope,
-} from "./workspace-scope-fixture.ts";
+import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 const completeScope = ALL_MANAGED_SCOPE;
 
 function digest(content: Uint8Array): string {
-  return createHash("sha256")
-    .update(content)
-    .digest("hex");
+  return createHash("sha256").update(content).digest("hex");
 }
 
 function physicalObjectPath(
@@ -61,13 +46,7 @@ function physicalObjectPath(
   kind: "blobs" | "trees",
   oid: string,
 ): string {
-  return join(
-    root,
-    "objects",
-    kind,
-    oid.slice(0, 2),
-    oid.slice(2),
-  );
+  return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
 }
 
 async function fileHandlePrototype(): Promise<{
@@ -93,9 +72,7 @@ describe("object store", () => {
   let store: ObjectStore;
 
   beforeEach(async () => {
-    root = await mkdtemp(
-      join(tmpdir(), "cyclotomy-object-store-"),
-    );
+    root = await mkdtemp(join(tmpdir(), "cyclotomy-object-store-"));
     store = await openObjectStore(root);
   });
 
@@ -111,12 +88,8 @@ describe("object store", () => {
     expect(oid).toBe(digest(content));
     expect(oid).toMatch(/^[0-9a-f]{64}$/u);
     const path = physicalObjectPath(root, "blobs", oid);
-    expect(
-      Buffer.from(await readFile(path)),
-    ).toEqual(content);
-    expect(
-      Buffer.from(await store.readBlob(oid)),
-    ).toEqual(content);
+    expect(Buffer.from(await readFile(path))).toEqual(content);
+    expect(Buffer.from(await store.readBlob(oid))).toEqual(content);
   });
 
   it("streams a file blob and reuses the authenticated object after source removal", async () => {
@@ -139,11 +112,9 @@ describe("object store", () => {
     await rm(source);
 
     expect(
-      await store.beginSnapshotPublication().publishBlobFromFile(
-        source,
-        oid,
-        content.byteLength,
-      ),
+      await store
+        .beginSnapshotPublication()
+        .publishBlobFromFile(source, oid, content.byteLength),
     ).toBe(oid);
   });
 
@@ -153,11 +124,9 @@ describe("object store", () => {
     const oid = digest(content);
 
     await expect(
-      store.beginSnapshotPublication().publishBlobFromFile(
-        source,
-        oid,
-        content.byteLength,
-      ),
+      store
+        .beginSnapshotPublication()
+        .publishBlobFromFile(source, oid, content.byteLength),
     ).rejects.toMatchObject({ code: "invalid-blob" });
   });
 
@@ -173,11 +142,9 @@ describe("object store", () => {
     );
 
     await expect(
-      store.beginSnapshotPublication().publishBlobFromFile(
-        source,
-        digest(content),
-        content.byteLength,
-      ),
+      store
+        .beginSnapshotPublication()
+        .publishBlobFromFile(source, digest(content), content.byteLength),
     ).rejects.toMatchObject({ code: "invalid-blob" });
     expect(await readFile(outside)).toEqual(content);
   });
@@ -185,44 +152,42 @@ describe("object store", () => {
   it("does not rewrite objects on an idempotent publication", async () => {
     const content = Buffer.from("stable object", "utf8");
     const blobOid = await publishTestBlob(store, content);
-    const blobPath = physicalObjectPath(
-      root,
-      "blobs",
-      blobOid,
-    );
+    const blobPath = physicalObjectPath(root, "blobs", blobOid);
     const beforeBlob = await stat(blobPath);
 
-    expect(await publishTestBlob(store, content)).toBe(
-      blobOid,
-    );
+    expect(await publishTestBlob(store, content)).toBe(blobOid);
     const afterBlob = await stat(blobPath);
     expect(afterBlob.ino).toBe(beforeBlob.ino);
     expect(afterBlob.mtimeMs).toBe(beforeBlob.mtimeMs);
 
-    const treeOid = await publishTestTree(store, [
-      {
-        path: "file",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o600,
-      },
-    ], completeScope);
-    const treePath = physicalObjectPath(
-      root,
-      "trees",
-      treeOid,
-    );
-    const beforeTree = await stat(treePath);
-
-    expect(
-      await publishTestTree(store, [
+    const treeOid = await publishTestTree(
+      store,
+      [
         {
           path: "file",
           type: "regular",
           blobOid,
           recreationMode: 0o600,
         },
-      ], completeScope),
+      ],
+      completeScope,
+    );
+    const treePath = physicalObjectPath(root, "trees", treeOid);
+    const beforeTree = await stat(treePath);
+
+    expect(
+      await publishTestTree(
+        store,
+        [
+          {
+            path: "file",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).toBe(treeOid);
     const afterTree = await stat(treePath);
     expect(afterTree.ino).toBe(beforeTree.ino);
@@ -232,27 +197,24 @@ describe("object store", () => {
   it("detects blob tampering on reads and repairs it from authenticated bytes", async () => {
     const original = Buffer.from("original", "utf8");
     const blobOid = await publishTestBlob(store, original);
-    const treeOid = await publishTestTree(store, [
-      {
-        path: "file",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o600,
-      },
-    ], completeScope);
-
-    await writeFile(
-      physicalObjectPath(root, "blobs", blobOid),
-      "tampered",
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "file",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o600,
+        },
+      ],
+      completeScope,
     );
-    await expect(
-      store.readBlob(blobOid),
-    ).rejects.toMatchObject({
+
+    await writeFile(physicalObjectPath(root, "blobs", blobOid), "tampered");
+    await expect(store.readBlob(blobOid)).rejects.toMatchObject({
       code: "object-integrity",
     });
-    await expect(
-      store.readTree(treeOid),
-    ).rejects.toMatchObject({
+    await expect(store.readTree(treeOid)).rejects.toMatchObject({
       code: "object-integrity",
     });
     await expect(publishTestBlob(store, original)).resolves.toBe(blobOid);
@@ -284,13 +246,13 @@ describe("object store", () => {
     const prototype = await fileHandlePrototype();
     const originalStat = prototype.stat;
     let regularHandleStats = 0;
-    vi.spyOn(prototype, "stat").mockImplementation(
-      async function (this: FileHandle): Promise<Stats> {
-        const observation = await originalStat.call(this);
-        if (observation.isFile()) regularHandleStats += 1;
-        return observation;
-      },
-    );
+    vi.spyOn(prototype, "stat").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<Stats> {
+      const observation = await originalStat.call(this);
+      if (observation.isFile()) regularHandleStats += 1;
+      return observation;
+    });
 
     await expect(publishTestBlob(store, original)).rejects.toMatchObject({
       code: "storage-failure",
@@ -331,17 +293,17 @@ describe("object store", () => {
     const prototype = await fileHandlePrototype();
     const originalStat = prototype.stat;
     let replaced = false;
-    vi.spyOn(prototype, "stat").mockImplementation(
-      async function (this: FileHandle): Promise<Stats> {
-        const observation = await originalStat.call(this);
-        if (!replaced) {
-          replaced = true;
-          await rename(objectPath, displacedPath);
-          await writeFile(objectPath, content);
-        }
-        return observation;
-      },
-    );
+    vi.spyOn(prototype, "stat").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<Stats> {
+      const observation = await originalStat.call(this);
+      if (!replaced) {
+        replaced = true;
+        await rename(objectPath, displacedPath);
+        await writeFile(objectPath, content);
+      }
+      return observation;
+    });
 
     await expect(store.readBlob(blobOid)).rejects.toMatchObject({
       code: "storage-failure",
@@ -352,30 +314,25 @@ describe("object store", () => {
   });
 
   it("rejects missing objects and malformed identifiers", async () => {
-    await expect(
-      store.readBlob("0".repeat(64)),
-    ).rejects.toMatchObject({ code: "missing-object" });
-    await expect(
-      store.readBlob("../escape"),
-    ).rejects.toMatchObject({
+    await expect(store.readBlob("0".repeat(64))).rejects.toMatchObject({
+      code: "missing-object",
+    });
+    await expect(store.readBlob("../escape")).rejects.toMatchObject({
+      code: "invalid-object-id",
+    });
+    await expect(store.readTree("A".repeat(64))).rejects.toMatchObject({
       code: "invalid-object-id",
     });
     await expect(
-      store.readTree("A".repeat(64)),
-    ).rejects.toMatchObject({
-      code: "invalid-object-id",
-    });
-    await expect(
-      store.beginSnapshotPublication().publishBlobFromFile(
-        "relative/source",
-        "0".repeat(64),
-        1,
-      ),
+      store
+        .beginSnapshotPublication()
+        .publishBlobFromFile("relative/source", "0".repeat(64), 1),
     ).rejects.toMatchObject({ code: "invalid-blob" });
   });
 
   it("publishes a canonical tree independent of input order and reads it back", async () => {
-    const blobOid = await publishTestBlob(store,
+    const blobOid = await publishTestBlob(
+      store,
       Buffer.from("hello\n", "utf8"),
     );
     const entries: TreeEntry[] = [
@@ -394,7 +351,8 @@ describe("object store", () => {
     ];
 
     const first = await publishTestTree(store, entries, completeScope);
-    const second = await publishTestTree(store,
+    const second = await publishTestTree(
+      store,
       [...entries].reverse(),
       completeScope,
     );
@@ -423,10 +381,12 @@ describe("object store", () => {
   });
 
   it("publishes a canonical target-time scope", async () => {
-    const rootIgnoreOid = await publishTestBlob(store,
+    const rootIgnoreOid = await publishTestBlob(
+      store,
       Buffer.from(".env\n", "utf8"),
     );
-    const nestedIgnoreOid = await publishTestBlob(store,
+    const nestedIgnoreOid = await publishTestBlob(
+      store,
       Buffer.from("*.tmp\n", "utf8"),
     );
     const scope = {
@@ -483,7 +443,6 @@ describe("object store", () => {
     if (caseInsensitive.kind === "git") {
       expect(caseInsensitive.ignoreCase).toBe(true);
     }
-
   });
 
   it("publishes canonical recreation hints including an unavailable hint", async () => {
@@ -505,7 +464,8 @@ describe("object store", () => {
     ];
 
     const first = await publishTestTree(store, entries, completeScope);
-    const second = await publishTestTree(store,
+    const second = await publishTestTree(
+      store,
       [...entries].reverse(),
       completeScope,
     );
@@ -549,14 +509,17 @@ describe("object store", () => {
       undefined,
     ]) {
       await expect(
-        store.beginSnapshotPublication().publishTree([
-          {
-            path: "file",
-            type: "regular",
-            blobOid,
-            recreationMode: recreationMode as never,
-          },
-        ], completeScope),
+        store.beginSnapshotPublication().publishTree(
+          [
+            {
+              path: "file",
+              type: "regular",
+              blobOid,
+              recreationMode: recreationMode as never,
+            },
+          ],
+          completeScope,
+        ),
       ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
     }
   });
@@ -565,32 +528,38 @@ describe("object store", () => {
     const blobOid = await publishTestBlob(store, Buffer.from("content"));
 
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "obsolete",
-          type: "regular",
-          blobOid,
-          executable: false,
-        } as never,
-        {
-          path: "current",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "obsolete",
+            type: "regular",
+            blobOid,
+            executable: false,
+          } as never,
+          {
+            path: "current",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
 
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "both",
-          type: "regular",
-          blobOid,
-          executable: false,
-          recreationMode: 0o600,
-        } as never,
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "both",
+            type: "regular",
+            blobOid,
+            executable: false,
+            recreationMode: 0o600,
+          } as never,
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
   });
 
@@ -619,27 +588,33 @@ describe("object store", () => {
 
   it("allows archived excluded policy sources but binds managed .gitignore entries", async () => {
     const ignoreOid = await publishTestBlob(store, Buffer.from("secret\n"));
-    await expect(store.beginSnapshotPublication().publishTree(
-      [],
-      gitScope({
-        gitignoreSources: [{ path: ".gitignore", contents: "secret\n" }],
-      }),
-    )).resolves.toMatch(/^[0-9a-f]{64}$/u);
+    await expect(
+      store.beginSnapshotPublication().publishTree(
+        [],
+        gitScope({
+          gitignoreSources: [{ path: ".gitignore", contents: "secret\n" }],
+        }),
+      ),
+    ).resolves.toMatch(/^[0-9a-f]{64}$/u);
 
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: ".gitignore",
-          type: "regular",
-          blobOid: ignoreOid,
-          recreationMode: 0o600,
-        },
-      ], gitScope()),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: ".gitignore",
+            type: "regular",
+            blobOid: ignoreOid,
+            recreationMode: 0o600,
+          },
+        ],
+        gitScope(),
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
   });
 
   it("rejects unsafe tree entry paths", async () => {
-    const blobOid = await publishTestBlob(store,
+    const blobOid = await publishTestBlob(
+      store,
       Buffer.from("content", "utf8"),
     );
     for (const path of [
@@ -656,14 +631,17 @@ describe("object store", () => {
       "sub/.GIT/index",
     ]) {
       await expect(
-        store.beginSnapshotPublication().publishTree([
-          {
-            path,
-            type: "regular",
-            blobOid,
-            recreationMode: 0o600,
-          },
-        ], completeScope),
+        store.beginSnapshotPublication().publishTree(
+          [
+            {
+              path,
+              type: "regular",
+              blobOid,
+              recreationMode: 0o600,
+            },
+          ],
+          completeScope,
+        ),
       ).rejects.toMatchObject({
         code: "invalid-tree-manifest",
       });
@@ -672,149 +650,176 @@ describe("object store", () => {
 
   it("rejects a symlink target containing malformed Unicode", async () => {
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "link",
-          type: "symlink",
-          target: "bad-\uD800",
-          symlinkKind: null,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "link",
+            type: "symlink",
+            target: "bad-\uD800",
+            symlinkKind: null,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
   });
 
   it("archives nested policy sources even when an ancestor policy excludes them", async () => {
     const rootPolicy = "vendor/\n";
     const nestedPolicy = "*.tmp\n";
-    const rootIgnoreOid = await publishTestBlob(
-      store,
-      Buffer.from(rootPolicy),
-    );
-    await expect(publishTestTree(store, [
-      {
-        path: ".gitignore",
-        type: "regular",
-        blobOid: rootIgnoreOid,
-        recreationMode: 0o600,
-      },
-    ], gitScope({
-      gitignoreSources: [
-        { path: ".gitignore", contents: rootPolicy },
-        { path: "vendor/.gitignore", contents: nestedPolicy },
-      ],
-    }))).resolves.toMatch(/^[0-9a-f]{64}$/u);
+    const rootIgnoreOid = await publishTestBlob(store, Buffer.from(rootPolicy));
+    await expect(
+      publishTestTree(
+        store,
+        [
+          {
+            path: ".gitignore",
+            type: "regular",
+            blobOid: rootIgnoreOid,
+            recreationMode: 0o600,
+          },
+        ],
+        gitScope({
+          gitignoreSources: [
+            { path: ".gitignore", contents: rootPolicy },
+            { path: "vendor/.gitignore", contents: nestedPolicy },
+          ],
+        }),
+      ),
+    ).resolves.toMatch(/^[0-9a-f]{64}$/u);
   });
 
   it("rejects NFC or case-fold-colliding tree paths", async () => {
     const blobOid = await publishTestBlob(store, Buffer.from("content"));
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "A/x",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-        {
-          path: "a/y",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "A/x",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+          {
+            path: "a/y",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "e\u0301.txt",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "e\u0301.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
   });
 
   it("rejects structurally invalid or noncanonical manifests", async () => {
-    const blobOid = await publishTestBlob(store,
+    const blobOid = await publishTestBlob(
+      store,
       Buffer.from("content", "utf8"),
     );
 
     await expect(
-      publishTestTree(store, [
-        {
-          path: "implicit/parent",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      publishTestTree(
+        store,
+        [
+          {
+            path: "implicit/parent",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).resolves.toMatch(/^[0-9a-f]{64}$/u);
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "parent",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-        {
-          path: "parent/child",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "parent",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+          {
+            path: "parent/child",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({
       code: "invalid-tree-manifest",
     });
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "same",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-        {
-          path: "same",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "same",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+          {
+            path: "same",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({
       code: "invalid-tree-manifest",
     });
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "link",
-          type: "symlink",
-          target: "target",
-          executable: true,
-        } as never,
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "link",
+            type: "symlink",
+            target: "target",
+            executable: true,
+          } as never,
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({
       code: "invalid-tree-manifest",
     });
     await expect(
-      store.beginSnapshotPublication().publishTree([
-        {
-          path: "file",
-          type: "regular",
-          blobOid: "not-a-digest",
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      store.beginSnapshotPublication().publishTree(
+        [
+          {
+            path: "file",
+            type: "regular",
+            blobOid: "not-a-digest",
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({
       code: "invalid-tree-manifest",
     });
 
     const empty = await publishTestTree(store, [], completeScope);
-    expect(
-      (await store.readTree(empty)).entries,
-    ).toEqual([]);
+    expect((await store.readTree(empty)).entries).toEqual([]);
   });
 
   it("publishes no tree whose referenced blob closure is missing", async () => {
@@ -826,14 +831,17 @@ describe("object store", () => {
     await unlink(physicalObjectPath(root, "blobs", blobOid));
 
     await expect(
-      publication.publishTree([
-        {
-          path: "missing",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      publication.publishTree(
+        [
+          {
+            path: "missing",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "missing-object" });
 
     const treeRoot = join(root, "objects", "trees");
@@ -847,9 +855,7 @@ describe("object store", () => {
       '{"format":"cyclotomy-tree-v1","entries":[]}',
     );
 
-    await expect(
-      store.readTree(treeOid),
-    ).rejects.toMatchObject({
+    await expect(store.readTree(treeOid)).rejects.toMatchObject({
       code: "object-integrity",
     });
   });
@@ -890,15 +896,18 @@ describe("object store", () => {
     };
     const originalRead = readablePrototype.read;
     let grew = false;
-    const spy = vi.spyOn(readablePrototype, "read").mockImplementation(
-      async function (this: FileHandle, ...args: unknown[]): Promise<unknown> {
+    const spy = vi
+      .spyOn(readablePrototype, "read")
+      .mockImplementation(async function (
+        this: FileHandle,
+        ...args: unknown[]
+      ): Promise<unknown> {
         if (!grew) {
           grew = true;
           await truncate(path, ABSOLUTE_MAX_TREE_MANIFEST_BYTES + 1);
         }
         return Reflect.apply(originalRead, this, args);
-      },
-    );
+      });
 
     await expect(store.readTree(oid)).rejects.toMatchObject({
       code: "object-integrity",
@@ -912,10 +921,15 @@ describe("object store", () => {
       maxEntries: 1,
       maxManifestBytes: 1024,
     });
-    await expect(entryLimited.beginSnapshotPublication().publishTree([
-      { path: "a", type: "symlink", target: "a", symlinkKind: null },
-      { path: "b", type: "symlink", target: "b", symlinkKind: null },
-    ], completeScope)).rejects.toMatchObject({
+    await expect(
+      entryLimited.beginSnapshotPublication().publishTree(
+        [
+          { path: "a", type: "symlink", target: "a", symlinkKind: null },
+          { path: "b", type: "symlink", target: "b", symlinkKind: null },
+        ],
+        completeScope,
+      ),
+    ).rejects.toMatchObject({
       code: "invalid-tree-manifest",
     });
 
@@ -935,18 +949,11 @@ describe("object store", () => {
     ]) {
       const content = Buffer.from(bytes, "utf8");
       const oid = digest(content);
-      const shard = join(
-        root,
-        "objects",
-        "trees",
-        oid.slice(0, 2),
-      );
+      const shard = join(root, "objects", "trees", oid.slice(0, 2));
       await mkdir(shard, { recursive: true });
       await writeFile(join(shard, oid.slice(2)), content);
 
-      await expect(
-        store.readTree(oid),
-      ).rejects.toMatchObject({
+      await expect(store.readTree(oid)).rejects.toMatchObject({
         code: "object-integrity",
       });
     }
@@ -986,12 +993,14 @@ describe("object store", () => {
     const content = Buffer.from(
       `${JSON.stringify({
         format: TREE_MANIFEST_FORMAT,
-        entries: [{
-          path: ".gitignore",
-          type: "regular",
-          blobOid: digest(ignoreBytes),
-          recreationMode: 0o600,
-        }],
+        entries: [
+          {
+            path: ".gitignore",
+            type: "regular",
+            blobOid: digest(ignoreBytes),
+            recreationMode: 0o600,
+          },
+        ],
         scope: gitScope(),
       })}\n`,
       "utf8",
@@ -1009,33 +1018,26 @@ describe("object store", () => {
   it("cleans an unpublished temp object after an fsync failure", async () => {
     const content = Buffer.from("fsync failure", "utf8");
     const oid = digest(content);
-    const shard = join(
-      root,
-      "objects",
-      "blobs",
-      oid.slice(0, 2),
-    );
+    const shard = join(root, "objects", "blobs", oid.slice(0, 2));
     await mkdir(shard);
 
     const prototype = await fileHandlePrototype();
     const originalSync = prototype.sync;
     let injected = false;
-    const spy = vi
-      .spyOn(prototype, "sync")
-      .mockImplementation(async function (
-        this: FileHandle,
-      ): Promise<void> {
-        const metadata = await this.stat();
-        if (metadata.isFile() && !injected) {
-          injected = true;
-          throw new Error("injected fsync failure");
-        }
-        await originalSync.call(this);
-      });
+    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<void> {
+      const metadata = await this.stat();
+      if (metadata.isFile() && !injected) {
+        injected = true;
+        throw new Error("injected fsync failure");
+      }
+      await originalSync.call(this);
+    });
 
-    await expect(
-      publishTestBlob(store, content),
-    ).rejects.toMatchObject({ code: "storage-failure" });
+    await expect(publishTestBlob(store, content)).rejects.toMatchObject({
+      code: "storage-failure",
+    });
     spy.mockRestore();
 
     expect(injected).toBe(true);
@@ -1051,68 +1053,59 @@ describe("object store", () => {
       process.platform === "win32",
       "Windows directory-entry durability is best-effort",
     );
-    const content = Buffer.from(
-      "directory fsync failure",
-      "utf8",
-    );
+    const content = Buffer.from("directory fsync failure", "utf8");
     const oid = digest(content);
     const prototype = await fileHandlePrototype();
     const originalSync = prototype.sync;
     let fileSynced = false;
     let injected = false;
-    const spy = vi
-      .spyOn(prototype, "sync")
-      .mockImplementation(async function (
-        this: FileHandle,
-      ): Promise<void> {
-        const metadata = await this.stat();
-        if (metadata.isFile()) {
-          fileSynced = true;
-          await originalSync.call(this);
-          return;
-        }
-        if (fileSynced && !injected) {
-          injected = true;
-          throw new Error(
-            "injected parent-directory fsync failure",
-          );
-        }
+    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<void> {
+      const metadata = await this.stat();
+      if (metadata.isFile()) {
+        fileSynced = true;
         await originalSync.call(this);
-      });
+        return;
+      }
+      if (fileSynced && !injected) {
+        injected = true;
+        throw new Error("injected parent-directory fsync failure");
+      }
+      await originalSync.call(this);
+    });
 
-    await expect(
-      publishTestBlob(store, content),
-    ).rejects.toMatchObject({ code: "storage-failure" });
+    await expect(publishTestBlob(store, content)).rejects.toMatchObject({
+      code: "storage-failure",
+    });
     spy.mockRestore();
 
     expect(injected).toBe(true);
-    expect(
-      Buffer.from(await store.readBlob(oid)),
-    ).toEqual(content);
+    expect(Buffer.from(await store.readBlob(oid))).toEqual(content);
     expect(await publishTestBlob(store, content)).toBe(oid);
   });
 
   it("requires a safe explicit root and preserves unrelated entries", async () => {
-    await expect(
-      openObjectStore("relative/store"),
-    ).rejects.toMatchObject({ code: "invalid-root" });
-    await expect(
-      openObjectStore(parsePath(root).root),
-    ).rejects.toMatchObject({ code: "invalid-root" });
+    await expect(openObjectStore("relative/store")).rejects.toMatchObject({
+      code: "invalid-root",
+    });
+    await expect(openObjectStore(parsePath(root).root)).rejects.toMatchObject({
+      code: "invalid-root",
+    });
 
     const regularRoot = join(root, "regular-root");
     await writeFile(regularRoot, "not a directory");
-    await expect(
-      openObjectStore(regularRoot),
-    ).rejects.toMatchObject({ code: "storage-failure" });
+    await expect(openObjectStore(regularRoot)).rejects.toMatchObject({
+      code: "storage-failure",
+    });
 
     const realRoot = join(root, "real-root");
     const linkedRoot = join(root, "linked-root");
     await mkdir(realRoot);
     await symlink(realRoot, linkedRoot);
-    await expect(
-      openObjectStore(linkedRoot),
-    ).rejects.toMatchObject({ code: "storage-failure" });
+    await expect(openObjectStore(linkedRoot)).rejects.toMatchObject({
+      code: "storage-failure",
+    });
 
     const sentinel = join(root, "unrelated");
     await writeFile(sentinel, "keep");
@@ -1142,20 +1135,24 @@ async function publishTwoBlobTree(
     await publishTestBlob(store, Buffer.from("alpha\n", "utf8")),
     await publishTestBlob(store, Buffer.from("beta\n\n", "utf8")),
   ];
-  const treeOid = await publishTestTree(store, [
-    {
-      path: "a.txt",
-      type: "regular",
-      blobOid: blobOids[0]!,
-      recreationMode: 0o600,
-    },
-    {
-      path: "b.txt",
-      type: "regular",
-      blobOid: blobOids[1]!,
-      recreationMode: 0o600,
-    },
-  ], completeScope);
+  const treeOid = await publishTestTree(
+    store,
+    [
+      {
+        path: "a.txt",
+        type: "regular",
+        blobOid: blobOids[0]!,
+        recreationMode: 0o600,
+      },
+      {
+        path: "b.txt",
+        type: "regular",
+        blobOid: blobOids[1]!,
+        recreationMode: 0o600,
+      },
+    ],
+    completeScope,
+  );
   return { treeOid, blobOids };
 }
 
@@ -1164,9 +1161,7 @@ describe("targeted blob verification", () => {
   let store: ObjectStore;
 
   beforeEach(async () => {
-    root = await mkdtemp(
-      join(tmpdir(), "cyclotomy-targeted-verification-"),
-    );
+    root = await mkdtemp(join(tmpdir(), "cyclotomy-targeted-verification-"));
     store = await openObjectStore(root);
   });
 
@@ -1183,9 +1178,9 @@ describe("targeted blob verification", () => {
     await expect(store.readTree(treeOid)).rejects.toMatchObject({
       code: "missing-object",
     });
-    await expect(
-      store.readTreeManifest("a".repeat(64)),
-    ).rejects.toMatchObject({ code: "missing-object" });
+    await expect(store.readTreeManifest("a".repeat(64))).rejects.toMatchObject({
+      code: "missing-object",
+    });
   });
 
   it("never treats matching size and mtime as a substitute for hashing", async () => {
@@ -1223,35 +1218,38 @@ describe("targeted blob verification", () => {
     const verify = vi.spyOn(store, "verifyBlobs");
     const outsideOid = await publishTestBlob(store, Buffer.from("outside"));
     await expect(
-      publication.publishTree([
-        {
-          path: "outside.txt",
-          type: "regular",
-          blobOid: outsideOid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      publication.publishTree(
+        [
+          {
+            path: "outside.txt",
+            type: "regular",
+            blobOid: outsideOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
 
     const insideOid = await publishTestBlobInPublication(
       publication,
       Buffer.from("inside"),
     );
-    const treeOid = await publication.publishTree([
-      {
-        path: "inside.txt",
-        type: "regular",
-        blobOid: insideOid,
-        recreationMode: 0o600,
-      },
-    ], completeScope);
+    const treeOid = await publication.publishTree(
+      [
+        {
+          path: "inside.txt",
+          type: "regular",
+          blobOid: insideOid,
+          recreationMode: 0o600,
+        },
+      ],
+      completeScope,
+    );
     expect(verify).not.toHaveBeenCalled();
     expect((await store.readTreeManifest(treeOid)).entries).toHaveLength(1);
     await expect(
-      publishTestBlobInPublication(
-        publication,
-        Buffer.from("too late"),
-      ),
+      publishTestBlobInPublication(publication, Buffer.from("too late")),
     ).rejects.toMatchObject({ code: "storage-failure" });
   });
 
@@ -1267,14 +1265,17 @@ describe("targeted blob verification", () => {
     await rename(replacement, path);
 
     await expect(
-      publication.publishTree([
-        {
-          path: "file.txt",
-          type: "regular",
-          blobOid: oid,
-          recreationMode: 0o600,
-        },
-      ], completeScope),
+      publication.publishTree(
+        [
+          {
+            path: "file.txt",
+            type: "regular",
+            blobOid: oid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      ),
     ).rejects.toMatchObject({ code: "object-integrity" });
     expect(await readdir(join(root, "objects", "trees"))).toEqual([]);
   });

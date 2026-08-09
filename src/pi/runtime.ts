@@ -55,10 +55,7 @@ import {
 } from "../infrastructure/workspace-scan.ts";
 import type { WorkspaceScope } from "../infrastructure/workspace-scope.ts";
 import { CyclotomyI18n } from "./i18n.ts";
-import {
-  formatUiDetail,
-  formatUiPath,
-} from "./restore-presentation.ts";
+import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
 import {
   TransitionState,
@@ -79,8 +76,8 @@ async function readLastAutomaticGcAt(path: string): Promise<number> {
       lastGcAt?: unknown;
     };
     return typeof parsed.lastGcAt === "number" &&
-        Number.isFinite(parsed.lastGcAt) &&
-        parsed.lastGcAt >= 0
+      Number.isFinite(parsed.lastGcAt) &&
+      parsed.lastGcAt >= 0
       ? parsed.lastGcAt
       : 0;
   } catch {
@@ -172,9 +169,8 @@ async function assertControlPathDoesNotOverlap(
   let current = absolute;
   const target = await prospectiveRealpath(absolute);
   while (true) {
-    const observed = current === absolute
-      ? target
-      : await prospectiveRealpath(current);
+    const observed =
+      current === absolute ? target : await prospectiveRealpath(current);
     if (isWithin(workspace, observed)) {
       throw new Error(
         "Cyclotomy control data and workspace paths must not overlap",
@@ -329,11 +325,12 @@ export class CyclotomyRuntime {
   ): void {
     if (this.#initFailureNotified && options.force !== true) return;
     this.#initFailureNotified = true;
-    const detail = this.#initFailureDetail === undefined
-      ? ""
-      : ` ${this.i18n.t("captureFailureDetail", {
-          message: this.#initFailureDetail,
-        })}`;
+    const detail =
+      this.#initFailureDetail === undefined
+        ? ""
+        : ` ${this.i18n.t("captureFailureDetail", {
+            message: this.#initFailureDetail,
+          })}`;
     this.notify(context, `${this.i18n.t("initFailure")}${detail}`, "error");
   }
 
@@ -344,11 +341,12 @@ export class CyclotomyRuntime {
   ): void {
     if (!captured && !this.#captureFailureNotified) {
       this.#captureFailureNotified = true;
-      const detail = failureMessage === undefined
-        ? ""
-        : ` ${this.i18n.t("captureFailureDetail", {
-            message: failureMessage,
-          })}`;
+      const detail =
+        failureMessage === undefined
+          ? ""
+          : ` ${this.i18n.t("captureFailureDetail", {
+              message: failureMessage,
+            })}`;
       this.notify(
         context,
         `${this.i18n.t("captureLaterFailed")}${detail}`,
@@ -374,9 +372,7 @@ export class CyclotomyRuntime {
       // closed through the same channel a workspace settings failure uses,
       // without touching the filesystem for a store that must not be opened.
       this.#selectNotificationWorkspace(notificationWorkspace);
-      this.#initFailureDetail = initializationDetail(
-        this.#registrationFailure,
-      );
+      this.#initFailureDetail = initializationDetail(this.#registrationFailure);
       return false;
     }
     try {
@@ -399,10 +395,7 @@ export class CyclotomyRuntime {
           this.#workspaceRoot === canonical
         );
       }
-      if (
-        this.#configuredWorkspace === canonical &&
-        this.#bindingFailed
-      ) {
+      if (this.#configuredWorkspace === canonical && this.#bindingFailed) {
         return false;
       }
       if (this.#configuredWorkspace !== canonical) {
@@ -432,7 +425,8 @@ export class CyclotomyRuntime {
         canonical,
         await prospectiveRealpath(join(root, "settings.json")),
       );
-      const config = this.#workspaceConfig ??
+      const config =
+        this.#workspaceConfig ??
         loadWorkspaceCyclotomyConfig(this.#globalConfig, root);
       this.#workspaceConfig = config;
       const store = await openObjectStore(root, {
@@ -474,7 +468,7 @@ export class CyclotomyRuntime {
       return false;
     }
     try {
-      return await realpath(cwd) === this.#workspaceRoot;
+      return (await realpath(cwd)) === this.#workspaceRoot;
     } catch {
       return false;
     }
@@ -486,17 +480,9 @@ export class CyclotomyRuntime {
     return result;
   }
 
-  enqueueWorkspace<T>(
-    operation: string,
-    action: () => Promise<T>,
-  ): Promise<T> {
+  enqueueWorkspace<T>(operation: string, action: () => Promise<T>): Promise<T> {
     return this.enqueue(() =>
-      withWorkspaceLock(
-        this.storeRoot,
-        operation,
-        action,
-        this.config.lock,
-      ),
+      withWorkspaceLock(this.storeRoot, operation, action, this.config.lock),
     );
   }
 
@@ -541,15 +527,10 @@ export class CyclotomyRuntime {
       if (startedAt - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
         return;
       }
-      await collectCyclotomyGarbage(
-        this.storeRoot,
-        this.store,
-        this.metadata,
-        {
-          objectGraceMs: GC_OBJECT_GRACE_MS,
-          retentionMs: this.config.sessionMetadataRetentionMs,
-        },
-      );
+      await collectCyclotomyGarbage(this.storeRoot, this.store, this.metadata, {
+        objectGraceMs: GC_OBJECT_GRACE_MS,
+        retentionMs: this.config.sessionMetadataRetentionMs,
+      });
       await writeLastAutomaticGcAt(statePath, startedAt);
     });
   }
@@ -625,10 +606,14 @@ export class CyclotomyRuntime {
 
   ancestryIds(view: SessionView, leafId: string | null): string[] {
     if (leafId === null) return [];
-    return [...walkNodeAncestry(
-      { sessionId: view.sessionId, entryId: leafId },
-      this.parentOfIn(view),
-    )].map(({ entryId }) => entryId).reverse();
+    return [
+      ...walkNodeAncestry(
+        { sessionId: view.sessionId, entryId: leafId },
+        this.parentOfIn(view),
+      ),
+    ]
+      .map(({ entryId }) => entryId)
+      .reverse();
   }
 
   async resolveReadableTreeIn(
@@ -691,9 +676,7 @@ export class CyclotomyRuntime {
     );
   }
 
-  prepareCaptureResult(
-    view: SessionView,
-  ): ReturnType<typeof prepareNodeState> {
+  prepareCaptureResult(view: SessionView): ReturnType<typeof prepareNodeState> {
     return prepareNodeState(this.checkpointDeps(), view.cwd);
   }
 

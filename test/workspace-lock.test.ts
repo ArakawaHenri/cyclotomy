@@ -1,8 +1,4 @@
-import {
-  execFile,
-  fork,
-  type ChildProcess,
-} from "node:child_process";
+import { execFile, fork, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstat,
@@ -130,7 +126,9 @@ async function waitForMessage(
     if (index >= 0) {
       return child.messages.splice(index, 1)[0]!;
     }
-    const unexpected = child.messages.find((message) => message.type === "error");
+    const unexpected = child.messages.find(
+      (message) => message.type === "error",
+    );
     if (unexpected !== undefined && type !== "error") {
       throw new Error(
         `lock child failed: ${unexpected.name}: ${unexpected.message}\n${child.stderr}`,
@@ -143,7 +141,9 @@ async function waitForMessage(
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error(`timed out waiting for lock child ${type}\n${child.stderr}`);
+      throw new Error(
+        `timed out waiting for lock child ${type}\n${child.stderr}`,
+      );
     }
     await new Promise<void>((resolveWait) => {
       const timer = setTimeout(() => {
@@ -159,10 +159,7 @@ async function waitForMessage(
   }
 }
 
-async function waitForExit(
-  child: LockChild,
-  timeoutMs = 2_000,
-): Promise<void> {
+async function waitForExit(child: LockChild, timeoutMs = 2_000): Promise<void> {
   if (child.exited) {
     return;
   }
@@ -190,9 +187,7 @@ afterEach(async () => {
   }
   await Promise.all(activeChildren.map((child) => waitForExit(child)));
   await Promise.all(
-    roots.splice(0).map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 

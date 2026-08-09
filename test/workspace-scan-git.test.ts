@@ -51,10 +51,12 @@ function targetScope(
     kind: "git",
     repositoryPrefix: "",
     ignoreCase,
-    gitignoreSources: [{
-      path: ".gitignore",
-      contentsBase64: Buffer.from(bytes).toString("base64"),
-    }],
+    gitignoreSources: [
+      {
+        path: ".gitignore",
+        contentsBase64: Buffer.from(bytes).toString("base64"),
+      },
+    ],
     infoExcludeBase64: "",
     globalExcludeBase64: "",
   });
@@ -214,10 +216,7 @@ describe("workspace scanner Git policy integration", () => {
     ]);
     expect(snapshot.scope).toMatchObject({
       kind: "git",
-      gitignoreSources: [
-        { path: ".gitignore" },
-        { path: "sub/.gitignore" },
-      ],
+      gitignoreSources: [{ path: ".gitignore" }, { path: "sub/.gitignore" }],
     });
   });
 
@@ -255,10 +254,12 @@ describe("workspace scanner Git policy integration", () => {
     ]);
     expect(snapshot.scope).toMatchObject({
       kind: "git",
-      gitignoreSources: [{
-        path: ".gitignore",
-        contentsBase64: Buffer.from(".gitignore\n").toString("base64"),
-      }],
+      gitignoreSources: [
+        {
+          path: ".gitignore",
+          contentsBase64: Buffer.from(".gitignore\n").toString("base64"),
+        },
+      ],
     });
   });
 
@@ -290,17 +291,18 @@ describe("workspace scanner Git policy integration", () => {
     await writeFile(join(root, "visible.txt"), "managed");
     const before = await directoryChangeTimes(root);
 
-    const snapshot = await withTemporaryDirectoryEnvironment(
-      root,
-      () => scanWorkspace(root),
+    const snapshot = await withTemporaryDirectoryEnvironment(root, () =>
+      scanWorkspace(root),
     );
 
     expect(snapshot.problems).toEqual([]);
     expect(pathsOf(snapshot)).toEqual([".gitignore", "visible.txt"]);
     expect(await directoryChangeTimes(root)).toEqual(before);
-    expect((await readdir(root)).some((name) =>
-      name.startsWith("cyclotomy-ignore-")
-    )).toBe(false);
+    expect(
+      (await readdir(root)).some((name) =>
+        name.startsWith("cyclotomy-ignore-"),
+      ),
+    ).toBe(false);
   });
 
   it("keeps a target scan read-only when TMPDIR is inside the workspace", async () => {
@@ -336,11 +338,11 @@ describe("workspace scanner Git policy integration", () => {
     const scratch = join(root, "scratch");
     await mkdir(scratch);
 
-    await expect(scanWorkspaceForScope(
-      root,
-      targetScope("ignored.txt\n"),
-      { gitIgnoreScratchParent: scratch },
-    )).rejects.toThrow(
+    await expect(
+      scanWorkspaceForScope(root, targetScope("ignored.txt\n"), {
+        gitIgnoreScratchParent: scratch,
+      }),
+    ).rejects.toThrow(
       "synthetic Git scratch parent is inside a forbidden root",
     );
     expect(await readdir(scratch)).toEqual([]);
@@ -379,14 +381,12 @@ describe("workspace scanner Git policy integration", () => {
     await writeFile(join(root, "foo"), "case probe");
     const policy = "foo\n!FOO\n";
 
-    expect(pathsOf(await scanWorkspaceForScope(
-      root,
-      targetScope(policy, false),
-    ))).toEqual([]);
-    expect(pathsOf(await scanWorkspaceForScope(
-      root,
-      targetScope(policy, true),
-    ))).toEqual(["foo"]);
+    expect(
+      pathsOf(await scanWorkspaceForScope(root, targetScope(policy, false))),
+    ).toEqual([]);
+    expect(
+      pathsOf(await scanWorkspaceForScope(root, targetScope(policy, true))),
+    ).toEqual(["foo"]);
   });
 
   it("binds the actual casing of a live .gitignore entry", async () => {
@@ -420,10 +420,12 @@ describe("workspace scanner Git policy integration", () => {
     expect(snapshot.scope).toMatchObject({
       kind: "git",
       ignoreCase: true,
-      gitignoreSources: [{
-        path: ".gitignore",
-        contentsBase64: Buffer.from(policy).toString("base64"),
-      }],
+      gitignoreSources: [
+        {
+          path: ".gitignore",
+          contentsBase64: Buffer.from(policy).toString("base64"),
+        },
+      ],
     });
   });
 
@@ -459,7 +461,10 @@ describe("workspace scanner Git policy integration", () => {
   it("archives non-UTF-8 policy bytes without interpreting them in JavaScript", async () => {
     const root = await temporaryWorkspace();
     await initializeRepository(root);
-    const policy = Buffer.concat([Buffer.from("ignored.txt\n"), Buffer.from([0xff, 0x0a])]);
+    const policy = Buffer.concat([
+      Buffer.from("ignored.txt\n"),
+      Buffer.from([0xff, 0x0a]),
+    ]);
     await writeFile(join(root, ".gitignore"), policy);
     await writeFile(join(root, "ignored.txt"), "ignored");
     await writeFile(join(root, "visible.txt"), "visible");
@@ -469,10 +474,12 @@ describe("workspace scanner Git policy integration", () => {
     expect(pathsOf(snapshot)).toEqual([".gitignore", "visible.txt"]);
     expect(snapshot.scope).toMatchObject({
       kind: "git",
-      gitignoreSources: [{
-        path: ".gitignore",
-        contentsBase64: policy.toString("base64"),
-      }],
+      gitignoreSources: [
+        {
+          path: ".gitignore",
+          contentsBase64: policy.toString("base64"),
+        },
+      ],
     });
   });
 

@@ -97,8 +97,7 @@ describe("real Pi integration", () => {
     const reported = pi.notifications.map(({ message }) => message).join("\n");
     expect(reported).toContain("~ a.txt");
     // A read-only preview must not touch files.
-    expect(await readFile(join(pi.workspace, "a.txt"), "utf8"))
-      .toBe("changed");
+    expect(await readFile(join(pi.workspace, "a.txt"), "utf8")).toBe("changed");
   });
 
   it("keeps files unchanged when the restore selector is cancelled", async () => {
@@ -114,8 +113,7 @@ describe("real Pi integration", () => {
     // Pi's real selector must offer the non-destructive option first.
     expect(pi.selections).toHaveLength(1);
     expect(pi.selections[0]!.options).toHaveLength(2);
-    expect(await readFile(join(pi.workspace, "a.txt"), "utf8"))
-      .toBe("current");
+    expect(await readFile(join(pi.workspace, "a.txt"), "utf8")).toBe("current");
   });
 
   it("restores the workspace when the destructive option is chosen", async () => {

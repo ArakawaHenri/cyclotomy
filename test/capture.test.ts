@@ -197,9 +197,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(
-      deps.metadata.getState("s1", "namespace-addition"),
-    ).toBeUndefined();
+    expect(deps.metadata.getState("s1", "namespace-addition")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -226,9 +224,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(
-      deps.metadata.getState("s1", "same-oid-path-drift"),
-    ).toBeUndefined();
+    expect(deps.metadata.getState("s1", "same-oid-path-drift")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -256,9 +252,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(
-      deps.metadata.getState("s1", "symlink-drift"),
-    ).toBeUndefined();
+    expect(deps.metadata.getState("s1", "symlink-drift")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -285,9 +279,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(
-      deps.metadata.getState("s1", "ignore-policy-drift"),
-    ).toBeUndefined();
+    expect(deps.metadata.getState("s1", "ignore-policy-drift")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -341,9 +333,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(
-      deps.metadata.getState("s1", "ignore-case-drift"),
-    ).toBeUndefined();
+    expect(deps.metadata.getState("s1", "ignore-case-drift")).toBeUndefined();
     deps.metadata.close();
   }, 15_000);
 
@@ -390,9 +380,7 @@ describe("captureNodeState", () => {
     const manifest = await deps.store.readTree(result.value.treeOid);
     const link = manifest.entries.find((entry) => entry.path === "link");
     expect(link).toMatchObject({ type: "symlink", target: "target.txt" });
-    const script = manifest.entries.find(
-      (entry) => entry.path === "run.sh",
-    );
+    const script = manifest.entries.find((entry) => entry.path === "run.sh");
     expect(script).toMatchObject({
       type: "regular",
       recreationMode: process.platform === "win32" ? null : 0o755,
@@ -414,9 +402,9 @@ describe("captureNodeState", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const manifest = await deps.store.readTree(result.value.treeOid);
-    expect(
-      manifest.entries.some((entry) => entry.path.includes(".git")),
-    ).toBe(false);
+    expect(manifest.entries.some((entry) => entry.path.includes(".git"))).toBe(
+      false,
+    );
     deps.metadata.close();
   });
 
@@ -446,11 +434,10 @@ describe("captureNodeState", () => {
 
   it("fails honestly when the workspace cannot be scanned", async () => {
     const deps = await openDeps();
-    const result = await captureNodeState(
-      deps,
-      join(root, "does-not-exist"),
-      { sessionId: "s1", entryId: "e1" },
-    );
+    const result = await captureNodeState(deps, join(root, "does-not-exist"), {
+      sessionId: "s1",
+      entryId: "e1",
+    });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.kind).toBe("scan-failed");

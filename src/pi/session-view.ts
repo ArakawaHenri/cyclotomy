@@ -25,9 +25,7 @@ export interface SessionView {
   navigationLandingId(entryId: string): string | null | undefined;
 }
 
-export function readSessionView(
-  context: ExtensionContext,
-): SessionView {
+export function readSessionView(context: ExtensionContext): SessionView {
   const manager = context.sessionManager;
   return {
     sessionId: manager.getSessionId(),

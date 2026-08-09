@@ -1,11 +1,5 @@
 import { constants, type Stats } from "node:fs";
-import {
-  mkdtemp,
-  open,
-  realpath,
-  rm,
-  type FileHandle,
-} from "node:fs/promises";
+import { mkdtemp, open, realpath, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 
@@ -71,17 +65,14 @@ function sameObservation(left: Stats, right: Stats): boolean {
 function isWithin(root: string, candidate: string): boolean {
   const pathFromRoot = relative(root, candidate);
   return (
-      pathFromRoot === "" ||
+    pathFromRoot === "" ||
     (!isAbsolute(pathFromRoot) &&
       pathFromRoot !== ".." &&
       !pathFromRoot.startsWith(`..${sep}`))
   );
 }
 
-async function readStagedFile(
-  path: string,
-  expected: Stats,
-): Promise<Buffer> {
+async function readStagedFile(path: string, expected: Stats): Promise<Buffer> {
   const handle = await open(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -97,9 +88,7 @@ async function readStagedFile(
     }
     const content = await handle.readFile();
     const after = await handle.stat();
-    if (
-      !sameObservation(before, after)
-    ) {
+    if (!sameObservation(before, after)) {
       throw new Error("staged blob changed while it was being read");
     }
     return content;
@@ -143,8 +132,8 @@ export async function stageBlobs(
   try {
     const [controlledRoots, stagingParent] = await Promise.all([
       Promise.all(
-        [options.workspaceRoot, ...(options.forbiddenRoots ?? [])].map(
-          (path) => realpath(path),
+        [options.workspaceRoot, ...(options.forbiddenRoots ?? [])].map((path) =>
+          realpath(path),
         ),
       ),
       realpath(options.stagingParent ?? tmpdir()),
@@ -154,9 +143,7 @@ export async function stageBlobs(
         `restore staging directory must be outside managed roots: ${stagingParent}`,
       );
     }
-    root = await mkdtemp(
-      join(stagingParent, "cyclotomy-restore-blobs-"),
-    );
+    root = await mkdtemp(join(stagingParent, "cyclotomy-restore-blobs-"));
   } catch (error) {
     throw new BlobStagingError(
       `cannot prepare private restore staging: ${

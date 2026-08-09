@@ -20,10 +20,9 @@ export class GarbageCollectionMarkError extends Error {
   readonly treeOid: string;
 
   constructor(treeOid: string, cause: unknown) {
-    super(
-      `refusing to sweep because rooted tree ${treeOid} is unreadable`,
-      { cause },
-    );
+    super(`refusing to sweep because rooted tree ${treeOid} is unreadable`, {
+      cause,
+    });
     this.name = "GarbageCollectionMarkError";
     this.treeOid = treeOid;
   }
@@ -88,10 +87,17 @@ async function observeRealDirectory(path: string): Promise<Stats | undefined> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return undefined;
     }
-    throw new GarbageCollectionNamespaceError(path, "cannot inspect directory", error);
+    throw new GarbageCollectionNamespaceError(
+      path,
+      "cannot inspect directory",
+      error,
+    );
   }
   if (info.isSymbolicLink() || !info.isDirectory()) {
-    throw new GarbageCollectionNamespaceError(path, "expected a real directory");
+    throw new GarbageCollectionNamespaceError(
+      path,
+      "expected a real directory",
+    );
   }
   return info;
 }
@@ -105,7 +111,10 @@ async function inventoryNamespace(
 ): Promise<readonly GcCandidate[]> {
   const storeRootStat = await observeRealDirectory(storeRoot);
   if (storeRootStat === undefined) {
-    throw new GarbageCollectionNamespaceError(storeRoot, "store root disappeared");
+    throw new GarbageCollectionNamespaceError(
+      storeRoot,
+      "store root disappeared",
+    );
   }
   const objectsRoot = join(storeRoot, "objects");
   const objectsRootStat = await observeRealDirectory(objectsRoot);
@@ -133,7 +142,11 @@ async function inventoryNamespace(
   try {
     shards = await readdir(namespace);
   } catch (error) {
-    throw new GarbageCollectionNamespaceError(namespace, "cannot list directory", error);
+    throw new GarbageCollectionNamespaceError(
+      namespace,
+      "cannot list directory",
+      error,
+    );
   }
   const candidates: GcCandidate[] = [];
   for (const shard of shards) {
@@ -161,20 +174,31 @@ async function inventoryNamespace(
     try {
       files = await readdir(shardDir);
     } catch (error) {
-      throw new GarbageCollectionNamespaceError(shardDir, "cannot list shard", error);
+      throw new GarbageCollectionNamespaceError(
+        shardDir,
+        "cannot list shard",
+        error,
+      );
     }
     for (const file of files) {
       const path = join(shardDir, file);
       const oid = `${shard}${file}`;
       const isTmp = TEMP_OBJECT.test(file);
       if (!isTmp && !HEX_64.test(oid)) {
-        throw new GarbageCollectionNamespaceError(path, "unexpected object name");
+        throw new GarbageCollectionNamespaceError(
+          path,
+          "unexpected object name",
+        );
       }
       let entryStat: Stats;
       try {
         entryStat = await lstat(path);
       } catch (error) {
-        throw new GarbageCollectionNamespaceError(path, "cannot inspect object", error);
+        throw new GarbageCollectionNamespaceError(
+          path,
+          "cannot inspect object",
+          error,
+        );
       }
       if (
         entryStat.isSymbolicLink() ||

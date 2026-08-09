@@ -103,8 +103,9 @@ describe("Pi runtime replacement", () => {
     db.close();
     await pi.endTurn();
     db = metadata();
-    expect(db.getState(pi.manager.sessionId, pi.manager.getLeafId()!))
-      .toBeDefined();
+    expect(
+      db.getState(pi.manager.sessionId, pi.manager.getLeafId()!),
+    ).toBeDefined();
     db.close();
   });
 
@@ -120,8 +121,9 @@ describe("Pi runtime replacement", () => {
     await pi.endTurn();
     const disabledLeaf = pi.manager.getLeafId()!;
 
-    expect(pi.notifications.some(({ message }) => message.includes("/reload")))
-      .toBe(true);
+    expect(
+      pi.notifications.some(({ message }) => message.includes("/reload")),
+    ).toBe(true);
     // The disabled runtime must not have created the hashed store at all.
     expect(() => metadata()).toThrow();
 
@@ -137,8 +139,9 @@ describe("Pi runtime replacement", () => {
     await pi.endTurn();
     const db = metadata();
     expect(db.getState(pi.manager.sessionId, disabledLeaf)).toBeUndefined();
-    expect(db.getState(pi.manager.sessionId, pi.manager.getLeafId()!))
-      .toBeDefined();
+    expect(
+      db.getState(pi.manager.sessionId, pi.manager.getLeafId()!),
+    ).toBeDefined();
     db.close();
   });
 
@@ -194,8 +197,9 @@ describe("Pi runtime replacement", () => {
 
     const db = metadata();
     expect(db.getState(sourceSession, first)).toEqual(sourceState);
-    expect(db.getState(pi.manager.sessionId, pi.manager.getLeafId()!)?.treeOid)
-      .not.toBe(sourceState?.treeOid);
+    expect(
+      db.getState(pi.manager.sessionId, pi.manager.getLeafId()!)?.treeOid,
+    ).not.toBe(sourceState?.treeOid);
     db.close();
   });
 

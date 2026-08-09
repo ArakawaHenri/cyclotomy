@@ -33,11 +33,11 @@ pi remove npm:cyclotomy
 
 ## Three commands, zero arguments
 
-| Command | Purpose |
-| --- | --- |
-| `/tree` | Move through Pi's session tree. If the workspace needs to change, Cyclotomy previews the restore and asks first. |
-| `/drift` | Check what running `/restore` right now would change. Read-only. |
-| `/restore` | Reapply the current node's exact or inherited checkpoint. |
+| Command    | Purpose                                                                                                          |
+| ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| `/tree`    | Move through Pi's session tree. If the workspace needs to change, Cyclotomy previews the restore and asks first. |
+| `/drift`   | Check what running `/restore` right now would change. Read-only.                                                 |
+| `/restore` | Reapply the current node's exact or inherited checkpoint.                                                        |
 
 `/tree` belongs to Pi; Cyclotomy adds `/drift` and `/restore`. All three are
 used without arguments.
@@ -165,17 +165,17 @@ Configuration is optional. Global settings live at
 }
 ```
 
-| Setting | Scope | Default | Meaning |
-| --- | --- | ---: | --- |
-| `storageDir` | global | `<agent-dir>/cyclotomy` | Parent of the hashed workspace stores. Relative paths resolve from the Pi agent directory; `~` and `~/...` from the home directory. |
-| `maxFileMiB` | global/workspace | `50` | Maximum size of one regular file. |
-| `maxSnapshotMiB` | global/workspace | `2048` | Maximum cumulative bytes in one workspace observation. |
-| `maxEntries` | global/workspace | `100000` | Maximum entries observed in one scan. Hard maximum: `1000000`. |
-| `maxManifestMiB` | global/workspace | `64` | Maximum encoded tree manifest, including ignore policy. Hard maximum: `256`. |
-| `lockTimeoutMs` | global/workspace | `5000` | Workspace-lock timeout. |
-| `gc.intervalMs` | global/workspace | `86400000` | Minimum interval between automatic GC runs; `0` disables them. |
-| `gc.sessionRetentionMs` | global/workspace | `2592000000` | Retention period for persistently deleted Pi sessions. |
-| `locale` | global | `auto` | `auto`, `en`, or `zh-CN`. |
+| Setting                 | Scope            |                 Default | Meaning                                                                                                                             |
+| ----------------------- | ---------------- | ----------------------: | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `storageDir`            | global           | `<agent-dir>/cyclotomy` | Parent of the hashed workspace stores. Relative paths resolve from the Pi agent directory; `~` and `~/...` from the home directory. |
+| `maxFileMiB`            | global/workspace |                    `50` | Maximum size of one regular file.                                                                                                   |
+| `maxSnapshotMiB`        | global/workspace |                  `2048` | Maximum cumulative bytes in one workspace observation.                                                                              |
+| `maxEntries`            | global/workspace |                `100000` | Maximum entries observed in one scan. Hard maximum: `1000000`.                                                                      |
+| `maxManifestMiB`        | global/workspace |                    `64` | Maximum encoded tree manifest, including ignore policy. Hard maximum: `256`.                                                        |
+| `lockTimeoutMs`         | global/workspace |                  `5000` | Workspace-lock timeout.                                                                                                             |
+| `gc.intervalMs`         | global/workspace |              `86400000` | Minimum interval between automatic GC runs; `0` disables them.                                                                      |
+| `gc.sessionRetentionMs` | global/workspace |            `2592000000` | Retention period for persistently deleted Pi sessions.                                                                              |
+| `locale`                | global           |                  `auto` | `auto`, `en`, or `zh-CN`.                                                                                                           |
 
 Per-workspace overrides live at
 `<storageDir>/<sha256(realpath(workspace))>/settings.json`; `storageDir` and
@@ -192,13 +192,13 @@ agent directory and Cyclotomy's default storage root.
 
 ## Compatibility
 
-| Area | Supported contract |
-| --- | --- |
-| Node.js | `>=24.15.0` |
-| Pi Coding Agent | `>=0.84.0`; verified against `0.84.1`, with a latest-Pi compatibility probe in CI. |
-| Git | Git worktrees require a `git` executable with `check-ignore --no-index -z -v -n --stdin`. |
-| Platforms | Linux, macOS, and Windows. Windows symlinks require the corresponding OS permissions and a known target kind. |
-| Filesystems | Local filesystems with stable identities and atomic same-directory rename. Network/shared stores, hard-linked managed files, mount points inside the workspace, and unsupported reparse behavior are outside the supported contract. |
+| Area            | Supported contract                                                                                                                                                                                                                   |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Node.js         | `>=24.15.0`                                                                                                                                                                                                                          |
+| Pi Coding Agent | `>=0.84.0`; verified against `0.84.1`, with a latest-Pi compatibility probe in CI.                                                                                                                                                   |
+| Git             | Git worktrees require a `git` executable with `check-ignore --no-index -z -v -n --stdin`.                                                                                                                                            |
+| Platforms       | Linux, macOS, and Windows. Windows symlinks require the corresponding OS permissions and a known target kind.                                                                                                                        |
+| Filesystems     | Local filesystems with stable identities and atomic same-directory rename. Network/shared stores, hard-linked managed files, mount points inside the workspace, and unsupported reparse behavior are outside the supported contract. |
 
 ## Development
 

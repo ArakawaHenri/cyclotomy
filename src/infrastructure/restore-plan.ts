@@ -59,10 +59,7 @@ function nonDirectoryTargetAtOrAbove(
   return nonDirectoryTargetAncestor(path, targetByPath);
 }
 
-function ancestorDirectories(
-  path: string,
-  into: Set<string>,
-): void {
+function ancestorDirectories(path: string, into: Set<string>): void {
   let separator = path.lastIndexOf("/");
   while (separator !== -1) {
     const ancestor = path.slice(0, separator);
@@ -116,7 +113,8 @@ export function planWorkspaceRestore(
     problems.push({
       path: ".",
       kind: "scope-mismatch",
-      detail: "current inventory was not scanned through the target workspace scope",
+      detail:
+        "current inventory was not scanned through the target workspace scope",
     });
   }
 
@@ -131,16 +129,10 @@ export function planWorkspaceRestore(
         deleted.push(entry.path);
       }
     } else if (entry.kind === "regular") {
-      if (
-        wanted.type !== "regular" ||
-        wanted.blobOid !== entry.sha256
-      ) {
+      if (wanted.type !== "regular" || wanted.blobOid !== entry.sha256) {
         modified.push(entry.path);
       }
-    } else if (
-      wanted.type !== "symlink" ||
-      wanted.target !== entry.target
-    ) {
+    } else if (wanted.type !== "symlink" || wanted.target !== entry.target) {
       modified.push(entry.path);
     }
   }
@@ -150,12 +142,11 @@ export function planWorkspaceRestore(
     ancestorDirectories(entry.path, targetImplicitDirectories);
   }
   for (const occupancy of current.excludedOccupancies) {
-    const targetPath = nonDirectoryTargetAtOrAbove(
-      occupancy.path,
-      targetByPath,
-    ) ?? (targetImplicitDirectories.has(occupancy.path)
-      ? occupancy.path
-      : undefined);
+    const targetPath =
+      nonDirectoryTargetAtOrAbove(occupancy.path, targetByPath) ??
+      (targetImplicitDirectories.has(occupancy.path)
+        ? occupancy.path
+        : undefined);
     if (targetPath !== undefined) {
       addScopeBlocker(occupancy.path, targetPath);
     }
@@ -164,16 +155,14 @@ export function planWorkspaceRestore(
   const expectedOccupancies = comparisonOccupancies(target);
   if (expectedOccupancies !== undefined) {
     const currentKinds = new Map(
-      current.excludedOccupancies.map((occupancy) => [
-        occupancy.path,
-        occupancy.kind,
-      ] as const),
+      current.excludedOccupancies.map(
+        (occupancy) => [occupancy.path, occupancy.kind] as const,
+      ),
     );
     const expectedKinds = new Map(
-      expectedOccupancies.map((occupancy) => [
-        occupancy.path,
-        occupancy.kind,
-      ] as const),
+      expectedOccupancies.map(
+        (occupancy) => [occupancy.path, occupancy.kind] as const,
+      ),
     );
     const paths = new Set([...currentKinds.keys(), ...expectedKinds.keys()]);
     for (const path of paths) {
@@ -188,10 +177,7 @@ export function planWorkspaceRestore(
     if (!currentByPath.has(entry.path)) created.push(entry.path);
     if (entry.type !== "regular") continue;
     const observed = currentByPath.get(entry.path);
-    if (
-      observed?.kind !== "regular" ||
-      observed.sha256 !== entry.blobOid
-    ) {
+    if (observed?.kind !== "regular" || observed.sha256 !== entry.blobOid) {
       requiredBlobOids.add(entry.blobOid);
     }
   }
@@ -244,9 +230,10 @@ export function workspaceSnapshotAsManifest(
             symlinkKind: entry.symlinkKind,
           },
     ),
-    excludedOccupancies: snapshot.excludedOccupancies.map(
-      ({ path, kind }) => ({ path, kind }),
-    ),
+    excludedOccupancies: snapshot.excludedOccupancies.map(({ path, kind }) => ({
+      path,
+      kind,
+    })),
     scope: snapshot.scope,
   };
 }

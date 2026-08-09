@@ -40,10 +40,7 @@ export type CaptureError =
       readonly problems: readonly ScanProblem[];
     }
   | {
-      readonly kind: Exclude<
-        CaptureErrorKind,
-        "scan-incomplete"
-      >;
+      readonly kind: Exclude<CaptureErrorKind, "scan-incomplete">;
       readonly message: string;
     };
 

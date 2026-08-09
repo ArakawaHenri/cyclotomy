@@ -28,12 +28,14 @@
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
     "test": "vitest run",
     "test:package": "node scripts/package-smoke.mjs",
     "test:performance": "vitest run test/scan-publication-performance.test.ts --reporter=verbose",
     "test:real-pi": "vitest run test/real-pi-integration.test.ts",
     "test:watch": "vitest",
-    "verify": "npm run check && npm test",
+    "verify": "npm run format:check && npm run check && npm test",
     "prepublishOnly": "npm run verify && npm run test:package"
   },
   "pi": {
@@ -47,6 +49,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.1",
     "@types/node": "24.12.4",
+    "prettier": "3.9.6",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
   }

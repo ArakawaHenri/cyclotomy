@@ -74,8 +74,7 @@ export interface ExcludedWorkspaceOccupancy {
 }
 
 /** Ephemeral identity proof attached by the real scanner. */
-export interface ExcludedWorkspaceObservation
-  extends ExcludedWorkspaceOccupancy {
+export interface ExcludedWorkspaceObservation extends ExcludedWorkspaceOccupancy {
   readonly dev: number;
   readonly ino: number;
 }
@@ -178,9 +177,7 @@ const DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024 ** 3;
 // --- path and entry helpers ------------------------------------------------
 
 function isGitComponent(name: string): boolean {
-  return (
-    name.normalize("NFC").toLocaleLowerCase("en-US") === ".git"
-  );
+  return name.normalize("NFC").toLocaleLowerCase("en-US") === ".git";
 }
 
 function canonicalPathKey(path: string): string {
@@ -188,10 +185,7 @@ function canonicalPathKey(path: string): string {
 }
 
 function comparePathBytes(left: string, right: string): number {
-  return Buffer.compare(
-    Buffer.from(left, "utf8"),
-    Buffer.from(right, "utf8"),
-  );
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function errorDetail(cause: unknown): string {
@@ -206,9 +200,7 @@ function unsupportedType(stat: Stats): string {
   return "unknown";
 }
 
-function excludedKind(
-  stat: Stats,
-): ExcludedWorkspaceObservation["kind"] {
+function excludedKind(stat: Stats): ExcludedWorkspaceObservation["kind"] {
   if (stat.isDirectory()) return "directory";
   if (stat.isSymbolicLink()) return "symlink";
   if (stat.isFile()) return "regular";
@@ -242,13 +234,18 @@ function entriesEqual(
       return false;
     }
     if (entry.kind === "regular" && candidate.kind === "regular") {
-      return entry.byteLength === candidate.byteLength &&
+      return (
+        entry.byteLength === candidate.byteLength &&
         entry.sha256 === candidate.sha256 &&
-        entry.recreationMode === candidate.recreationMode;
+        entry.recreationMode === candidate.recreationMode
+      );
     }
-    return entry.kind === "symlink" && candidate.kind === "symlink" &&
+    return (
+      entry.kind === "symlink" &&
+      candidate.kind === "symlink" &&
       entry.target === candidate.target &&
-      entry.symlinkKind === candidate.symlinkKind;
+      entry.symlinkKind === candidate.symlinkKind
+    );
   });
 }
 
@@ -256,25 +253,35 @@ function excludedOccupanciesEqual(
   left: readonly ExcludedWorkspaceObservation[],
   right: readonly ExcludedWorkspaceObservation[],
 ): boolean {
-  return left.length === right.length && left.every((entry, index) => {
-    const candidate = right[index];
-    return candidate !== undefined &&
-      entry.path === candidate.path &&
-      entry.kind === candidate.kind;
-  });
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => {
+      const candidate = right[index];
+      return (
+        candidate !== undefined &&
+        entry.path === candidate.path &&
+        entry.kind === candidate.kind
+      );
+    })
+  );
 }
 
 function directoryObservationsEqual(
   left: readonly DirectoryObservation[],
   right: readonly DirectoryObservation[],
 ): boolean {
-  return left.length === right.length && left.every((entry, index) => {
-    const candidate = right[index];
-    return candidate !== undefined &&
-      entry.path === candidate.path &&
-      entry.dev === candidate.dev &&
-      entry.ino === candidate.ino;
-  });
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => {
+      const candidate = right[index];
+      return (
+        candidate !== undefined &&
+        entry.path === candidate.path &&
+        entry.dev === candidate.dev &&
+        entry.ino === candidate.ino
+      );
+    })
+  );
 }
 
 /** Stable equality for a scan followed by its final validation scan. */
@@ -282,7 +289,8 @@ export function workspaceSnapshotsEqual(
   left: WorkspaceSnapshot,
   right: WorkspaceSnapshot,
 ): boolean {
-  return left.rootPath === right.rootPath &&
+  return (
+    left.rootPath === right.rootPath &&
     workspaceScopesEqual(left.scope, right.scope) &&
     entriesEqual(left.entries, right.entries) &&
     excludedOccupanciesEqual(
@@ -292,7 +300,8 @@ export function workspaceSnapshotsEqual(
     directoryObservationsEqual(
       left.directoryObservations,
       right.directoryObservations,
-    );
+    )
+  );
 }
 
 function treeEntryForManifestEstimate(entry: WorkspaceEntry): TreeEntry {
@@ -353,12 +362,7 @@ async function hashFileHandle(
   const buffer = Buffer.allocUnsafe(64 * 1024);
   let position = 0;
   while (true) {
-    const result = await handle.read(
-      buffer,
-      0,
-      buffer.byteLength,
-      position,
-    );
+    const result = await handle.read(buffer, 0, buffer.byteLength, position);
     if (result.bytesRead === 0) {
       break;
     }
@@ -443,32 +447,22 @@ async function scanWorkspaceWithScope(
     // symlink.
     workspaceRoot = await realpath(requestedRoot);
   } catch (cause) {
-    throw new ScanError(
-      `workspace root is not readable: ${root}`,
-      { cause },
-    );
+    throw new ScanError(`workspace root is not readable: ${root}`, { cause });
   }
   let rootStat: Stats;
   try {
     rootStat = await lstat(workspaceRoot);
   } catch (cause) {
-    throw new ScanError(
-      `workspace root is not readable: ${root}`,
-      { cause },
-    );
+    throw new ScanError(`workspace root is not readable: ${root}`, { cause });
   }
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new ScanError(
-      `workspace root is not a real directory: ${root}`,
-    );
+    throw new ScanError(`workspace root is not a real directory: ${root}`);
   }
-  const discovery = targetScope === undefined
-    ? await discoverWorkspaceScope(workspaceRoot)
-    : undefined;
-  if (
-    discovery !== undefined &&
-    discovery.workspaceRoot !== workspaceRoot
-  ) {
+  const discovery =
+    targetScope === undefined
+      ? await discoverWorkspaceScope(workspaceRoot)
+      : undefined;
+  if (discovery !== undefined && discovery.workspaceRoot !== workspaceRoot) {
     throw new ScanError("Git discovery changed the canonical workspace root");
   }
   const initialScope = targetScope ?? discovery!.scope;
@@ -479,9 +473,10 @@ async function scanWorkspaceWithScope(
       ? {}
       : { scratchParent: options.gitIgnoreScratchParent }),
   };
-  const oracle = targetScope === undefined
-    ? await createLiveGitIgnoreOracle(workspaceRoot, initialScope)
-    : await createSyntheticGitIgnoreOracle(initialScope, syntheticScratch);
+  const oracle =
+    targetScope === undefined
+      ? await createLiveGitIgnoreOracle(workspaceRoot, initialScope)
+      : await createSyntheticGitIgnoreOracle(initialScope, syntheticScratch);
 
   const entries: WorkspaceEntry[] = [];
   const excludedOccupancies: ExcludedWorkspaceObservation[] = [];
@@ -529,7 +524,9 @@ async function scanWorkspaceWithScope(
       const batch = queries.slice(offset, offset + 2_048);
       const managed = await oracle.managed(batch);
       if (managed.length !== batch.length) {
-        throw new ScanError("Git ignore oracle returned the wrong result count");
+        throw new ScanError(
+          "Git ignore oracle returned the wrong result count",
+        );
       }
       results.push(...managed);
       if (discovery?.scope.kind === "git") {
@@ -579,16 +576,19 @@ async function scanWorkspaceWithScope(
     });
     reachedDirectories.push(relativeDirectory);
 
-    const loadedIgnore = discovery?.scope.kind === "git"
-      ? await readWorkspaceGitignoreSource(discovery, relativeDirectory)
-      : undefined;
+    const loadedIgnore =
+      discovery?.scope.kind === "git"
+        ? await readWorkspaceGitignoreSource(discovery, relativeDirectory)
+        : undefined;
     if (loadedIgnore !== undefined) {
       const existing = policySources.get(loadedIgnore.path);
       if (
         existing !== undefined &&
         existing.contentsBase64 !== loadedIgnore.contentsBase64
       ) {
-        throw new ScanError("Git ignore policy changed while it was discovered");
+        throw new ScanError(
+          "Git ignore policy changed while it was discovered",
+        );
       }
       policyBudget.upsertGitignoreSource(loadedIgnore);
       policySources.set(loadedIgnore.path, loadedIgnore);
@@ -642,9 +642,7 @@ async function scanWorkspaceWithScope(
         continue;
       }
       const relativePath =
-        relativeDirectory === ""
-          ? name
-          : `${relativeDirectory}/${name}`;
+        relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
       const absolutePath = join(absoluteDirectory, name);
       let stat: Stats;
       try {
@@ -660,10 +658,12 @@ async function scanWorkspaceWithScope(
       candidates.push({ relativePath, absolutePath, stat });
     }
 
-    const managed = await classify(candidates.map(({ relativePath, stat }) => ({
-      path: relativePath,
-      isDirectory: stat.isDirectory(),
-    })));
+    const managed = await classify(
+      candidates.map(({ relativePath, stat }) => ({
+        path: relativePath,
+        isDirectory: stat.isDirectory(),
+      })),
+    );
     for (let index = 0; index < candidates.length; index += 1) {
       const candidate = candidates[index]!;
       const { relativePath, absolutePath, stat } = candidate;
@@ -731,9 +731,7 @@ async function scanWorkspaceWithScope(
           let symlinkKind: SymlinkKind | null = null;
           try {
             const targetMetadata = await statPath(absolutePath);
-            symlinkKind = targetMetadata.isDirectory()
-              ? "directory"
-              : "file";
+            symlinkKind = targetMetadata.isDirectory() ? "directory" : "file";
           } catch {
             if (process.platform === "win32") {
               problems.push({
@@ -797,9 +795,7 @@ async function scanWorkspaceWithScope(
         try {
           const before = await handle.stat();
           if (!before.isFile() || !sameFileObservation(stat, before)) {
-            throw new Error(
-              "entry changed before it could be read safely",
-            );
+            throw new Error("entry changed before it could be read safely");
           }
           if (before.size > maxFileBytes) {
             problems.push({
@@ -857,9 +853,7 @@ async function scanWorkspaceWithScope(
     await oracle.close();
   }
 
-  entries.sort((left, right) =>
-    comparePathBytes(left.path, right.path),
-  );
+  entries.sort((left, right) => comparePathBytes(left.path, right.path));
   excludedOccupancies.sort((left, right) =>
     comparePathBytes(left.path, right.path),
   );
@@ -870,16 +864,25 @@ async function scanWorkspaceWithScope(
   if (discovery !== undefined) {
     const rediscovered = await discoverWorkspaceScope(workspaceRoot);
     if (!workspaceScopesEqual(discovery.scope, rediscovered.scope)) {
-      throw new ScanError("Git ignore policy changed while the workspace was scanned");
+      throw new ScanError(
+        "Git ignore policy changed while the workspace was scanned",
+      );
     }
     if (discovery.scope.kind === "git") {
       if (rediscovered.scope.kind !== "git") {
-        throw new ScanError("Git worktree disappeared while the workspace was scanned");
+        throw new ScanError(
+          "Git worktree disappeared while the workspace was scanned",
+        );
       }
       const finalSources = new Map<string, WorkspaceGitignoreSource>(
-        rediscovered.scope.gitignoreSources.map((source) => [source.path, source]),
+        rediscovered.scope.gitignoreSources.map((source) => [
+          source.path,
+          source,
+        ]),
       );
-      const finalPolicyBudget = new WorkspaceGitPolicyBudget(rediscovered.scope);
+      const finalPolicyBudget = new WorkspaceGitPolicyBudget(
+        rediscovered.scope,
+      );
       for (const directory of reachedDirectories) {
         const source = await readWorkspaceGitignoreSource(
           rediscovered,
@@ -899,7 +902,9 @@ async function scanWorkspaceWithScope(
         gitignoreSources: [...finalSources.values()],
       });
       if (!workspaceScopesEqual(observedScope, finalScope)) {
-        throw new ScanError("Git ignore policy changed while the workspace was scanned");
+        throw new ScanError(
+          "Git ignore policy changed while the workspace was scanned",
+        );
       }
       scope = finalScope;
 
@@ -916,7 +921,9 @@ async function scanWorkspaceWithScope(
           const actual = await replay.managed(expected);
           if (
             actual.length !== expected.length ||
-            actual.some((managed, index) => managed !== expected[index]!.managed)
+            actual.some(
+              (managed, index) => managed !== expected[index]!.managed,
+            )
           ) {
             throw new ScanError(
               "archived Git policy does not reproduce the live workspace boundary",

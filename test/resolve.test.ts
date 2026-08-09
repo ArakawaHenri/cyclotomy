@@ -50,12 +50,14 @@ describe("resolveReadableNodeState", () => {
   it("rejects cycles instead of disguising them as missing state", async () => {
     const a = node("s", "a");
     const b = node("s", "b");
-    await expect(resolveReadableNodeState(
-      a,
-      (key) => (nodeToken(key) === nodeToken(a) ? b : a),
-      noState,
-      async () => {},
-    )).rejects.toMatchObject({
+    await expect(
+      resolveReadableNodeState(
+        a,
+        (key) => (nodeToken(key) === nodeToken(a) ? b : a),
+        noState,
+        async () => {},
+      ),
+    ).rejects.toMatchObject({
       name: "ResolutionTraversalError",
       reason: "cycle",
     });
@@ -69,13 +71,15 @@ describe("resolveReadableNodeState", () => {
     const getState = vi.fn((key: NodeKey) =>
       nodeToken(key) === nodeToken(beyond) ? state : undefined,
     );
-    await expect(resolveReadableNodeState(
-      node("s", "a"),
-      parentOf,
-      getState,
-      async () => {},
-      { maxHops: 3 },
-    )).rejects.toMatchObject({
+    await expect(
+      resolveReadableNodeState(
+        node("s", "a"),
+        parentOf,
+        getState,
+        async () => {},
+        { maxHops: 3 },
+      ),
+    ).rejects.toMatchObject({
       name: "ResolutionTraversalError",
       reason: "hop-limit",
     });
@@ -99,27 +103,27 @@ describe("resolveReadableNodeState", () => {
       }
     };
 
-    await expect(resolveReadableNodeState(
-      a,
-      parentOf,
-      noState,
-      async () => {},
-      { maxHops: 3 },
-    )).resolves.toBeUndefined();
+    await expect(
+      resolveReadableNodeState(a, parentOf, noState, async () => {}, {
+        maxHops: 3,
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it("surfaces unknown ancestry entries instead of accepting their metadata", async () => {
     const leaf = node("s", "leaf");
     const missingParent = node("s", "missing-parent");
-    await expect(resolveReadableNodeState(
-      leaf,
-      (key) => {
-        if (key.entryId === "leaf") return missingParent;
-        throw new ResolutionTraversalError("unknown-node", key.entryId);
-      },
-      stateLookup([[missingParent, state]]),
-      async () => {},
-    )).rejects.toMatchObject({
+    await expect(
+      resolveReadableNodeState(
+        leaf,
+        (key) => {
+          if (key.entryId === "leaf") return missingParent;
+          throw new ResolutionTraversalError("unknown-node", key.entryId);
+        },
+        stateLookup([[missingParent, state]]),
+        async () => {},
+      ),
+    ).rejects.toMatchObject({
       name: "ResolutionTraversalError",
       reason: "unknown-node",
     });
@@ -130,36 +134,38 @@ describe("resolveReadableNodeState", () => {
     const leafState: NodeState = {
       treeOid: "b".repeat(64),
     };
-    await expect(resolveReadableNodeState(
-      leaf,
-      (key) =>
-        nodeToken(key) === nodeToken(leaf) ? parent : undefined,
-      stateLookup([
-        [leaf, leafState],
-        [parent, state],
-      ]),
-      async (candidate) => {
-        if (candidate.treeOid === leafState.treeOid) {
-          throw new Error("missing tree");
-        }
-      },
-    )).rejects.toThrow("missing tree");
+    await expect(
+      resolveReadableNodeState(
+        leaf,
+        (key) => (nodeToken(key) === nodeToken(leaf) ? parent : undefined),
+        stateLookup([
+          [leaf, leafState],
+          [parent, state],
+        ]),
+        async (candidate) => {
+          if (candidate.treeOid === leafState.treeOid) {
+            throw new Error("missing tree");
+          }
+        },
+      ),
+    ).rejects.toThrow("missing tree");
   });
 
   it("surfaces corrupt metadata lookup instead of walking past it", async () => {
     const leaf = node("s", "leaf");
     const parent = node("s", "parent");
-    await expect(resolveReadableNodeState(
-      leaf,
-      (key) =>
-        nodeToken(key) === nodeToken(leaf) ? parent : undefined,
-      (key) => {
-        if (nodeToken(key) === nodeToken(leaf)) {
-          throw new Error("bad oid");
-        }
-        return state;
-      },
-      async () => {},
-    )).rejects.toThrow("bad oid");
+    await expect(
+      resolveReadableNodeState(
+        leaf,
+        (key) => (nodeToken(key) === nodeToken(leaf) ? parent : undefined),
+        (key) => {
+          if (nodeToken(key) === nodeToken(leaf)) {
+            throw new Error("bad oid");
+          }
+          return state;
+        },
+        async () => {},
+      ),
+    ).rejects.toThrow("bad oid");
   });
 });

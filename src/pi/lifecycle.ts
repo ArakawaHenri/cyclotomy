@@ -6,10 +6,7 @@ import type {
 import type { NodeKey } from "../domain/model.ts";
 import { notifyRestoreOutcome } from "./restore-outcome.ts";
 import { registerNavigationLifecycle } from "./navigation-lifecycle.ts";
-import {
-  CyclotomyRuntime,
-  messageOf,
-} from "./runtime.ts";
+import { CyclotomyRuntime, messageOf } from "./runtime.ts";
 import { runConfirmedRestore } from "./confirmed-restore.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 
@@ -91,13 +88,11 @@ async function captureSourceOrCancel(
         detail = "active location changed during source capture";
         return false;
       }
-      const committed = await runtime.commitPreparedCapture(
-        {
-          source: node,
-          prepared: prepared.value,
-          expectedTreeOid,
-        },
-      );
+      const committed = await runtime.commitPreparedCapture({
+        source: node,
+        prepared: prepared.value,
+        expectedTreeOid,
+      });
       if (!committed.ok) detail = committed.error.message;
       return committed.ok;
     })
@@ -121,7 +116,6 @@ async function captureSourceOrCancel(
   }
   return captured;
 }
-
 
 async function reconcileLoadedSession(
   runtime: CyclotomyRuntime,
@@ -161,7 +155,9 @@ async function reconcileLoadedSession(
           // reacquired. Re-resolve the complete ancestry before publishing a
           // first-observed state; structural errors and unreadable candidates
           // throw and therefore remain fail-closed.
-          if (await runtime.resolveReadableTreeIn(view, anchor) !== undefined) {
+          if (
+            (await runtime.resolveReadableTreeIn(view, anchor)) !== undefined
+          ) {
             return { kind: "target-changed" as const };
           }
           const prepared = await runtime.prepareCaptureResult(view);
@@ -177,11 +173,7 @@ async function reconcileLoadedSession(
           ) {
             return { kind: "location-changed" as const };
           }
-          if (!runtime.resolutionStillAuthoritative(
-            view,
-            anchor,
-            undefined,
-          )) {
+          if (!runtime.resolutionStillAuthoritative(view, anchor, undefined)) {
             return { kind: "target-changed" as const };
           }
           const committed = await runtime.commitPreparedCapture({
@@ -220,11 +212,7 @@ async function reconcileLoadedSession(
           );
           break;
         case "capture-failed":
-          runtime.notifyCaptureResult(
-            context,
-            false,
-            initialized.message,
-          );
+          runtime.notifyCaptureResult(context, false, initialized.message);
           break;
       }
       return;
@@ -283,11 +271,7 @@ async function reconcileLoadedSession(
       );
       break;
     case "outcome":
-      notifyRestoreOutcome(
-        runtime,
-        context,
-        result.outcome,
-      );
+      notifyRestoreOutcome(runtime, context, result.outcome);
       break;
   }
 }
@@ -656,10 +640,7 @@ export function registerCyclotomyLifecycle(
     try {
       view = readSessionView(context);
       if (!runtime.sessionIsUsable(view)) return undefined;
-      if (
-        !context.isIdle() ||
-        !runtime.transitions.tryBegin("switch")
-      ) {
+      if (!context.isIdle() || !runtime.transitions.tryBegin("switch")) {
         runtime.notify(
           context,
           runtime.i18n.t("transitionInProgress"),

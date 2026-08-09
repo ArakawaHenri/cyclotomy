@@ -1,11 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import {
-  lstatSync,
-  realpathSync,
-  renameSync,
-  symlinkSync,
-} from "node:fs";
+import { lstatSync, realpathSync, renameSync, symlinkSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -25,14 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApplyError,
@@ -51,10 +39,7 @@ import {
   type WorkspaceSnapshot,
 } from "../src/infrastructure/workspace-scan.ts";
 import { planWorkspaceRestore } from "../src/infrastructure/restore-plan.ts";
-import {
-  ALL_MANAGED_SCOPE,
-  gitScope,
-} from "./workspace-scope-fixture.ts";
+import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const encoder = new TextEncoder();
 const execFileAsync = promisify(execFile);
@@ -81,10 +66,7 @@ function regularWorkspaceEntry(
   };
 }
 
-function symlinkWorkspaceEntry(
-  path: string,
-  target: string,
-): WorkspaceEntry {
+function symlinkWorkspaceEntry(path: string, target: string): WorkspaceEntry {
   return { path, kind: "symlink", target, symlinkKind: null };
 }
 
@@ -193,15 +175,15 @@ describe("applyTreeToWorkspace", () => {
     });
     const unmanaged = await lstat(join(root, "a", "b"));
     const current: WorkspaceSnapshot = {
-      ...snapshot([
-        regularWorkspaceEntry(".gitignore", ""),
-      ]),
-      excludedOccupancies: [{
-        path: "a/b",
-        kind: "regular",
-        dev: unmanaged.dev,
-        ino: unmanaged.ino,
-      }],
+      ...snapshot([regularWorkspaceEntry(".gitignore", "")]),
+      excludedOccupancies: [
+        {
+          path: "a/b",
+          kind: "regular",
+          dev: unmanaged.dev,
+          ino: unmanaged.ino,
+        },
+      ],
       scope: targetScope,
     };
     const target: TreeManifest = {
@@ -259,49 +241,47 @@ describe("applyTreeToWorkspace", () => {
       blockerPath: "p",
       targetPath: "p",
     },
-  ])("preflights $name before every mutation", async ({
-    policy,
-    seed,
-    targetEntry,
-    blockerPath,
-    targetPath,
-  }) => {
-    await writeFile(join(root, ".gitignore"), policy);
-    await writeFile(join(root, "delete-me"), "must survive preflight");
-    await seed();
-    const scope = gitScope({
-      gitignoreSources: [{ path: ".gitignore", contents: policy }],
-    });
-    const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
-      entries: [
-        regularTarget(".gitignore", policy),
-        targetEntry(),
-      ],
-      scope,
-    };
-    const current = await scanWorkspaceForScope(root, scope);
+  ])(
+    "preflights $name before every mutation",
+    async ({ policy, seed, targetEntry, blockerPath, targetPath }) => {
+      await writeFile(join(root, ".gitignore"), policy);
+      await writeFile(join(root, "delete-me"), "must survive preflight");
+      await seed();
+      const scope = gitScope({
+        gitignoreSources: [{ path: ".gitignore", contents: policy }],
+      });
+      const target: TreeManifest = {
+        format: TREE_MANIFEST_FORMAT,
+        entries: [regularTarget(".gitignore", policy), targetEntry()],
+        scope,
+      };
+      const current = await scanWorkspaceForScope(root, scope);
 
-    const plan = planWorkspaceRestore(current, target);
-    expect(plan.scopeBlockers).toContainEqual({
-      path: blockerPath,
-      targetPath,
-    });
-    await expect(
-      applyTreeToWorkspace(root, target, readBlob, current),
-    ).rejects.toThrow(/unmanaged descendant/u);
+      const plan = planWorkspaceRestore(current, target);
+      expect(plan.scopeBlockers).toContainEqual({
+        path: blockerPath,
+        targetPath,
+      });
+      await expect(
+        applyTreeToWorkspace(root, target, readBlob, current),
+      ).rejects.toThrow(/unmanaged descendant/u);
 
-    expect(await readFile(join(root, "delete-me"), "utf8"))
-      .toBe("must survive preflight");
-    if (blockerPath === "p") {
-      expect(await lstat(join(root, "p"))).toBeDefined();
-    } else {
-      expect(await readFile(join(root, blockerPath), "utf8"))
-        .toBe("ignored child");
-      expect(await readFile(join(root, "p", "managed"), "utf8"))
-        .toBe("managed child");
-    }
-  }, 15_000);
+      expect(await readFile(join(root, "delete-me"), "utf8")).toBe(
+        "must survive preflight",
+      );
+      if (blockerPath === "p") {
+        expect(await lstat(join(root, "p"))).toBeDefined();
+      } else {
+        expect(await readFile(join(root, blockerPath), "utf8")).toBe(
+          "ignored child",
+        );
+        expect(await readFile(join(root, "p", "managed"), "utf8")).toBe(
+          "managed child",
+        );
+      }
+    },
+    15_000,
+  );
 
   it("preflights excluded-occupancy identity drift before every mutation", async () => {
     const policy = "p\n!p/\n!p/child\n";
@@ -415,12 +395,7 @@ describe("applyTreeToWorkspace", () => {
     };
 
     await expect(
-      applyTreeToWorkspace(
-        root,
-        manifest([]),
-        readBlob,
-        incompleteCurrent,
-      ),
+      applyTreeToWorkspace(root, manifest([]), readBlob, incompleteCurrent),
     ).rejects.toThrow(/incomplete current workspace scan/);
     expect(await readFile(join(root, "recovered.txt"), "utf8")).toBe(
       "still here",
@@ -490,12 +465,9 @@ describe("applyTreeToWorkspace", () => {
       },
     ]);
 
-    await expect(applyTreeToWorkspace(
-      root,
-      target,
-      readBlob,
-      snapshot([deleteMe]),
-    )).rejects.toThrow(/replacement namespace changed/u);
+    await expect(
+      applyTreeToWorkspace(root, target, readBlob, snapshot([deleteMe])),
+    ).rejects.toThrow(/replacement namespace changed/u);
 
     await expectRegular("hidden.txt", "unobserved current bytes");
     expect(await readlink(join(root, "hidden-link"))).toBe("current-target");
@@ -570,13 +542,17 @@ describe("applyTreeToWorkspace", () => {
       expect(await readFile(join(outside, "victim.txt"), "utf8")).toBe(
         "outside late bytes",
       );
-      expect(await readFile(join(observedDirectory, "victim.txt"), "utf8")).toBe(
-        "observed",
-      );
+      expect(
+        await readFile(join(observedDirectory, "victim.txt"), "utf8"),
+      ).toBe("observed");
       expect(report.deleted).toEqual([]);
-      expect(report.problems.some((problem) =>
-        problem.detail.includes("workspace directory changed since scan: dir")
-      )).toBe(true);
+      expect(
+        report.problems.some((problem) =>
+          problem.detail.includes(
+            "workspace directory changed since scan: dir",
+          ),
+        ),
+      ).toBe(true);
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
@@ -614,17 +590,19 @@ describe("applyTreeToWorkspace", () => {
                 return observed!.ino;
               },
             }
-          : entry
+          : entry,
       ),
     };
 
     try {
-      await expect(applyTreeToWorkspace(
-        root,
-        manifest([regularTarget("safe/new/file.txt", "checkpoint")]),
-        readBlob,
-        racedCurrent,
-      )).rejects.toThrow(/replacement namespace changed/u);
+      await expect(
+        applyTreeToWorkspace(
+          root,
+          manifest([regularTarget("safe/new/file.txt", "checkpoint")]),
+          readBlob,
+          racedCurrent,
+        ),
+      ).rejects.toThrow(/replacement namespace changed/u);
 
       expect(swapped).toBe(true);
       await expect(lstat(join(outside, "new"))).rejects.toMatchObject({
@@ -639,16 +617,11 @@ describe("applyTreeToWorkspace", () => {
     const outside = await mkdtemp(join(tmpdir(), "cyclotomy-apply-outside-"));
     await symlink(outside, join(root, "sub"));
     const deleteMe = await seedRegular("delete-me", "must survive preflight");
-    const target = manifest([
-      regularTarget("sub/new.txt", "must stay inside"),
-    ]);
+    const target = manifest([regularTarget("sub/new.txt", "must stay inside")]);
     try {
-      await expect(applyTreeToWorkspace(
-        root,
-        target,
-        readBlob,
-        snapshot([deleteMe]),
-      )).rejects.toThrow(/replacement namespace changed/u);
+      await expect(
+        applyTreeToWorkspace(root, target, readBlob, snapshot([deleteMe])),
+      ).rejects.toThrow(/replacement namespace changed/u);
 
       await expect(readFile(join(outside, "new.txt"))).rejects.toThrow();
       expect((await lstat(join(root, "sub"))).isSymbolicLink()).toBe(true);
@@ -678,15 +651,17 @@ describe("applyTreeToWorkspace", () => {
     // carries their namespace identity exclusively as an occupancy proof.
     const current: WorkspaceSnapshot = {
       ...scanned,
-      entries: scanned.entries.filter((entry) =>
-        entry.path !== "hidden/file.txt"
+      entries: scanned.entries.filter(
+        (entry) => entry.path !== "hidden/file.txt",
       ),
-      excludedOccupancies: [{
-        path: "hidden",
-        kind: "directory",
-        dev: hiddenDirectory.dev,
-        ino: hiddenDirectory.ino,
-      }],
+      excludedOccupancies: [
+        {
+          path: "hidden",
+          kind: "directory",
+          dev: hiddenDirectory.dev,
+          ino: hiddenDirectory.ino,
+        },
+      ],
       scope: target.scope,
     };
 
@@ -698,8 +673,9 @@ describe("applyTreeToWorkspace", () => {
     await unlink(join(root, "sync-hidden-probe"));
     const originalSync = prototype.sync;
     let hiddenDirectorySynced = false;
-    const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-      async function (this: FileHandle): Promise<void> {
+    const syncSpy = vi
+      .spyOn(prototype, "sync")
+      .mockImplementation(async function (this: FileHandle): Promise<void> {
         const metadata = await this.stat();
         if (
           metadata.isDirectory() &&
@@ -709,8 +685,7 @@ describe("applyTreeToWorkspace", () => {
           hiddenDirectorySynced = true;
         }
         await originalSync.call(this);
-      },
-    );
+      });
 
     try {
       await expect(
@@ -720,8 +695,7 @@ describe("applyTreeToWorkspace", () => {
       syncSpy.mockRestore();
     }
 
-    expect(await readFile(join(root, ".gitignore"), "utf8"))
-      .toBe("hidden/\n");
+    expect(await readFile(join(root, ".gitignore"), "utf8")).toBe("hidden/\n");
     expect(await readFile(join(root, "hidden", "file.txt"), "utf8")).toBe(
       "unobserved",
     );
@@ -740,9 +714,7 @@ describe("applyTreeToWorkspace", () => {
   });
 
   // Minimal rescan, mirroring what the caller's scanner would produce.
-  async function scanWorkspace(
-    relative: string,
-  ): Promise<WorkspaceEntry[]> {
+  async function scanWorkspace(relative: string): Promise<WorkspaceEntry[]> {
     const absolute = join(root, relative);
     const dirents = await readdir(absolute, { withFileTypes: true });
     const entries: WorkspaceEntry[] = [];
@@ -775,10 +747,7 @@ describe("applyTreeToWorkspace", () => {
     );
   }
 
-  async function expectRegular(
-    path: string,
-    content: string,
-  ): Promise<void> {
+  async function expectRegular(path: string, content: string): Promise<void> {
     const absolute = join(root, path);
     const metadata = await lstat(absolute);
     expect(metadata.isFile()).toBe(true);
@@ -794,9 +763,7 @@ describe("applyTreeToWorkspace", () => {
       code = (error as NodeJS.ErrnoException).code;
     }
     // ENOENT: the path itself is gone; ENOTDIR: an ancestor is now a file.
-    expect(code, `expected ${path} to be absent`).toMatch(
-      /^(ENOENT|ENOTDIR)$/,
-    );
+    expect(code, `expected ${path} to be absent`).toMatch(/^(ENOENT|ENOTDIR)$/);
   }
 
   it("creates files, symlinks, and exact recreation modes", async () => {
@@ -826,12 +793,10 @@ describe("applyTreeToWorkspace", () => {
     // `bin` was only an implicit ancestor of the symlink entry.
     expect((await lstat(join(root, "bin"))).isDirectory()).toBe(true);
     if (process.platform !== "win32") {
-      expect(
-        (await lstat(join(root, "src/index.ts"))).mode & 0o777,
-      ).toBe(0o755);
-      expect(
-        (await lstat(join(root, "README.md"))).mode & 0o777,
-      ).toBe(0o644);
+      expect((await lstat(join(root, "src/index.ts"))).mode & 0o777).toBe(
+        0o755,
+      );
+      expect((await lstat(join(root, "README.md"))).mode & 0o777).toBe(0o644);
     }
 
     expect(report.created).toEqual([
@@ -879,19 +844,13 @@ describe("applyTreeToWorkspace", () => {
     const beforeByPath = new Map<string, Awaited<ReturnType<typeof lstat>>>();
     for (const item of cases) {
       current.push(
-        await seedRegular(
-          item.path,
-          `old ${item.path}\n`,
-          item.mode,
-        ),
+        await seedRegular(item.path, `old ${item.path}\n`, item.mode),
       );
       await chmod(join(root, item.path), item.mode);
       beforeByPath.set(item.path, await lstat(join(root, item.path)));
       // A deliberately different hint proves that an existing file's current
       // mode wins over target recreation metadata.
-      target.push(
-        regularTarget(item.path, `new ${item.path}\n`, 0o600),
-      );
+      target.push(regularTarget(item.path, `new ${item.path}\n`, 0o600));
     }
 
     const report = await applyTreeToWorkspace(
@@ -939,25 +898,23 @@ describe("applyTreeToWorkspace", () => {
     await unlink(join(root, "mode-race-probe"));
     const originalSync = prototype.sync;
     let injected = false;
-    const spy = vi.spyOn(prototype, "sync").mockImplementation(
-      async function (this: FileHandle): Promise<void> {
-        const metadata = await this.stat();
-        await originalSync.call(this);
-        if (
-          !injected &&
-          metadata.isFile() &&
-          metadata.dev === original.dev &&
-          metadata.ino === original.ino
-        ) {
-          injected = true;
-          await chmod(path, 0o400);
-        }
-      },
-    );
+    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<void> {
+      const metadata = await this.stat();
+      await originalSync.call(this);
+      if (
+        !injected &&
+        metadata.isFile() &&
+        metadata.dev === original.dev &&
+        metadata.ino === original.ino
+      ) {
+        injected = true;
+        await chmod(path, 0o400);
+      }
+    });
 
-    let report:
-      | Awaited<ReturnType<typeof applyTreeToWorkspace>>
-      | undefined;
+    let report: Awaited<ReturnType<typeof applyTreeToWorkspace>> | undefined;
     try {
       report = await applyTreeToWorkspace(
         root,
@@ -996,26 +953,24 @@ describe("applyTreeToWorkspace", () => {
     await unlink(join(root, "race-probe"));
     const originalSync = prototype.sync;
     let injected = false;
-    const spy = vi.spyOn(prototype, "sync").mockImplementation(
-      async function (this: FileHandle): Promise<void> {
-        const metadata = await this.stat();
-        await originalSync.call(this);
-        if (
-          !injected &&
-          metadata.isFile() &&
-          metadata.dev === original.dev &&
-          metadata.ino === original.ino
-        ) {
-          injected = true;
-          await rename(path, moved);
-          await writeFile(path, "racer");
-        }
-      },
-    );
+    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: FileHandle,
+    ): Promise<void> {
+      const metadata = await this.stat();
+      await originalSync.call(this);
+      if (
+        !injected &&
+        metadata.isFile() &&
+        metadata.dev === original.dev &&
+        metadata.ino === original.ino
+      ) {
+        injected = true;
+        await rename(path, moved);
+        await writeFile(path, "racer");
+      }
+    });
 
-    let report:
-      | Awaited<ReturnType<typeof applyTreeToWorkspace>>
-      | undefined;
+    let report: Awaited<ReturnType<typeof applyTreeToWorkspace>> | undefined;
     try {
       report = await applyTreeToWorkspace(
         root,
@@ -1097,9 +1052,7 @@ describe("applyTreeToWorkspace", () => {
 
     expect(await readFile(join(root, "missing"), "utf8")).toBe("created\n");
     expect((await lstat(join(root, "missing"))).mode & 0o777).toBe(0o640);
-    expect(await readFile(join(root, "replace"), "utf8")).toBe(
-      "regular now\n",
-    );
+    expect(await readFile(join(root, "replace"), "utf8")).toBe("regular now\n");
     expect((await lstat(join(root, "replace"))).mode & 0o777).toBe(0o711);
     expect(report.created).toEqual(["missing"]);
     expect(report.updated).toEqual(["replace"]);
@@ -1119,9 +1072,7 @@ describe("applyTreeToWorkspace", () => {
 
     await expectRegular("run.sh", content);
     if (process.platform !== "win32") {
-      expect(
-        (await lstat(join(root, "run.sh"))).mode & 0o777,
-      ).toBe(0o644);
+      expect((await lstat(join(root, "run.sh"))).mode & 0o777).toBe(0o644);
     }
     expect(report.created).toEqual([]);
     expect(report.updated).toEqual([]);
@@ -1140,9 +1091,9 @@ describe("applyTreeToWorkspace", () => {
     };
     await probe.close();
     await unlink(join(root, "chmod-probe"));
-    const spy = vi.spyOn(prototype, "chmod").mockRejectedValueOnce(
-      new Error("injected temp chmod failure"),
-    );
+    const spy = vi
+      .spyOn(prototype, "chmod")
+      .mockRejectedValueOnce(new Error("injected temp chmod failure"));
 
     const report = await applyTreeToWorkspace(
       root,
@@ -1212,12 +1163,14 @@ describe("applyTreeToWorkspace", () => {
     try {
       const report = await applyTreeToWorkspace(
         root,
-        manifest([{
-          path: "link",
-          type: "symlink",
-          target: "new-target",
-          symlinkKind: null,
-        }]),
+        manifest([
+          {
+            path: "link",
+            type: "symlink",
+            target: "new-target",
+            symlinkKind: null,
+          },
+        ]),
         readBlob,
         snapshot([current]),
       );
@@ -1233,19 +1186,23 @@ describe("applyTreeToWorkspace", () => {
 
   it("preflights a Windows symlink without a recorded target type", async () => {
     const deleteMe = await seedRegular("delete-me", "must survive preflight");
-    await expect(withSimulatedWindows(() =>
-      applyTreeToWorkspace(
-        root,
-        manifest([{
-          path: "dangling-link",
-          type: "symlink",
-          target: "missing-directory",
-          symlinkKind: null,
-        }]),
-        readBlob,
-        snapshot([deleteMe]),
-      )
-    )).rejects.toThrow(/without a recorded target type/u);
+    await expect(
+      withSimulatedWindows(() =>
+        applyTreeToWorkspace(
+          root,
+          manifest([
+            {
+              path: "dangling-link",
+              type: "symlink",
+              target: "missing-directory",
+              symlinkKind: null,
+            },
+          ]),
+          readBlob,
+          snapshot([deleteMe]),
+        ),
+      ),
+    ).rejects.toThrow(/without a recorded target type/u);
     await expectAbsent("dangling-link");
     await expectRegular("delete-me", "must survive preflight");
   });
@@ -1255,15 +1212,17 @@ describe("applyTreeToWorkspace", () => {
     const report = await withSimulatedWindows(() =>
       applyTreeToWorkspace(
         root,
-        manifest([{
-          path: "directory-link",
-          type: "symlink",
-          target: "directory-target",
-          symlinkKind: "directory",
-        }]),
+        manifest([
+          {
+            path: "directory-link",
+            type: "symlink",
+            target: "directory-target",
+            symlinkKind: "directory",
+          },
+        ]),
         readBlob,
         snapshot([]),
-      )
+      ),
     );
 
     expect(await readlink(join(root, "directory-link"))).toBe(
@@ -1307,9 +1266,7 @@ describe("applyTreeToWorkspace", () => {
       snapshot([current]),
     );
 
-    expect((await lstat(join(root, "link"))).isSymbolicLink()).toBe(
-      true,
-    );
+    expect((await lstat(join(root, "link"))).isSymbolicLink()).toBe(true);
     expect(await readlink(join(root, "link"))).toBe("elsewhere");
     expect(report.updated).toEqual(["link"]);
     expect(report.created).toEqual([]);
@@ -1359,17 +1316,10 @@ describe("applyTreeToWorkspace", () => {
 
   it("migrates a regular file to a directory", async () => {
     await seedRegular("sub", "was a file");
-    const target = manifest([
-      regularTarget("sub/child.txt", "child\n"),
-    ]);
+    const target = manifest([regularTarget("sub/child.txt", "child\n")]);
     const current = await scanWorkspaceForScope(root, target.scope);
     expect(planWorkspaceRestore(current, target).scopeBlockers).toEqual([]);
-    const report = await applyTreeToWorkspace(
-      root,
-      target,
-      readBlob,
-      current,
-    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
 
     expect((await lstat(join(root, "sub"))).isDirectory()).toBe(true);
     await expectRegular("sub/child.txt", "child\n");
@@ -1402,12 +1352,7 @@ describe("applyTreeToWorkspace", () => {
     const target = manifest([regularTarget("sub", "now a file")]);
     const current = await scanWorkspaceForScope(root, target.scope);
     expect(planWorkspaceRestore(current, target).scopeBlockers).toEqual([]);
-    const report = await applyTreeToWorkspace(
-      root,
-      target,
-      readBlob,
-      current,
-    );
+    const report = await applyTreeToWorkspace(root, target, readBlob, current);
 
     await expectRegular("sub", "now a file");
     await expectAbsent("sub/old.txt");
@@ -1459,12 +1404,14 @@ describe("applyTreeToWorkspace", () => {
 
     const report = await applyTreeToWorkspace(
       root,
-      manifest([{
-        path: "empty",
-        type: "symlink",
-        target: "target",
-        symlinkKind: null,
-      }]),
+      manifest([
+        {
+          path: "empty",
+          type: "symlink",
+          target: "target",
+          symlinkKind: null,
+        },
+      ]),
       readBlob,
       current,
     );
@@ -1481,15 +1428,18 @@ describe("applyTreeToWorkspace", () => {
     const current = await scanRealWorkspace(root);
     await writeFile(join(root, "empty", "raced.txt"), "keep");
 
-    await expect(applyTreeToWorkspace(
-      root,
-      manifest([regularTarget("empty", "target")]),
-      readBlob,
-      current,
-    )).rejects.toThrow(/replacement namespace changed/u);
+    await expect(
+      applyTreeToWorkspace(
+        root,
+        manifest([regularTarget("empty", "target")]),
+        readBlob,
+        current,
+      ),
+    ).rejects.toThrow(/replacement namespace changed/u);
 
-    expect(await readFile(join(root, "empty", "raced.txt"), "utf8"))
-      .toBe("keep");
+    expect(await readFile(join(root, "empty", "raced.txt"), "utf8")).toBe(
+      "keep",
+    );
     await expectRegular("delete-me", "must survive preflight");
   });
 
@@ -1499,18 +1449,17 @@ describe("applyTreeToWorkspace", () => {
     const current = await scanRealWorkspace(root);
     await writeFile(join(root, "empty", "nested", "raced.txt"), "keep");
 
-    await expect(applyTreeToWorkspace(
-      root,
-      manifest([regularTarget("empty", "target")]),
-      readBlob,
-      current,
-    )).rejects.toThrow(/replacement namespace changed/u);
+    await expect(
+      applyTreeToWorkspace(
+        root,
+        manifest([regularTarget("empty", "target")]),
+        readBlob,
+        current,
+      ),
+    ).rejects.toThrow(/replacement namespace changed/u);
 
     expect(
-      await readFile(
-        join(root, "empty", "nested", "raced.txt"),
-        "utf8",
-      ),
+      await readFile(join(root, "empty", "nested", "raced.txt"), "utf8"),
     ).toBe("keep");
     await expectRegular("delete-me", "must survive preflight");
   });
@@ -1570,10 +1519,7 @@ describe("applyTreeToWorkspace", () => {
 
   it("refuses git-internal paths on both sides", async () => {
     await mkdir(join(root, ".git"), { recursive: true });
-    await writeFile(
-      join(root, ".git/HEAD"),
-      "ref: refs/heads/main\n",
-    );
+    await writeFile(join(root, ".git/HEAD"), "ref: refs/heads/main\n");
     const currentGit = regularWorkspaceEntry(
       ".git/HEAD",
       "ref: refs/heads/main\n",
@@ -1593,10 +1539,7 @@ describe("applyTreeToWorkspace", () => {
 
     await expectRegular("ok.txt", "fine\n");
     // The on-disk git-internal file must survive untouched.
-    await expectRegular(
-      ".git/HEAD",
-      "ref: refs/heads/main\n",
-    );
+    await expectRegular(".git/HEAD", "ref: refs/heads/main\n");
     await expectAbsent(".git/config");
     await expectAbsent("sub");
     expect(report.created).toEqual(["ok.txt"]);
@@ -1610,9 +1553,9 @@ describe("applyTreeToWorkspace", () => {
       ".git/config",
       "sub/.GIT/hooks/pre-commit",
     ]);
-    expect(
-      refused.every((problem) => problem.kind === "write-failed"),
-    ).toBe(true);
+    expect(refused.every((problem) => problem.kind === "write-failed")).toBe(
+      true,
+    );
     expect(report.problems).toHaveLength(3);
   });
 

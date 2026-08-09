@@ -1,9 +1,6 @@
 import { lstat } from "node:fs/promises";
 
-import {
-  collectGarbage,
-  type GcReport,
-} from "../infrastructure/object-gc.ts";
+import { collectGarbage, type GcReport } from "../infrastructure/object-gc.ts";
 import type {
   MetadataStore,
   SessionMetadataRemovalReport,
@@ -11,8 +8,7 @@ import type {
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 
 /** New session metadata is retained for at least a long operator-visible window. */
-export const DEFAULT_SESSION_METADATA_RETENTION_MS =
-  30 * 24 * 60 * 60 * 1000;
+export const DEFAULT_SESSION_METADATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export type SessionFileProbe = (
   sessionFile: string,
@@ -25,8 +21,7 @@ export interface SessionMetadataGcOptions {
   readonly probeSessionFile?: SessionFileProbe;
 }
 
-export interface SessionMetadataGcReport
-  extends SessionMetadataRemovalReport {
+export interface SessionMetadataGcReport extends SessionMetadataRemovalReport {
   readonly inspectedSessions: number;
   readonly presentSessions: number;
   readonly newlyMissingSessions: number;
@@ -45,10 +40,7 @@ export interface CyclotomyGcReport extends GcReport {
 }
 
 type SessionClassification =
-  | "present"
-  | "newly-missing"
-  | "still-missing"
-  | "unknown";
+  "present" | "newly-missing" | "still-missing" | "unknown";
 
 interface SessionInspection {
   readonly sessionFile: string;
@@ -107,10 +99,7 @@ export async function collectSessionMetadataGarbage(
     }
     const applied =
       state === "present"
-        ? metadata.observeSessionPresent(
-            session.sessionId,
-            session.sessionFile,
-          )
+        ? metadata.observeSessionPresent(session.sessionId, session.sessionFile)
         : metadata.observeSessionMissing(
             session.sessionId,
             session.sessionFile,
@@ -239,8 +228,7 @@ export async function collectCyclotomyGarbage(
   );
   const metadataReport = await collectSessionMetadataGarbage(metadata, {
     now,
-    retentionMs:
-      options.retentionMs ?? DEFAULT_SESSION_METADATA_RETENTION_MS,
+    retentionMs: options.retentionMs ?? DEFAULT_SESSION_METADATA_RETENTION_MS,
     ...(options.probeSessionFile === undefined
       ? {}
       : { probeSessionFile: options.probeSessionFile }),

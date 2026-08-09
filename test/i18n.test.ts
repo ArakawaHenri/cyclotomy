@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  CyclotomyI18n,
-  resolveCyclotomyLocale,
-} from "../src/pi/i18n.ts";
+import { CyclotomyI18n, resolveCyclotomyLocale } from "../src/pi/i18n.ts";
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 
 function plan(
@@ -45,20 +42,24 @@ describe("Cyclotomy Pi localization", () => {
 
   it("resolves auto from process locale before the host locale", () => {
     expect(resolveCyclotomyLocale("zh-CN", {}, "en-US")).toBe("zh-CN");
-    expect(resolveCyclotomyLocale("en", { LANG: "zh_CN.UTF-8" }, "zh-CN"))
-      .toBe("en");
-    expect(resolveCyclotomyLocale("auto", { LANG: "zh_CN.UTF-8" }, "en-US"))
-      .toBe("zh-CN");
+    expect(resolveCyclotomyLocale("en", { LANG: "zh_CN.UTF-8" }, "zh-CN")).toBe(
+      "en",
+    );
+    expect(
+      resolveCyclotomyLocale("auto", { LANG: "zh_CN.UTF-8" }, "en-US"),
+    ).toBe("zh-CN");
     expect(resolveCyclotomyLocale("auto", {}, "fr-FR")).toBe("en");
   });
 
   it("formats restore-oriented previews and explains ignore-rule scope", () => {
     const en = new CyclotomyI18n("en");
-    const preview = en.formatRestorePreview(plan({
-      created: ["new.txt"],
-      deleted: [],
-      modified: [".gitignore"],
-    }));
+    const preview = en.formatRestorePreview(
+      plan({
+        created: ["new.txt"],
+        deleted: [],
+        modified: [".gitignore"],
+      }),
+    );
 
     expect(preview).toContain("2 paths · ~1 overwrite · +1 create");
     expect(preview).toContain("~ .gitignore");
@@ -71,11 +72,13 @@ describe("Cyclotomy Pi localization", () => {
     const message = zh.t("restorePrepareFailed", {
       message: "bad\n\u001b[31m\u202edetail",
     });
-    const problems = zh.formatApplyProblems([{
-      path: "bad\npath",
-      kind: "write-failed",
-      detail: "denied\r\ntry again",
-    }]);
+    const problems = zh.formatApplyProblems([
+      {
+        path: "bad\npath",
+        kind: "write-failed",
+        detail: "denied\r\ntry again",
+      },
+    ]);
 
     expect(message).toContain("bad\\n\\u001b[31m\\u202edetail");
     expect(message).not.toMatch(/[\n\u001b\u202e]/u);

@@ -133,9 +133,13 @@ async function defaultProcessIdentity(
     try {
       const stat = await readFile(`/proc/${pid}/stat`, "utf8");
       const close = stat.lastIndexOf(")");
-      const fields = close === -1
-        ? []
-        : stat.slice(close + 2).trim().split(/\s+/u);
+      const fields =
+        close === -1
+          ? []
+          : stat
+              .slice(close + 2)
+              .trim()
+              .split(/\s+/u);
       // The suffix starts at field 3; Linux field 22 is process start ticks.
       const started = fields[19];
       return started === undefined ? undefined : `linux:${started}`;
@@ -270,10 +274,7 @@ async function readOwnerFile(
 
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    handle = await open(
-      path,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-    );
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const before = await handle.stat();
     if (
       !before.isFile() ||
@@ -297,10 +298,7 @@ async function readOwnerFile(
     }
     const probe = Buffer.allocUnsafe(1);
     const { bytesRead: extraBytes } = await handle.read(probe, 0, 1, offset);
-    const [after, pathAfter] = await Promise.all([
-      handle.stat(),
-      lstat(path),
-    ]);
+    const [after, pathAfter] = await Promise.all([handle.stat(), lstat(path)]);
     if (
       extraBytes !== 0 ||
       offset !== allocated.byteLength ||
@@ -388,10 +386,7 @@ async function observeLock(
   let heartbeatMtimeMs = lockInfo.mtimeMs;
   if (owner.kind === "valid") {
     const record = owner.record;
-    const heartbeatPath = join(
-      lockPath,
-      heartbeatFileName(record.owner.token),
-    );
+    const heartbeatPath = join(lockPath, heartbeatFileName(record.owner.token));
     try {
       const heartbeatInfo = await lstat(heartbeatPath);
       if (!heartbeatInfo.isFile()) {
@@ -427,19 +422,14 @@ async function observeLock(
   };
 }
 
-function sameLock(
-  left: LockObservation,
-  right: LockObservation,
-): boolean {
+function sameLock(left: LockObservation, right: LockObservation): boolean {
   const sameOwner =
     left.owner.kind === right.owner.kind &&
     (left.owner.kind !== "valid" ||
       (right.owner.kind === "valid" &&
         left.owner.record.owner.token === right.owner.record.owner.token));
   return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    sameOwner
+    left.device === right.device && left.inode === right.inode && sameOwner
   );
 }
 
@@ -464,7 +454,9 @@ async function canRecoverOwner(
   }
   if (!processIsAlive(record.owner.pid)) return true;
   if (record.owner.processIdentity === null) return false;
-  const current = await identifyProcess(record.owner.pid).catch(() => undefined);
+  const current = await identifyProcess(record.owner.pid).catch(
+    () => undefined,
+  );
   return current !== undefined && current !== record.owner.processIdentity;
 }
 
@@ -563,12 +555,9 @@ async function acquireStealClaim(
       if (errorCode(error) !== "EEXIST") {
         throw error;
       }
-      if (!(await removeStaleStealClaim(
-        claimPath,
-        staleMs,
-        now,
-        identifyProcess,
-      ))) {
+      if (
+        !(await removeStaleStealClaim(claimPath, staleMs, now, identifyProcess))
+      ) {
         return undefined;
       }
       continue;
@@ -620,9 +609,7 @@ async function acquireStealClaim(
   return undefined;
 }
 
-async function releaseStealClaim(
-  claim: StealClaim,
-): Promise<void> {
+async function releaseStealClaim(claim: StealClaim): Promise<void> {
   await unlinkOwnedFile(claim.ownerPath);
   await removeEmptyDirectory(claim.path);
 }
@@ -743,9 +730,7 @@ export async function acquireWorkspaceLock(
     throw new RangeError("workspace lock clock returned a non-finite value");
   }
   const monotonicStartedAt = performance.now();
-  const processIdentity = await identifyCurrentProcess(
-    options.identifyProcess,
-  );
+  const processIdentity = await identifyCurrentProcess(options.identifyProcess);
   const owner: LockOwner = {
     token: randomUUID(),
     pid: process.pid,
@@ -804,15 +789,19 @@ export async function acquireWorkspaceLock(
       }
       const current = now();
       if (!Number.isFinite(current)) {
-        throw new RangeError("workspace lock clock returned a non-finite value");
+        throw new RangeError(
+          "workspace lock clock returned a non-finite value",
+        );
       }
-      if (await stealIfOrphaned(
-        lockPath,
-        staleMs,
-        current,
-        identifyProcess,
-        processIdentity,
-      )) {
+      if (
+        await stealIfOrphaned(
+          lockPath,
+          staleMs,
+          current,
+          identifyProcess,
+          processIdentity,
+        )
+      ) {
         continue;
       }
       const elapsed = performance.now() - monotonicStartedAt;

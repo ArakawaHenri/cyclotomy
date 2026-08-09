@@ -93,17 +93,12 @@ function exactKeys(
   const canonical = [...expected].sort();
   return (
     actual.length === canonical.length &&
-    actual.every(
-      (key, index) => key === canonical[index],
-    )
+    actual.every((key, index) => key === canonical[index])
   );
 }
 
 function invalidManifest(message: string): never {
-  throw new TreeManifestError(
-    "invalid-tree-manifest",
-    message,
-  );
+  throw new TreeManifestError("invalid-tree-manifest", message);
 }
 
 export function assertTreeManifestLimits(limits: TreeManifestLimits): void {
@@ -133,10 +128,7 @@ function assertEntryLimit(
   }
 }
 
-function comparePathBytes(
-  left: TreeEntry,
-  right: TreeEntry,
-): number {
+function comparePathBytes(left: TreeEntry, right: TreeEntry): number {
   return Buffer.compare(
     Buffer.from(left.path, "utf8"),
     Buffer.from(right.path, "utf8"),
@@ -156,9 +148,7 @@ function validateEntryPath(path: string): void {
     path !== path.normalize("NFC") ||
     !isWellFormedUnicode(path)
   ) {
-    invalidManifest(
-      `unsafe tree entry path: ${JSON.stringify(path)}`,
-    );
+    invalidManifest(`unsafe tree entry path: ${JSON.stringify(path)}`);
   }
   for (const component of path.split("/")) {
     if (
@@ -167,9 +157,7 @@ function validateEntryPath(path: string): void {
       component === ".." ||
       component.toLocaleLowerCase("en-US") === ".git"
     ) {
-      invalidManifest(
-        `unsafe tree entry path: ${JSON.stringify(path)}`,
-      );
+      invalidManifest(`unsafe tree entry path: ${JSON.stringify(path)}`);
     }
   }
 }
@@ -191,32 +179,19 @@ function validateRecreationMode(value: unknown): FileRecreationMode {
   return invalidManifest("regular entry has an invalid recreation mode");
 }
 
-function validateEntry(
-  value: unknown,
-): TreeEntry {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value)
-  ) {
+function validateEntry(value: unknown): TreeEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return invalidManifest("tree entry must be an object");
   }
   const entry = value as Record<string, unknown>;
   if (typeof entry.path !== "string") {
-    return invalidManifest(
-      "tree entry path must be a string",
-    );
+    return invalidManifest("tree entry path must be a string");
   }
   validateEntryPath(entry.path);
 
   if (entry.type === "regular") {
     if (
-      !exactKeys(entry, [
-        "path",
-        "type",
-        "blobOid",
-        "recreationMode",
-      ]) ||
+      !exactKeys(entry, ["path", "type", "blobOid", "recreationMode"]) ||
       !isTreeOid(entry.blobOid)
     ) {
       return invalidManifest(
@@ -233,10 +208,7 @@ function validateEntry(
 
   if (entry.type === "symlink") {
     if (
-      !exactKeys(
-        entry,
-        ["path", "type", "target", "symlinkKind"],
-      ) ||
+      !exactKeys(entry, ["path", "type", "target", "symlinkKind"]) ||
       typeof entry.target !== "string" ||
       entry.target.length === 0 ||
       entry.target.includes("\0") ||
@@ -257,9 +229,7 @@ function validateEntry(
     };
   }
 
-  return invalidManifest(
-    "tree entry type is unsupported",
-  );
+  return invalidManifest("tree entry type is unsupported");
 }
 
 function canonicalizeTreeEntries(
@@ -275,9 +245,7 @@ function canonicalizeTreeEntries(
   const canonicalOwners = new Map<string, string>();
   for (const entry of entries) {
     if (byPath.has(entry.path)) {
-      return invalidManifest(
-        `duplicate tree entry path: ${entry.path}`,
-      );
+      return invalidManifest(`duplicate tree entry path: ${entry.path}`);
     }
     const canonical = entry.path.toLocaleLowerCase("en-US");
     const owner = canonicalOwners.get(canonical);
@@ -293,10 +261,7 @@ function canonicalizeTreeEntries(
   for (const entry of entries) {
     let separator = entry.path.lastIndexOf("/");
     while (separator !== -1) {
-      const parentPath = entry.path.slice(
-        0,
-        separator,
-      );
+      const parentPath = entry.path.slice(0, separator);
       const parent = byPath.get(parentPath);
       if (parent !== undefined) {
         return invalidManifest(
@@ -336,9 +301,7 @@ function validateTreeScopeBindings(
     const localPath = workspaceLocalGitignorePath(scope, source.path);
     if (localPath === undefined) continue;
     const key = workspaceScopePathKey(scope, localPath);
-    const expectedOid = sha256(
-      workspaceScopeBytes(source.contentsBase64),
-    );
+    const expectedOid = sha256(workspaceScopeBytes(source.contentsBase64));
     const previous = localSources.get(key);
     if (previous !== undefined && previous !== localPath) {
       invalidManifest(
@@ -361,10 +324,7 @@ function validateTreeScopeBindings(
     const isIgnoreSource = scope.ignoreCase
       ? basename.toLocaleLowerCase("en-US") === ".gitignore"
       : basename === ".gitignore";
-    if (
-      entry.type !== "regular" ||
-      !isIgnoreSource
-    ) {
+    if (entry.type !== "regular" || !isIgnoreSource) {
       continue;
     }
     if (!localSources.has(workspaceScopePathKey(scope, entry.path))) {
@@ -408,10 +368,7 @@ export function encodeTreeManifest(
     entries,
     scope,
   };
-  const encoded = Buffer.from(
-    `${JSON.stringify(manifest)}\n`,
-    "utf8",
-  );
+  const encoded = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
   if (encoded.byteLength > limits.maxManifestBytes) {
     invalidManifest(
       `tree manifest is ${encoded.byteLength} bytes, exceeding the ${limits.maxManifestBytes}-byte limit`,
@@ -424,9 +381,7 @@ export function encodeTreeManifest(
  * Strictly validate a manifest read from disk: the byte encoding must be
  * exactly the canonical re-encoding of a structurally valid manifest.
  */
-export function parseCanonicalTreeManifest(
-  content: Uint8Array,
-): TreeManifest {
+export function parseCanonicalTreeManifest(content: Uint8Array): TreeManifest {
   if (content.byteLength > ABSOLUTE_MAX_TREE_MANIFEST_BYTES) {
     throw new TreeManifestError(
       "object-integrity",
@@ -446,11 +401,7 @@ export function parseCanonicalTreeManifest(
       error,
     );
   }
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    Array.isArray(parsed)
-  ) {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new TreeManifestError(
       "object-integrity",
       "tree object has an invalid manifest shape",
@@ -488,9 +439,7 @@ export function parseCanonicalTreeManifest(
     scope,
     ABSOLUTE_TREE_MANIFEST_LIMITS,
   );
-  if (
-    !canonicalBytes.equals(Buffer.from(content))
-  ) {
+  if (!canonicalBytes.equals(Buffer.from(content))) {
     throw new TreeManifestError(
       "object-integrity",
       "tree object is not canonically encoded",

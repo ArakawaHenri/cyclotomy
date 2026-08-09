@@ -1,10 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import {
-  mkdtemp,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -24,9 +20,7 @@ async function scratch(): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(
-    roots.splice(0).map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 

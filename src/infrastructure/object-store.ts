@@ -1,18 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  rename,
-  unlink,
-} from "node:fs/promises";
-import {
-  isAbsolute,
-  join,
-  parse as parsePath,
-  resolve,
-} from "node:path";
+import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { isAbsolute, join, parse as parsePath, resolve } from "node:path";
 
 import { isTreeOid } from "../domain/model.ts";
 import type { WorkspaceScope } from "./workspace-scope.ts";
@@ -51,15 +40,8 @@ export type ObjectStoreErrorCode =
 export class ObjectStoreError extends Error {
   readonly code: ObjectStoreErrorCode;
 
-  constructor(
-    code: ObjectStoreErrorCode,
-    message: string,
-    cause?: unknown,
-  ) {
-    super(
-      message,
-      cause === undefined ? undefined : { cause },
-    );
+  constructor(code: ObjectStoreErrorCode, message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
     this.name = "ObjectStoreError";
     this.code = code;
   }
@@ -132,19 +114,12 @@ function errorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-function asStoreError(
-  action: string,
-  error: unknown,
-): ObjectStoreError {
+function asStoreError(action: string, error: unknown): ObjectStoreError {
   if (error instanceof ObjectStoreError) return error;
   if (error instanceof TreeManifestError) {
     return new ObjectStoreError(error.kind, error.message, error);
   }
-  return new ObjectStoreError(
-    "storage-failure",
-    `${action} failed`,
-    error,
-  );
+  return new ObjectStoreError("storage-failure", `${action} failed`, error);
 }
 
 function isReplaceableObjectFailure(error: unknown): boolean {
@@ -155,9 +130,7 @@ function isReplaceableObjectFailure(error: unknown): boolean {
 }
 
 function sha256(content: Uint8Array): string {
-  return createHash("sha256")
-    .update(content)
-    .digest("hex");
+  return createHash("sha256").update(content).digest("hex");
 }
 
 function assertOid(oid: string): void {
@@ -169,9 +142,7 @@ function assertOid(oid: string): void {
   }
 }
 
-async function syncDirectory(
-  path: string,
-): Promise<void> {
+async function syncDirectory(path: string): Promise<void> {
   // Windows has no portable directory-fsync primitive. Regular object bytes
   // are still flushed before rename; directory-entry durability is best-effort.
   if (process.platform === "win32") return;
@@ -195,9 +166,7 @@ async function syncDirectory(
   }
 }
 
-async function assertDirectory(
-  path: string,
-): Promise<void> {
+async function assertDirectory(path: string): Promise<void> {
   const stat = await lstat(path);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new ObjectStoreError(
@@ -238,10 +207,7 @@ class StreamedFileChangedError extends Error {
 
 type RegularPathRole = "private-object" | "stream-source";
 
-function unsafeRegularPath(
-  role: RegularPathRole,
-  message: string,
-): Error {
+function unsafeRegularPath(role: RegularPathRole, message: string): Error {
   return role === "stream-source"
     ? new StreamedFileChangedError(message)
     : new ObjectStoreError("storage-failure", message);
@@ -288,10 +254,7 @@ async function readRegularFile(
   path: string,
   maxBytes?: number,
 ): Promise<Buffer> {
-  const pathBefore = await observeRegularPathBeforeOpen(
-    path,
-    "private-object",
-  );
+  const pathBefore = await observeRegularPathBeforeOpen(path, "private-object");
   const handle = await open(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -335,21 +298,17 @@ async function readRegularFile(
         offset += bytesRead;
       }
       const probe = Buffer.allocUnsafe(1);
-      const { bytesRead: extraBytes } = await handle.read(
-        probe,
-        0,
-        1,
-        offset,
-      );
+      const { bytesRead: extraBytes } = await handle.read(probe, 0, 1, offset);
       if (extraBytes !== 0) {
         throw new ObjectStoreError(
           "object-integrity",
           "object grew while it was being read",
         );
       }
-      content = offset === allocated.byteLength
-        ? allocated
-        : allocated.subarray(0, offset);
+      content =
+        offset === allocated.byteLength
+          ? allocated
+          : allocated.subarray(0, offset);
     }
     const after = await handle.stat();
     if (
@@ -456,12 +415,10 @@ async function streamRegularFile(
   readonly observation: Stats;
 }> {
   const pathBefore = await observeRegularPathBeforeOpen(path, pathRole);
-  const handle = pathRole === "stream-source"
-    ? await openWorkspaceRegularCandidate(path, constants.O_RDONLY)
-    : await open(
-        path,
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-      );
+  const handle =
+    pathRole === "stream-source"
+      ? await openWorkspaceRegularCandidate(path, constants.O_RDONLY)
+      : await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const before = await handle.stat();
     if (
@@ -485,12 +442,7 @@ async function streamRegularFile(
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (true) {
-      const result = await handle.read(
-        buffer,
-        0,
-        buffer.byteLength,
-        position,
-      );
+      const result = await handle.read(buffer, 0, buffer.byteLength, position);
       if (result.bytesRead === 0) {
         break;
       }
@@ -526,10 +478,7 @@ async function streamRegularFile(
 }
 
 async function observeRegularFile(path: string): Promise<Stats> {
-  const pathBefore = await observeRegularPathBeforeOpen(
-    path,
-    "private-object",
-  );
+  const pathBefore = await observeRegularPathBeforeOpen(path, "private-object");
   const handle = await open(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -553,13 +502,8 @@ async function observeRegularFile(path: string): Promise<Stats> {
   }
 }
 
-async function syncRegularFile(
-  path: string,
-): Promise<void> {
-  const pathBefore = await observeRegularPathBeforeOpen(
-    path,
-    "private-object",
-  );
+async function syncRegularFile(path: string): Promise<void> {
+  const pathBefore = await observeRegularPathBeforeOpen(path, "private-object");
   const handle = await open(
     path,
     // FlushFileBuffers requires a write-capable handle on Windows. The object
@@ -704,18 +648,11 @@ class FileObjectStore implements ObjectStore {
           }
           if (!checked.has(entry.blobOid)) {
             checked.add(entry.blobOid);
-            await this.#assertStillVerified(
-              "blob",
-              entry.blobOid,
-              proof,
-            );
+            await this.#assertStillVerified("blob", entry.blobOid, proof);
           }
         }
         treePublished = true;
-        return this.#publishPreparedTree(
-          prepared.entries,
-          prepared.scope,
-        );
+        return this.#publishPreparedTree(prepared.entries, prepared.scope);
       },
     };
   }
@@ -725,11 +662,7 @@ class FileObjectStore implements ObjectStore {
     scope: WorkspaceScope,
   ): Promise<string> {
     try {
-      const encoded = encodeTreeManifest(
-        entries,
-        scope,
-        this.#manifestLimits,
-      );
+      const encoded = encodeTreeManifest(entries, scope, this.#manifestLimits);
       const oid = sha256(encoded);
       await this.#publishObject("tree", oid, encoded);
       return oid;
@@ -746,11 +679,7 @@ class FileObjectStore implements ObjectStore {
     readonly scope: WorkspaceScope;
   } {
     try {
-      return canonicalizeTreeManifest(
-        entries,
-        scope,
-        this.#manifestLimits,
-      );
+      return canonicalizeTreeManifest(entries, scope, this.#manifestLimits);
     } catch (error) {
       if (error instanceof TreeManifestError) {
         throw new ObjectStoreError(
@@ -763,9 +692,7 @@ class FileObjectStore implements ObjectStore {
     }
   }
 
-  async readTree(
-    treeOid: string,
-  ): Promise<TreeManifest> {
+  async readTree(treeOid: string): Promise<TreeManifest> {
     assertOid(treeOid);
     try {
       const manifest = await this.readTreeManifest(treeOid);
@@ -776,15 +703,10 @@ class FileObjectStore implements ObjectStore {
     }
   }
 
-  async readTreeManifest(
-    treeOid: string,
-  ): Promise<TreeManifest> {
+  async readTreeManifest(treeOid: string): Promise<TreeManifest> {
     assertOid(treeOid);
     try {
-      const encoded = await this.#readObject(
-        "tree",
-        treeOid,
-      );
+      const encoded = await this.#readObject("tree", treeOid);
       return parseCanonicalTreeManifest(encoded);
     } catch (error) {
       throw asStoreError("tree read", error);
@@ -815,16 +737,11 @@ class FileObjectStore implements ObjectStore {
   }
 
   /** Authenticate every distinct blob referenced by the entries. */
-  async #verifyClosure(
-    entries: readonly TreeEntry[],
-  ): Promise<void> {
+  async #verifyClosure(entries: readonly TreeEntry[]): Promise<void> {
     const seen = new Set<string>();
     const oids: string[] = [];
     for (const entry of entries) {
-      if (
-        entry.type === "regular" &&
-        !seen.has(entry.blobOid)
-      ) {
+      if (entry.type === "regular" && !seen.has(entry.blobOid)) {
         seen.add(entry.blobOid);
         oids.push(entry.blobOid);
       }
@@ -839,17 +756,11 @@ class FileObjectStore implements ObjectStore {
   ): Promise<string> {
     assertOid(oid);
     await assertDirectory(this.#root);
-    const namespace =
-      kind === "blob"
-        ? this.#blobRoot
-        : this.#treeRoot;
+    const namespace = kind === "blob" ? this.#blobRoot : this.#treeRoot;
     await assertDirectory(namespace);
     const shardName = oid.slice(0, 2);
     const shard = createShard
-      ? await ensureChildDirectory(
-          namespace,
-          shardName,
-        )
+      ? await ensureChildDirectory(namespace, shardName)
       : join(namespace, shardName);
     if (!createShard) {
       try {
@@ -899,15 +810,8 @@ class FileObjectStore implements ObjectStore {
     await this.#verifyObject(kind, oid);
   }
 
-  async #readObject(
-    kind: ObjectKind,
-    oid: string,
-  ): Promise<Buffer> {
-    const path = await this.#objectPath(
-      kind,
-      oid,
-      false,
-    );
+  async #readObject(kind: ObjectKind, oid: string): Promise<Buffer> {
+    const path = await this.#objectPath(kind, oid, false);
     let content: Buffer;
     try {
       content = await readRegularFile(
@@ -1056,11 +960,7 @@ class FileObjectStore implements ObjectStore {
     oid: string,
     content: Uint8Array,
   ): Promise<Stats> {
-    const target = await this.#objectPath(
-      kind,
-      oid,
-      true,
-    );
+    const target = await this.#objectPath(kind, oid, true);
     const parent =
       kind === "blob"
         ? join(this.#blobRoot, oid.slice(0, 2))
@@ -1081,9 +981,7 @@ class FileObjectStore implements ObjectStore {
       parent,
       `.${oid}.${process.pid}.${randomUUID()}.tmp`,
     );
-    let handle:
-      | Awaited<ReturnType<typeof open>>
-      | undefined;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(
         temporary,
@@ -1123,20 +1021,14 @@ class FileObjectStore implements ObjectStore {
 }
 
 function canonicalStoreRoot(root: string): string {
-  if (
-    root.length === 0 ||
-    root.includes("\0") ||
-    !isAbsolute(root)
-  ) {
+  if (root.length === 0 || root.includes("\0") || !isAbsolute(root)) {
     throw new ObjectStoreError(
       "invalid-root",
       "object-store root must be an absolute path",
     );
   }
   const canonicalRoot = resolve(root);
-  if (
-    canonicalRoot === parsePath(canonicalRoot).root
-  ) {
+  if (canonicalRoot === parsePath(canonicalRoot).root) {
     throw new ObjectStoreError(
       "invalid-root",
       "filesystem root cannot be used as an object store",
@@ -1156,11 +1048,9 @@ export async function openObjectStore(
 ): Promise<ObjectStore> {
   const canonicalRoot = canonicalStoreRoot(root);
   const manifestLimits: TreeManifestLimits = {
-    maxEntries:
-      options.maxEntries ?? DEFAULT_TREE_MANIFEST_LIMITS.maxEntries,
+    maxEntries: options.maxEntries ?? DEFAULT_TREE_MANIFEST_LIMITS.maxEntries,
     maxManifestBytes:
-      options.maxManifestBytes ??
-      DEFAULT_TREE_MANIFEST_LIMITS.maxManifestBytes,
+      options.maxManifestBytes ?? DEFAULT_TREE_MANIFEST_LIMITS.maxManifestBytes,
   };
 
   try {
@@ -1171,28 +1061,11 @@ export async function openObjectStore(
     });
     await assertDirectory(canonicalRoot);
     await syncDirectory(canonicalRoot);
-    const objects = await ensureChildDirectory(
-      canonicalRoot,
-      OBJECT_DIRECTORY,
-    );
-    const blobs = await ensureChildDirectory(
-      objects,
-      BLOB_DIRECTORY,
-    );
-    const trees = await ensureChildDirectory(
-      objects,
-      TREE_DIRECTORY,
-    );
-    return new FileObjectStore(
-      canonicalRoot,
-      blobs,
-      trees,
-      manifestLimits,
-    );
+    const objects = await ensureChildDirectory(canonicalRoot, OBJECT_DIRECTORY);
+    const blobs = await ensureChildDirectory(objects, BLOB_DIRECTORY);
+    const trees = await ensureChildDirectory(objects, TREE_DIRECTORY);
+    return new FileObjectStore(canonicalRoot, blobs, trees, manifestLimits);
   } catch (error) {
-    throw asStoreError(
-      "object-store initialization",
-      error,
-    );
+    throw asStoreError("object-store initialization", error);
   }
 }

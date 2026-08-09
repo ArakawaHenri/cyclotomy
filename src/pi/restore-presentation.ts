@@ -152,14 +152,13 @@ export function formatWorkspaceRestorePreview(
   plan: RestorePreview,
   options: RestorePreviewOptions,
 ): string {
-  const sampleLimit = options.sampleLimit === undefined
-    ? Number.POSITIVE_INFINITY
-    : Math.max(0, Math.floor(options.sampleLimit));
+  const sampleLimit =
+    options.sampleLimit === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(options.sampleLimit));
   const actionsFor = (paths: readonly string[], symbol: string) =>
     [...paths]
-      .sort((left, right) =>
-        left < right ? -1 : left > right ? 1 : 0
-      )
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
       .map((path) => ({ path, symbol }));
   const actions = [
     ...actionsFor(plan.deleted, "-"),
@@ -202,9 +201,9 @@ export function formatApplyProblems(
   const sampleLimit = 3;
   const lines = problems.slice(0, sampleLimit).map((problem) => {
     const detail = formatUiDetail(problem.detail);
-    return `• ${formatUiPath(problem.path)} · ${
-      options.problemLabel(problem)
-    }${detail.length > 0 ? `: ${detail}` : ""}`;
+    return `• ${formatUiPath(problem.path)} · ${options.problemLabel(
+      problem,
+    )}${detail.length > 0 ? `: ${detail}` : ""}`;
   });
   const omitted = problems.length - lines.length;
   if (omitted > 0) lines.push(options.omittedNotice(omitted));

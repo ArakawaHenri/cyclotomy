@@ -25,10 +25,7 @@ import {
   scanWorkspace,
   type WorkspaceSnapshot,
 } from "../src/infrastructure/workspace-scan.ts";
-import {
-  ALL_MANAGED_SCOPE,
-  gitScope,
-} from "./workspace-scope-fixture.ts";
+import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const sha256 = (content: string): string =>
   createHash("sha256").update(content).digest("hex");
@@ -45,9 +42,7 @@ async function tempRoot(prefix: string): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(
-    roots.splice(0).map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 
@@ -74,10 +69,12 @@ describe("snapshot publication", () => {
     const snapshot: WorkspaceSnapshot = {
       ...scanned,
       scope: gitScope({
-        gitignoreSources: [{
-          path: ".gitignore",
-          contents: ".gitignore\nsecret\n",
-        }],
+        gitignoreSources: [
+          {
+            path: ".gitignore",
+            contents: ".gitignore\nsecret\n",
+          },
+        ],
       }),
     };
 
@@ -100,9 +97,9 @@ describe("snapshot publication", () => {
       }),
     };
 
-    await expect(
-      publishSnapshot(store, inconsistent),
-    ).rejects.toThrow(/does not match tree entry/);
+    await expect(publishSnapshot(store, inconsistent)).rejects.toThrow(
+      /does not match tree entry/,
+    );
   });
 
   it("refuses to publish a snapshot with unresolved scan problems", async () => {
@@ -124,15 +121,13 @@ describe("snapshot publication", () => {
       scope,
     };
 
-    await expect(
-      publishSnapshot(store, incomplete),
-    ).rejects.toMatchObject({
+    await expect(publishSnapshot(store, incomplete)).rejects.toMatchObject({
       name: "IncompleteSnapshotError",
       problems: incomplete.problems,
     });
-    await expect(
-      publishSnapshot(store, incomplete),
-    ).rejects.toThrow(IncompleteSnapshotError);
+    await expect(publishSnapshot(store, incomplete)).rejects.toThrow(
+      IncompleteSnapshotError,
+    );
   });
 
   it("publishes blobs and a tree that reads back with the same entries and bytes", async () => {
@@ -168,14 +163,10 @@ describe("snapshot publication", () => {
       },
     ]);
     expect(
-      Buffer.from(
-        await store.readBlob(sha256("export {};\n")),
-      ).toString(),
+      Buffer.from(await store.readBlob(sha256("export {};\n"))).toString(),
     ).toBe("export {};\n");
     expect(
-      Buffer.from(
-        await store.readBlob(sha256("#!/bin/sh\n")),
-      ).toString(),
+      Buffer.from(await store.readBlob(sha256("#!/bin/sh\n"))).toString(),
     ).toBe("#!/bin/sh\n");
   });
 
@@ -291,10 +282,7 @@ describe("snapshot publication", () => {
         return {
           publishBlobFromFile: () => Promise.resolve("0".repeat(64)),
           publishTree: (entries, targetScope) =>
-            store.beginSnapshotPublication().publishTree(
-              entries,
-              targetScope,
-            ),
+            store.beginSnapshotPublication().publishTree(entries, targetScope),
         };
       },
       readBlob: (oid) => store.readBlob(oid),
@@ -303,9 +291,9 @@ describe("snapshot publication", () => {
       verifyBlobs: (oids) => store.verifyBlobs(oids),
     };
 
-    await expect(
-      publishSnapshot(broken, snapshot),
-    ).rejects.toThrow(/does not match the scanned digest/);
+    await expect(publishSnapshot(broken, snapshot)).rejects.toThrow(
+      /does not match the scanned digest/,
+    );
   });
 
   it("leaves duplicate path rejection to the store's canonical validation", async () => {
@@ -321,8 +309,6 @@ describe("snapshot publication", () => {
       entries: [entry, entry],
     };
 
-    await expect(
-      publishSnapshot(store, forged),
-    ).rejects.toThrow(/duplicate/);
+    await expect(publishSnapshot(store, forged)).rejects.toThrow(/duplicate/);
   });
 });

@@ -21,11 +21,7 @@ describe("session view boundary", () => {
       content: "hello",
       timestamp: Date.now(),
     });
-    const customId = manager.appendCustomMessageEntry(
-      "test",
-      "context",
-      false,
-    );
+    const customId = manager.appendCustomMessageEntry("test", "context", false);
     const stateId = manager.appendThinkingLevelChange("high");
     const view = readSessionView(context(manager));
 

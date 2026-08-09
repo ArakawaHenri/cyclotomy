@@ -1,10 +1,4 @@
-import {
-  mkdir,
-  mkdtemp,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,10 +18,7 @@ async function createAgentDir(): Promise<string> {
   return join(root, "agent");
 }
 
-async function writeSettings(
-  path: string,
-  value: unknown,
-): Promise<void> {
+async function writeSettings(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(
     path,
@@ -97,9 +88,7 @@ describe("Cyclotomy configuration", () => {
 
     const config = loadCyclotomyConfig(agentDir);
 
-    expect(config.storageRootPath).toBe(
-      resolve(agentDir, "stores/cyclotomy"),
-    );
+    expect(config.storageRootPath).toBe(resolve(agentDir, "stores/cyclotomy"));
     expect(config.scan).toEqual({
       maxFileBytes: 100 * 1024 * 1024,
       maxSnapshotBytes: 50 * 1024 * 1024,
@@ -193,7 +182,7 @@ describe("Cyclotomy configuration", () => {
       });
 
       expect(() =>
-        loadWorkspaceCyclotomyConfig(globalConfig, storeRoot)
+        loadWorkspaceCyclotomyConfig(globalConfig, storeRoot),
       ).toThrow(`${setting} is only allowed in global settings`);
     },
   );
@@ -206,10 +195,7 @@ describe("Cyclotomy configuration", () => {
     ['{"gc":{"unknown":true}}', "unknown setting"],
   ])("rejects malformed or unknown settings: %s", async (contents, message) => {
     const agentDir = await createAgentDir();
-    await writeSettings(
-      join(agentDir, "cyclotomy", "settings.json"),
-      contents,
-    );
+    await writeSettings(join(agentDir, "cyclotomy", "settings.json"), contents);
 
     expect(() => loadCyclotomyConfig(agentDir)).toThrow(message);
   });

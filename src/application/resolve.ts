@@ -13,10 +13,7 @@ export interface ResolvedNodeState {
 
 const DEFAULT_MAX_HOPS = 10000;
 
-export type ResolutionTraversalFailure =
-  | "cycle"
-  | "hop-limit"
-  | "unknown-node";
+export type ResolutionTraversalFailure = "cycle" | "hop-limit" | "unknown-node";
 
 /** A malformed or unreasonably deep session ancestry is not a missing state. */
 export class ResolutionTraversalError extends Error {
@@ -27,10 +24,10 @@ export class ResolutionTraversalError extends Error {
       reason === "cycle"
         ? "session ancestry contains a cycle"
         : reason === "hop-limit"
-        ? `session ancestry exceeds ${detail ?? DEFAULT_MAX_HOPS} nodes`
-        : `session ancestry references an unknown node${
-            detail === undefined ? "" : ` ${JSON.stringify(detail)}`
-          }`;
+          ? `session ancestry exceeds ${detail ?? DEFAULT_MAX_HOPS} nodes`
+          : `session ancestry references an unknown node${
+              detail === undefined ? "" : ` ${JSON.stringify(detail)}`
+            }`;
     super(message);
     this.name = "ResolutionTraversalError";
     this.reason = reason;

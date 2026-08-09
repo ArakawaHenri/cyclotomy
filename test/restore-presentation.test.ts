@@ -23,40 +23,36 @@ function preview(value: WorkspaceRestorePlan, sampleLimit?: number): string {
 
 describe("restore presentation", () => {
   it("shows every action by default with deletions and overwrites first", () => {
-    const result = preview(plan({
-      created: Array.from({ length: 13 }, (_, index) => `a/new-${index}.txt`),
-      deleted: ["z/old file.txt"],
-      modified: ["y/main.ts"],
-    }));
+    const result = preview(
+      plan({
+        created: Array.from({ length: 13 }, (_, index) => `a/new-${index}.txt`),
+        deleted: ["z/old file.txt"],
+        modified: ["y/main.ts"],
+      }),
+    );
 
     const lines = result.split("\n");
-    expect(lines[0]).toBe(
-      "15 paths · -1 delete · ~1 overwrite · +13 create",
-    );
-    expect(lines.slice(1, 3)).toEqual([
-      "- z/old file.txt",
-      "~ y/main.ts",
-    ]);
+    expect(lines[0]).toBe("15 paths · -1 delete · ~1 overwrite · +13 create");
+    expect(lines.slice(1, 3)).toEqual(["- z/old file.txt", "~ y/main.ts"]);
     expect(lines).toContain("+ a/new-12.txt");
     expect(result).not.toContain("more");
   });
 
   it("escapes terminal-sensitive paths so they cannot forge actions", () => {
-    const result = preview(plan({
-      created: ["created\n- forged-delete.txt"],
-      deleted: [
-        "escape\u001b[31mred.txt",
-        "deleted\r\n+ forged-create.txt",
-      ],
-      modified: [
-        "c1\u009b31m.txt",
-        "bidi\u202egnp.txt",
-        'plain"quote.txt',
-        "plain\\backslash.txt",
-        " trailing-space ",
-        "zero-width\u200bname.txt",
-      ],
-    }));
+    const result = preview(
+      plan({
+        created: ["created\n- forged-delete.txt"],
+        deleted: ["escape\u001b[31mred.txt", "deleted\r\n+ forged-create.txt"],
+        modified: [
+          "c1\u009b31m.txt",
+          "bidi\u202egnp.txt",
+          'plain"quote.txt',
+          "plain\\backslash.txt",
+          " trailing-space ",
+          "zero-width\u200bname.txt",
+        ],
+      }),
+    );
 
     expect(result).toContain('+ "created\\n- forged-delete.txt"');
     expect(result).toContain('- "escape\\u001b[31mred.txt"');
@@ -73,11 +69,14 @@ describe("restore presentation", () => {
   });
 
   it("reports the exact omitted action count", () => {
-    const result = preview(plan({
-      created: ["b", "c"],
-      deleted: ["a"],
-      modified: [],
-    }), 1);
+    const result = preview(
+      plan({
+        created: ["b", "c"],
+        deleted: ["a"],
+        modified: [],
+      }),
+      1,
+    );
 
     expect(result).toContain("- a");
     expect(result).not.toContain("+ b");
@@ -87,11 +86,13 @@ describe("restore presentation", () => {
   it("keeps both ends of long paths visible", () => {
     const longAscii = `src/${"nested/".repeat(24)}important-file.ts`;
     const longUnicode = `${"目录/".repeat(40)}最终文件.ts`;
-    const result = preview(plan({
-      created: [longAscii, `${longUnicode}\nunsafe-tail`],
-      deleted: [],
-      modified: [],
-    }));
+    const result = preview(
+      plan({
+        created: [longAscii, `${longUnicode}\nunsafe-tail`],
+        deleted: [],
+        modified: [],
+      }),
+    );
 
     expect(result).toContain('"src/nested/');
     expect(result).toContain("…");
@@ -102,20 +103,25 @@ describe("restore presentation", () => {
   });
 
   it("marks incomplete previews and sanitizes host details", () => {
-    const result = preview(plan({
-      created: [],
-      deleted: [],
-      modified: [],
-      problems: [{
-        path: "secret\n+ forged",
-        kind: "read-failed",
-        detail: "denied",
-      }],
-    }));
+    const result = preview(
+      plan({
+        created: [],
+        deleted: [],
+        modified: [],
+        problems: [
+          {
+            path: "secret\n+ forged",
+            kind: "read-failed",
+            detail: "denied",
+          },
+        ],
+      }),
+    );
 
     expect(result).toContain("Preview incomplete");
     expect(result).toContain('? cannot read · "secret\\n+ forged"');
-    expect(formatUiDetail("failed\n\u001b[31m\u202eunsafe"))
-      .toBe("failed\\n\\u001b[31m\\u202eunsafe");
+    expect(formatUiDetail("failed\n\u001b[31m\u202eunsafe")).toBe(
+      "failed\\n\\u001b[31m\\u202eunsafe",
+    );
   });
 });

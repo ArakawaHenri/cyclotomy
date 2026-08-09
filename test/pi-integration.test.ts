@@ -23,15 +23,8 @@ import {
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
-import {
-  CyclotomyI18n,
-  type MessageKey,
-} from "../src/pi/i18n.ts";
-import {
-  FakePi,
-  FakeSessionManager,
-  type FakeEntry,
-} from "./fake-pi.ts";
+import { CyclotomyI18n, type MessageKey } from "../src/pi/i18n.ts";
+import { FakePi, FakeSessionManager, type FakeEntry } from "./fake-pi.ts";
 import { gitScope } from "./workspace-scope-fixture.ts";
 
 let workspace: string;
@@ -84,8 +77,9 @@ function messageFor(key: MessageKey): string {
   // A template's text before its first placeholder identifies the key without
   // depending on the interpolated host detail. The sentinel must survive
   // `formatUiDetail`, which escapes control characters, so it stays ASCII.
-  return TEST_I18N.t(key, { message: SENTINEL, preview: SENTINEL })
-    .split(SENTINEL)[0]!;
+  return TEST_I18N.t(key, { message: SENTINEL, preview: SENTINEL }).split(
+    SENTINEL,
+  )[0]!;
 }
 
 function notified(pi: FakePi, key: MessageKey): boolean {
@@ -163,10 +157,12 @@ describe("single-state Pi lifecycle", () => {
       await pi.startSession("startup");
 
       expect(notified(pi, "initFailure")).toBe(true);
-      expect(await readFile(join(workspace, "user.txt"), "utf8"))
-        .toBe("untouched");
-      await expect(stat(join(workspace, basename(storeRoot))))
-        .rejects.toThrow();
+      expect(await readFile(join(workspace, "user.txt"), "utf8")).toBe(
+        "untouched",
+      );
+      await expect(
+        stat(join(workspace, basename(storeRoot))),
+      ).rejects.toThrow();
     });
 
     it("fails closed with an actionable invalid workspace-settings error", async () => {
@@ -186,8 +182,9 @@ describe("single-state Pi lifecycle", () => {
       expect(notifiedVerbatim(pi, "settings.json")).toBe(true);
       expect(notifiedVerbatim(pi, "misspelledLimit")).toBe(true);
       expect(notifiedVerbatim(pi, "/reload")).toBe(true);
-      expect(await readFile(join(workspace, "user.txt"), "utf8"))
-        .toBe("untouched");
+      expect(await readFile(join(workspace, "user.txt"), "utf8")).toBe(
+        "untouched",
+      );
       await expect(stat(join(storeRoot, "state.db"))).rejects.toThrow();
       await expect(stat(join(storeRoot, "objects"))).rejects.toThrow();
     });
@@ -227,8 +224,9 @@ describe("single-state Pi lifecycle", () => {
       expect(notifiedVerbatim(pi, "maxFileMiB")).toBe(true);
       expect(notified(pi, "sessionIdentityUnavailable")).toBe(false);
 
-      expect(await readFile(join(workspace, "user.txt"), "utf8"))
-        .toBe("untouched");
+      expect(await readFile(join(workspace, "user.txt"), "utf8")).toBe(
+        "untouched",
+      );
     });
   });
 
@@ -316,8 +314,9 @@ describe("single-state Pi lifecycle", () => {
 
       await pi.startSession("resume");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("ancestor-state");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "ancestor-state",
+      );
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, ancestor)).toBeDefined();
       expect(db.getState(pi.manager.sessionId, child.id)).toBeUndefined();
@@ -338,11 +337,13 @@ describe("single-state Pi lifecycle", () => {
       expect(db.getState(pi.manager.sessionId, first.id)).toBeUndefined();
       expect(db.getState(pi.manager.sessionId, second.id)).toBeUndefined();
       db.close();
-      expect(notifiedWithDetail(
-        pi,
-        "restoreFailed",
-        "session ancestry contains a cycle",
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "restoreFailed",
+          "session ancestry contains a cycle",
+        ),
+      ).toBe(true);
     });
 
     it("does not accept metadata ancestry that references an unknown entry", async () => {
@@ -359,11 +360,13 @@ describe("single-state Pi lifecycle", () => {
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, leaf.id)).toBeUndefined();
       db.close();
-      expect(notifiedWithDetail(
-        pi,
-        "restoreFailed",
-        "session ancestry references an unknown node \"missing-parent\"",
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "restoreFailed",
+          'session ancestry references an unknown node "missing-parent"',
+        ),
+      ).toBe(true);
     });
 
     it("startup asks before reconciling an existing node", async () => {
@@ -377,8 +380,9 @@ describe("single-state Pi lifecycle", () => {
       pi.selectDestructive = false;
       await pi.startSession("startup");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
-      expect(pi.selections.at(-1)?.prompt)
-        .toContain(messageFor("choiceLoadedTitle"));
+      expect(pi.selections.at(-1)?.prompt).toContain(
+        messageFor("choiceLoadedTitle"),
+      );
       // The non-destructive choice must stay first and be Pi's initial pick.
       expect(pi.selections.at(-1)?.options).toEqual([
         messageFor("choiceLoadedSafe"),
@@ -446,7 +450,8 @@ describe("single-state Pi lifecycle", () => {
       };
       const beginSnapshotPublication = prototype.beginSnapshotPublication;
       let advancedLeaf: FakeEntry | undefined;
-      const publication = vi.spyOn(prototype, "beginSnapshotPublication")
+      const publication = vi
+        .spyOn(prototype, "beginSnapshotPublication")
         .mockImplementation(function (this: ObjectStore) {
           const candidate = beginSnapshotPublication.call(this);
           return {
@@ -466,10 +471,12 @@ describe("single-state Pi lifecycle", () => {
 
       expect(advancedLeaf).toBeDefined();
       db = metadata();
-      expect(db.getState(pi.manager.sessionId, capturedLeaf.id))
-        .toEqual(original);
-      expect(db.getState(pi.manager.sessionId, advancedLeaf!.id))
-        .toBeUndefined();
+      expect(db.getState(pi.manager.sessionId, capturedLeaf.id)).toEqual(
+        original,
+      );
+      expect(
+        db.getState(pi.manager.sessionId, advancedLeaf!.id),
+      ).toBeUndefined();
       db.close();
       expect(notified(pi, "captureLaterFailed")).toBe(true);
     });
@@ -492,14 +499,17 @@ describe("single-state Pi lifecycle", () => {
         blobOid,
         targetBytes.byteLength,
       );
-      const treeOid = await publication.publishTree([
-        {
-          path: "secret.txt",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ], gitScope({ globalExclude: "secret.txt\n" }));
+      const treeOid = await publication.publishTree(
+        [
+          {
+            path: "secret.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        gitScope({ globalExclude: "secret.txt\n" }),
+      );
       await rm(targetPath);
       const db = metadata();
       db.setState(pi.manager.sessionId, leaf.id, treeOid);
@@ -507,18 +517,22 @@ describe("single-state Pi lifecycle", () => {
       const selectionsBefore = pi.selections.length;
 
       await pi.runCommand("drift");
-      expect(notifiedWithDetail(
-        pi,
-        "commandFailed",
-        "tree entry is excluded by its archived workspace scope: secret.txt",
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "commandFailed",
+          "tree entry is excluded by its archived workspace scope: secret.txt",
+        ),
+      ).toBe(true);
 
       await pi.runCommand("restore");
-      expect(notifiedWithDetail(
-        pi,
-        "restorePrepareFailed",
-        "tree entry is excluded by its archived workspace scope: secret.txt",
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "restorePrepareFailed",
+          "tree entry is excluded by its archived workspace scope: secret.txt",
+        ),
+      ).toBe(true);
       expect(pi.selections).toHaveLength(selectionsBefore);
       await expect(stat(targetPath)).rejects.toThrow();
     });
@@ -605,12 +619,15 @@ describe("single-state Pi lifecycle", () => {
 
       await pi.runCommand("restore");
 
-      expect(await readFile(join(workspace, ".gitignore"), "utf8"))
-        .toBe("ignored.txt\n");
-      expect(await readFile(join(workspace, "visible.txt"), "utf8"))
-        .toBe("saved");
-      expect(await readFile(join(workspace, "ignored.txt"), "utf8"))
-        .toBe("outside target scope");
+      expect(await readFile(join(workspace, ".gitignore"), "utf8")).toBe(
+        "ignored.txt\n",
+      );
+      expect(await readFile(join(workspace, "visible.txt"), "utf8")).toBe(
+        "saved",
+      );
+      expect(await readFile(join(workspace, "ignored.txt"), "utf8")).toBe(
+        "outside target scope",
+      );
     });
 
     it("rejects non-empty drift arguments without changing state", async () => {
@@ -662,8 +679,9 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
       expect(pi.selections).toHaveLength(selectionsBefore);
-      expect(pi.notifications.at(-1)?.message)
-        .toBe(messageFor("waitIdleRestore"));
+      expect(pi.notifications.at(-1)?.message).toBe(
+        messageFor("waitIdleRestore"),
+      );
       const after = metadata();
       expect(after.getState(pi.manager.sessionId, leaf)).toEqual(stateBefore);
       expect(after.listRegisteredSessions()).toEqual(sessionsBefore);
@@ -686,21 +704,24 @@ describe("single-state Pi lifecycle", () => {
       await pi.runCommand("restore");
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
-      expect(pi.selections.at(-1)?.prompt)
-        .toContain(messageFor("choiceManualIntro"));
+      expect(pi.selections.at(-1)?.prompt).toContain(
+        messageFor("choiceManualIntro"),
+      );
       expect(pi.selections.at(-1)?.options).toEqual([
         messageFor("choiceManualSafe"),
         messageFor("choiceManualRestore"),
       ]);
-      expect(pi.selections.at(-1)?.prompt.split("\n").length)
-        .toBeLessThanOrEqual(10);
+      expect(
+        pi.selections.at(-1)?.prompt.split("\n").length,
+      ).toBeLessThanOrEqual(10);
       const dbAfter = metadata();
       expect(dbAfter.getState(pi.manager.sessionId, leaf)).toEqual(stateBefore);
       dbAfter.close();
       await writeFile(join(workspace, "a.txt"), "still-current");
       await pi.runCommand("restore", "--force");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("still-current");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "still-current",
+      );
       expect(pi.notifications.at(-1)?.message).toContain("/restore");
     });
 
@@ -749,8 +770,9 @@ describe("single-state Pi lifecycle", () => {
       const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
       try {
         await pi.runCommand("restore");
-        expect(await readFile(join(workspace, "a.txt"), "utf8"))
-          .toBe("current");
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+          "current",
+        );
         expect(stderr).toHaveBeenCalledWith(
           expect.stringContaining(messageFor("restoreNeedsUi")),
         );
@@ -777,8 +799,9 @@ describe("single-state Pi lifecycle", () => {
       try {
         await pi.startSession("resume");
         const unchanged = metadata();
-        expect(unchanged.getState(pi.manager.sessionId, leaf)?.treeOid)
-          .toBe(savedOid);
+        expect(unchanged.getState(pi.manager.sessionId, leaf)?.treeOid).toBe(
+          savedOid,
+        );
         unchanged.close();
         expect(stderr).toHaveBeenCalledWith(
           expect.stringContaining(messageFor("sessionRestoreNeedsUi")),
@@ -786,8 +809,9 @@ describe("single-state Pi lifecycle", () => {
 
         expect(await pi.submitInput()).toBe("continued");
         const accepted = metadata();
-        expect(accepted.getState(pi.manager.sessionId, leaf)?.treeOid)
-          .not.toBe(savedOid);
+        expect(accepted.getState(pi.manager.sessionId, leaf)?.treeOid).not.toBe(
+          savedOid,
+        );
         accepted.close();
       } finally {
         stderr.mockRestore();
@@ -830,7 +854,11 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
       expect(
-        notifiedWithDetail(pi, "restoreFailed", "confirmation transport failed"),
+        notifiedWithDetail(
+          pi,
+          "restoreFailed",
+          "confirmation transport failed",
+        ),
       ).toBe(true);
     });
 
@@ -847,8 +875,9 @@ describe("single-state Pi lifecycle", () => {
 
       await pi.runCommand("restore");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("changed-during-confirm");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "changed-during-confirm",
+      );
       expect(notified(pi, "commandPreviewStale")).toBe(true);
     });
 
@@ -864,18 +893,15 @@ describe("single-state Pi lifecycle", () => {
       db.close();
       pi.selectHook = async () => {
         const concurrent = metadata();
-        concurrent.setState(
-          pi.manager.sessionId,
-          child.id,
-          alternate.treeOid,
-        );
+        concurrent.setState(pi.manager.sessionId, child.id, alternate.treeOid);
         concurrent.close();
       };
 
       await pi.runCommand("restore");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("unsaved-child");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unsaved-child",
+      );
       expect(notified(pi, "commandTargetChanged")).toBe(true);
     });
   });
@@ -893,8 +919,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(second)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(await pi.navigate(first)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("branch-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "branch-edit",
+      );
     });
 
     it("authenticates navigation once in each real trust phase", async () => {
@@ -934,10 +961,13 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(first)).toBe("cancelled");
 
       expect(pi.manager.getLeafId()).toBe(second);
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("declined-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "declined-edit",
+      );
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, second)).toEqual(sourceBefore);
+      expect(after.getState(pi.manager.sessionId, second)).toEqual(
+        sourceBefore,
+      );
       after.close();
     });
 
@@ -961,11 +991,13 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(childPrompt.id)).toBe("done");
 
       expect(pi.manager.getLeafId()).toBe(source);
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("editor-no-op");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "editor-no-op",
+      );
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
 
@@ -990,8 +1022,9 @@ describe("single-state Pi lifecycle", () => {
       await pi.commitPreparedSummary(childPrompt.id, true);
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
 
@@ -1008,8 +1041,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(first)).toBe("cancelled");
 
       expect(pi.manager.getLeafId()).toBe(second);
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("still-current");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "still-current",
+      );
     });
 
     it("cancels navigation if the agent becomes busy during confirmation", async () => {
@@ -1024,8 +1058,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(first)).toBe("cancelled");
 
       expect(pi.manager.getLeafId()).toBe(second);
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("still-current");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "still-current",
+      );
     });
 
     it("cancels navigation when a non-null source entry is unreadable", async () => {
@@ -1040,10 +1075,13 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await pi.navigate(first)).toBe("cancelled");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("unowned-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unowned-edit",
+      );
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, second)).toEqual(sourceBefore);
+      expect(after.getState(pi.manager.sessionId, second)).toEqual(
+        sourceBefore,
+      );
       after.close();
     });
 
@@ -1062,8 +1100,9 @@ describe("single-state Pi lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "unowned-label-edit");
 
       expect(await pi.navigate(first)).toBe("cancelled");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("unowned-label-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "unowned-label-edit",
+      );
     });
 
     it("fails closed when Pi session context access throws", async () => {
@@ -1128,8 +1167,9 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await pi.navigate(child.id)).toBe("done");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("source-current");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "source-current",
+      );
       expect(pi.selections).toHaveLength(selectionsBefore);
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, source)).toBeDefined();
@@ -1206,8 +1246,9 @@ describe("single-state Pi lifecycle", () => {
 
       await pi.runCommand("restore");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("edited-at-label");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "edited-at-label",
+      );
       sourceDb = metadata();
       expect(sourceDb.getState(fork.sessionId, summary)).toBeDefined();
       expect(sourceDb.getState(fork.sessionId, newLabel.id)).toBeUndefined();
@@ -1229,8 +1270,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.navigate(first)).toBe("cancelled");
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, second)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, second)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
 
@@ -1265,14 +1307,16 @@ describe("single-state Pi lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "source-before-navigation");
 
       expect(await pi.navigate(first)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("written-by-earlier-target-handler");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "written-by-earlier-target-handler",
+      );
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
 
       pi.manager.setLeaf(second);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("source-before-navigation");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "source-before-navigation",
+      );
     });
 
     it("does not backflow a later arrival handler after target restore", async () => {
@@ -1284,8 +1328,9 @@ describe("single-state Pi lifecycle", () => {
       const { first, second } = await twoStates(pi);
 
       expect(await pi.navigate(first)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("later-target-handler");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "later-target-handler",
+      );
       pi.manager.setLeaf(second);
       await pi.runCommand("restore");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
@@ -1303,8 +1348,7 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("gap-edit");
       expect(notified(pi, "navigationChangedAfterPreview")).toBe(true);
-      expect(lastStatus(pi))
-        .toBe(messageFor("navigationAttentionStatus"));
+      expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
       const db = metadata();
       const secondAfter = db.getState(pi.manager.sessionId, second)!;
       const firstState = db.getState(pi.manager.sessionId, first)!;
@@ -1354,19 +1398,23 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await pi.navigate(first)).toBe("done");
 
-      expect(await readFile(join(firstRoot, "a.txt"), "utf8"))
-        .toBe("prepared-source");
-      expect(await readFile(join(secondRoot, "outside.txt"), "utf8"))
-        .toBe("outside");
+      expect(await readFile(join(firstRoot, "a.txt"), "utf8")).toBe(
+        "prepared-source",
+      );
+      expect(await readFile(join(secondRoot, "outside.txt"), "utf8")).toBe(
+        "outside",
+      );
       db = new MetadataStore(join(firstStore, "state.db"));
-      expect(db.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(before.treeOid);
+      expect(db.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        before.treeOid,
+      );
       db.close();
       const secondHash = createHash("sha256")
         .update(await realpath(secondRoot))
         .digest("hex");
-      await expect(stat(join(home, "cyclotomy", secondHash, "state.db")))
-        .rejects.toThrow();
+      await expect(
+        stat(join(home, "cyclotomy", secondHash, "state.db")),
+      ).rejects.toThrow();
     });
 
     it("keeps the verified source independent of arrival process state", async (context) => {
@@ -1399,13 +1447,15 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
       const afterDb = metadata();
-      expect(afterDb.getState(pi.manager.sessionId, second)?.treeOid)
-        .not.toBe(before.treeOid);
+      expect(afterDb.getState(pi.manager.sessionId, second)?.treeOid).not.toBe(
+        before.treeOid,
+      );
       afterDb.close();
       pi.manager.setLeaf(second);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("prepared-before-scan-error");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "prepared-before-scan-error",
+      );
     });
 
     it("never guesses on an unplanned tree arrival", async () => {
@@ -1420,7 +1470,9 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       const dbAfter = metadata();
-      expect(dbAfter.getState(pi.manager.sessionId, first)).toEqual(targetBefore);
+      expect(dbAfter.getState(pi.manager.sessionId, first)).toEqual(
+        targetBefore,
+      );
       dbAfter.close();
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
     });
@@ -1439,8 +1491,9 @@ describe("single-state Pi lifecycle", () => {
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeUndefined();
       db.close();
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("descendant");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "descendant",
+      );
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
     });
 
@@ -1451,23 +1504,27 @@ describe("single-state Pi lifecycle", () => {
       const db = metadata();
       const target = db.getState(pi.manager.sessionId, second)!;
       db.close();
-      await rm(join(
-        storeRoot,
-        "objects",
-        "trees",
-        target.treeOid.slice(0, 2),
-        target.treeOid.slice(2),
-      ));
+      await rm(
+        join(
+          storeRoot,
+          "objects",
+          "trees",
+          target.treeOid.slice(0, 2),
+          target.treeOid.slice(2),
+        ),
+      );
       await writeFile(join(workspace, "a.txt"), "v3");
       await pi.endTurn();
 
       expect(await pi.navigate(second)).toBe("cancelled");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v3");
-      expect(notifiedWithDetail(
-        pi,
-        "navigationPrepareFailed",
-        "tree object does not exist",
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "navigationPrepareFailed",
+          "tree object does not exist",
+        ),
+      ).toBe(true);
       // A readable older ancestor state exists, but corruption of the nearest
       // authoritative slot is never silently downgraded to inheriting it.
       const readable = metadata();
@@ -1487,8 +1544,9 @@ describe("single-state Pi lifecycle", () => {
 
       expect(await pi.navigate(ancestor.id)).toBe("done");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("source-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "source-edit",
+      );
       let db = metadata();
       expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeDefined();
       expect(db.getState(pi.manager.sessionId, descendant)).toBeDefined();
@@ -1502,11 +1560,13 @@ describe("single-state Pi lifecycle", () => {
 
       await writeFile(join(workspace, "a.txt"), "ancestor-edit");
       expect(await pi.navigate(descendant)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("source-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "source-edit",
+      );
       expect(await pi.navigate(ancestor.id)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("ancestor-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "ancestor-edit",
+      );
 
       db = metadata();
       expect(db.getState(pi.manager.sessionId, ancestor.id)).toBeDefined();
@@ -1591,15 +1651,18 @@ describe("single-state Pi lifecycle", () => {
       editArrival = true;
       expect(await pi.navigate(ancestor.id)).toBe("done");
       editArrival = false;
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("target-handler-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "target-handler-edit",
+      );
 
       expect(await pi.navigate(descendant)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("descendant-state");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "descendant-state",
+      );
       expect(await pi.navigate(ancestor.id)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("target-handler-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "target-handler-edit",
+      );
     });
 
     it("cancels a transition when a complete source snapshot is impossible", async () => {
@@ -1614,8 +1677,9 @@ describe("single-state Pi lifecycle", () => {
       expect(pi.notifications.at(-1)?.message)
         // Both hard links are reported, so the plural form is the expected one.
         .toContain(TEST_I18N.t("previewProblemMany", { count: 2 }));
-      expect(pi.notifications.at(-1)?.message)
-        .toContain(messageFor("scanProblemHardlink"));
+      expect(pi.notifications.at(-1)?.message).toContain(
+        messageFor("scanProblemHardlink"),
+      );
 
       expect(await pi.navigate(first)).toBe("cancelled");
       expect(pi.manager.getLeafId()).not.toBe(first);
@@ -1639,21 +1703,26 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.submitInput()).toBe("continued");
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)!.treeOid)
-        .not.toBe(beforeOid);
+      expect(after.getState(pi.manager.sessionId, source)!.treeOid).not.toBe(
+        beforeOid,
+      );
       after.close();
     });
 
     it("captures idle custom-trigger messages at the safest observable hook", async () => {
       const pi = new FakePi(workspace);
       pi.api.on("message_end", async (event) => {
-        if ((event as { message: { role: string } }).message.role === "custom") {
+        if (
+          (event as { message: { role: string } }).message.role === "custom"
+        ) {
           await writeFile(join(workspace, "a.txt"), "earlier-custom-handler");
         }
       });
       registerCyclotomy(pi.api);
       pi.api.on("message_end", async (event) => {
-        if ((event as { message: { role: string } }).message.role === "custom") {
+        if (
+          (event as { message: { role: string } }).message.role === "custom"
+        ) {
           await writeFile(join(workspace, "a.txt"), "later-custom-handler");
         }
       });
@@ -1663,15 +1732,17 @@ describe("single-state Pi lifecycle", () => {
       const source = pi.manager.getLeafId()!;
 
       const custom = await pi.sendCustomMessage("trigger", true);
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("later-custom-handler");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "later-custom-handler",
+      );
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, custom)).toBeUndefined();
       db.close();
       pi.manager.setLeaf(source);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("earlier-custom-handler");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "earlier-custom-handler",
+      );
     });
 
     it("never backflows a later user message_end mutation to the parent", async () => {
@@ -1689,12 +1760,14 @@ describe("single-state Pi lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "before-input");
 
       expect(await pi.submitInput()).toBe("continued");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("later-message-handler");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "later-message-handler",
+      );
       pi.manager.setLeaf(source);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("before-input");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "before-input",
+      );
     }, 15_000);
 
     it("keeps a harmless before-input capture when user persistence fails", async () => {
@@ -1715,8 +1788,9 @@ describe("single-state Pi lifecycle", () => {
       await pi.emitContext();
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
 
@@ -1736,8 +1810,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.submitInput()).toBe("handled");
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
   });
@@ -1761,7 +1836,9 @@ describe("single-state Pi lifecycle", () => {
       const userLeaf = pi.manager.getLeafId()!;
       const db = metadata();
       expect(compactionLeaf).toBeDefined();
-      expect(db.getState(pi.manager.sessionId, compactionLeaf!)).toBeUndefined();
+      expect(
+        db.getState(pi.manager.sessionId, compactionLeaf!),
+      ).toBeUndefined();
       expect(db.getState(pi.manager.sessionId, userLeaf)).toBeUndefined();
       db.close();
     });
@@ -1781,8 +1858,9 @@ describe("single-state Pi lifecycle", () => {
 
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, source)).toBeDefined();
-      expect(db.getState(pi.manager.sessionId, pi.manager.getLeafId()!))
-        .toBeUndefined();
+      expect(
+        db.getState(pi.manager.sessionId, pi.manager.getLeafId()!),
+      ).toBeUndefined();
       db.close();
     });
 
@@ -1806,17 +1884,19 @@ describe("single-state Pi lifecycle", () => {
 
       const db = metadata();
       expect(db.getState(pi.manager.sessionId, source)).toEqual(sourceBefore);
-      expect(db.getState(pi.manager.sessionId, selected.modelId)).toBeUndefined();
-      expect(db.getState(pi.manager.sessionId, selected.thinkingId!))
-        .toBeUndefined();
+      expect(
+        db.getState(pi.manager.sessionId, selected.modelId),
+      ).toBeUndefined();
+      expect(
+        db.getState(pi.manager.sessionId, selected.thinkingId!),
+      ).toBeUndefined();
       expect(db.getState(pi.manager.sessionId, thinking)).toBeUndefined();
       expect(db.getState(pi.manager.sessionId, sessionInfo)).toBeUndefined();
       db.close();
 
       pi.manager.setLeaf(source);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("turn");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("turn");
     });
 
     it("does not guess when a metadata tail contains duplicate event matches", async () => {
@@ -1862,8 +1942,9 @@ describe("single-state Pi lifecycle", () => {
       db.close();
       pi.manager.setLeaf(metadataLeaf);
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("metadata-handler-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "metadata-handler-edit",
+      );
     });
 
     it("leaves a harmless capture when a later compaction hook cancels", async () => {
@@ -1882,8 +1963,9 @@ describe("single-state Pi lifecycle", () => {
       expect(await pi.compact()).toBe("cancelled");
 
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
     });
   });
@@ -1901,8 +1983,9 @@ describe("single-state Pi lifecycle", () => {
       });
       // The fake host appends a metadata-only bash leaf after the operation.
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("before-bash");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "before-bash",
+      );
     });
 
     it("does not assume priority over an earlier user_bash interceptor", async () => {
@@ -1966,13 +2049,15 @@ describe("single-state Pi lifecycle", () => {
       expect(executed).toBe(true);
       expect(pi.manager.getLeafId()).not.toBe(source);
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(sourceBefore.treeOid);
+      expect(after.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        sourceBefore.treeOid,
+      );
       after.close();
       await writeFile(join(workspace, "a.txt"), "later-drift");
       await pi.runCommand("restore");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("between-turns");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "between-turns",
+      );
     });
 
     it("blocks bash execution when source capture fails but models Pi's result leaf", async () => {
@@ -2018,7 +2103,9 @@ describe("single-state Pi lifecycle", () => {
       expect(executed).toBe(false);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
       const after = metadata();
-      expect(after.getState(pi.manager.sessionId, source)).toEqual(sourceBefore);
+      expect(after.getState(pi.manager.sessionId, source)).toEqual(
+        sourceBefore,
+      );
       after.close();
     });
   });
@@ -2067,18 +2154,22 @@ describe("single-state Pi lifecycle", () => {
       await pi.endTurn(0);
       await pi.runCommand("restore");
 
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("duplicate-workspace");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "duplicate-workspace",
+      );
       const after = metadata();
       expect(after.getState(sessionId, entryId)).toEqual(original);
-      expect(after.listRegisteredSessions()[0]?.sessionFile)
-        .toBe("/sessions/s1.jsonl");
+      expect(after.listRegisteredSessions()[0]?.sessionFile).toBe(
+        "/sessions/s1.jsonl",
+      );
       after.close();
-      expect(notifiedWithDetail(
-        pi,
-        "sessionRegistrationFailed",
-        'session id "s1" is already owned by another file',
-      )).toBe(true);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "sessionRegistrationFailed",
+          'session id "s1" is already owned by another file',
+        ),
+      ).toBe(true);
     });
 
     it("never recovers into an unregistered duplicate identity after init failure", async () => {
@@ -2109,11 +2200,13 @@ describe("single-state Pi lifecycle", () => {
 
       db = metadata();
       expect(db.getState("shared-session", leaf.id)?.treeOid).toBe(originalOid);
-      expect(db.listRegisteredSessions()[0]?.sessionFile)
-        .toBe("/sessions/original.jsonl");
+      expect(db.listRegisteredSessions()[0]?.sessionFile).toBe(
+        "/sessions/original.jsonl",
+      );
       db.close();
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("must-not-be-captured");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "must-not-be-captured",
+      );
     });
   });
 
@@ -2131,16 +2224,19 @@ describe("single-state Pi lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "session-two");
       await pi.endTurn();
       expect(await pi.resumeTo(firstManager)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("session-one");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "session-one",
+      );
 
       await writeFile(join(workspace, "a.txt"), "session-one-edit");
       expect(await pi.resumeTo(secondManager)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("session-two");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "session-two",
+      );
       expect(await pi.resumeTo(firstManager)).toBe("done");
-      expect(await readFile(join(workspace, "a.txt"), "utf8"))
-        .toBe("session-one-edit");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
+        "session-one-edit",
+      );
     });
 
     it("keeps harmless captures when later fork and switch hooks veto", async () => {
@@ -2151,7 +2247,10 @@ describe("single-state Pi lifecycle", () => {
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
       const initial = metadata();
-      const initialOid = initial.getState(pi.manager.sessionId, source)!.treeOid;
+      const initialOid = initial.getState(
+        pi.manager.sessionId,
+        source,
+      )!.treeOid;
       initial.close();
       await writeFile(join(workspace, "a.txt"), "before-fork-veto");
       pi.api.on("session_before_fork", async () => ({ cancel: true }));
@@ -2166,13 +2265,16 @@ describe("single-state Pi lifecycle", () => {
       pi.api.on("session_before_switch", async () => ({ cancel: true }));
       expect(await pi.resumeTo(pi.newDetachedSession())).toBe("cancelled");
       db = metadata();
-      expect(db.getState(pi.manager.sessionId, source)?.treeOid)
-        .not.toBe(forkOid);
+      expect(db.getState(pi.manager.sessionId, source)?.treeOid).not.toBe(
+        forkOid,
+      );
       db.close();
     });
 
     it("never overwrites a different workspace while loading it without confirmation", async () => {
-      const otherWorkspace = await mkdtemp(join(tmpdir(), "cyclotomy-pi-ws-b-"));
+      const otherWorkspace = await mkdtemp(
+        join(tmpdir(), "cyclotomy-pi-ws-b-"),
+      );
       try {
         const pi = new FakePi(workspace);
         registerCyclotomy(pi.api);
@@ -2190,13 +2292,15 @@ describe("single-state Pi lifecycle", () => {
 
         pi.selectDestructive = false;
         expect(await pi.resumeTo(managerB)).toBe("done");
-        expect(await readFile(join(otherWorkspace, "b.txt"), "utf8"))
-          .toBe("external-b");
+        expect(await readFile(join(otherWorkspace, "b.txt"), "utf8")).toBe(
+          "external-b",
+        );
 
         pi.selectDestructive = true;
         await pi.runCommand("restore");
-        expect(await readFile(join(otherWorkspace, "b.txt"), "utf8"))
-          .toBe("session-b");
+        expect(await readFile(join(otherWorkspace, "b.txt"), "utf8")).toBe(
+          "session-b",
+        );
       } finally {
         await rm(otherWorkspace, { recursive: true, force: true });
       }

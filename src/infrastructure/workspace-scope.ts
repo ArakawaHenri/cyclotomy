@@ -47,8 +47,10 @@ function exactKeys(
 ): boolean {
   const actual = Object.keys(value).sort();
   const canonical = [...expected].sort();
-  return actual.length === canonical.length &&
-    actual.every((key, index) => key === canonical[index]);
+  return (
+    actual.length === canonical.length &&
+    actual.every((key, index) => key === canonical[index])
+  );
 }
 
 function isExactUtf8String(value: string): boolean {
@@ -127,16 +129,19 @@ function decodeCanonicalBase64(value: unknown, label: string): Buffer {
 
 function sourceIsRelevant(path: string, repositoryPrefix: string): boolean {
   const suffix = "/.gitignore";
-  const base = path === ".gitignore"
-    ? ""
-    : path.endsWith(suffix)
-    ? path.slice(0, -suffix.length)
-    : undefined;
+  const base =
+    path === ".gitignore"
+      ? ""
+      : path.endsWith(suffix)
+        ? path.slice(0, -suffix.length)
+        : undefined;
   if (base === undefined) return false;
-  return base === repositoryPrefix ||
+  return (
+    base === repositoryPrefix ||
     base === "" ||
     repositoryPrefix.startsWith(`${base}/`) ||
-    base.startsWith(repositoryPrefix === "" ? "" : `${repositoryPrefix}/`);
+    base.startsWith(repositoryPrefix === "" ? "" : `${repositoryPrefix}/`)
+  );
 }
 
 /** Build one source without ever interpreting its bytes as text. */
@@ -219,7 +224,11 @@ export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
   };
 
   const gitignoreSources = candidate.gitignoreSources.map((source) => {
-    if (typeof source !== "object" || source === null || Array.isArray(source)) {
+    if (
+      typeof source !== "object" ||
+      source === null ||
+      Array.isArray(source)
+    ) {
       return invalidScope("Git ignore source must be an object");
     }
     const record = source as Record<string, unknown>;
@@ -238,7 +247,9 @@ export function canonicalizeWorkspaceScope(value: unknown): WorkspaceScope {
       ),
     };
   });
-  gitignoreSources.sort((left, right) => comparePathBytes(left.path, right.path));
+  gitignoreSources.sort((left, right) =>
+    comparePathBytes(left.path, right.path),
+  );
   for (let index = 1; index < gitignoreSources.length; index += 1) {
     if (gitignoreSources[index]?.path === gitignoreSources[index - 1]?.path) {
       return invalidScope("Git workspace scope has duplicate ignore sources");
@@ -273,6 +284,8 @@ export function workspaceScopesEqual(
   left: WorkspaceScope,
   right: WorkspaceScope,
 ): boolean {
-  return JSON.stringify(canonicalizeWorkspaceScope(left)) ===
-    JSON.stringify(canonicalizeWorkspaceScope(right));
+  return (
+    JSON.stringify(canonicalizeWorkspaceScope(left)) ===
+    JSON.stringify(canonicalizeWorkspaceScope(right))
+  );
 }

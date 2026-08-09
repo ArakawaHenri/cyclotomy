@@ -223,10 +223,7 @@ export async function restoreWorkspace(
       report,
     };
   }
-  if (
-    verification.problems.length > 0 ||
-    restorePlanHasChanges(verification)
-  ) {
+  if (verification.problems.length > 0 || restorePlanHasChanges(verification)) {
     return {
       kind: "verify-failed",
       reason: "mismatch",

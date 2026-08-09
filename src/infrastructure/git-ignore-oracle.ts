@@ -1,4 +1,8 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  execFile,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { constants as fsConstants, type Stats } from "node:fs";
 import {
   lstat,
@@ -13,14 +17,7 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import {
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
   MAX_GITIGNORE_POLICY_BYTES,
@@ -102,14 +99,16 @@ export class WorkspaceGitPolicyBudget {
     const path = canonicalWorkspaceRelativePath(source.path, false);
     const byteLength = workspaceScopeBytes(source.contentsBase64).byteLength;
     const previousBytes = this.#sourceBytes.get(path);
-    const sourceCount = this.#sourceBytes.size +
-      (previousBytes === undefined ? 1 : 0);
+    const sourceCount =
+      this.#sourceBytes.size + (previousBytes === undefined ? 1 : 0);
     if (sourceCount > MAX_GITIGNORE_SOURCES) {
       throw new GitIgnoreOracleError("Git ignore policy has too many sources");
     }
     const totalBytes = this.#totalBytes - (previousBytes ?? 0) + byteLength;
     if (totalBytes > MAX_GITIGNORE_POLICY_BYTES) {
-      throw new GitIgnoreOracleError("Git ignore policy exceeds the byte limit");
+      throw new GitIgnoreOracleError(
+        "Git ignore policy exceeds the byte limit",
+      );
     }
     this.#sourceBytes.set(path, byteLength);
     this.#totalBytes = totalBytes;
@@ -117,11 +116,15 @@ export class WorkspaceGitPolicyBudget {
 
   addExternalPolicy(contents: Uint8Array, label: string): void {
     if (contents.byteLength > MAX_GITIGNORE_SOURCE_BYTES) {
-      throw new GitIgnoreOracleError(`${label} exceeds the per-source byte limit`);
+      throw new GitIgnoreOracleError(
+        `${label} exceeds the per-source byte limit`,
+      );
     }
     const totalBytes = this.#totalBytes + contents.byteLength;
     if (totalBytes > MAX_GITIGNORE_POLICY_BYTES) {
-      throw new GitIgnoreOracleError("Git ignore policy exceeds the byte limit");
+      throw new GitIgnoreOracleError(
+        "Git ignore policy exceeds the byte limit",
+      );
     }
     this.#totalBytes = totalBytes;
   }
@@ -153,12 +156,14 @@ interface GitCommandFailure extends Error {
 }
 
 function isProcessGitConfigEnvironment(key: string): boolean {
-  return key === "GIT_CONFIG_GLOBAL" ||
+  return (
+    key === "GIT_CONFIG_GLOBAL" ||
     key === "GIT_CONFIG_SYSTEM" ||
     key === "GIT_CONFIG_NOSYSTEM" ||
     key === "GIT_CONFIG_PARAMETERS" ||
     key === "GIT_CONFIG_COUNT" ||
-    /^GIT_CONFIG_(?:KEY|VALUE)_[0-9]+$/u.test(key);
+    /^GIT_CONFIG_(?:KEY|VALUE)_[0-9]+$/u.test(key)
+  );
 }
 
 function sanitizedGitEnvironment(
@@ -167,12 +172,12 @@ function sanitizedGitEnvironment(
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([key]) => {
       const normalized = key.toUpperCase();
-      return normalized !== "LC_ALL" &&
+      return (
+        normalized !== "LC_ALL" &&
         normalized !== "LANG" &&
-        (
-          !normalized.startsWith("GIT_") ||
-          (preserveProcessConfig && isProcessGitConfigEnvironment(normalized))
-        );
+        (!normalized.startsWith("GIT_") ||
+          (preserveProcessConfig && isProcessGitConfigEnvironment(normalized)))
+      );
     }),
   );
   return { ...env, LC_ALL: "C", LANG: "C", GIT_FLUSH: "1" };
@@ -234,13 +239,15 @@ function failureStderr(cause: unknown): string {
 
 function failureCode(cause: unknown): number | string | undefined {
   return typeof cause === "object" && cause !== null
-    ? Reflect.get(cause, "code") as number | string | undefined
+    ? (Reflect.get(cause, "code") as number | string | undefined)
     : undefined;
 }
 
 function isNotRepository(cause: unknown): boolean {
-  return failureCode(cause) === 128 &&
-    failureStderr(cause).includes("not a git repository");
+  return (
+    failureCode(cause) === 128 &&
+    failureStderr(cause).includes("not a git repository")
+  );
 }
 
 function decodeSingleLine(bytes: Buffer, label: string): string {
@@ -289,14 +296,24 @@ async function locateGitWorktree(
       ["-C", workspaceRoot, "rev-parse", "--show-toplevel"],
       env,
     );
-    repositoryRoot = await realpath(decodeSingleLine(result.stdout, "worktree root"));
+    repositoryRoot = await realpath(
+      decodeSingleLine(result.stdout, "worktree root"),
+    );
   } catch (cause) {
     if (cause instanceof GitIgnoreOracleError) throw cause;
-    throw new GitIgnoreOracleError("cannot determine the Git worktree root", { cause });
+    throw new GitIgnoreOracleError("cannot determine the Git worktree root", {
+      cause,
+    });
   }
   const nativePrefix = relative(repositoryRoot, workspaceRoot);
-  if (nativePrefix === ".." || nativePrefix.startsWith(`..${sep}`) || isAbsolute(nativePrefix)) {
-    throw new GitIgnoreOracleError("workspace is outside the reported Git worktree");
+  if (
+    nativePrefix === ".." ||
+    nativePrefix.startsWith(`..${sep}`) ||
+    isAbsolute(nativePrefix)
+  ) {
+    throw new GitIgnoreOracleError(
+      "workspace is outside the reported Git worktree",
+    );
   }
   const repositoryPrefix = canonicalWorkspaceRelativePath(
     nativePrefix === "" ? "" : nativePrefix.split(sep).join("/"),
@@ -309,15 +326,20 @@ function sameFile(
   left: Awaited<ReturnType<FileHandle["stat"]>>,
   right: Awaited<ReturnType<FileHandle["stat"]>>,
 ): boolean {
-  return left.dev === right.dev &&
+  return (
+    left.dev === right.dev &&
     left.ino === right.ino &&
     left.size === right.size &&
     left.mode === right.mode &&
     left.mtimeMs === right.mtimeMs &&
-    left.ctimeMs === right.ctimeMs;
+    left.ctimeMs === right.ctimeMs
+  );
 }
 
-async function readHandleBounded(handle: FileHandle, label: string): Promise<Buffer> {
+async function readHandleBounded(
+  handle: FileHandle,
+  label: string,
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   let position = 0;
@@ -331,7 +353,9 @@ async function readHandleBounded(handle: FileHandle, label: string): Promise<Buf
     total += read.bytesRead;
     position += read.bytesRead;
     if (total > MAX_GITIGNORE_SOURCE_BYTES) {
-      throw new GitIgnoreOracleError(`${label} exceeds the per-source byte limit`);
+      throw new GitIgnoreOracleError(
+        `${label} exceeds the per-source byte limit`,
+      );
     }
   }
   return Buffer.concat(chunks, total);
@@ -350,9 +374,12 @@ async function readOptionalPolicyFile(
       throw new GitIgnoreOracleError(`${label} is not a regular file`);
     }
     if (observed.size > MAX_GITIGNORE_SOURCE_BYTES) {
-      throw new GitIgnoreOracleError(`${label} exceeds the per-source byte limit`);
+      throw new GitIgnoreOracleError(
+        `${label} exceeds the per-source byte limit`,
+      );
     }
-    const flags = fsConstants.O_RDONLY |
+    const flags =
+      fsConstants.O_RDONLY |
       (followSymlink ? 0 : (fsConstants.O_NOFOLLOW ?? 0)) |
       (fsConstants.O_NONBLOCK ?? 0);
     const handle = await open(path, flags);
@@ -397,7 +424,9 @@ async function gitBoolean(
   }
 }
 
-async function gitInfoExcludePath(context: GitWorktreeContext): Promise<string> {
+async function gitInfoExcludePath(
+  context: GitWorktreeContext,
+): Promise<string> {
   try {
     const result = await runGit(
       ["-C", context.workspaceRoot, "rev-parse", "--git-path", "info/exclude"],
@@ -407,7 +436,9 @@ async function gitInfoExcludePath(context: GitWorktreeContext): Promise<string> 
     return isAbsolute(value) ? value : resolve(context.workspaceRoot, value);
   } catch (cause) {
     if (cause instanceof GitIgnoreOracleError) throw cause;
-    throw new GitIgnoreOracleError("cannot determine Git info/exclude path", { cause });
+    throw new GitIgnoreOracleError("cannot determine Git info/exclude path", {
+      cause,
+    });
   }
 }
 
@@ -419,10 +450,12 @@ function defaultGlobalExcludePath(
   if (env.XDG_CONFIG_HOME !== undefined && env.XDG_CONFIG_HOME !== "") {
     path = join(env.XDG_CONFIG_HOME, "git", "ignore");
   } else {
-    const home = env.HOME ?? (process.platform === "win32" ? homedir() : undefined);
-    path = home === undefined || home === ""
-      ? undefined
-      : join(home, ".config", "git", "ignore");
+    const home =
+      env.HOME ?? (process.platform === "win32" ? homedir() : undefined);
+    path =
+      home === undefined || home === ""
+        ? undefined
+        : join(home, ".config", "git", "ignore");
   }
   if (path === undefined || isAbsolute(path)) return path;
   // Git resolves this fallback after `-C` has entered the worktree. The live
@@ -436,7 +469,14 @@ async function globalExcludePath(
 ): Promise<string | undefined> {
   try {
     const result = await runGit(
-      ["-C", context.workspaceRoot, "config", "--path", "--get", "core.excludesFile"],
+      [
+        "-C",
+        context.workspaceRoot,
+        "config",
+        "--path",
+        "--get",
+        "core.excludesFile",
+      ],
       context.env,
     );
     const value = decodeSingleLine(result.stdout, "core.excludesFile path");
@@ -446,7 +486,9 @@ async function globalExcludePath(
   } catch (cause) {
     if (failureCode(cause) === 1) return defaultGlobalExcludePath(context);
     if (cause instanceof GitIgnoreOracleError) throw cause;
-    throw new GitIgnoreOracleError("cannot determine Git core.excludesFile", { cause });
+    throw new GitIgnoreOracleError("cannot determine Git core.excludesFile", {
+      cause,
+    });
   }
 }
 
@@ -475,7 +517,9 @@ export async function discoverWorkspaceScope(
     try {
       workspaceRoot = await realpath(resolve(root));
     } catch (cause) {
-      throw new GitIgnoreOracleError("workspace root is not readable", { cause });
+      throw new GitIgnoreOracleError("workspace root is not readable", {
+        cause,
+      });
     }
     return { workspaceRoot, scope: { kind: "all-managed" } };
   }
@@ -540,7 +584,9 @@ export async function readWorkspaceGitignoreSource(
     discovery.repositoryRoot === undefined ||
     !isAbsolute(discovery.repositoryRoot)
   ) {
-    throw new GitIgnoreOracleError("Git scope discovery has no absolute repository root");
+    throw new GitIgnoreOracleError(
+      "Git scope discovery has no absolute repository root",
+    );
   }
   const base = [scope.repositoryPrefix, relativeDirectory]
     .filter((part) => part !== "")
@@ -551,7 +597,9 @@ export async function readWorkspaceGitignoreSource(
     `Git ignore source ${JSON.stringify(sourcePath)}`,
     false,
   );
-  return contents === undefined ? undefined : workspaceGitignoreSource(sourcePath, contents);
+  return contents === undefined
+    ? undefined
+    : workspaceGitignoreSource(sourcePath, contents);
 }
 
 class AllManagedOracle implements GitIgnoreOracle {
@@ -573,25 +621,32 @@ interface SyntheticScratchRoot {
 }
 
 function sameDirectoryIdentity(expected: Stats, actual: Stats): boolean {
-  return actual.isDirectory() &&
+  return (
+    actual.isDirectory() &&
     !actual.isSymbolicLink() &&
     expected.dev === actual.dev &&
-    expected.ino === actual.ino;
+    expected.ino === actual.ino
+  );
 }
 
 function pathIsWithin(root: string, candidate: string): boolean {
   const fromRoot = relative(root, candidate);
-  return fromRoot === "" ||
+  return (
+    fromRoot === "" ||
     (!isAbsolute(fromRoot) &&
       fromRoot !== ".." &&
-      !fromRoot.startsWith(`..${sep}`));
+      !fromRoot.startsWith(`..${sep}`))
+  );
 }
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException).code;
 }
 
-async function realDirectory(path: string, label: string): Promise<{
+async function realDirectory(
+  path: string,
+  label: string,
+): Promise<{
   readonly path: string;
   readonly observation: Stats;
 }> {
@@ -611,8 +666,10 @@ async function selectSyntheticScratchParent(
   readonly forbiddenRoots: readonly string[];
 }> {
   const forbiddenRoots = await Promise.all(
-    (options.forbiddenRoots ?? []).map(async (path) =>
-      (await realDirectory(path, "synthetic Git scratch forbidden root")).path
+    (options.forbiddenRoots ?? []).map(
+      async (path) =>
+        (await realDirectory(path, "synthetic Git scratch forbidden root"))
+          .path,
     ),
   );
   const preferred = await realDirectory(
@@ -687,10 +744,9 @@ async function removeSyntheticScratchRoot(
   try {
     await rm(scratch.path, { recursive: true, force: false });
   } catch (error) {
-    throw new GitIgnoreOracleError(
-      "cannot clean synthetic Git scratch root",
-      { cause: error },
-    );
+    throw new GitIgnoreOracleError("cannot clean synthetic Git scratch root", {
+      cause: error,
+    });
   }
 }
 
@@ -767,7 +823,10 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   #tail: Promise<void> = Promise.resolve();
   #failure: GitIgnoreOracleError | undefined;
   #closed = false;
-  readonly #exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>;
+  readonly #exit: Promise<{
+    readonly code: number | null;
+    readonly signal: NodeJS.Signals | null;
+  }>;
 
   constructor(
     repositoryRoot: string,
@@ -798,15 +857,21 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
     );
     this.#exit = new Promise((resolveExit) => {
-      this.#child.once("close", (code, signal) => resolveExit({ code, signal }));
+      this.#child.once("close", (code, signal) =>
+        resolveExit({ code, signal }),
+      );
     });
     this.#child.once("error", (cause) => {
-      this.#fail(new GitIgnoreOracleError("cannot start Git ignore oracle", { cause }));
+      this.#fail(
+        new GitIgnoreOracleError("cannot start Git ignore oracle", { cause }),
+      );
     });
     this.#child.stdout.on("data", (chunk: Buffer) => this.#onStdout(chunk));
     this.#child.stdin.on("error", (cause) => {
       if (!this.#closed) {
-        this.#fail(new GitIgnoreOracleError("Git ignore oracle input failed", { cause }));
+        this.#fail(
+          new GitIgnoreOracleError("Git ignore oracle input failed", { cause }),
+        );
       }
     });
     this.#child.stderr.on("data", (chunk: Buffer) => {
@@ -815,14 +880,18 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
         !this.#allowBoundedDiagnostics ||
         this.#diagnosticBytes > MAX_LIVE_ORACLE_DIAGNOSTIC_BYTES
       ) {
-        this.#fail(new GitIgnoreOracleError("Git ignore oracle produced diagnostics"));
+        this.#fail(
+          new GitIgnoreOracleError("Git ignore oracle produced diagnostics"),
+        );
       }
     });
     this.#child.once("exit", (code, signal) => {
       if (!this.#closed) {
-        this.#fail(new GitIgnoreOracleError(
-          `Git ignore oracle exited unexpectedly (${code ?? signal ?? "unknown"})`,
-        ));
+        this.#fail(
+          new GitIgnoreOracleError(
+            `Git ignore oracle exited unexpectedly (${code ?? signal ?? "unknown"})`,
+          ),
+        );
       }
     });
   }
@@ -835,7 +904,9 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     }
     if (paths.length === 0) return Promise.resolve([]);
     if (paths.length > MAX_ORACLE_BATCH_PATHS) {
-      return Promise.reject(new GitIgnoreOracleError("Git ignore query has too many paths"));
+      return Promise.reject(
+        new GitIgnoreOracleError("Git ignore query has too many paths"),
+      );
     }
     const encoded: Buffer[] = [];
     const encodedIndexes: number[] = [];
@@ -845,13 +916,19 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       for (let index = 0; index < paths.length; index += 1) {
         const item = paths[index]!;
         const local = canonicalWorkspaceRelativePath(item.path, false);
-        const repositoryPath = this.#repositoryPrefix === ""
-          ? local
-          : `${this.#repositoryPrefix}/${local}`;
-        const pathname = Buffer.from(`${repositoryPath}${item.isDirectory ? "/" : ""}`, "utf8");
+        const repositoryPath =
+          this.#repositoryPrefix === ""
+            ? local
+            : `${this.#repositoryPrefix}/${local}`;
+        const pathname = Buffer.from(
+          `${repositoryPath}${item.isDirectory ? "/" : ""}`,
+          "utf8",
+        );
         bytes += pathname.byteLength + 1;
         if (bytes > MAX_ORACLE_BATCH_BYTES) {
-          throw new GitIgnoreOracleError("Git ignore query exceeds the byte limit");
+          throw new GitIgnoreOracleError(
+            "Git ignore query exceeds the byte limit",
+          );
         }
         if (
           !item.isDirectory &&
@@ -885,18 +962,25 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       });
       return results;
     });
-    this.#tail = run.then(() => undefined, () => undefined);
+    this.#tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
     return run;
   }
 
   #run(expectedPaths: readonly Buffer[]): Promise<readonly boolean[]> {
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#pending !== undefined || this.#stdout.byteLength !== 0) {
-      return Promise.reject(new GitIgnoreOracleError("Git ignore oracle protocol is out of sync"));
+      return Promise.reject(
+        new GitIgnoreOracleError("Git ignore oracle protocol is out of sync"),
+      );
     }
     return new Promise((resolveQuery, reject) => {
       const timer = setTimeout(() => {
-        this.#fail(new GitIgnoreOracleError("Git ignore oracle query timed out"));
+        this.#fail(
+          new GitIgnoreOracleError("Git ignore oracle query timed out"),
+        );
       }, GIT_COMMAND_TIMEOUT_MS);
       this.#pending = {
         expectedPaths,
@@ -911,7 +995,11 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       );
       this.#child.stdin.write(input, (cause) => {
         if (cause !== null && cause !== undefined) {
-          this.#fail(new GitIgnoreOracleError("cannot write to Git ignore oracle", { cause }));
+          this.#fail(
+            new GitIgnoreOracleError("cannot write to Git ignore oracle", {
+              cause,
+            }),
+          );
         }
       });
     });
@@ -921,12 +1009,18 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     if (this.#failure !== undefined) return;
     const pending = this.#pending;
     if (pending === undefined) {
-      this.#fail(new GitIgnoreOracleError("Git ignore oracle emitted unsolicited bytes"));
+      this.#fail(
+        new GitIgnoreOracleError("Git ignore oracle emitted unsolicited bytes"),
+      );
       return;
     }
     pending.responseBytes += chunk.byteLength;
     if (pending.responseBytes > MAX_ORACLE_RESPONSE_BYTES) {
-      this.#fail(new GitIgnoreOracleError("Git ignore oracle response exceeds the byte limit"));
+      this.#fail(
+        new GitIgnoreOracleError(
+          "Git ignore oracle response exceeds the byte limit",
+        ),
+      );
       return;
     }
     this.#stdout = Buffer.concat([this.#stdout, chunk]);
@@ -944,7 +1038,9 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       const remainder = fields.slice(complete);
       if (remainder.length > 0) {
         this.#stdout = Buffer.concat(
-          remainder.flatMap((field) => [field, Buffer.from([0])]).concat(this.#stdout),
+          remainder
+            .flatMap((field) => [field, Buffer.from([0])])
+            .concat(this.#stdout),
         );
       }
       fields.length = complete;
@@ -952,7 +1048,11 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     for (let index = 0; index < fields.length; index += 4) {
       const pending = this.#pending;
       if (pending === undefined) {
-        this.#fail(new GitIgnoreOracleError("Git ignore oracle emitted an unsolicited record"));
+        this.#fail(
+          new GitIgnoreOracleError(
+            "Git ignore oracle emitted an unsolicited record",
+          ),
+        );
         return;
       }
       const source = fields[index] as Buffer;
@@ -965,9 +1065,17 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
         !pathname.equals(expected) ||
         (line.byteLength > 0 && !/^[0-9]+$/u.test(line.toString("ascii"))) ||
         ((source.byteLength === 0 || pattern.byteLength === 0) &&
-          !(source.byteLength === 0 && line.byteLength === 0 && pattern.byteLength === 0))
+          !(
+            source.byteLength === 0 &&
+            line.byteLength === 0 &&
+            pattern.byteLength === 0
+          ))
       ) {
-        this.#fail(new GitIgnoreOracleError("Git ignore oracle returned a malformed record"));
+        this.#fail(
+          new GitIgnoreOracleError(
+            "Git ignore oracle returned a malformed record",
+          ),
+        );
         return;
       }
       const nonMatch = source.byteLength === 0;
@@ -1023,10 +1131,14 @@ export async function createLiveGitIgnoreOracle(
   if (canonical.kind === "all-managed") return new AllManagedOracle();
   const context = await locateGitWorktree(root);
   if (context === undefined) {
-    throw new GitIgnoreOracleError("checkpoint expects Git but workspace is not a Git worktree");
+    throw new GitIgnoreOracleError(
+      "checkpoint expects Git but workspace is not a Git worktree",
+    );
   }
   if (context.repositoryPrefix !== canonical.repositoryPrefix) {
-    throw new GitIgnoreOracleError("workspace Git repository prefix changed during discovery");
+    throw new GitIgnoreOracleError(
+      "workspace Git repository prefix changed during discovery",
+    );
   }
   return new ProcessGitIgnoreOracle(
     context.repositoryRoot,
@@ -1065,7 +1177,9 @@ export async function createSyntheticGitIgnoreOracle(
       }
       const path = join(repositoryRoot, ...source.path.split("/"));
       await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, workspaceScopeBytes(source.contentsBase64), { flag: "wx" });
+      await writeFile(path, workspaceScopeBytes(source.contentsBase64), {
+        flag: "wx",
+      });
     }
     if (canonical.repositoryPrefix !== "") {
       await mkdir(
@@ -1077,7 +1191,10 @@ export async function createSyntheticGitIgnoreOracle(
       ["-C", repositoryRoot, "rev-parse", "--git-path", "info/exclude"],
       env,
     );
-    const rawInfoPath = decodeSingleLine(infoPathResult.stdout, "synthetic info/exclude path");
+    const rawInfoPath = decodeSingleLine(
+      infoPathResult.stdout,
+      "synthetic info/exclude path",
+    );
     const infoPath = isAbsolute(rawInfoPath)
       ? rawInfoPath
       : resolve(repositoryRoot, rawInfoPath);
@@ -1088,13 +1205,31 @@ export async function createSyntheticGitIgnoreOracle(
       ".git",
       "cyclotomy-global-excludes",
     );
-    await writeFile(globalPath, workspaceScopeBytes(canonical.globalExcludeBase64), { flag: "wx" });
+    await writeFile(
+      globalPath,
+      workspaceScopeBytes(canonical.globalExcludeBase64),
+      { flag: "wx" },
+    );
     await runGit(
-      ["-C", repositoryRoot, "config", "--local", "core.ignoreCase", String(canonical.ignoreCase)],
+      [
+        "-C",
+        repositoryRoot,
+        "config",
+        "--local",
+        "core.ignoreCase",
+        String(canonical.ignoreCase),
+      ],
       env,
     );
     await runGit(
-      ["-C", repositoryRoot, "config", "--local", "core.excludesFile", globalPath],
+      [
+        "-C",
+        repositoryRoot,
+        "config",
+        "--local",
+        "core.excludesFile",
+        globalPath,
+      ],
       env,
     );
     return new ProcessGitIgnoreOracle(
@@ -1120,6 +1255,9 @@ export async function createSyntheticGitIgnoreOracle(
       );
     }
     if (cause instanceof GitIgnoreOracleError) throw cause;
-    throw new GitIgnoreOracleError("cannot create synthetic Git ignore oracle", { cause });
+    throw new GitIgnoreOracleError(
+      "cannot create synthetic Git ignore oracle",
+      { cause },
+    );
   }
 }

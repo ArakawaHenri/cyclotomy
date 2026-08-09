@@ -16,18 +16,13 @@ export function openWorkspaceRegularCandidate(
   path: string,
   accessMode: number,
 ): Promise<FileHandle> {
-  if (
-    accessMode !== constants.O_RDONLY &&
-    accessMode !== constants.O_RDWR
-  ) {
+  if (accessMode !== constants.O_RDONLY && accessMode !== constants.O_RDWR) {
     throw new TypeError(
       "workspace regular candidates may only be opened read-only or read-write",
     );
   }
   return open(
     path,
-    accessMode |
-      (constants.O_NOFOLLOW ?? 0) |
-      (constants.O_NONBLOCK ?? 0),
+    accessMode | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
   );
 }

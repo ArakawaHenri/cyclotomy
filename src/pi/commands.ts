@@ -33,11 +33,7 @@ function finishRestore(
       );
       break;
     case "preview-stale":
-      runtime.notify(
-        context,
-        runtime.i18n.t("commandPreviewStale"),
-        "warning",
-      );
+      runtime.notify(context, runtime.i18n.t("commandPreviewStale"), "warning");
       break;
     case "scan-incomplete":
       runtime.notify(
@@ -49,21 +45,13 @@ function finishRestore(
       );
       break;
     case "outcome":
-      notifyRestoreOutcome(
-        runtime,
-        context,
-        execution.outcome,
-      );
+      notifyRestoreOutcome(runtime, context, execution.outcome);
       break;
     case "missing":
       runtime.notify(context, runtime.i18n.t("restoreMissing"), "info");
       break;
     case "matches":
-      runtime.notify(
-        context,
-        runtime.i18n.t("restoreAlreadyMatches"),
-        "info",
-      );
+      runtime.notify(context, runtime.i18n.t("restoreAlreadyMatches"), "info");
       break;
     case "needs-ui":
       runtime.notify(context, runtime.i18n.t("restoreNeedsUi"), "warning");

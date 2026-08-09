@@ -118,11 +118,7 @@ function positiveSafeInteger(
   settingsPath: string,
   label: string,
 ): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value <= 0
-  ) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
     return configError(settingsPath, `${label} must be a positive integer`);
   }
   return value;
@@ -136,10 +132,7 @@ function boundedPositiveSafeInteger(
 ): number {
   const parsed = positiveSafeInteger(value, settingsPath, label);
   if (parsed > maximum) {
-    return configError(
-      settingsPath,
-      `${label} must not exceed ${maximum}`,
-    );
+    return configError(settingsPath, `${label} must not exceed ${maximum}`);
   }
   return parsed;
 }
@@ -149,15 +142,8 @@ function nonNegativeSafeInteger(
   settingsPath: string,
   label: string,
 ): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < 0
-  ) {
-    return configError(
-      settingsPath,
-      `${label} must be a non-negative integer`,
-    );
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    return configError(settingsPath, `${label} must be a non-negative integer`);
   }
   return value;
 }
@@ -177,10 +163,7 @@ function positiveMiB(
   return bytes;
 }
 
-function localeValue(
-  value: unknown,
-  settingsPath: string,
-): CyclotomyLocale {
+function localeValue(value: unknown, settingsPath: string): CyclotomyLocale {
   if (value === "auto" || value === "en" || value === "zh-CN") {
     return value;
   }
@@ -304,11 +287,7 @@ function readSettings(
   try {
     contents = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (cause) {
-    return configError(
-      settingsPath,
-      "settings file is not valid UTF-8",
-      cause,
-    );
+    return configError(settingsPath, "settings file is not valid UTF-8", cause);
   }
 
   let value: unknown;
@@ -371,11 +350,9 @@ function applyOverrides(
       heartbeatMs: LOCK_HEARTBEAT_MS,
       staleMs: LOCK_STALE_MS,
     },
-    autoGcIntervalMs:
-      overrides.autoGcIntervalMs ?? base.autoGcIntervalMs,
+    autoGcIntervalMs: overrides.autoGcIntervalMs ?? base.autoGcIntervalMs,
     sessionMetadataRetentionMs:
-      overrides.sessionMetadataRetentionMs ??
-      base.sessionMetadataRetentionMs,
+      overrides.sessionMetadataRetentionMs ?? base.sessionMetadataRetentionMs,
     locale: overrides.locale ?? base.locale,
   };
 }

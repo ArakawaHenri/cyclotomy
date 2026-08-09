@@ -36,11 +36,7 @@ export interface PendingSourceCapture {
 }
 
 export type TransitionKind =
-  | "input"
-  | "tree"
-  | "compaction"
-  | "fork"
-  | "switch";
+  "input" | "tree" | "compaction" | "fork" | "switch";
 
 /**
  * Short-lived plans that bridge Pi before/after events. This is deliberately

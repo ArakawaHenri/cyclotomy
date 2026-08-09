@@ -30,10 +30,7 @@ import {
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
 
 export type ApplyProblemKind =
-  | "write-failed"
-  | "delete-failed"
-  | "mkdir-failed"
-  | "read-failed";
+  "write-failed" | "delete-failed" | "mkdir-failed" | "read-failed";
 
 export interface ApplyProblem {
   readonly path: string;
@@ -71,14 +68,8 @@ export class ApplyError extends Error {
   }
 }
 
-type RegularTargetEntry = Extract<
-  TreeEntry,
-  { readonly type: "regular" }
->;
-type SymlinkTargetEntry = Extract<
-  TreeEntry,
-  { readonly type: "symlink" }
->;
+type RegularTargetEntry = Extract<TreeEntry, { readonly type: "regular" }>;
+type SymlinkTargetEntry = Extract<TreeEntry, { readonly type: "symlink" }>;
 
 const GIT_INTERNAL_DETAIL = "git-internal path refused";
 const UNOBSERVED_PATH_DETAIL =
@@ -99,8 +90,7 @@ function errorCode(error: unknown): string | undefined {
 }
 
 function errorDetail(action: string, error: unknown): string {
-  const message =
-    error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
   return `${action}: ${message}`;
 }
 
@@ -125,10 +115,7 @@ function isGitInternalPath(relativePath: string): boolean {
     .includes(".git");
 }
 
-function ancestorDirectories(
-  relativePath: string,
-  into: Set<string>,
-): void {
+function ancestorDirectories(relativePath: string, into: Set<string>): void {
   let separator = relativePath.lastIndexOf("/");
   while (separator !== -1) {
     const ancestor = relativePath.slice(0, separator);
@@ -235,10 +222,7 @@ async function hashOpenedRegular(
   return { byteLength, sha256: hash.digest("hex") };
 }
 
-function assertStableRead(
-  before: Stats,
-  after: Stats,
-): void {
+function assertStableRead(before: Stats, after: Stats): void {
   if (
     !sameInode(before, after) ||
     before.size !== after.size ||
@@ -399,9 +383,7 @@ async function writeSymlinkAtomically(
   }
 }
 
-function targetRecreationMode(
-  entry: RegularTargetEntry,
-): FileRecreationMode {
+function targetRecreationMode(entry: RegularTargetEntry): FileRecreationMode {
   if (process.platform === "win32") return null;
   return entry.recreationMode;
 }
@@ -435,9 +417,10 @@ async function assertObservedDirectory(
   workspaceRoot: string,
   observation: DirectoryObservation,
 ): Promise<void> {
-  const absolute = observation.path === ""
-    ? workspaceRoot
-    : join(workspaceRoot, observation.path);
+  const absolute =
+    observation.path === ""
+      ? workspaceRoot
+      : join(workspaceRoot, observation.path);
   const current = await lstat(absolute);
   if (
     current.isSymbolicLink() ||
@@ -486,11 +469,7 @@ async function assertExcludedObservation(
   observation: ExcludedObservation,
   directories: ReadonlyMap<string, DirectoryObservation>,
 ): Promise<void> {
-  await assertObservedAncestors(
-    workspaceRoot,
-    observation.path,
-    directories,
-  );
+  await assertObservedAncestors(workspaceRoot, observation.path, directories);
   const current = await lstat(join(workspaceRoot, observation.path));
   if (
     current.dev !== observation.dev ||
@@ -514,11 +493,7 @@ async function preflightScopeBlockers(
   const observation = excluded.get(blocker.path);
   if (observation !== undefined) {
     try {
-      await assertExcludedObservation(
-        workspaceRoot,
-        observation,
-        directories,
-      );
+      await assertExcludedObservation(workspaceRoot, observation, directories);
     } catch (error) {
       throw new ApplyError(
         `refusing a stale replacement preflight for excluded path "${blocker.path}"`,
@@ -570,9 +545,10 @@ async function assertWorkspaceEntryKindUnchanged(
 ): Promise<void> {
   await assertObservedAncestors(workspaceRoot, entry.path, directories);
   const current = await lstat(join(workspaceRoot, entry.path));
-  const matches = entry.kind === "regular"
-    ? !current.isSymbolicLink() && current.isFile()
-    : current.isSymbolicLink();
+  const matches =
+    entry.kind === "regular"
+      ? !current.isSymbolicLink() && current.isFile()
+      : current.isSymbolicLink();
   if (!matches) {
     throw new Error(`workspace entry type changed since scan: ${entry.path}`);
   }
@@ -590,7 +566,9 @@ async function assertReplacementDirectoryInventory(
     .filter((observation) => isAtOrBelow(observation.path, replacementRoot))
     .sort((left, right) => comparePaths(left.path, right.path));
   if (observedDirectories[0]?.path !== replacementRoot) {
-    throw new Error("replacement directory was absent from the current inventory");
+    throw new Error(
+      "replacement directory was absent from the current inventory",
+    );
   }
 
   // Validate the namespace kind of every managed leaf that will have to
@@ -627,8 +605,9 @@ async function assertReplacementDirectoryInventory(
     await assertObservedDirectory(workspaceRoot, observation);
     const actual = await readdir(join(workspaceRoot, observation.path));
     await assertObservedDirectory(workspaceRoot, observation);
-    const expected = [...(expectedChildren.get(observation.path) ?? [])]
-      .sort(comparePaths);
+    const expected = [...(expectedChildren.get(observation.path) ?? [])].sort(
+      comparePaths,
+    );
     actual.sort(comparePaths);
     if (
       actual.length !== expected.length ||
@@ -655,11 +634,7 @@ async function preflightReplacementNamespace(
   const validatedEntries = new Set<string>();
   const validateEntry = async (entry: WorkspaceEntry): Promise<void> => {
     if (validatedEntries.has(entry.path)) return;
-    await assertWorkspaceEntryKindUnchanged(
-      workspaceRoot,
-      entry,
-      directories,
-    );
+    await assertWorkspaceEntryKindUnchanged(workspaceRoot, entry, directories);
     validatedEntries.add(entry.path);
   };
 
@@ -710,11 +685,7 @@ async function preflightReplacementNamespace(
         await validateEntry(ancestor);
         continue;
       }
-      await assertUnobservedPathAbsent(
-        workspaceRoot,
-        entry.path,
-        directories,
-      );
+      await assertUnobservedPathAbsent(workspaceRoot, entry.path, directories);
     }
   } catch (error) {
     throw new ApplyError(
@@ -867,9 +838,7 @@ export async function applyTreeToWorkspace(
     );
   }
   if (!rootMetadata.isDirectory()) {
-    throw new ApplyError(
-      `workspace root is not a directory: ${root}`,
-    );
+    throw new ApplyError(`workspace root is not a directory: ${root}`);
   }
 
   const directoryObservations = new Map<string, DirectoryObservation>();
@@ -883,10 +852,7 @@ export async function applyTreeToWorkspace(
   // paths validate their observed ancestors and content just before commit;
   // hashing every untouched file here would make a restore re-read the
   // entire workspace solely for preflight.
-  await assertObservedDirectory(
-    workspaceRoot,
-    directoryObservations.get("")!,
-  );
+  await assertObservedDirectory(workspaceRoot, directoryObservations.get("")!);
 
   const problems: ApplyProblem[] = [];
   const created: string[] = [];
@@ -899,10 +865,7 @@ export async function applyTreeToWorkspace(
   const blockedDirectories = new Set<string>();
   const isBlocked = (relativePath: string): boolean => {
     for (const blocked of blockedDirectories) {
-      if (
-        relativePath === blocked ||
-        relativePath.startsWith(`${blocked}/`)
-      ) {
+      if (relativePath === blocked || relativePath.startsWith(`${blocked}/`)) {
         return true;
       }
     }
@@ -1030,7 +993,7 @@ export async function applyTreeToWorkspace(
   // symlink replacements remain in place until a prepared sibling can rename
   // over them atomically in a later step.
   const currentEntries = [...currentByPath.values()].sort((left, right) =>
-    comparePaths(left.path, right.path)
+    comparePaths(left.path, right.path),
   );
   for (const currentEntry of currentEntries) {
     const relativePath = currentEntry.path;
@@ -1065,13 +1028,10 @@ export async function applyTreeToWorkspace(
   // Step 2: prune directories the target no longer needs, deepest first.
   // A directory that still holds unmanaged content is kept on purpose.
   const prunableDirectories = [...currentDirectories]
-    .filter(
-      (relativePath) => !targetKeptDirectories.has(relativePath),
-    )
+    .filter((relativePath) => !targetKeptDirectories.has(relativePath))
     .sort(
       (left, right) =>
-        pathDepth(right) - pathDepth(left) ||
-        comparePaths(left, right),
+        pathDepth(right) - pathDepth(left) || comparePaths(left, right),
     );
   for (const relativePath of prunableDirectories) {
     try {
@@ -1092,11 +1052,7 @@ export async function applyTreeToWorkspace(
       markDirty(relativePath);
     } catch (error) {
       const code = errorCode(error);
-      if (
-        code === "ENOTEMPTY" ||
-        code === "ENOTDIR" ||
-        code === "EEXIST"
-      ) {
+      if (code === "ENOTEMPTY" || code === "ENOTDIR" || code === "EEXIST") {
         continue;
       }
       problems.push({
@@ -1131,8 +1087,7 @@ export async function applyTreeToWorkspace(
       )
       .sort(
         (left, right) =>
-          pathDepth(right) - pathDepth(left) ||
-          comparePaths(left, right),
+          pathDepth(right) - pathDepth(left) || comparePaths(left, right),
       );
     for (const relativePath of observedSubtree) {
       try {
@@ -1165,8 +1120,7 @@ export async function applyTreeToWorkspace(
   // A file or symlink sitting at a directory path is unlinked first.
   const directoriesToCreate = [...targetKeptDirectories].sort(
     (left, right) =>
-      pathDepth(left) - pathDepth(right) ||
-      comparePaths(left, right),
+      pathDepth(left) - pathDepth(right) || comparePaths(left, right),
   );
   for (const relativePath of directoriesToCreate) {
     if (isBlocked(relativePath)) {
@@ -1295,8 +1249,7 @@ export async function applyTreeToWorkspace(
     readonly entry: RegularTargetEntry;
     readonly createdPath: boolean;
     readonly existingRegular:
-      | Extract<WorkspaceEntry, { readonly kind: "regular" }>
-      | undefined;
+      Extract<WorkspaceEntry, { readonly kind: "regular" }> | undefined;
   }> = [];
   const symlinkWrites: Array<{
     readonly entry: SymlinkTargetEntry;
@@ -1376,16 +1329,12 @@ export async function applyTreeToWorkspace(
     try {
       const absolute = join(workspaceRoot, entry.path);
       if (existingRegular !== undefined) {
-        await rewriteRegularInPlace(
-          absolute,
-          content,
-          existingRegular,
-          () =>
-            assertObservedAncestors(
-              workspaceRoot,
-              entry.path,
-              directoryObservations,
-            ),
+        await rewriteRegularInPlace(absolute, content, existingRegular, () =>
+          assertObservedAncestors(
+            workspaceRoot,
+            entry.path,
+            directoryObservations,
+          ),
         );
       } else {
         const validateDestination = createdPath
@@ -1488,9 +1437,7 @@ export async function applyTreeToWorkspace(
         directoryObservations,
       );
       await syncDirectory(
-        relativePath === ""
-          ? workspaceRoot
-          : join(workspaceRoot, relativePath),
+        relativePath === "" ? workspaceRoot : join(workspaceRoot, relativePath),
       );
     } catch (error) {
       if (errorCode(error) === "ENOENT") {

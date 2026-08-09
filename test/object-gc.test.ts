@@ -88,15 +88,22 @@ describe("object garbage collection", () => {
     roots.push(root);
     const store = await openObjectStore(root);
     const metadata = new MetadataStore(join(root, "state.db"));
-    const blobOid = await publishTestBlob(store, Buffer.from("still referenced"));
-    const treeOid = await publishTestTree(store, [
-      {
-        path: "a.txt",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o644,
-      },
-    ], scope);
+    const blobOid = await publishTestBlob(
+      store,
+      Buffer.from("still referenced"),
+    );
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "a.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o644,
+        },
+      ],
+      scope,
+    );
     metadata.setState("s1", "e1", treeOid);
 
     const old = new Date(Date.now() - 10_000);
@@ -106,7 +113,9 @@ describe("object garbage collection", () => {
     await expect(
       collectGarbage(root, store, metadata, 1, Date.now()),
     ).rejects.toBeInstanceOf(GarbageCollectionMarkError);
-    await expect(stat(objectPath(root, "blobs", blobOid))).resolves.toBeDefined();
+    await expect(
+      stat(objectPath(root, "blobs", blobOid)),
+    ).resolves.toBeDefined();
     metadata.close();
   });
 
@@ -116,14 +125,18 @@ describe("object garbage collection", () => {
     const store = await openObjectStore(root);
     const metadata = new MetadataStore(join(root, "state.db"));
     const blobOid = await publishTestBlob(store, Buffer.from("rooted bytes"));
-    const treeOid = await publishTestTree(store, [
-      {
-        path: "rooted.txt",
-        type: "regular",
-        blobOid,
-        recreationMode: 0o644,
-      },
-    ], scope);
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "rooted.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o644,
+        },
+      ],
+      scope,
+    );
     metadata.setState("s1", "e1", treeOid);
 
     const rootedPath = objectPath(root, "blobs", blobOid);

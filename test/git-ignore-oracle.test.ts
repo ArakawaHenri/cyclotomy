@@ -67,10 +67,9 @@ function syntheticScope(policy = "*.log\n"): GitWorkspaceScope {
     kind: "git",
     repositoryPrefix: "",
     ignoreCase: false,
-    gitignoreSources: [workspaceGitignoreSource(
-      ".gitignore",
-      Buffer.from(policy),
-    )],
+    gitignoreSources: [
+      workspaceGitignoreSource(".gitignore", Buffer.from(policy)),
+    ],
     infoExcludeBase64: "",
     globalExcludeBase64: "",
   });
@@ -117,12 +116,15 @@ describe("workspace Git scope", () => {
       gitignoreSources: [{ path: ".gitignore" }, { path: "app/z/.gitignore" }],
     });
     if (left.kind !== "git") throw new Error("expected Git scope");
-    expect(workspaceScopeBytes(left.gitignoreSources[1]!.contentsBase64))
-      .toEqual(Buffer.from([0xff, 0x0a]));
-    expect(workspaceScopesEqual(left, {
-      ...left,
-      gitignoreSources: [...left.gitignoreSources].reverse(),
-    })).toBe(true);
+    expect(
+      workspaceScopeBytes(left.gitignoreSources[1]!.contentsBase64),
+    ).toEqual(Buffer.from([0xff, 0x0a]));
+    expect(
+      workspaceScopesEqual(left, {
+        ...left,
+        gitignoreSources: [...left.gitignoreSources].reverse(),
+      }),
+    ).toBe(true);
   });
 
   it("rejects noncanonical, ambiguous, unrelated, duplicate, and oversized policy", () => {
@@ -138,7 +140,10 @@ describe("workspace Git scope", () => {
       { ignoreCase: false, ignoreSources: [] },
       { ...base, extra: true },
       { ...base, repositoryPrefix: "../app" },
-      { ...base, gitignoreSources: [{ path: "other/.gitignore", contentsBase64: "" }] },
+      {
+        ...base,
+        gitignoreSources: [{ path: "other/.gitignore", contentsBase64: "" }],
+      },
       {
         ...base,
         gitignoreSources: [
@@ -149,21 +154,29 @@ describe("workspace Git scope", () => {
       { ...base, infoExcludeBase64: "A===" },
       {
         ...base,
-        globalExcludeBase64: Buffer.alloc(MAX_GITIGNORE_SOURCE_BYTES + 1).toString("base64"),
+        globalExcludeBase64: Buffer.alloc(
+          MAX_GITIGNORE_SOURCE_BYTES + 1,
+        ).toString("base64"),
       },
     ]) {
-      expect(() => canonicalizeWorkspaceScope(value)).toThrow(WorkspaceScopeError);
+      expect(() => canonicalizeWorkspaceScope(value)).toThrow(
+        WorkspaceScopeError,
+      );
     }
 
-    expect(() => canonicalizeWorkspaceScope({
-      ...base,
-      gitignoreSources: Array.from(
-        { length: MAX_GITIGNORE_SOURCES + 1 },
-        () => ({ path: "app/.gitignore", contentsBase64: "" }),
-      ),
-    })).toThrow("too many");
+    expect(() =>
+      canonicalizeWorkspaceScope({
+        ...base,
+        gitignoreSources: Array.from(
+          { length: MAX_GITIGNORE_SOURCES + 1 },
+          () => ({ path: "app/.gitignore", contentsBase64: "" }),
+        ),
+      }),
+    ).toThrow("too many");
 
-    const fullSource = Buffer.alloc(MAX_GITIGNORE_SOURCE_BYTES).toString("base64");
+    const fullSource = Buffer.alloc(MAX_GITIGNORE_SOURCE_BYTES).toString(
+      "base64",
+    );
     const sourcesAtTotalLimit = Array.from(
       { length: MAX_GITIGNORE_POLICY_BYTES / MAX_GITIGNORE_SOURCE_BYTES },
       (_, index) => ({
@@ -171,16 +184,20 @@ describe("workspace Git scope", () => {
         contentsBase64: fullSource,
       }),
     );
-    expect(() => canonicalizeWorkspaceScope({
-      ...base,
-      gitignoreSources: sourcesAtTotalLimit,
-      infoExcludeBase64: "AA==",
-    })).toThrow("policy byte limit");
+    expect(() =>
+      canonicalizeWorkspaceScope({
+        ...base,
+        gitignoreSources: sourcesAtTotalLimit,
+        infoExcludeBase64: "AA==",
+      }),
+    ).toThrow("policy byte limit");
   });
 
   it("bounds incrementally accumulated policy before a scope is assembled", () => {
     const budget = new WorkspaceGitPolicyBudget();
-    const fullSource = Buffer.alloc(MAX_GITIGNORE_SOURCE_BYTES).toString("base64");
+    const fullSource = Buffer.alloc(MAX_GITIGNORE_SOURCE_BYTES).toString(
+      "base64",
+    );
     const sourcesAtLimit =
       MAX_GITIGNORE_POLICY_BYTES / MAX_GITIGNORE_SOURCE_BYTES;
     for (let index = 0; index < sourcesAtLimit; index += 1) {
@@ -189,10 +206,12 @@ describe("workspace Git scope", () => {
         contentsBase64: fullSource,
       });
     }
-    expect(() => budget.upsertGitignoreSource({
-      path: "overflow/.gitignore",
-      contentsBase64: fullSource,
-    })).toThrow("policy exceeds the byte limit");
+    expect(() =>
+      budget.upsertGitignoreSource({
+        path: "overflow/.gitignore",
+        contentsBase64: fullSource,
+      }),
+    ).toThrow("policy exceeds the byte limit");
   });
 
   it("treats a non-Git directory as all-managed", async () => {
@@ -200,10 +219,12 @@ describe("workspace Git scope", () => {
     const discovery = await discoverWorkspaceScope(root);
     expect(discovery.scope).toEqual({ kind: "all-managed" });
     const oracle = await createSyntheticGitIgnoreOracle(discovery.scope);
-    await expect(oracle.managed([
-      { path: ".gitignore", isDirectory: false },
-      { path: "nested/file", isDirectory: false },
-    ])).resolves.toEqual([true, true]);
+    await expect(
+      oracle.managed([
+        { path: ".gitignore", isDirectory: false },
+        { path: "nested/file", isDirectory: false },
+      ]),
+    ).resolves.toEqual([true, true]);
     await oracle.close();
   });
 });
@@ -224,10 +245,13 @@ describe("Git ignore oracle", () => {
       join(workspace, ".gitignore"),
       "*.log\n!keep.log\nbuild/\n.gitignore\n",
     );
-    await put(join(workspace, "sub", ".gitignore"), Buffer.concat([
-      Buffer.from("*.tmp\n# raw bytes remain exact: "),
-      Buffer.from([0xff, 0x0a]),
-    ]));
+    await put(
+      join(workspace, "sub", ".gitignore"),
+      Buffer.concat([
+        Buffer.from("*.tmp\n# raw bytes remain exact: "),
+        Buffer.from([0xff, 0x0a]),
+      ]),
+    );
     const infoPath = join(root, ".git", "info", "exclude");
     const globalPath = join(root, "global-ignore");
     await put(infoPath, "info.ignore\n");
@@ -311,10 +335,12 @@ describe("Git ignore oracle", () => {
 
     try {
       expect(await readdir(scratchParent)).toHaveLength(1);
-      await expect(oracle.managed([
-        { path: "drop.log", isDirectory: false },
-        { path: "keep.txt", isDirectory: false },
-      ])).resolves.toEqual([false, true]);
+      await expect(
+        oracle.managed([
+          { path: "drop.log", isDirectory: false },
+          { path: "keep.txt", isDirectory: false },
+        ]),
+      ).resolves.toEqual([false, true]);
     } finally {
       await oracle.close();
     }
@@ -328,10 +354,11 @@ describe("Git ignore oracle", () => {
     const emptyExecutablePath = await makeRoot();
     const scope = syntheticScope();
 
-    await expect(withEnvironment(
-      { PATH: emptyExecutablePath },
-      () => createSyntheticGitIgnoreOracle(scope, { scratchParent }),
-    )).rejects.toThrow();
+    await expect(
+      withEnvironment({ PATH: emptyExecutablePath }, () =>
+        createSyntheticGitIgnoreOracle(scope, { scratchParent }),
+      ),
+    ).rejects.toThrow();
 
     expect(await readdir(scratchParent)).toEqual([]);
   });
@@ -440,7 +467,11 @@ describe("Git ignore oracle", () => {
     const synthetic = await createSyntheticGitIgnoreOracle(scope);
     try {
       await expect(live.managed(paths)).resolves.toEqual([true, false, true]);
-      await expect(synthetic.managed(paths)).resolves.toEqual([true, false, true]);
+      await expect(synthetic.managed(paths)).resolves.toEqual([
+        true,
+        false,
+        true,
+      ]);
     } finally {
       await live.close();
       await synthetic.close();
@@ -452,19 +483,23 @@ describe("Git ignore oracle", () => {
       kind: "git",
       repositoryPrefix: "empty.gitconfig/workspace",
       ignoreCase: false,
-      gitignoreSources: [workspaceGitignoreSource(
-        "empty.gitconfig/.gitignore",
-        Buffer.from("*.tmp\n"),
-      )],
+      gitignoreSources: [
+        workspaceGitignoreSource(
+          "empty.gitconfig/.gitignore",
+          Buffer.from("*.tmp\n"),
+        ),
+      ],
       infoExcludeBase64: "",
       globalExcludeBase64: "",
     });
     const oracle = await createSyntheticGitIgnoreOracle(scope);
     try {
-      await expect(oracle.managed([
-        { path: "drop.tmp", isDirectory: false },
-        { path: "keep.txt", isDirectory: false },
-      ])).resolves.toEqual([false, true]);
+      await expect(
+        oracle.managed([
+          { path: "drop.tmp", isDirectory: false },
+          { path: "keep.txt", isDirectory: false },
+        ]),
+      ).resolves.toEqual([false, true]);
     } finally {
       await oracle.close();
     }
@@ -489,13 +524,16 @@ describe("Git ignore oracle", () => {
   it("serializes concurrent batches and rejects use after close", async () => {
     const { scope } = await fixture();
     const oracle = await createSyntheticGitIgnoreOracle(scope);
-    await expect(Promise.all([
-      oracle.managed([{ path: "one.log", isDirectory: false }]),
-      oracle.managed([{ path: "two.txt", isDirectory: false }]),
-    ])).resolves.toEqual([[false], [true]]);
+    await expect(
+      Promise.all([
+        oracle.managed([{ path: "one.log", isDirectory: false }]),
+        oracle.managed([{ path: "two.txt", isDirectory: false }]),
+      ]),
+    ).resolves.toEqual([[false], [true]]);
     await oracle.close();
-    await expect(oracle.managed([{ path: "late", isDirectory: false }]))
-      .rejects.toThrow("closed");
+    await expect(
+      oracle.managed([{ path: "late", isDirectory: false }]),
+    ).rejects.toThrow("closed");
   });
 
   it("treats an explicitly empty core.excludesFile as disabled", async () => {
@@ -525,9 +563,9 @@ describe("Git ignore oracle", () => {
       });
       const live = await createLiveGitIgnoreOracle(root, discovery.scope);
       try {
-        await expect(live.managed([
-          { path: "xdg.ignore", isDirectory: false },
-        ])).resolves.toEqual([false]);
+        await expect(
+          live.managed([{ path: "xdg.ignore", isDirectory: false }]),
+        ).resolves.toEqual([false]);
       } finally {
         await live.close();
       }
@@ -549,36 +587,40 @@ describe("Git ignore oracle", () => {
       policyPath,
     ]);
 
-    await withEnvironment({
-      GIT_CONFIG_GLOBAL: configPath,
-      GIT_CONFIG_SYSTEM: undefined,
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_PARAMETERS: undefined,
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "core.ignoreCase",
-      GIT_CONFIG_VALUE_0: "true",
-      GIT_DIR: join(configRoot, "not-the-workspace-repository"),
-    }, async () => {
-      const discovery = await discoverWorkspaceScope(root);
-      expect(discovery.scope).toMatchObject({
-        kind: "git",
-        ignoreCase: true,
-        globalExcludeBase64: Buffer.from("process.ignore\n").toString("base64"),
-      });
-      const live = await createLiveGitIgnoreOracle(root, discovery.scope);
-      const synthetic = await createSyntheticGitIgnoreOracle(discovery.scope);
-      try {
-        await expect(live.managed([
-          { path: "process.ignore", isDirectory: false },
-        ])).resolves.toEqual([false]);
-        await expect(synthetic.managed([
-          { path: "process.ignore", isDirectory: false },
-        ])).resolves.toEqual([false]);
-      } finally {
-        await live.close();
-        await synthetic.close();
-      }
-    });
+    await withEnvironment(
+      {
+        GIT_CONFIG_GLOBAL: configPath,
+        GIT_CONFIG_SYSTEM: undefined,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_PARAMETERS: undefined,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.ignoreCase",
+        GIT_CONFIG_VALUE_0: "true",
+        GIT_DIR: join(configRoot, "not-the-workspace-repository"),
+      },
+      async () => {
+        const discovery = await discoverWorkspaceScope(root);
+        expect(discovery.scope).toMatchObject({
+          kind: "git",
+          ignoreCase: true,
+          globalExcludeBase64:
+            Buffer.from("process.ignore\n").toString("base64"),
+        });
+        const live = await createLiveGitIgnoreOracle(root, discovery.scope);
+        const synthetic = await createSyntheticGitIgnoreOracle(discovery.scope);
+        try {
+          await expect(
+            live.managed([{ path: "process.ignore", isDirectory: false }]),
+          ).resolves.toEqual([false]);
+          await expect(
+            synthetic.managed([{ path: "process.ignore", isDirectory: false }]),
+          ).resolves.toEqual([false]);
+        } finally {
+          await live.close();
+          await synthetic.close();
+        }
+      },
+    );
   });
 
   it("isolates synthetic replay from host GIT_* routing and config injection", async () => {
@@ -594,21 +636,24 @@ describe("Git ignore oracle", () => {
       globalExcludeBase64: "",
     });
 
-    await withEnvironment({
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "core.excludesFile",
-      GIT_CONFIG_VALUE_0: poison,
-      GIT_DIR: join(poisonRoot, "not-a-repository"),
-    }, async () => {
-      const synthetic = await createSyntheticGitIgnoreOracle(scope);
-      try {
-        await expect(synthetic.managed([
-          { path: "poisoned.txt", isDirectory: false },
-        ])).resolves.toEqual([true]);
-      } finally {
-        await synthetic.close();
-      }
-    });
+    await withEnvironment(
+      {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.excludesFile",
+        GIT_CONFIG_VALUE_0: poison,
+        GIT_DIR: join(poisonRoot, "not-a-repository"),
+      },
+      async () => {
+        const synthetic = await createSyntheticGitIgnoreOracle(scope);
+        try {
+          await expect(
+            synthetic.managed([{ path: "poisoned.txt", isDirectory: false }]),
+          ).resolves.toEqual([true]);
+        } finally {
+          await synthetic.close();
+        }
+      },
+    );
   });
 
   it("handles Git's expected live warning for a symlinked .gitignore", async () => {
@@ -664,9 +709,9 @@ describe("Git ignore oracle", () => {
     });
     const oracle = await createLiveGitIgnoreOracle(workspace, discovery.scope);
     try {
-      await expect(oracle.managed([
-        { path: "common.ignore", isDirectory: false },
-      ])).resolves.toEqual([false]);
+      await expect(
+        oracle.managed([{ path: "common.ignore", isDirectory: false }]),
+      ).resolves.toEqual([false]);
     } finally {
       await oracle.close();
     }

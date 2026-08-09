@@ -2,10 +2,7 @@ import {
   createSyntheticGitIgnoreOracle,
   type SyntheticGitIgnoreScratchOptions,
 } from "./git-ignore-oracle.ts";
-import {
-  TreeManifestError,
-  type TreeManifest,
-} from "./tree-manifest.ts";
+import { TreeManifestError, type TreeManifest } from "./tree-manifest.ts";
 import {
   workspaceLocalGitignorePath,
   workspaceScopePathKey,
@@ -70,10 +67,7 @@ export async function validateTreeEntriesAgainstScope(
       offset < paths.length;
       offset += VALIDATION_BATCH_SIZE
     ) {
-      const batch = paths.slice(
-        offset,
-        offset + VALIDATION_BATCH_SIZE,
-      );
+      const batch = paths.slice(offset, offset + VALIDATION_BATCH_SIZE);
       const managed = await oracle.managed(
         batch.map(({ path }) => ({ path, isDirectory: false })),
       );
@@ -92,11 +86,7 @@ export async function validateTreeEntriesAgainstScope(
             `tree entry is excluded by its archived workspace scope: ${item.path}`,
           );
         }
-        if (
-          item.isLocalIgnoreSource &&
-          isManaged &&
-          !item.isEntry
-        ) {
+        if (item.isLocalIgnoreSource && isManaged && !item.isEntry) {
           throw new TreeManifestError(
             "object-integrity",
             `tree omits a managed archived .gitignore source: ${item.path}`,

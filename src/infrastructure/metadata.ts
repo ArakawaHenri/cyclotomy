@@ -10,11 +10,7 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import {
-  isTreeOid,
-  type NodeState,
-  type TreeOid,
-} from "../domain/model.ts";
+import { isTreeOid, type NodeState, type TreeOid } from "../domain/model.ts";
 
 /** Persistent schema version; every increment requires an explicit migration. */
 const METADATA_SCHEMA_VERSION = 1;
@@ -51,8 +47,7 @@ function enableWalWithRetry(db: DatabaseSync): void {
   while (true) {
     try {
       const row = db.prepare("PRAGMA journal_mode=WAL").get() as
-        | { journal_mode: string }
-        | undefined;
+        { journal_mode: string } | undefined;
       if (row?.journal_mode.toLowerCase() !== "wal") {
         throw new Error("SQLite refused WAL journal mode");
       }
@@ -139,11 +134,7 @@ function checkedRegularMetadataPath(path: string): Stats {
       `cannot inspect file (${error instanceof Error ? error.message : String(error)})`,
     );
   }
-  if (
-    observed.isSymbolicLink() ||
-    !observed.isFile() ||
-    observed.nlink !== 1
-  ) {
+  if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
     throw metadataPathError(
       path,
       "must be a single-link regular file, not a symlink or another file type",
@@ -170,8 +161,11 @@ function checkedRegularMetadataPath(path: string): Stats {
 }
 
 function optionalMetadataSidecar(path: string): void {
-  validation:
-  for (let attempt = 0; attempt < SIDECAR_VALIDATION_ATTEMPTS; attempt += 1) {
+  validation: for (
+    let attempt = 0;
+    attempt < SIDECAR_VALIDATION_ATTEMPTS;
+    attempt += 1
+  ) {
     let before: Stats;
     try {
       before = lstatSync(path);
@@ -284,11 +278,7 @@ function prepareMetadataPath(path: string): {
   readonly canonicalPath: string;
   readonly observation: Stats;
 } {
-  if (
-    !isAbsolute(path) ||
-    path.includes("\0") ||
-    resolve(path) !== path
-  ) {
+  if (!isAbsolute(path) || path.includes("\0") || resolve(path) !== path) {
     throw metadataPathError(path, "path must be canonical and absolute");
   }
   const parent = dirname(path);
@@ -378,10 +368,7 @@ function sessionRegistrationFromRow(
   row: SessionRegistrationRow,
 ): SessionRegistration {
   const sessionId = requireNonEmpty(String(row.session_id), "session id");
-  const sessionFile = requireNonEmpty(
-    String(row.session_file),
-    "session file",
-  );
+  const sessionFile = requireNonEmpty(String(row.session_file), "session file");
   const missingSince =
     row.missing_since === null
       ? null
@@ -437,10 +424,7 @@ export class MetadataStore {
       }
       throw error instanceof MetadataError
         ? error
-        : new MetadataError(
-            `cannot open metadata database at ${path}`,
-            error,
-          );
+        : new MetadataError(`cannot open metadata database at ${path}`, error);
     }
     this.#db = db;
 
@@ -481,11 +465,7 @@ export class MetadataStore {
   }
 
   /** Overwrite the node's sole state slot. */
-  setState(
-    sessionId: string,
-    entryId: string,
-    treeOid: string,
-  ): void {
+  setState(sessionId: string, entryId: string, treeOid: string): void {
     requireNonEmpty(sessionId, "session id");
     requireNonEmpty(entryId, "entry id");
     const checkedTreeOid = requireTreeOid(treeOid, "node state");
@@ -500,10 +480,7 @@ export class MetadataStore {
   }
 
   /** Register the unique persisted file that owns one Pi session id. */
-  touchSession(
-    sessionId: string,
-    sessionFile: string,
-  ): SessionRegistration {
+  touchSession(sessionId: string, sessionFile: string): SessionRegistration {
     requireNonEmpty(sessionId, "session id");
     requireNonEmpty(sessionFile, "session file");
     const row = this.#database()
@@ -519,8 +496,7 @@ export class MetadataStore {
          RETURNING *`,
       )
       .get(sessionId, sessionFile) as unknown as
-        | SessionRegistrationRow
-        | undefined;
+      SessionRegistrationRow | undefined;
     if (row === undefined) {
       throw new MetadataError(
         `session id ${JSON.stringify(sessionId)} is already owned by another file`,
@@ -560,8 +536,7 @@ export class MetadataStore {
            WHERE session_file = ?`,
         )
         .get(input.parentSessionFile) as
-        | { readonly session_id: unknown }
-        | undefined;
+        { readonly session_id: unknown } | undefined;
       if (source === undefined) {
         return { sourceSessionId: undefined, copiedStates: 0 };
       }
@@ -597,11 +572,8 @@ export class MetadataStore {
       let copiedStates = 0;
       for (const state of checked) {
         copiedStates += Number(
-          insert.run(
-            input.targetSessionId,
-            state.entryId,
-            state.treeOid,
-          ).changes,
+          insert.run(input.targetSessionId, state.entryId, state.treeOid)
+            .changes,
         );
       }
       return { sourceSessionId, copiedStates };
@@ -635,13 +607,7 @@ export class MetadataStore {
              missing_observed_at = MAX(COALESCE(missing_observed_at, ?), ?)
          WHERE session_id = ? AND session_file = ?`,
       )
-      .run(
-        observedAt,
-        observedAt,
-        observedAt,
-        sessionId,
-        expectedSessionFile,
-      );
+      .run(observedAt, observedAt, observedAt, sessionId, expectedSessionFile);
     return Number(result.changes) === 1;
   }
 
@@ -702,7 +668,8 @@ export class MetadataStore {
         };
       }
       const removedNodeStates = Number(
-        db.prepare("DELETE FROM node_state WHERE session_id = ?")
+        db
+          .prepare("DELETE FROM node_state WHERE session_id = ?")
           .run(expectedSessionId).changes,
       );
       return {
@@ -718,9 +685,7 @@ export class MetadataStore {
     const rows = this.#database()
       .prepare("SELECT DISTINCT tree_oid FROM node_state ORDER BY tree_oid")
       .all();
-    return rows.map((row) =>
-      requireTreeOid(row.tree_oid, "metadata GC root"),
-    );
+    return rows.map((row) => requireTreeOid(row.tree_oid, "metadata GC root"));
   }
 
   close(): void {
@@ -730,9 +695,9 @@ export class MetadataStore {
   }
 
   #schemaVersion(db: DatabaseSync): number {
-    const row = db
-      .prepare("PRAGMA user_version")
-      .get() as { user_version: number | bigint };
+    const row = db.prepare("PRAGMA user_version").get() as {
+      user_version: number | bigint;
+    };
     const version = Number(row.user_version);
     if (!Number.isSafeInteger(version) || version < 0) {
       throw new MetadataError("metadata schema version is invalid");
@@ -797,21 +762,28 @@ export class MetadataStore {
     if (this.#schemaVersion(db) !== METADATA_SCHEMA_VERSION) {
       throw new MetadataError("metadata schema migration did not converge");
     }
-    const tables = (db.prepare("PRAGMA table_list").all() as unknown as {
-      readonly name: unknown;
-      readonly type: unknown;
-      readonly wr: unknown;
-      readonly strict: unknown;
-    }[])
-      .filter((row) =>
-        row.type === "table" && !String(row.name).startsWith("sqlite_")
+    const tables = (
+      db.prepare("PRAGMA table_list").all() as unknown as {
+        readonly name: unknown;
+        readonly type: unknown;
+        readonly wr: unknown;
+        readonly strict: unknown;
+      }[]
+    )
+      .filter(
+        (row) =>
+          row.type === "table" && !String(row.name).startsWith("sqlite_"),
       )
-      .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+      .sort((left, right) =>
+        String(left.name).localeCompare(String(right.name)),
+      );
     if (
       tables.length !== 2 ||
       String(tables[0]?.name) !== "node_state" ||
       String(tables[1]?.name) !== "session_registry" ||
-      tables.some((table) => Number(table.wr) !== 1 || Number(table.strict) !== 1)
+      tables.some(
+        (table) => Number(table.wr) !== 1 || Number(table.strict) !== 1,
+      )
     ) {
       throw new MetadataError(
         "metadata schema has unexpected tables or table options",
@@ -822,15 +794,18 @@ export class MetadataStore {
     // layouts look right. Names reserved by SQLite (autoindexes/statistics)
     // cannot be user-created and are validated semantically below where they
     // affect a product invariant.
-    const userObjects = db.prepare(
-      `SELECT type, name, tbl_name FROM sqlite_schema
+    const userObjects = db
+      .prepare(
+        `SELECT type, name, tbl_name FROM sqlite_schema
        WHERE type IN ('trigger', 'view') OR name NOT GLOB 'sqlite_*'
        ORDER BY type, name`,
-    ).all().map((row) => ({
-      type: String(row.type),
-      name: String(row.name),
-      table: String(row.tbl_name),
-    }));
+      )
+      .all()
+      .map((row) => ({
+        type: String(row.type),
+        name: String(row.name),
+        table: String(row.tbl_name),
+      }));
     const expectedObjects = [
       {
         type: "index",
@@ -848,10 +823,12 @@ export class MetadataStore {
       userObjects.length !== expectedObjects.length ||
       userObjects.some((object, index) => {
         const expected = expectedObjects[index];
-        return expected === undefined ||
+        return (
+          expected === undefined ||
           object.type !== expected.type ||
           object.name !== expected.name ||
-          object.table !== expected.table;
+          object.table !== expected.table
+        );
       })
     ) {
       throw new MetadataError("metadata schema has unexpected schema objects");
@@ -878,11 +855,13 @@ export class MetadataStore {
         actual.length !== expected.length ||
         actual.some((column, index) => {
           const wanted = expected[index];
-          return wanted === undefined ||
+          return (
+            wanted === undefined ||
             column.name !== wanted.name ||
             column.type !== wanted.type ||
             column.notnull !== wanted.notnull ||
-            column.pk !== wanted.pk;
+            column.pk !== wanted.pk
+          );
         })
       ) {
         throw new MetadataError(
@@ -903,11 +882,12 @@ export class MetadataStore {
     ]);
 
     const indexes = db.prepare("PRAGMA index_list(session_registry)").all();
-    const missing = indexes.find((row) =>
-      row.name === "session_registry_missing" &&
-      Number(row.unique) === 0 &&
-      row.origin === "c" &&
-      Number(row.partial) === 0
+    const missing = indexes.find(
+      (row) =>
+        row.name === "session_registry_missing" &&
+        Number(row.unique) === 0 &&
+        row.origin === "c" &&
+        Number(row.partial) === 0,
     );
     const uniqueSessionFile = indexes.find((row) => {
       if (Number(row.unique) !== 1 || row.origin !== "u") return false;

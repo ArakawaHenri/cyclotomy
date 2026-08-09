@@ -3,15 +3,9 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import type {
-  FakeEntry,
-  FakeNotification,
-} from "./fake-pi.ts";
+import type { FakeEntry, FakeNotification } from "./fake-pi.ts";
 
-type Handler = (
-  event: never,
-  context: ExtensionContext,
-) => Promise<unknown>;
+type Handler = (event: never, context: ExtensionContext) => Promise<unknown>;
 
 type ExtensionFactory = (pi: ExtensionAPI) => void;
 
@@ -142,7 +136,7 @@ export class ReloadingFakePi {
       [...ReloadingFakePi.#live].map((pi) => pi.dispose()),
     );
     const failures = settled.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : []
+      result.status === "rejected" ? [result.reason] : [],
     );
     if (failures.length > 0) {
       throw new AggregateError(
@@ -220,10 +214,7 @@ export class ReloadingFakePi {
       registerCommand(
         name: string,
         definition: {
-          handler: (
-            args: string,
-            context: ExtensionContext,
-          ) => Promise<void>;
+          handler: (args: string, context: ExtensionContext) => Promise<void>;
         },
       ) {
         self.#commands.set(name, definition.handler);

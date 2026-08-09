@@ -15,10 +15,7 @@ describe("operation-local blob staging", () => {
     testRoot = await mkdtemp(join(tmpdir(), "cyclotomy-blob-staging-test-"));
     workspaceRoot = join(testRoot, "workspace");
     stagingParent = join(testRoot, "scratch");
-    await Promise.all([
-      mkdir(workspaceRoot),
-      mkdir(stagingParent),
-    ]);
+    await Promise.all([mkdir(workspaceRoot), mkdir(stagingParent)]);
   });
 
   afterEach(async () => {
@@ -38,11 +35,10 @@ describe("operation-local blob staging", () => {
       return content;
     });
 
-    const staged = await stageBlobs(
-      ["a", "a", "b", "a", "b"],
-      readBlob,
-      { workspaceRoot, stagingParent },
-    );
+    const staged = await stageBlobs(["a", "a", "b", "a", "b"], readBlob, {
+      workspaceRoot,
+      stagingParent,
+    });
     expect(readBlob.mock.calls.map(([oid]) => oid)).toEqual(["a", "b"]);
     expect(Buffer.from(await staged.readBlob("a")).toString()).toBe("alpha");
     expect(Buffer.from(await staged.readBlob("b")).toString()).toBe("beta");

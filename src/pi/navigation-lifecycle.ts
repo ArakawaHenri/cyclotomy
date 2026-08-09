@@ -18,10 +18,7 @@ import {
 import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
 import { requestRestoreChoice } from "./restore-choice.ts";
 import { notifyRestoreOutcome } from "./restore-outcome.ts";
-import {
-  CyclotomyRuntime,
-  messageOf,
-} from "./runtime.ts";
+import { CyclotomyRuntime, messageOf } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 import type {
   NavigationTargetPlan,
@@ -189,9 +186,7 @@ export function registerNavigationLifecycle(
           if (sourceSnapshot.problems.length > 0) {
             return {
               kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(
-                sourceSnapshot.problems,
-              ),
+              message: runtime.i18n.formatScanProblems(sourceSnapshot.problems),
             };
           }
 
@@ -219,10 +214,7 @@ export function registerNavigationLifecycle(
               targetKind: "inherit-source" as const,
             };
           }
-          const readable = await runtime.resolveReadableTreeIn(
-            view,
-            target,
-          );
+          const readable = await runtime.resolveReadableTreeIn(view, target);
           if (readable === undefined) {
             return {
               kind: "ready" as const,
@@ -337,9 +329,7 @@ export function registerNavigationLifecycle(
           if (sourceCurrent.problems.length > 0) {
             return {
               kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(
-                sourceCurrent.problems,
-              ),
+              message: runtime.i18n.formatScanProblems(sourceCurrent.problems),
             };
           }
           if (sourceCurrent.rootPath !== prepared.sourceSnapshot.rootPath) {
@@ -355,17 +345,14 @@ export function registerNavigationLifecycle(
           ) {
             return { kind: "preview-stale" as const };
           }
-          const restoreCurrent =
-            await runtime.scanCurrentWorkspaceForScope(
-              view.cwd,
-              prepared.restoreSnapshot.scope,
-            );
+          const restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
+            view.cwd,
+            prepared.restoreSnapshot.scope,
+          );
           if (restoreCurrent.problems.length > 0) {
             return {
               kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(
-                restoreCurrent.problems,
-              ),
+              message: runtime.i18n.formatScanProblems(restoreCurrent.problems),
             };
           }
           if (restoreCurrent.rootPath !== prepared.restoreSnapshot.rootPath) {
@@ -387,13 +374,14 @@ export function registerNavigationLifecycle(
             source,
             target,
           );
-          const targetKind = target === undefined
-            ? "no-node"
-            : targetFollowsSource
-            ? "inherit-source"
-            : prepared.resolution === undefined
-            ? "materialize-missing"
-            : "restore";
+          const targetKind =
+            target === undefined
+              ? "no-node"
+              : targetFollowsSource
+                ? "inherit-source"
+                : prepared.resolution === undefined
+                  ? "materialize-missing"
+                  : "restore";
           if (targetKind !== prepared.targetKind) {
             return { kind: "target-changed" as const };
           }
@@ -576,10 +564,7 @@ export function registerNavigationLifecycle(
   pi.on("session_tree", async (event, context) => {
     const plan = runtime.transitions.takeNavigation();
     const attentionStatus = () =>
-      runtime.setStatus(
-        context,
-        runtime.i18n.t("navigationAttentionStatus"),
-      );
+      runtime.setStatus(context, runtime.i18n.t("navigationAttentionStatus"));
     let view: SessionView;
     try {
       view = readSessionView(context);
@@ -634,18 +619,19 @@ export function registerNavigationLifecycle(
 
         const authenticatedRootSummary =
           plan.target.kind === "no-node" &&
-            plan.expectedDestinationId === null &&
-            event.summaryEntry?.parentId === null &&
-            view.entryTypeOf(event.summaryEntry.id) === "branch_summary" &&
-            view.parentIdOf(event.summaryEntry.id) === null
+          plan.expectedDestinationId === null &&
+          event.summaryEntry?.parentId === null &&
+          view.entryTypeOf(event.summaryEntry.id) === "branch_summary" &&
+          view.parentIdOf(event.summaryEntry.id) === null
             ? {
                 sessionId: plan.sessionId,
                 entryId: event.summaryEntry.id,
               }
             : undefined;
-        const missingTarget = plan.target.kind === "materialize-missing"
-          ? plan.target.node
-          : authenticatedRootSummary;
+        const missingTarget =
+          plan.target.kind === "materialize-missing"
+            ? plan.target.node
+            : authenticatedRootSummary;
 
         if (plan.target.kind === "no-node" && missingTarget === undefined) {
           return { kind: "no-node" as const };
@@ -656,11 +642,9 @@ export function registerNavigationLifecycle(
           // The sole late-bound exception is Pi's explicit summary entry for
           // a null logical destination; a wrapping label never owns state.
           const targetNode = missingTarget;
-          if (!runtime.resolutionStillAuthoritative(
-            view,
-            targetNode,
-            undefined,
-          )) {
+          if (
+            !runtime.resolutionStillAuthoritative(view, targetNode, undefined)
+          ) {
             return { kind: "target-changed" as const };
           }
 
@@ -679,9 +663,7 @@ export function registerNavigationLifecycle(
           if (targetCurrent.problems.length > 0) {
             return {
               kind: "scan-incomplete" as const,
-              message: runtime.i18n.formatScanProblems(
-                targetCurrent.problems,
-              ),
+              message: runtime.i18n.formatScanProblems(targetCurrent.problems),
             };
           }
           const preparedTarget = await prepareObservedNodeState(
@@ -700,11 +682,9 @@ export function registerNavigationLifecycle(
           ) {
             return { kind: "location-changed" as const };
           }
-          if (!runtime.resolutionStillAuthoritative(
-            view,
-            targetNode,
-            undefined,
-          )) {
+          if (
+            !runtime.resolutionStillAuthoritative(view, targetNode, undefined)
+          ) {
             return { kind: "target-changed" as const };
           }
           const committedTarget = await commitPreparedNodeState(
@@ -744,9 +724,7 @@ export function registerNavigationLifecycle(
         if (restoreCurrent.problems.length > 0) {
           return {
             kind: "scan-incomplete" as const,
-            message: runtime.i18n.formatScanProblems(
-              restoreCurrent.problems,
-            ),
+            message: runtime.i18n.formatScanProblems(restoreCurrent.problems),
           };
         }
         if (restoreCurrent.rootPath !== plan.previewSnapshot.rootPath) {
@@ -761,11 +739,13 @@ export function registerNavigationLifecycle(
         if (gap.problems.length > 0 || restorePlanHasChanges(gap)) {
           return { kind: "preview-stale" as const };
         }
-        if (!runtime.resolutionStillAuthoritative(
-          view,
-          plan.target.node,
-          plan.target.resolution,
-        )) {
+        if (
+          !runtime.resolutionStillAuthoritative(
+            view,
+            plan.target.node,
+            plan.target.resolution,
+          )
+        ) {
           return { kind: "target-changed" as const };
         }
         if (plan.target.kind === "inherit-source") {
@@ -840,12 +820,9 @@ export function registerNavigationLifecycle(
         break;
       case "outcome": {
         const restoreNeedsAttention = execution.outcome.kind !== "restored";
-        notifyRestoreOutcome(
-          runtime,
-          context,
-          execution.outcome,
-          { announceSuccess: false },
-        );
+        notifyRestoreOutcome(runtime, context, execution.outcome, {
+          announceSuccess: false,
+        });
         if (restoreNeedsAttention) {
           attentionStatus();
         } else {

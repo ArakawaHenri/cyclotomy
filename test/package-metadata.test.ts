@@ -44,8 +44,9 @@ describe("package metadata", () => {
 
     expect(lockedRoot).toBeDefined();
     for (const field of ROOT_METADATA_FIELDS) {
-      expect(lockedRoot?.[field], `root package-lock field ${field}`)
-        .toEqual(manifest[field]);
+      expect(lockedRoot?.[field], `root package-lock field ${field}`).toEqual(
+        manifest[field],
+      );
     }
   });
 });

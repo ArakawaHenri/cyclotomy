@@ -12,10 +12,7 @@ import {
   workspaceSnapshotAsManifest,
 } from "../src/infrastructure/restore-plan.ts";
 import type { WorkspaceState } from "../src/infrastructure/workspace-scan.ts";
-import {
-  ALL_MANAGED_SCOPE,
-  gitScope,
-} from "./workspace-scope-fixture.ts";
+import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const oid = (content: string): string =>
   createHash("sha256").update(content).digest("hex");
@@ -34,13 +31,15 @@ function state(input: WorkspaceStateInput): WorkspaceState {
 describe("workspace restore plan", () => {
   it("marks an inventory from a different workspace scope incomplete", () => {
     const current = state({
-      entries: [{
-        path: "current-only.txt",
-        kind: "regular",
-        recreationMode: 0o644,
-        byteLength: 1,
-        sha256: oid("x"),
-      }],
+      entries: [
+        {
+          path: "current-only.txt",
+          kind: "regular",
+          recreationMode: 0o644,
+          byteLength: 1,
+          sha256: oid("x"),
+        },
+      ],
       problems: [],
       scope: gitScope({ ignoreCase: true }),
     });
@@ -106,33 +105,35 @@ describe("workspace restore plan", () => {
       modified: ["changed.txt"],
       scopeBlockers: [],
     });
-    expect(plan.requiredBlobOids).toEqual(
-      [oid("old"), oid("gone")].sort(),
-    );
+    expect(plan.requiredBlobOids).toEqual([oid("old"), oid("gone")].sort());
     expect(restorePlanHasChanges(plan)).toBe(true);
   });
 
   it("ignores recreation-mode-only drift and does not request its blob", () => {
     const content = "same";
     const current = state({
-      entries: [{
-        path: "run.sh",
-        kind: "regular",
-        recreationMode: 0o640,
-        byteLength: content.length,
-        sha256: oid(content),
-      }],
+      entries: [
+        {
+          path: "run.sh",
+          kind: "regular",
+          recreationMode: 0o640,
+          byteLength: content.length,
+          sha256: oid(content),
+        },
+      ],
       problems: [],
       scope,
     });
     const target: TreeManifest = {
       format: TREE_MANIFEST_FORMAT,
-      entries: [{
-        path: "run.sh",
-        type: "regular",
-        blobOid: oid(content),
-        recreationMode: 0o711,
-      }],
+      entries: [
+        {
+          path: "run.sh",
+          type: "regular",
+          blobOid: oid(content),
+          recreationMode: 0o711,
+        },
+      ],
       scope,
     };
 
@@ -155,8 +156,9 @@ describe("workspace restore plan", () => {
     };
     const current = state({ entries: [], problems: [], scope });
 
-    expect(planWorkspaceRestore(current, target).requiredBlobOids)
-      .toEqual([blobOid]);
+    expect(planWorkspaceRestore(current, target).requiredBlobOids).toEqual([
+      blobOid,
+    ]);
   });
 
   it("deletes only current-only paths inside the target scope", () => {
@@ -187,17 +189,20 @@ describe("workspace restore plan", () => {
     });
     const target: TreeManifest = {
       format: TREE_MANIFEST_FORMAT,
-      entries: [{
-        path: ".gitignore",
-        type: "regular",
-        blobOid: oid("secret.txt\n"),
-        recreationMode: 0o644,
-      }],
+      entries: [
+        {
+          path: ".gitignore",
+          type: "regular",
+          blobOid: oid("secret.txt\n"),
+          recreationMode: 0o644,
+        },
+      ],
       scope: targetScope,
     };
 
-    expect(planWorkspaceRestore(current, target).deleted)
-      .toEqual(["managed.txt"]);
+    expect(planWorkspaceRestore(current, target).deleted).toEqual([
+      "managed.txt",
+    ]);
   });
 
   it("preserves scan problems and reports scope blockers once", () => {
@@ -207,26 +212,24 @@ describe("workspace restore plan", () => {
     const current = state({
       entries: [],
       excludedOccupancies: [{ path: "a/b", kind: "regular" }],
-      problems: [
-        { path: "other", kind: "read-failed", detail: "denied" },
-      ],
+      problems: [{ path: "other", kind: "read-failed", detail: "denied" }],
       scope: targetScope,
     });
     const target: TreeManifest = {
       format: TREE_MANIFEST_FORMAT,
-      entries: [{
-        path: "a",
-        type: "regular",
-        blobOid: oid("target"),
-        recreationMode: 0o644,
-      }],
+      entries: [
+        {
+          path: "a",
+          type: "regular",
+          blobOid: oid("target"),
+          recreationMode: 0o644,
+        },
+      ],
       scope: targetScope,
     };
 
     const plan = planWorkspaceRestore(current, target);
-    expect(plan.scopeBlockers).toEqual([
-      { path: "a/b", targetPath: "a" },
-    ]);
+    expect(plan.scopeBlockers).toEqual([{ path: "a/b", targetPath: "a" }]);
     expect(plan.problems).toEqual([
       expect.objectContaining({ kind: "read-failed", path: "other" }),
       expect.objectContaining({ kind: "scope-blocker", path: "a/b" }),
@@ -238,34 +241,40 @@ describe("workspace restore plan", () => {
       name: "target non-directory versus ignored descendant",
       occupancy: { path: "a/hidden", kind: "regular" as const },
       targetPath: "a",
-      targetEntries: [{
-        path: "a",
-        type: "regular" as const,
-        blobOid: oid("target"),
-        recreationMode: 0o644,
-      }],
+      targetEntries: [
+        {
+          path: "a",
+          type: "regular" as const,
+          blobOid: oid("target"),
+          recreationMode: 0o644,
+        },
+      ],
     },
     {
       name: "target non-directory versus wholly ignored directory",
       occupancy: { path: "a", kind: "directory" as const },
       targetPath: "a",
-      targetEntries: [{
-        path: "a",
-        type: "symlink" as const,
-        target: "destination",
-        symlinkKind: null,
-      }],
+      targetEntries: [
+        {
+          path: "a",
+          type: "symlink" as const,
+          target: "destination",
+          symlinkKind: null,
+        },
+      ],
     },
     {
       name: "target implicit directory versus ignored regular",
       occupancy: { path: "a", kind: "regular" as const },
       targetPath: "a",
-      targetEntries: [{
-        path: "a/child",
-        type: "regular" as const,
-        blobOid: oid("target"),
-        recreationMode: 0o644,
-      }],
+      targetEntries: [
+        {
+          path: "a/child",
+          type: "regular" as const,
+          blobOid: oid("target"),
+          recreationMode: 0o644,
+        },
+      ],
     },
   ])("blocks $name", ({ occupancy, targetPath, targetEntries }) => {
     const current = state({
@@ -282,10 +291,12 @@ describe("workspace restore plan", () => {
 
     const plan = planWorkspaceRestore(current, target);
 
-    expect(plan.scopeBlockers).toEqual([{
-      path: occupancy.path,
-      targetPath,
-    }]);
+    expect(plan.scopeBlockers).toEqual([
+      {
+        path: occupancy.path,
+        targetPath,
+      },
+    ]);
     expect(plan.problems).toContainEqual(
       expect.objectContaining({
         path: occupancy.path,
@@ -297,35 +308,39 @@ describe("workspace restore plan", () => {
   it("treats excluded occupancy appearance, disappearance, and kind change as stale", () => {
     const observed = (
       excludedOccupancies: WorkspaceState["excludedOccupancies"],
-    ): WorkspaceState => state({
-      entries: [],
-      excludedOccupancies,
-      problems: [],
-      scope,
-    });
+    ): WorkspaceState =>
+      state({
+        entries: [],
+        excludedOccupancies,
+        problems: [],
+        scope,
+      });
     const before = observed([{ path: "ignored", kind: "regular" }]);
     const comparison = workspaceSnapshotAsManifest(before);
 
-    expect(planWorkspaceRestore(before, comparison).occupancyChanged)
-      .toEqual([]);
-    expect(restorePlanHasChanges(planWorkspaceRestore(
-      observed([]),
-      comparison,
-    ))).toBe(true);
-    expect(planWorkspaceRestore(
-      observed([]),
-      comparison,
-    ).occupancyChanged).toEqual(["ignored"]);
-    expect(planWorkspaceRestore(
-      observed([{ path: "ignored", kind: "symlink" }]),
-      comparison,
-    ).occupancyChanged).toEqual(["ignored"]);
-    expect(planWorkspaceRestore(
-      observed([
-        { path: "ignored", kind: "regular" },
-        { path: "new", kind: "directory" },
-      ]),
-      comparison,
-    ).occupancyChanged).toEqual(["new"]);
+    expect(planWorkspaceRestore(before, comparison).occupancyChanged).toEqual(
+      [],
+    );
+    expect(
+      restorePlanHasChanges(planWorkspaceRestore(observed([]), comparison)),
+    ).toBe(true);
+    expect(
+      planWorkspaceRestore(observed([]), comparison).occupancyChanged,
+    ).toEqual(["ignored"]);
+    expect(
+      planWorkspaceRestore(
+        observed([{ path: "ignored", kind: "symlink" }]),
+        comparison,
+      ).occupancyChanged,
+    ).toEqual(["ignored"]);
+    expect(
+      planWorkspaceRestore(
+        observed([
+          { path: "ignored", kind: "regular" },
+          { path: "new", kind: "directory" },
+        ]),
+        comparison,
+      ).occupancyChanged,
+    ).toEqual(["new"]);
   });
 });

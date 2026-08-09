@@ -61,9 +61,7 @@ async function withSimulatedWindows<T>(action: () => Promise<T>): Promise<T> {
 
 afterEach(async () => {
   await Promise.all(
-    roots.splice(0).map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 describe("workspace scanner", () => {
@@ -141,14 +139,10 @@ describe("workspace scanner", () => {
     const root = await workspace();
     await writeFile(join(root, "file"), "x");
 
-    await expect(
-      scanWorkspace(join(root, "missing")),
-    ).rejects.toMatchObject({
+    await expect(scanWorkspace(join(root, "missing"))).rejects.toMatchObject({
       name: "ScanError",
     });
-    await expect(
-      scanWorkspace(join(root, "file")),
-    ).rejects.toThrow(ScanError);
+    await expect(scanWorkspace(join(root, "file"))).rejects.toThrow(ScanError);
   });
 
   it("structurally excludes .git components at any depth and casing", async () => {
@@ -157,10 +151,7 @@ describe("workspace scanner", () => {
     await writeFile(join(root, ".git", "config"), "secret");
     await mkdir(join(root, "nested"));
     await mkdir(join(root, "nested", ".GIT"));
-    await writeFile(
-      join(root, "nested", ".GIT", "HEAD"),
-      "never read",
-    );
+    await writeFile(join(root, "nested", ".GIT", "HEAD"), "never read");
     await writeFile(join(root, "visible"), "yes");
 
     const snapshot = await scanWorkspace(root);
@@ -289,12 +280,12 @@ describe("workspace scanner", () => {
     await writeFile(join(root, "a"), "1234");
     await writeFile(join(root, "b"), "5678");
 
-    await expect(
-      scanWorkspace(root, { maxSnapshotBytes: 5 }),
-    ).rejects.toThrow(ScanError);
-    await expect(
-      scanWorkspace(root, { maxSnapshotBytes: 5 }),
-    ).rejects.toThrow(/5-byte limit/);
+    await expect(scanWorkspace(root, { maxSnapshotBytes: 5 })).rejects.toThrow(
+      ScanError,
+    );
+    await expect(scanWorkspace(root, { maxSnapshotBytes: 5 })).rejects.toThrow(
+      /5-byte limit/,
+    );
   });
 
   it("bounds managed, excluded, and directory observations together", async () => {
@@ -304,13 +295,15 @@ describe("workspace scanner", () => {
     await mkdir(join(root, "ignored"));
     await writeFile(join(root, "ignored", "child"), "not enumerated");
 
-    await expect(scanWorkspace(root, { maxEntries: 3 }))
-      .resolves.toMatchObject({
+    await expect(scanWorkspace(root, { maxEntries: 3 })).resolves.toMatchObject(
+      {
         problems: [],
         excludedOccupancies: [expect.objectContaining({ path: "ignored" })],
-      });
-    await expect(scanWorkspace(root, { maxEntries: 2 }))
-      .rejects.toThrow("2-entry limit");
+      },
+    );
+    await expect(scanWorkspace(root, { maxEntries: 2 })).rejects.toThrow(
+      "2-entry limit",
+    );
   });
 
   it("charges invalid pathnames before appending scan problems", async () => {
@@ -320,10 +313,12 @@ describe("workspace scanner", () => {
 
     const exact = await scanWorkspace(root, { maxEntries: 3 });
     expect(exact.problems).toHaveLength(2);
-    expect(exact.problems.every((problem) => problem.kind === "unsupported"))
-      .toBe(true);
-    await expect(scanWorkspace(root, { maxEntries: 2 }))
-      .rejects.toThrow("2-entry limit");
+    expect(
+      exact.problems.every((problem) => problem.kind === "unsupported"),
+    ).toBe(true);
+    await expect(scanWorkspace(root, { maxEntries: 2 })).rejects.toThrow(
+      "2-entry limit",
+    );
   });
 
   it("charges read-failed entries before appending scan problems", async (context) => {
@@ -337,10 +332,12 @@ describe("workspace scanner", () => {
 
     const exact = await scanWorkspace(root, { maxEntries: 3 });
     expect(exact.problems).toHaveLength(2);
-    expect(exact.problems.every((problem) => problem.kind === "read-failed"))
-      .toBe(true);
-    await expect(scanWorkspace(root, { maxEntries: 2 }))
-      .rejects.toThrow("2-entry limit");
+    expect(
+      exact.problems.every((problem) => problem.kind === "read-failed"),
+    ).toBe(true);
+    await expect(scanWorkspace(root, { maxEntries: 2 })).rejects.toThrow(
+      "2-entry limit",
+    );
   });
 
   it("charges unsupported Windows symlinks before appending scan problems", async () => {
@@ -349,14 +346,15 @@ describe("workspace scanner", () => {
     await symlink("missing-two", join(root, "dangling-two"));
 
     const exact = await withSimulatedWindows(() =>
-      scanWorkspace(root, { maxEntries: 3 })
+      scanWorkspace(root, { maxEntries: 3 }),
     );
     expect(exact.problems).toHaveLength(2);
-    expect(exact.problems.every((problem) => problem.kind === "unsupported"))
-      .toBe(true);
-    await expect(withSimulatedWindows(() =>
-      scanWorkspace(root, { maxEntries: 2 })
-    )).rejects.toThrow("2-entry limit");
+    expect(
+      exact.problems.every((problem) => problem.kind === "unsupported"),
+    ).toBe(true);
+    await expect(
+      withSimulatedWindows(() => scanWorkspace(root, { maxEntries: 2 })),
+    ).rejects.toThrow("2-entry limit");
   });
 
   it("bounds the exact canonical manifest estimate before publication", async () => {
@@ -376,17 +374,19 @@ describe("workspace scanner", () => {
             type: "symlink",
             target: entry.target,
             symlinkKind: entry.symlinkKind,
-          }
+          },
     );
     const exactBytes = encodeTreeManifest(
       durableEntries,
       initial.scope,
     ).byteLength;
 
-    await expect(scanWorkspace(root, { maxManifestBytes: exactBytes }))
-      .resolves.toMatchObject({ problems: [] });
-    await expect(scanWorkspace(root, { maxManifestBytes: exactBytes - 1 }))
-      .rejects.toThrow("manifest estimate");
+    await expect(
+      scanWorkspace(root, { maxManifestBytes: exactBytes }),
+    ).resolves.toMatchObject({ problems: [] });
+    await expect(
+      scanWorkspace(root, { maxManifestBytes: exactBytes - 1 }),
+    ).rejects.toThrow("manifest estimate");
   });
 
   it("compares complete snapshots without treating excluded inode churn as drift", async () => {
@@ -399,38 +399,49 @@ describe("workspace scanner", () => {
     const occupancy = snapshot.excludedOccupancies[0]!;
 
     expect(workspaceSnapshotsEqual(snapshot, snapshot)).toBe(true);
-    expect(workspaceSnapshotsEqual(snapshot, {
-      ...snapshot,
-      excludedOccupancies: [{
-        ...occupancy,
-        dev: occupancy.dev + 1,
-        ino: occupancy.ino + 1,
-      }],
-    })).toBe(true);
-    expect(workspaceSnapshotsEqual(snapshot, {
-      ...snapshot,
-      excludedOccupancies: [{ ...occupancy, kind: "symlink" }],
-    })).toBe(false);
-    expect(workspaceSnapshotsEqual(snapshot, {
-      ...snapshot,
-      directoryObservations: snapshot.directoryObservations.map(
-        (observation, index) => index === 0
-          ? {
-              ...observation,
-              dev: observation.dev + 1,
-              ino: observation.ino + 1,
-            }
-          : observation,
-      ),
-    })).toBe(false);
-    expect(workspaceSnapshotsEqual(snapshot, {
-      ...snapshot,
-      entries: snapshot.entries.map((entry) =>
-        entry.kind === "regular" && entry.path === "managed"
-          ? { ...entry, sha256: "0".repeat(64) }
-          : entry
-      ),
-    })).toBe(false);
+    expect(
+      workspaceSnapshotsEqual(snapshot, {
+        ...snapshot,
+        excludedOccupancies: [
+          {
+            ...occupancy,
+            dev: occupancy.dev + 1,
+            ino: occupancy.ino + 1,
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      workspaceSnapshotsEqual(snapshot, {
+        ...snapshot,
+        excludedOccupancies: [{ ...occupancy, kind: "symlink" }],
+      }),
+    ).toBe(false);
+    expect(
+      workspaceSnapshotsEqual(snapshot, {
+        ...snapshot,
+        directoryObservations: snapshot.directoryObservations.map(
+          (observation, index) =>
+            index === 0
+              ? {
+                  ...observation,
+                  dev: observation.dev + 1,
+                  ino: observation.ino + 1,
+                }
+              : observation,
+        ),
+      }),
+    ).toBe(false);
+    expect(
+      workspaceSnapshotsEqual(snapshot, {
+        ...snapshot,
+        entries: snapshot.entries.map((entry) =>
+          entry.kind === "regular" && entry.path === "managed"
+            ? { ...entry, sha256: "0".repeat(64) }
+            : entry,
+        ),
+      }),
+    ).toBe(false);
   });
 
   it("sorts canonical entries by UTF-8 path bytes and rejects non-NFC names", async () => {
@@ -509,14 +520,18 @@ describe("workspace scanner", () => {
     );
 
     const snapshot = await scanWorkspace(root);
-    const kinds = new Map(snapshot.entries.flatMap((entry) =>
-      entry.kind === "symlink" ? [[entry.path, entry.symlinkKind]] : []
-    ));
+    const kinds = new Map(
+      snapshot.entries.flatMap((entry) =>
+        entry.kind === "symlink" ? [[entry.path, entry.symlinkKind]] : [],
+      ),
+    );
 
-    expect(kinds).toEqual(new Map([
-      ["directory-link", "directory"],
-      ["file-link", "file"],
-    ]));
+    expect(kinds).toEqual(
+      new Map([
+        ["directory-link", "directory"],
+        ["file-link", "file"],
+      ]),
+    );
   });
 
   it("fails closed for an unclassifiable Windows symlink", async () => {
@@ -532,5 +547,4 @@ describe("workspace scanner", () => {
       detail: expect.stringContaining("target type is unavailable"),
     });
   });
-
 });

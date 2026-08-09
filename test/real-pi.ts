@@ -178,10 +178,7 @@ export class RealPiHarness {
     // registerCyclotomy resolves its own configuration through Pi's
     // getAgentDir(), which reads this variable on every call. Without it the
     // suite would bind the developer's real ~/.pi/agent store.
-    this.#agentDirEnvWasSet = Object.hasOwn(
-      process.env,
-      "PI_CODING_AGENT_DIR",
-    );
+    this.#agentDirEnvWasSet = Object.hasOwn(process.env, "PI_CODING_AGENT_DIR");
     this.#previousAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     await mkdir(join(agentDir, "cyclotomy"));
@@ -194,7 +191,9 @@ export class RealPiHarness {
     this.#storeRoot = join(
       agentDir,
       "cyclotomy",
-      createHash("sha256").update(await realpath(workspace)).digest("hex"),
+      createHash("sha256")
+        .update(await realpath(workspace))
+        .digest("hex"),
     );
 
     // Pin every credential and catalog path into the temporary agent
@@ -215,15 +214,17 @@ export class RealPiHarness {
       // Required even with streamSimple, but never contacted.
       baseUrl: "http://127.0.0.1:1/v1",
       streamSimple: () => fixedAssistantTurn() as never,
-      models: [{
-        id: MODEL_ID,
-        name: "Cyclotomy Test Model",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 100_000,
-        maxTokens: 4096,
-      }],
+      models: [
+        {
+          id: MODEL_ID,
+          name: "Cyclotomy Test Model",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 100_000,
+          maxTokens: 4096,
+        },
+      ],
     });
     const model = modelRuntime.getModel(PROVIDER_ID, MODEL_ID);
     if (model === undefined) {

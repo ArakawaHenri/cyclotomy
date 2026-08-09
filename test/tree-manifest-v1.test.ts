@@ -29,13 +29,27 @@ function manifest(
 describe("final tree manifest v1", () => {
   it("writes only v1 and requires the final symlink shape", () => {
     const encoded = encodeTreeManifest(
-      [{ path: "link", type: "symlink", target: "target", symlinkKind: "file" }],
+      [
+        {
+          path: "link",
+          type: "symlink",
+          target: "target",
+          symlinkKind: "file",
+        },
+      ],
       allManaged,
     );
     expect(TREE_MANIFEST_FORMAT).toBe("cyclotomy-tree-v1");
     expect(parseCanonicalTreeManifest(encoded)).toEqual({
       format: "cyclotomy-tree-v1",
-      entries: [{ path: "link", type: "symlink", target: "target", symlinkKind: "file" }],
+      entries: [
+        {
+          path: "link",
+          type: "symlink",
+          target: "target",
+          symlinkKind: "file",
+        },
+      ],
       scope: allManaged,
     });
     for (const candidate of [
@@ -46,9 +60,11 @@ describe("final tree manifest v1", () => {
         scope: allManaged,
       },
     ]) {
-      expect(() => parseCanonicalTreeManifest(
-        Buffer.from(`${JSON.stringify(candidate)}\n`),
-      )).toThrow();
+      expect(() =>
+        parseCanonicalTreeManifest(
+          Buffer.from(`${JSON.stringify(candidate)}\n`),
+        ),
+      ).toThrow();
     }
   });
 
@@ -63,8 +79,9 @@ describe("final tree manifest v1", () => {
       globalExcludeBase64: "",
     } as const;
     expect(canonicalizeTreeManifest([], scope)).toEqual({ entries: [], scope });
-    await expect(validateTreeEntriesAgainstScope(manifest([], scope)))
-      .resolves.toBeUndefined();
+    await expect(
+      validateTreeEntriesAgainstScope(manifest([], scope)),
+    ).resolves.toBeUndefined();
   });
 
   it("binds a managed .gitignore entry to the archived raw bytes", () => {
@@ -78,24 +95,45 @@ describe("final tree manifest v1", () => {
       infoExcludeBase64: "",
       globalExcludeBase64: "",
     } as const;
-    expect(canonicalizeTreeManifest([{
-      path: ".gitignore",
-      type: "regular",
-      blobOid: oid,
-      recreationMode: 0o644,
-    }], scope).entries).toHaveLength(1);
-    expect(() => canonicalizeTreeManifest([{
-      path: ".gitignore",
-      type: "regular",
-      blobOid: "0".repeat(64),
-      recreationMode: 0o644,
-    }], scope)).toThrow("does not match");
-    expect(() => canonicalizeTreeManifest([{
-      path: "nested/.gitignore",
-      type: "regular",
-      blobOid: "0".repeat(64),
-      recreationMode: 0o644,
-    }], scope)).toThrow("missing from workspace scope");
+    expect(
+      canonicalizeTreeManifest(
+        [
+          {
+            path: ".gitignore",
+            type: "regular",
+            blobOid: oid,
+            recreationMode: 0o644,
+          },
+        ],
+        scope,
+      ).entries,
+    ).toHaveLength(1);
+    expect(() =>
+      canonicalizeTreeManifest(
+        [
+          {
+            path: ".gitignore",
+            type: "regular",
+            blobOid: "0".repeat(64),
+            recreationMode: 0o644,
+          },
+        ],
+        scope,
+      ),
+    ).toThrow("does not match");
+    expect(() =>
+      canonicalizeTreeManifest(
+        [
+          {
+            path: "nested/.gitignore",
+            type: "regular",
+            blobOid: "0".repeat(64),
+            recreationMode: 0o644,
+          },
+        ],
+        scope,
+      ),
+    ).toThrow("missing from workspace scope");
   });
 
   it("uses the archived ignoreCase policy for .gitignore entry aliases", async () => {
@@ -116,15 +154,23 @@ describe("final tree manifest v1", () => {
       recreationMode: 0o644,
     };
 
-    await expect(validateTreeEntriesAgainstScope(manifest([alias], scope)))
-      .resolves.toBeUndefined();
-    expect(() => manifest([{ ...alias, blobOid: "0".repeat(64) }], scope))
-      .toThrow("does not match");
-    expect(() => manifest([alias], { ...scope, gitignoreSources: [] }))
-      .toThrow("missing from workspace scope");
-    await expect(validateTreeEntriesAgainstScope(manifest(
-      [alias],
-      { ...scope, ignoreCase: false, gitignoreSources: [] },
-    ))).resolves.toBeUndefined();
+    await expect(
+      validateTreeEntriesAgainstScope(manifest([alias], scope)),
+    ).resolves.toBeUndefined();
+    expect(() =>
+      manifest([{ ...alias, blobOid: "0".repeat(64) }], scope),
+    ).toThrow("does not match");
+    expect(() => manifest([alias], { ...scope, gitignoreSources: [] })).toThrow(
+      "missing from workspace scope",
+    );
+    await expect(
+      validateTreeEntriesAgainstScope(
+        manifest([alias], {
+          ...scope,
+          ignoreCase: false,
+          gitignoreSources: [],
+        }),
+      ),
+    ).resolves.toBeUndefined();
   });
 });

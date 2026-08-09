@@ -33,9 +33,7 @@ export function notifyRestoreOutcome(
       runtime.notify(
         context,
         runtime.i18n.t("restoreApplyIncomplete", {
-          problems: runtime.i18n.formatApplyProblems(
-            outcome.report.problems,
-          ),
+          problems: runtime.i18n.formatApplyProblems(outcome.report.problems),
           applied: runtime.i18n.formatAppliedMutations(outcome.report),
         }),
         "error",

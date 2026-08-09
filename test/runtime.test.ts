@@ -89,15 +89,14 @@ describe("Cyclotomy runtime", () => {
       new CyclotomyI18n("en"),
       new CyclotomyConfigError(
         settingsPath,
-        'maxFileMiB must be a positive number',
+        "maxFileMiB must be a positive number",
       ),
     );
 
     expect(await runtime.ensureStore(workspace)).toBe(false);
 
     // A disabled runtime must not create the hashed store while binding.
-    expect(await readdir(join(home, "cyclotomy")).catch(() => []))
-      .toEqual([]);
+    expect(await readdir(join(home, "cyclotomy")).catch(() => [])).toEqual([]);
     expect(() => runtime.store).toThrow("store is not initialized");
     expect(() => runtime.metadata).toThrow("metadata is not initialized");
 
@@ -159,10 +158,7 @@ describe("Cyclotomy runtime", () => {
       join(storeRoot, "settings.json"),
       JSON.stringify({ maxFileMiB: 2, gc: { intervalMs: 0 } }),
     );
-    const runtime = new CyclotomyRuntime(
-      globalConfig,
-      new CyclotomyI18n("en"),
-    );
+    const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
 
     expect(await runtime.ensureStore(workspace)).toBe(true);
     expect(runtime.storeRoot).toBe(await realpath(storeRoot));
@@ -186,10 +182,7 @@ describe("Cyclotomy runtime", () => {
     await mkdir(storeRoot, { recursive: true });
     await writeFile(settingsPath, JSON.stringify({ maxFileMiB: 2 }));
     const globalConfig = loadCyclotomyConfig(home);
-    const runtime = new CyclotomyRuntime(
-      globalConfig,
-      new CyclotomyI18n("en"),
-    );
+    const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
 
     expect(await runtime.ensureStore(workspace)).toBe(true);
     expect(runtime.config.scan.maxFileBytes).toBe(2 * 1024 * 1024);
@@ -265,7 +258,9 @@ describe("Cyclotomy runtime", () => {
       process.platform === "win32",
       "Windows symlink creation is privilege-dependent",
     );
-    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-store-link-"));
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-store-link-"),
+    );
     roots.push(parent);
     const workspace = join(parent, "workspace");
     const home = join(parent, "home");
@@ -297,7 +292,9 @@ describe("Cyclotomy runtime", () => {
       process.platform === "win32",
       "Windows symlink creation is privilege-dependent",
     );
-    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-hash-link-"));
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-hash-link-"),
+    );
     roots.push(parent);
     const first = join(parent, "first");
     const second = join(parent, "second");
@@ -318,14 +315,8 @@ describe("Cyclotomy runtime", () => {
     await mkdir(secondRoot);
     await symlink(secondRoot, join(storageRoot, firstHash));
     const config = loadCyclotomyConfig(home);
-    const firstRuntime = new CyclotomyRuntime(
-      config,
-      new CyclotomyI18n("en"),
-    );
-    const secondRuntime = new CyclotomyRuntime(
-      config,
-      new CyclotomyI18n("en"),
-    );
+    const firstRuntime = new CyclotomyRuntime(config, new CyclotomyI18n("en"));
+    const secondRuntime = new CyclotomyRuntime(config, new CyclotomyI18n("en"));
 
     expect(await firstRuntime.ensureStore(first)).toBe(false);
     expect(await readdir(secondRoot)).toEqual([]);
@@ -351,9 +342,10 @@ describe("Cyclotomy runtime", () => {
       expect((await lstat(statePath)).mode & 0o777).toBe(0o600);
     }
     expect(
-      (await readdir(runtime.storeRoot)).filter((name) =>
-        name.startsWith(`gc-state.json.${process.pid}.`) &&
-        name.endsWith(".tmp")
+      (await readdir(runtime.storeRoot)).filter(
+        (name) =>
+          name.startsWith(`gc-state.json.${process.pid}.`) &&
+          name.endsWith(".tmp"),
       ),
     ).toEqual([]);
     runtime.close();
@@ -445,48 +437,68 @@ describe("Cyclotomy runtime", () => {
 
   it("treats the nearest recorded ancestor as authoritative", async () => {
     const { workspace, runtime } = await createRuntime();
-    const parentBlob = await publishTestBlob(runtime.store, Buffer.from("parent"));
-    const parentTree = await publishTestTree(runtime.store, [{
-      path: "file.txt",
-      type: "regular",
-      blobOid: parentBlob,
-      recreationMode: 0o600,
-    }], TEST_SCOPE);
+    const parentBlob = await publishTestBlob(
+      runtime.store,
+      Buffer.from("parent"),
+    );
+    const parentTree = await publishTestTree(
+      runtime.store,
+      [
+        {
+          path: "file.txt",
+          type: "regular",
+          blobOid: parentBlob,
+          recreationMode: 0o600,
+        },
+      ],
+      TEST_SCOPE,
+    );
     const leafBlob = await publishTestBlob(runtime.store, Buffer.from("leaf"));
-    const leafTree = await publishTestTree(runtime.store, [{
-      path: "file.txt",
-      type: "regular",
-      blobOid: leafBlob,
-      recreationMode: 0o600,
-    }], TEST_SCOPE);
+    const leafTree = await publishTestTree(
+      runtime.store,
+      [
+        {
+          path: "file.txt",
+          type: "regular",
+          blobOid: leafBlob,
+          recreationMode: 0o600,
+        },
+      ],
+      TEST_SCOPE,
+    );
     runtime.metadata.setState("s", "parent", parentTree);
     runtime.metadata.setState("s", "leaf", leafTree);
     await writeFile(join(workspace, "file.txt"), "current");
-    await rm(join(
-      runtime.storeRoot,
-      "objects",
-      "blobs",
-      leafBlob.slice(0, 2),
-      leafBlob.slice(2),
-    ));
-
-    const currentView = view(
-      workspace,
-      "leaf",
-      { parent: null, leaf: "parent" },
+    await rm(
+      join(
+        runtime.storeRoot,
+        "objects",
+        "blobs",
+        leafBlob.slice(0, 2),
+        leafBlob.slice(2),
+      ),
     );
-    await expect(runtime.resolveReadableTreeIn(
-      currentView,
-      { sessionId: "s", entryId: "leaf" },
-    )).rejects.toThrow();
-    expect(runtime.resolutionStillAuthoritative(
-      currentView,
-      { sessionId: "s", entryId: "leaf" },
-      {
-        treeOid: leafTree,
-        foundAt: { sessionId: "s", entryId: "leaf" },
-      },
-    )).toBe(true);
+
+    const currentView = view(workspace, "leaf", {
+      parent: null,
+      leaf: "parent",
+    });
+    await expect(
+      runtime.resolveReadableTreeIn(currentView, {
+        sessionId: "s",
+        entryId: "leaf",
+      }),
+    ).rejects.toThrow();
+    expect(
+      runtime.resolutionStillAuthoritative(
+        currentView,
+        { sessionId: "s", entryId: "leaf" },
+        {
+          treeOid: leafTree,
+          foundAt: { sessionId: "s", entryId: "leaf" },
+        },
+      ),
+    ).toBe(true);
     expect(runtime.metadata.getState("s", "parent")?.treeOid).toBe(parentTree);
     runtime.close();
   });

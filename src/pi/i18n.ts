@@ -64,8 +64,7 @@ const EN = {
     "The loaded session differs from the workspace, but no interactive confirmation is available. Current files were kept. In print/JSON mode, the next successful checkpoint accepts them and replaces this node's saved state; use interactive /restore first if you need that state.",
   sessionRestoreDeferredRpc:
     "The loaded session differs from the workspace. Automatic restore was deferred until RPC startup completes; invoke /restore explicitly to choose which files to keep.",
-  sessionRestoreCancelled:
-    "Continuing with the current files.",
+  sessionRestoreCancelled: "Continuing with the current files.",
   waitIdleRestore: "Cyclotomy: wait until the agent is idle before restoring.",
   locationUnknown: "Cyclotomy: the current location cannot be identified.",
   restoreMissing: "Cyclotomy: there is no checkpoint here to restore.",
@@ -162,14 +161,11 @@ const ZH_CN: Record<MessageKey, string> = {
   automaticGcFailed:
     "Cyclotomy 自动清理失败（{{message}}）。保存状态已经成功建立且会继续工作；稍后将重试清理。",
   captureFailureDetail: "详情：{{message}}",
-  sourceCaptureFailed:
-    "Cyclotomy 无法保存当前工作区，因此已取消本次操作。",
+  sourceCaptureFailed: "Cyclotomy 无法保存当前工作区，因此已取消本次操作。",
   inputCaptureFailed:
     "Cyclotomy 因无法保存当前工作区而没有提交这条提示。请修复上述问题后重新提交。",
-  bashWhileBusy:
-    "Pi 正在工作或切换会话，Cyclotomy 没有执行这条终端命令。",
-  transitionInProgress:
-    "另一项会话切换尚未完成，Cyclotomy 没有执行本次操作。",
+  bashWhileBusy: "Pi 正在工作或切换会话，Cyclotomy 没有执行这条终端命令。",
+  transitionInProgress: "另一项会话切换尚未完成，Cyclotomy 没有执行本次操作。",
   sessionRegistrationFailed:
     "Cyclotomy 无法安全登记此会话（{{message}}），因此不会为它保存或恢复工作区。",
   sessionIdentityUnavailable:
@@ -194,14 +190,12 @@ const ZH_CN: Record<MessageKey, string> = {
     "载入的会话与工作区不同，但当前无法交互确认，已保留当前文件。在 print/JSON 模式下，下一次成功保存会接受这些文件并替换此节点原有的保存状态；若需要原状态，请先在交互界面执行 /restore。",
   sessionRestoreDeferredRpc:
     "载入的会话与工作区不同。自动恢复已推迟到 RPC 启动完成之后；请显式执行 /restore 选择保留哪份文件。",
-  sessionRestoreCancelled:
-    "继续使用当前文件。",
+  sessionRestoreCancelled: "继续使用当前文件。",
   waitIdleRestore: "Cyclotomy：请等 Pi 空闲后再执行 /restore。",
   locationUnknown: "Cyclotomy：当前位置不可识别。",
   restoreMissing: "Cyclotomy：当前位置没有保存状态，无法恢复。",
   restorePrepareFailed: "Cyclotomy 无法准备恢复（{{message}}）。",
-  restoreScanIncomplete:
-    "Cyclotomy 因工作区扫描不完整而拒绝恢复：{{message}}",
+  restoreScanIncomplete: "Cyclotomy 因工作区扫描不完整而拒绝恢复：{{message}}",
   restoreNeedsUi: "恢复需要交互式选择；当前文件已保留。",
   commandPreviewStale:
     "Cyclotomy：预览后工作区发生了变化；没有应用任何内容，请重新执行 /restore。",
@@ -220,29 +214,22 @@ const ZH_CN: Record<MessageKey, string> = {
     "文件已经改动，但 Cyclotomy 无法确认最终工作区状态。\n{{applied}}\n请先运行 /drift 再继续。",
   restoreAppliedNone: "停止前没有完成任何路径变更。",
   restoreAppliedPaths: "停止前已完成：\n{{mutations}}",
-  restoreNotStarted:
-    "恢复尚未开始（{{message}}）；当前文件没有改动。",
-  restoreExecutionFailed:
-    "恢复已停止（{{message}}）；请先运行 /drift 再继续。",
-  restoreFailed:
-    "恢复失败（{{message}}）；原保存状态仍是下次恢复的目标。",
+  restoreNotStarted: "恢复尚未开始（{{message}}）；当前文件没有改动。",
+  restoreExecutionFailed: "恢复已停止（{{message}}）；请先运行 /drift 再继续。",
+  restoreFailed: "恢复失败（{{message}}）；原保存状态仍是下次恢复的目标。",
   driftMissing: "当前节点还没有可用的保存状态。",
   driftClean: "没有漂移 · 工作区与当前节点的保存状态一致。",
-  driftCleanInherited:
-    "没有漂移 · 工作区与最近祖先节点继承的保存状态一致。",
+  driftCleanInherited: "没有漂移 · 工作区与最近祖先节点继承的保存状态一致。",
   driftTitle: "工作区漂移\n{{preview}}",
-  driftTitleInherited:
-    "工作区漂移 · 使用最近祖先节点的保存状态\n{{preview}}",
+  driftTitleInherited: "工作区漂移 · 使用最近祖先节点的保存状态\n{{preview}}",
   previewPathOne: "{{count}} 个路径",
   previewPathMany: "{{count}} 个路径",
   previewCreate: "+{{count}} 创建",
   previewOverwrite: "~{{count}} 覆盖",
   previewDelete: "-{{count}} 删除",
   previewOmitted: "… 还有 {{count}} 项",
-  previewProblemOne:
-    "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
-  previewProblemMany:
-    "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
+  previewProblemOne: "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
+  previewProblemMany: "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
   previewScopeNotice:
     "提示：忽略规则也会恢复；此保存状态排除的路径不会被改动。",
   scanProblemTooLarge: "文件过大",
@@ -258,13 +245,11 @@ const ZH_CN: Record<MessageKey, string> = {
   applyProblemMkdirFailed: "创建目录失败",
   applyProblemReadFailed: "读取失败",
   choiceManualTitle: "恢复当前节点的保存状态？",
-  choiceManualIntro:
-    "恢复会丢弃下列当前差异，Cyclotomy 无法撤销此次操作。",
+  choiceManualIntro: "恢复会丢弃下列当前差异，Cyclotomy 无法撤销此次操作。",
   choiceManualSafe: "取消（不改动文件）",
   choiceManualRestore: "恢复保存状态",
   choiceLoadedTitle: "载入的会话与工作区不同",
-  choiceLoadedIntro:
-    "请选择继续使用哪份工作区；恢复会丢弃下列当前差异。",
+  choiceLoadedIntro: "请选择继续使用哪份工作区；恢复会丢弃下列当前差异。",
   choiceLoadedSafe: "使用当前文件",
   choiceLoadedRestore: "恢复会话状态",
   choiceNavigationTitle: "目标节点的工作区不同",
@@ -317,23 +302,35 @@ export class CyclotomyI18n {
 
   #scanProblemLabel(kind: ScanProblemKind): string {
     switch (kind) {
-      case "too-large": return this.t("scanProblemTooLarge");
-      case "read-failed": return this.t("scanProblemReadFailed");
-      case "unsupported": return this.t("scanProblemUnsupported");
-      case "hardlink": return this.t("scanProblemHardlink");
-      case "cross-device": return this.t("scanProblemCrossDevice");
-      case "path-collision": return this.t("scanProblemPathCollision");
-      case "scope-mismatch": return this.t("scanProblemScopeMismatch");
-      case "scope-blocker": return this.t("scanProblemScopeBlocker");
+      case "too-large":
+        return this.t("scanProblemTooLarge");
+      case "read-failed":
+        return this.t("scanProblemReadFailed");
+      case "unsupported":
+        return this.t("scanProblemUnsupported");
+      case "hardlink":
+        return this.t("scanProblemHardlink");
+      case "cross-device":
+        return this.t("scanProblemCrossDevice");
+      case "path-collision":
+        return this.t("scanProblemPathCollision");
+      case "scope-mismatch":
+        return this.t("scanProblemScopeMismatch");
+      case "scope-blocker":
+        return this.t("scanProblemScopeBlocker");
     }
   }
 
   #applyProblemLabel(kind: ApplyProblemKind): string {
     switch (kind) {
-      case "write-failed": return this.t("applyProblemWriteFailed");
-      case "delete-failed": return this.t("applyProblemDeleteFailed");
-      case "mkdir-failed": return this.t("applyProblemMkdirFailed");
-      case "read-failed": return this.t("applyProblemReadFailed");
+      case "write-failed":
+        return this.t("applyProblemWriteFailed");
+      case "delete-failed":
+        return this.t("applyProblemDeleteFailed");
+      case "mkdir-failed":
+        return this.t("applyProblemMkdirFailed");
+      case "read-failed":
+        return this.t("applyProblemReadFailed");
     }
   }
 
@@ -358,8 +355,7 @@ export class CyclotomyI18n {
     return formatWorkspaceRestorePreview(plan, {
       ...(sampleLimit === undefined ? {} : { sampleLimit }),
       summary: count === 0 && problemCount > 0 ? "" : summary,
-      omittedNotice: (omitted) =>
-        this.t("previewOmitted", { count: omitted }),
+      omittedNotice: (omitted) => this.t("previewOmitted", { count: omitted }),
       problemNotice: this.t(
         problemCount === 1 ? "previewProblemOne" : "previewProblemMany",
         { count: problemCount },
@@ -371,9 +367,12 @@ export class CyclotomyI18n {
   }
 
   formatScanProblems(problems: readonly ScanProblem[]): string {
-    const lines = problems.slice(0, 3).map((problem) =>
-      `${this.#scanProblemLabel(problem.kind)} · ${formatUiPath(problem.path)}`
-    );
+    const lines = problems
+      .slice(0, 3)
+      .map(
+        (problem) =>
+          `${this.#scanProblemLabel(problem.kind)} · ${formatUiPath(problem.path)}`,
+      );
     const omitted = problems.length - lines.length;
     if (omitted > 0) {
       lines.push(this.t("previewOmitted", { count: omitted }));
@@ -390,9 +389,7 @@ export class CyclotomyI18n {
 
   formatRestoreSuccess(report: ApplyReport): string {
     const count =
-      report.created.length +
-      report.updated.length +
-      report.deleted.length;
+      report.created.length + report.updated.length + report.deleted.length;
     return this.t(count === 1 ? "restoreSuccessOne" : "restoreSuccessMany", {
       count,
     });
@@ -404,12 +401,12 @@ export class CyclotomyI18n {
       ...report.updated.map((path) => ({ symbol: "~", path })),
       ...report.deleted.map((path) => ({ symbol: "-", path })),
     ].sort((left, right) =>
-      left.path < right.path ? -1 : left.path > right.path ? 1 : 0
+      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
     );
     if (mutations.length === 0) return this.t("restoreAppliedNone");
     const bounded = mutations.slice(0, Math.max(0, sampleLimit));
-    const lines = bounded.map(({ symbol, path }) =>
-      `${symbol} ${formatUiPath(path)}`
+    const lines = bounded.map(
+      ({ symbol, path }) => `${symbol} ${formatUiPath(path)}`,
     );
     const omitted = mutations.length - bounded.length;
     if (omitted > 0) {
@@ -419,8 +416,6 @@ export class CyclotomyI18n {
   }
 }
 
-export function createCyclotomyI18n(
-  locale: CyclotomyLocale,
-): CyclotomyI18n {
+export function createCyclotomyI18n(locale: CyclotomyLocale): CyclotomyI18n {
   return new CyclotomyI18n(resolveCyclotomyLocale(locale));
 }

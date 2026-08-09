@@ -46,10 +46,7 @@ export interface FakeSelection {
   readonly options: readonly string[];
 }
 
-type Handler = (
-  event: never,
-  context: ExtensionContext,
-) => Promise<unknown>;
+type Handler = (event: never, context: ExtensionContext) => Promise<unknown>;
 
 export class FakeSessionManager {
   readonly entries = new Map<string, FakeEntry>();
@@ -155,7 +152,7 @@ export class FakePi {
       [...FakePi.#live].map((pi) => pi.dispose()),
     );
     const failures = settled.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : []
+      result.status === "rejected" ? [result.reason] : [],
     );
     if (failures.length > 0) {
       throw new AggregateError(failures, "failed to dispose fake Pi hosts");
@@ -220,10 +217,7 @@ export class FakePi {
       registerCommand(
         name: string,
         definition: {
-          handler: (
-            args: string,
-            context: ExtensionContext,
-          ) => Promise<void>;
+          handler: (args: string, context: ExtensionContext) => Promise<void>;
         },
       ) {
         self.#commands.set(name, definition.handler);
@@ -285,9 +279,7 @@ export class FakePi {
   async #emit(type: string, event: object): Promise<unknown[]> {
     const results: unknown[] = [];
     for (const handler of this.#handlers.get(type) ?? []) {
-      results.push(
-        await handler(event as never, this.context),
-      );
+      results.push(await handler(event as never, this.context));
     }
     return results;
   }
@@ -314,11 +306,7 @@ export class FakePi {
     let intercepted = false;
     for (const handler of this.#handlers.get("user_bash") ?? []) {
       const result = await handler(event as never, this.context);
-      if (
-        typeof result === "object" &&
-        result !== null &&
-        "result" in result
-      ) {
+      if (typeof result === "object" && result !== null && "result" in result) {
         intercepted = true;
         break;
       }
@@ -520,9 +508,7 @@ export class FakePi {
     return new FakeSessionManager(`memory-${this.#nextSession}`, null, cwd);
   }
 
-  async resumeTo(
-    target: FakeSessionManager,
-  ): Promise<"done" | "cancelled"> {
+  async resumeTo(target: FakeSessionManager): Promise<"done" | "cancelled"> {
     const before = await this.#emit("session_before_switch", {
       type: "session_before_switch",
       reason: "resume",
@@ -549,9 +535,7 @@ export class FakePi {
     return "done";
   }
 
-  async navigate(
-    targetId: string,
-  ): Promise<"done" | "cancelled"> {
+  async navigate(targetId: string): Promise<"done" | "cancelled"> {
     const oldLeafId = this.manager.getLeafId();
     const before = await this.#emit("session_before_tree", {
       type: "session_before_tree",
@@ -584,9 +568,7 @@ export class FakePi {
   }
 
   /** Run only Pi's cancellable preparation hook, without committing a move. */
-  async prepareNavigation(
-    targetId: string,
-  ): Promise<"ready" | "cancelled"> {
+  async prepareNavigation(targetId: string): Promise<"ready" | "cancelled"> {
     const oldLeafId = this.manager.getLeafId();
     const before = await this.#emit("session_before_tree", {
       type: "session_before_tree",
@@ -661,9 +643,7 @@ export class FakePi {
     });
   }
 
-  async fork(
-    entryId: string,
-  ): Promise<"done" | "cancelled"> {
+  async fork(entryId: string): Promise<"done" | "cancelled"> {
     const before = await this.#emit("session_before_fork", {
       type: "session_before_fork",
       entryId,

@@ -1,12 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
-import {
-  link,
-  mkdir,
-  mkdtemp,
-  rm,
-  stat,
-  symlink,
-} from "node:fs/promises";
+import { link, mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -93,14 +86,14 @@ function startMetadataChild(
   iterations = 1,
   writeState = true,
 ): MetadataChild {
-  const child = fork(metadataOpenFixture, [
-    path,
-    String(iterations),
-    writeState ? "write" : "open-only",
-  ], {
-    execArgv: ["--experimental-strip-types", "--no-warnings"],
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
+  const child = fork(
+    metadataOpenFixture,
+    [path, String(iterations), writeState ? "write" : "open-only"],
+    {
+      execArgv: ["--experimental-strip-types", "--no-warnings"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    },
+  );
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer | string) => {
     stderr += chunk.toString();
@@ -117,9 +110,11 @@ function waitForChildExit(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve();
   }
-  return new Promise<void>((resolveExit) => child.once("exit", () => {
-    resolveExit();
-  }));
+  return new Promise<void>((resolveExit) =>
+    child.once("exit", () => {
+      resolveExit();
+    }),
+  );
 }
 
 async function createStore(): Promise<{
@@ -144,16 +139,21 @@ describe("single-state metadata", () => {
     const { path, store } = await createStore();
     store.close();
     const db = new DatabaseSync(path);
-    const tables = db.prepare(
-      `SELECT name FROM sqlite_master
+    const tables = db
+      .prepare(
+        `SELECT name FROM sqlite_master
        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
        ORDER BY name`,
-    ).all().map((row) => String(row.name));
+      )
+      .all()
+      .map((row) => String(row.name));
     expect(tables).toEqual(["node_state", "session_registry"]);
-    expect(Number(
-      (db.prepare("PRAGMA user_version").get() as { user_version: number })
-        .user_version,
-    )).toBe(1);
+    expect(
+      Number(
+        (db.prepare("PRAGMA user_version").get() as { user_version: number })
+          .user_version,
+      ),
+    ).toBe(1);
     db.close();
   });
 
@@ -165,17 +165,15 @@ describe("single-state metadata", () => {
     gate.exec("PRAGMA journal_mode=WAL;");
     gate.exec("BEGIN IMMEDIATE;");
     let gateOpen = true;
-    const children = Array.from({ length: 4 }, () =>
-      startMetadataChild(path)
-    );
+    const children = Array.from({ length: 4 }, () => startMetadataChild(path));
 
     try {
       await Promise.all(children.map((child) => child.ready));
       const opening = children.map((child) =>
-        waitForChildMessage(child.process, "opening", child.stderr)
+        waitForChildMessage(child.process, "opening", child.stderr),
       );
       const opened = children.map((child) =>
-        waitForChildMessage(child.process, "opened", child.stderr)
+        waitForChildMessage(child.process, "opened", child.stderr),
       );
       for (const child of children) child.process.send?.("start");
       await Promise.all(opening);
@@ -191,9 +189,9 @@ describe("single-state metadata", () => {
       );
       const store = new MetadataStore(path);
       for (const result of results) {
-        expect(
-          store.getState("concurrent-open", `${result.pid}-0`),
-        ).toEqual({ treeOid: "a".repeat(64) });
+        expect(store.getState("concurrent-open", `${result.pid}-0`)).toEqual({
+          treeOid: "a".repeat(64),
+        });
       }
       store.close();
     } finally {
@@ -223,15 +221,15 @@ describe("single-state metadata", () => {
 
     const iterations = 20;
     const children = Array.from({ length: 4 }, () =>
-      startMetadataChild(path, iterations, false)
+      startMetadataChild(path, iterations, false),
     );
     try {
       await Promise.all(children.map((child) => child.ready));
       const opening = children.map((child) =>
-        waitForChildMessage(child.process, "opening", child.stderr)
+        waitForChildMessage(child.process, "opening", child.stderr),
       );
       const opened = children.map((child) =>
-        waitForChildMessage(child.process, "opened", child.stderr)
+        waitForChildMessage(child.process, "opened", child.stderr),
       );
       for (const child of children) child.process.send?.("start");
       await Promise.all(opening);
@@ -262,8 +260,9 @@ describe("single-state metadata", () => {
     store.setState("s", "e", second);
     expect(store.getState("s", "e")).toEqual({ treeOid: second });
     expect(store.getState("other", "e")).toBeUndefined();
-    expect(() => store.setState("s", "bad", "not-an-oid"))
-      .toThrow(MetadataError);
+    expect(() => store.setState("s", "bad", "not-an-oid")).toThrow(
+      MetadataError,
+    );
     store.close();
   });
 
@@ -289,21 +288,25 @@ describe("single-state metadata", () => {
     expect(store.getState("fork", "root")).toEqual({ treeOid: root });
     expect(store.getState("fork", "selected")?.treeOid).toBe(destinationWins);
     expect(store.getState("fork", "sibling")).toBeUndefined();
-    expect(store.copyForkAncestry({
-      targetSessionId: "fork",
-      parentSessionFile: "/sessions/source.jsonl",
-      ancestryEntryIds: ["root", "selected"],
-    }).copiedStates).toBe(0);
+    expect(
+      store.copyForkAncestry({
+        targetSessionId: "fork",
+        parentSessionFile: "/sessions/source.jsonl",
+        ancestryEntryIds: ["root", "selected"],
+      }).copiedStates,
+    ).toBe(0);
     store.close();
   });
 
   it("does not guess when a fork parent was never registered", async () => {
     const { store } = await createStore();
-    expect(store.copyForkAncestry({
-      targetSessionId: "fork",
-      parentSessionFile: "/missing.jsonl",
-      ancestryEntryIds: ["root"],
-    })).toEqual({ sourceSessionId: undefined, copiedStates: 0 });
+    expect(
+      store.copyForkAncestry({
+        targetSessionId: "fork",
+        parentSessionFile: "/missing.jsonl",
+        ancestryEntryIds: ["root"],
+      }),
+    ).toEqual({ sourceSessionId: undefined, copiedStates: 0 });
     expect(store.getState("fork", "root")).toBeUndefined();
     store.close();
   });
@@ -311,8 +314,7 @@ describe("single-state metadata", () => {
   it("enforces unique ownership of a persisted session file", async () => {
     const { store } = await createStore();
     store.touchSession("s1", "/sessions/shared.jsonl");
-    expect(() => store.touchSession("s2", "/sessions/shared.jsonl"))
-      .toThrow();
+    expect(() => store.touchSession("s2", "/sessions/shared.jsonl")).toThrow();
     expect(store.listRegisteredSessions()).toHaveLength(1);
     store.close();
   });
@@ -321,7 +323,7 @@ describe("single-state metadata", () => {
     const { store } = await createStore();
     store.touchSession("same", "/sessions/original.jsonl");
     expect(() =>
-      store.touchSession("same", "/sessions/duplicate.jsonl")
+      store.touchSession("same", "/sessions/duplicate.jsonl"),
     ).toThrow(MetadataError);
     expect(store.listRegisteredSessions()).toEqual([
       expect.objectContaining({
@@ -339,31 +341,33 @@ describe("single-state metadata", () => {
     expect(store.observeSessionMissing("s", "/sessions/s.jsonl", 100)).toBe(
       true,
     );
-    expect(store.pruneMissingSession({
-      expectedSessionId: "s",
-      expectedSessionFile: "/sessions/s.jsonl",
-      expectedMissingSince: 100,
-      expectedMissingObservedAt: 100,
-      now: 1_000,
-      retentionMs: 500,
-    }))
-      .toMatchObject({ removedSessions: 0, removedNodeStates: 0 });
+    expect(
+      store.pruneMissingSession({
+        expectedSessionId: "s",
+        expectedSessionFile: "/sessions/s.jsonl",
+        expectedMissingSince: 100,
+        expectedMissingObservedAt: 100,
+        now: 1_000,
+        retentionMs: 500,
+      }),
+    ).toMatchObject({ removedSessions: 0, removedNodeStates: 0 });
     expect(store.observeSessionMissing("s", "/sessions/s.jsonl", 1_000)).toBe(
       true,
     );
-    expect(store.pruneMissingSession({
-      expectedSessionId: "s",
-      expectedSessionFile: "/sessions/s.jsonl",
-      expectedMissingSince: 100,
-      expectedMissingObservedAt: 1_000,
-      now: 1_000,
-      retentionMs: 500,
-    }))
-      .toEqual({
-        removedSessions: 1,
-        removedNodeStates: 1,
-        removedMetadataRows: 2,
-      });
+    expect(
+      store.pruneMissingSession({
+        expectedSessionId: "s",
+        expectedSessionFile: "/sessions/s.jsonl",
+        expectedMissingSince: 100,
+        expectedMissingObservedAt: 1_000,
+        now: 1_000,
+        retentionMs: 500,
+      }),
+    ).toEqual({
+      removedSessions: 1,
+      removedNodeStates: 1,
+      removedMetadataRows: 2,
+    });
     expect(store.listReferencedTreeOids()).toEqual([]);
     store.close();
   });
@@ -501,26 +505,28 @@ describe("single-state metadata", () => {
       `CREATE TRIGGER sabotage AFTER INSERT ON node_state
        BEGIN DELETE FROM node_state; END`,
     ],
-    [
-      "view",
-      "CREATE VIEW leaked_node_state AS SELECT * FROM node_state",
-    ],
+    ["view", "CREATE VIEW leaked_node_state AS SELECT * FROM node_state"],
     [
       "extra index",
       "CREATE INDEX unexpected_node_state_oid ON node_state(tree_oid)",
     ],
-  ])("rejects an unexpected user %s in a current schema", async (_kind, sql) => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-object-"));
-    roots.push(root);
-    const path = join(root, "state.db");
-    const initial = new MetadataStore(path);
-    initial.close();
-    const db = new DatabaseSync(path);
-    db.exec(sql);
-    db.close();
+  ])(
+    "rejects an unexpected user %s in a current schema",
+    async (_kind, sql) => {
+      const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-object-"));
+      roots.push(root);
+      const path = join(root, "state.db");
+      const initial = new MetadataStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(sql);
+      db.close();
 
-    expect(() => new MetadataStore(path)).toThrow(/unexpected schema objects/u);
-  });
+      expect(() => new MetadataStore(path)).toThrow(
+        /unexpected schema objects/u,
+      );
+    },
+  );
 
   it("refuses a newer schema without mutating it", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-newer-"));
@@ -532,9 +538,13 @@ describe("single-state metadata", () => {
     expect(() => new MetadataStore(path)).toThrow(/newer than supported/u);
     const check = new DatabaseSync(path);
     expect(
-      Number((check.prepare("PRAGMA user_version").get() as {
-        user_version: number;
-      }).user_version),
+      Number(
+        (
+          check.prepare("PRAGMA user_version").get() as {
+            user_version: number;
+          }
+        ).user_version,
+      ),
     ).toBe(2);
     check.close();
   });

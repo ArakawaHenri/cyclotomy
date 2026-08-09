@@ -34,9 +34,7 @@ export class InconsistentSnapshotScopeError extends Error {
 /** Refuse forged snapshots that would make publication read outside its scan. */
 function assertEntrySourcesBound(snapshot: WorkspaceSnapshot): void {
   if (!isAbsolute(snapshot.rootPath)) {
-    throw new InconsistentSnapshotScopeError(
-      "workspace root is not absolute",
-    );
+    throw new InconsistentSnapshotScopeError("workspace root is not absolute");
   }
   for (const entry of snapshot.entries) {
     if (
@@ -45,9 +43,9 @@ function assertEntrySourcesBound(snapshot: WorkspaceSnapshot): void {
       entry.path.includes("\\") ||
       entry.path.includes("\0") ||
       entry.path !== entry.path.normalize("NFC") ||
-      entry.path.split("/").some((part) =>
-        part.length === 0 || part === "." || part === ".."
-      )
+      entry.path
+        .split("/")
+        .some((part) => part.length === 0 || part === "." || part === "..")
     ) {
       throw new InconsistentSnapshotScopeError(
         `unsafe entry path ${JSON.stringify(entry.path)}`,

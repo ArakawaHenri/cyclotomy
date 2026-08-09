@@ -2,7 +2,14 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,9 +25,12 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 async function runNpm(args, cwd) {
   const npmCli = process.env.npm_execpath;
-  const command = npmCli === undefined
-    ? (process.platform === "win32" ? "npm.cmd" : "npm")
-    : process.execPath;
+  const command =
+    npmCli === undefined
+      ? process.platform === "win32"
+        ? "npm.cmd"
+        : "npm"
+      : process.execPath;
   const commandArgs = npmCli === undefined ? args : [npmCli, ...args];
   await execFileAsync(command, commandArgs, {
     cwd,
@@ -51,31 +61,33 @@ try {
 
   // Build the exact artifact npm would publish. Lifecycle scripts are disabled
   // so this smoke test can also run safely from prepublishOnly.
-  await runNpm([
-    "pack",
-    "--ignore-scripts",
-    "--pack-destination",
-    packDirectory,
-  ], repositoryRoot);
-  const archives = (await readdir(packDirectory))
-    .filter((name) => name.endsWith(".tgz"));
+  await runNpm(
+    ["pack", "--ignore-scripts", "--pack-destination", packDirectory],
+    repositoryRoot,
+  );
+  const archives = (await readdir(packDirectory)).filter((name) =>
+    name.endsWith(".tgz"),
+  );
   assert.equal(archives.length, 1, "npm pack must produce exactly one archive");
   const archive = join(packDirectory, archives[0]);
 
   // Install only the packed artifact into Pi's managed user-package layout.
   // Cyclotomy has no runtime dependencies; legacy-peer-deps deliberately keeps
   // npm from fetching its Pi peer and proves the locked host can supply it.
-  await runNpm([
-    "install",
-    "--prefix",
-    installRoot,
-    "--ignore-scripts",
-    "--legacy-peer-deps",
-    "--no-package-lock",
-    "--no-audit",
-    "--no-fund",
-    archive,
-  ], sandbox);
+  await runNpm(
+    [
+      "install",
+      "--prefix",
+      installRoot,
+      "--ignore-scripts",
+      "--legacy-peer-deps",
+      "--no-package-lock",
+      "--no-audit",
+      "--no-fund",
+      archive,
+    ],
+    sandbox,
+  );
 
   const installedRoot = join(installRoot, "node_modules", "cyclotomy");
   const manifest = JSON.parse(
