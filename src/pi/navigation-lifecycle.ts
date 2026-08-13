@@ -1654,12 +1654,14 @@ export function registerNavigationLifecycle(
         arrivalDisposition,
         workspaceLockCleanup,
       );
-      if (
-        result.execution.kind !== "initialization-conflict" ||
-        (result.arrival.kind === "protected" &&
-          result.arrival.evidence.kind === "session-barrier" &&
-          result.arrival.evidence.admission.kind === "failed")
-      ) {
+      const conflictPresentsEmbeddedProtection =
+        result.execution.kind === "initialization-conflict" ||
+        result.execution.kind === "post-mutation-conflict";
+      const barrierAdmissionFailed =
+        result.arrival.kind === "protected" &&
+        result.arrival.evidence.kind === "session-barrier" &&
+        result.arrival.evidence.admission.kind === "failed";
+      if (!conflictPresentsEmbeddedProtection || barrierAdmissionFailed) {
         notifyArrivalDispositionFailure(runtime, context, result.arrival);
       }
       runtime.presentBestEffort(context, () => {

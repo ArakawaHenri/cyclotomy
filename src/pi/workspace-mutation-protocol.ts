@@ -282,9 +282,9 @@ export class WorkspaceMutationProtocol {
   }
 
   /**
-   * The workspace queue itself can reject after its action has returned (for
-   * example while releasing a lock). Preserve the explicit execution fact and
-   * run the same recovery only when a cutover authorized workspace mutation.
+   * Reconcile an explicit execution receipt with the independent workspace-lock
+   * cleanup result. Preserve settled facts and recover only when an authorized
+   * cutover means workspace mutation may have occurred.
    */
   recoverAfterWorkspaceFailure(
     cause: unknown,

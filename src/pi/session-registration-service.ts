@@ -99,6 +99,7 @@ export type ForkRejection =
   | ForkRejectionOf<"source-store-missing">
   | ForkRejectionOf<"source-registration-absent">
   | ForkRejectionOf<"source-registration-conflict">
+  | ForkRejectionOf<"source-registration-unverified">
   | ForkRejectionOf<"source-metadata-recovery-required">
   | ForkRejectionOf<"source-metadata-unrecognized">
   | ForkRejectionOf<"source-projection-invalid">
@@ -113,6 +114,13 @@ function rejection(
     kind,
     cause: new Error(message, cause === undefined ? undefined : { cause }),
   };
+}
+
+function unverifiedSourceRegistration(): ForkRejection {
+  return rejection(
+    "source-registration-unverified",
+    "Cyclotomy parent registration is not verified for inheritance",
+  );
 }
 
 class ForkRejectedError extends Error {
@@ -1381,9 +1389,13 @@ export class SessionRegistrationService {
               retainedEntryIds: [],
             });
             if (localSource === undefined) {
-              throw new Error(
-                "Cyclotomy parent registration is not yet verified",
-              );
+              return {
+                kind: "complete",
+                outcome: await this.#registerTarget(input, readCurrentView, {
+                  kind: "quarantine",
+                  rejection: unverifiedSourceRegistration(),
+                }),
+              };
             }
             await this.#assertStillCurrent(
               view,
@@ -1429,9 +1441,13 @@ export class SessionRegistrationService {
               retainedEntryIds: provenEntryIds,
             });
             if (localProjection === undefined) {
-              throw new Error(
-                "Cyclotomy parent registration is not yet verified",
-              );
+              return {
+                kind: "complete",
+                outcome: await this.#registerTarget(input, readCurrentView, {
+                  kind: "quarantine",
+                  rejection: unverifiedSourceRegistration(),
+                }),
+              };
             }
             if (
               localProjection.sourceSessionId !== localSource.sourceSessionId ||
@@ -1595,13 +1611,17 @@ export class SessionRegistrationService {
     }
     const authenticatedSourceStoreBinding = sourceStoreBinding;
     const authenticatedSourceStoreRoot = sourceStoreBinding.canonicalPath;
+    const sourceConfig = loadWorkspaceCyclotomyConfig(
+      this.#options.globalConfig,
+      authenticatedSourceStoreRoot,
+    );
 
     const execution = await runWithOrderedWorkspaceLocks(
       [
         { storeRoot, options: config.lock },
         {
           storeRoot: authenticatedSourceStoreRoot,
-          options: this.#options.globalConfig.lock,
+          options: sourceConfig.lock,
         },
       ],
       "fork-import",
@@ -1712,10 +1732,6 @@ export class SessionRegistrationService {
           view.stableCoordinates,
         );
         try {
-          const sourceConfig = loadWorkspaceCyclotomyConfig(
-            this.#options.globalConfig,
-            authenticatedSourceStoreRoot,
-          );
           sourceStore = await openObjectStore(authenticatedSourceStoreRoot, {
             maxFileBytes: sourceConfig.scan.maxFileBytes,
             maxEntries: sourceConfig.scan.maxEntries,
@@ -1735,9 +1751,7 @@ export class SessionRegistrationService {
             retainedEntryIds: provenEntryIds,
           });
           if (exported === undefined) {
-            throw new Error(
-              "Cyclotomy parent registration is not yet verified",
-            );
+            throw new ForkRejectedError(unverifiedSourceRegistration());
           }
           if (
             exported.sourceSessionId !== source.sourceSessionId ||

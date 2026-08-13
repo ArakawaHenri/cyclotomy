@@ -12,7 +12,8 @@ Cyclotomy 让两者同行。它安静地记录对话推进时的工作区，并�
 
 ## 安装
 
-需要 Node.js `>=24.15.0` 和 Pi Coding Agent `>=0.84.0`。
+需要 Node.js `>=24.15.0`、Pi Coding Agent `>=0.84.0`，以及 `PATH` 中可用的
+`git`。
 
 ```bash
 pi install npm:cyclotomy

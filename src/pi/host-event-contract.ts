@@ -73,7 +73,11 @@ const MESSAGE_END_POLICY = {
 /** Only extension custom messages lack a dedicated cancellable preflight. */
 export function messageEndNeedsSourceCapture(role: MessageRole): boolean {
   if (!Object.hasOwn(MESSAGE_END_POLICY, role)) {
-    throw new Error(`unsupported Pi message role: ${String(role)}`);
+    // A newer Pi may reach older emitted JavaScript with a role that was not
+    // present at compile time. Observing that boundary is safer than assuming
+    // another event already captured its source; the table above still makes
+    // every role in the installed Pi types an explicit compile-time decision.
+    return true;
   }
   return MESSAGE_END_POLICY[role] === "capture-observed-location";
 }

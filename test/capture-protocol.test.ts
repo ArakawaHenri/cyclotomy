@@ -78,6 +78,49 @@ describe("capture protocol", () => {
     expect(prepareCurrent).not.toHaveBeenCalled();
   });
 
+  it("stops before admission when the public view has already changed", async () => {
+    const expected = view();
+    const options = deps(expected);
+    const captureAdmission = vi.fn(options.captureAdmission);
+    const prepareCurrent = vi.fn(options.prepareCurrent);
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...options,
+          readCurrentView: () => view(),
+          captureAdmission,
+          prepareCurrent,
+        },
+        { expected },
+      ),
+    ).resolves.toEqual({
+      kind: "location-changed",
+      phase: "before-capture",
+    });
+    expect(captureAdmission).not.toHaveBeenCalled();
+    expect(prepareCurrent).not.toHaveBeenCalled();
+  });
+
+  it("returns a missing stable coordinate without scanning", async () => {
+    const expected = view();
+    const options = deps(expected);
+    const prepareCurrent = vi.fn(options.prepareCurrent);
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...options,
+          captureAnchor: () => undefined,
+          captureAdmission: () => ({ kind: "no-coordinate" }),
+          prepareCurrent,
+        },
+        { expected },
+      ),
+    ).resolves.toEqual({ kind: "no-coordinate" });
+    expect(prepareCurrent).not.toHaveBeenCalled();
+  });
+
   it("returns a durable write-protected decision without rewriting it", async () => {
     const expected = view();
 
@@ -115,5 +158,72 @@ describe("capture protocol", () => {
         { expected },
       ),
     ).resolves.toEqual({ kind: "workspace-unavailable" });
+  });
+
+  it("preserves a classified preparation failure", async () => {
+    const expected = view();
+    const failure = {
+      kind: "workspace-changed",
+      reason: "contents",
+    } as const;
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...deps(expected),
+          prepareCurrent: async () => ({ ok: false, error: failure }),
+        },
+        { expected },
+      ),
+    ).resolves.toEqual({ kind: "capture-failed", failure });
+  });
+
+  it.each([
+    [
+      { kind: "write-protected" as const },
+      { kind: "write-protected" as const },
+    ],
+    [
+      {
+        kind: "state-changed" as const,
+        reason: "checkpoint" as const,
+      },
+      {
+        kind: "capture-failed" as const,
+        failure: {
+          kind: "state-changed" as const,
+          reason: "checkpoint" as const,
+        },
+      },
+    ],
+  ])("normalizes a classified commit result", async (failure, result) => {
+    const expected = view();
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...deps(expected),
+          commitPrepared: () => ({ ok: false, error: failure }),
+        },
+        { expected },
+      ),
+    ).resolves.toEqual(result);
+  });
+
+  it("totalizes an unexpected dependency exception", async () => {
+    const expected = view();
+    const cause = new Error("capture dependency failed");
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...deps(expected),
+          prepareCurrent: async () => {
+            throw cause;
+          },
+        },
+        { expected },
+      ),
+    ).resolves.toEqual({ kind: "failed", cause });
   });
 });

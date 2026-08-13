@@ -34,4 +34,12 @@ describe("Pi public lifecycle contract", () => {
       expect(messageEndNeedsSourceCapture(role)).toBe(false);
     }
   });
+
+  it("conservatively captures a message role introduced by a newer host", () => {
+    const runtimePolicy = messageEndNeedsSourceCapture as (
+      role: string,
+    ) => boolean;
+
+    expect(runtimePolicy("futureMessageRole")).toBe(true);
+  });
 });

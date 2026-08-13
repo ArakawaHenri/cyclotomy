@@ -14,7 +14,8 @@ Install it, then use Pi as usual.
 
 ## Install
 
-Requires Node.js `>=24.15.0` and Pi Coding Agent `>=0.84.0`.
+Requires Node.js `>=24.15.0`, Pi Coding Agent `>=0.84.0`, and a `git`
+executable on `PATH`.
 
 ```bash
 pi install npm:cyclotomy

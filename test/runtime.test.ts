@@ -30,6 +30,8 @@ import {
   type NativeObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
+import { CURRENT_METADATA_VERSION } from "../src/infrastructure/metadata/current.ts";
+import { METADATA_WRITER_PROTOCOL_FUNCTION } from "../src/infrastructure/metadata/schema.ts";
 import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
 import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
@@ -434,6 +436,37 @@ function readSessionProjectionResidue(
       readonly registrations: number;
       readonly slots: number;
     };
+  } finally {
+    db.close();
+  }
+}
+
+function setSessionRegistrationState(
+  storeRoot: string,
+  sessionId: string,
+  state: "pending" | "verified",
+): void {
+  const writerProtocol = CURRENT_METADATA_VERSION.schema.writerProtocol;
+  if (writerProtocol === undefined) {
+    throw new Error("current metadata lacks a writer protocol");
+  }
+  const db = new DatabaseSync(join(storeRoot, "state.db"));
+  try {
+    db.function(
+      METADATA_WRITER_PROTOCOL_FUNCTION,
+      { deterministic: true, directOnly: false },
+      () => writerProtocol,
+    );
+    const updated = db
+      .prepare(
+        `UPDATE session_registry
+         SET registration_state = ?
+         WHERE session_id = ?`,
+      )
+      .run(state, sessionId);
+    if (Number(updated.changes) !== 1) {
+      throw new Error("test session registration is absent");
+    }
   } finally {
     db.close();
   }
@@ -1373,66 +1406,96 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
-  it("retries a local parent registration that is not yet verified", async () => {
-    const { workspace, home, runtime } = await createRuntime();
-    const parentFile = join(home, "pending-parent.jsonl");
-    await writeFile(
-      parentFile,
-      [
-        JSON.stringify({
-          type: "session",
-          version: 3,
-          id: "pending-parent",
-          cwd: workspace,
-        }),
-        JSON.stringify({
-          type: "custom",
-          id: "shared",
-          parentId: null,
-          timestamp: new Date(0).toISOString(),
-          customType: "test",
-        }),
-      ].join("\n") + "\n",
-    );
-    registerTestSession(runtime.metadata, "pending-parent", parentFile, [
-      "shared",
-    ]);
-    const treeOid = "e".repeat(64);
-    commitTestNodeState(runtime.metadata, "pending-parent", "shared", treeOid);
-    const child = registrationView({
-      cwd: workspace,
-      sessionId: "pending-child",
-      sessionFile: join(home, "pending-child.jsonl"),
-      parentSessionFile: parentFile,
-      retainedEntryIds: ["shared"],
-    });
-    const preparation = await runtime.registrations.prepare(child, {
-      kind: "fork",
-      previousSessionFile: parentFile,
-    });
-    const projection = vi
-      .spyOn(runtime.metadata, "exportForkProjection")
-      .mockReturnValueOnce(undefined);
+  it.each([
+    { rejectedExport: 1, stage: "initial authentication" },
+    { rejectedExport: 2, stage: "retained projection" },
+  ])(
+    "quarantines an unverified local parent during $stage without late inheritance",
+    async ({ rejectedExport }) => {
+      const { workspace, home, runtime } = await createRuntime();
+      const parentFile = join(home, "pending-parent.jsonl");
+      await writeFile(
+        parentFile,
+        [
+          JSON.stringify({
+            type: "session",
+            version: 3,
+            id: "pending-parent",
+            cwd: workspace,
+          }),
+          JSON.stringify({
+            type: "custom",
+            id: "shared",
+            parentId: null,
+            timestamp: new Date(0).toISOString(),
+            customType: "test",
+          }),
+        ].join("\n") + "\n",
+      );
+      registerTestSession(runtime.metadata, "pending-parent", parentFile, [
+        "shared",
+      ]);
+      const treeOid = "e".repeat(64);
+      commitTestNodeState(
+        runtime.metadata,
+        "pending-parent",
+        "shared",
+        treeOid,
+      );
+      const child = registrationView({
+        cwd: workspace,
+        sessionId: "pending-child",
+        sessionFile: join(home, "pending-child.jsonl"),
+        parentSessionFile: parentFile,
+        retainedEntryIds: ["shared"],
+      });
+      const preparation = await runtime.registrations.prepare(child, {
+        kind: "fork",
+        previousSessionFile: parentFile,
+      });
+      const originalExport = runtime.metadata.exportForkProjection.bind(
+        runtime.metadata,
+      );
+      let exportCount = 0;
+      const projection = vi
+        .spyOn(runtime.metadata, "exportForkProjection")
+        .mockImplementation((input) => {
+          exportCount += 1;
+          return exportCount === rejectedExport
+            ? undefined
+            : originalExport(input);
+        });
 
-    await expect(
-      runtime.registrations.register(child, () => child, preparation),
-    ).rejects.toThrow(/not yet verified/u);
-    expect(
-      readSessionProjectionResidue(
-        join(runtime.storeRoot, "state.db"),
-        child.sessionId,
-      ),
-    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+      await expect(
+        runtime.registrations.register(child, () => child, preparation),
+      ).resolves.toMatchObject({
+        kind: "active",
+        disposition: {
+          kind: "quarantined",
+          rejection: { kind: "source-registration-unverified" },
+        },
+      });
+      expect(exportCount).toBe(rejectedExport);
+      expect(
+        readSessionProjectionResidue(
+          join(runtime.storeRoot, "state.db"),
+          child.sessionId,
+        ),
+      ).toEqual({ barriers: 1, registrations: 1, slots: 1 });
+      expect(
+        runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
+      ).toEqual({ kind: "blocked-missing" });
 
-    projection.mockRestore();
-    await expect(
-      runtime.registrations.register(child, () => child, preparation),
-    ).resolves.toEqual(activeRegistration("inherited"));
-    expect(
-      runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
-    ).toEqual({ kind: "open-checkpoint", treeOid });
-    runtime.close();
-  });
+      projection.mockRestore();
+      await expect(
+        runtime.registrations.register(child, () => child, preparation),
+      ).resolves.toEqual(activeRegistration("existing"));
+      expect(
+        runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
+      ).toEqual({ kind: "blocked-missing" });
+      runtime.close();
+    },
+  );
 
   it("quarantines a declared fork when its parent file is unavailable", async () => {
     const { workspace, home, runtime } = await createRuntime();
@@ -1989,10 +2052,57 @@ describe("Cyclotomy runtime", () => {
     await expectExternalForkInheritance(fixture);
   });
 
-  it("aborts an ordered source-lock timeout and inherits on retry", async () => {
+  it("quarantines an unverified external parent without late inheritance", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-unverified-",
+    );
+    setSessionRegistrationState(fixture.sourceStoreRoot, "parent", "pending");
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { kind: "source-registration-unverified" },
+      },
+    });
+    expect(
+      runtime.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+
+    setSessionRegistrationState(fixture.sourceStoreRoot, "parent", "verified");
+    const reopened = await openExternalForkTarget(fixture);
+    await expect(
+      reopened.runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        reopened.preparation,
+      ),
+    ).resolves.toEqual(activeRegistration("existing"));
+    expect(
+      reopened.runtime.metadata.getCheckpointSlot(
+        fixture.child.sessionId,
+        "retained",
+      ),
+    ).toEqual({ kind: "blocked-missing" });
+    reopened.runtime.close();
+  });
+
+  it("uses the source workspace lock timeout and inherits on retry", async () => {
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-source-lock-",
-      25,
+      100,
+    );
+    await writeFile(
+      join(fixture.sourceStoreRoot, "settings.json"),
+      JSON.stringify({ lockTimeoutMs: 25 }),
     );
     const { preparation, runtime } = await openExternalForkTarget(fixture);
     const sourceLock = await acquireWorkspaceLock(
@@ -2010,6 +2120,10 @@ describe("Cyclotomy runtime", () => {
       ).rejects.toMatchObject({
         name: OrderedWorkspaceLockAcquisitionError.name,
         storeRoot: fixture.sourceStoreRoot,
+        cause: {
+          name: "WorkspaceLockTimeoutError",
+          message: expect.stringContaining("25 ms"),
+        },
       });
       expect(
         readSessionProjectionResidue(
@@ -2022,6 +2136,56 @@ describe("Cyclotomy runtime", () => {
     }
     runtime.close();
 
+    await expectExternalForkInheritance(fixture);
+  });
+
+  it("returns an existing external target without reading source settings", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-config-shortcut-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    registerTestSession(
+      runtime.metadata,
+      fixture.child.sessionId,
+      fixture.child.sessionFile!,
+      fixture.child.stableEntryIds,
+    );
+    await writeFile(join(fixture.sourceStoreRoot, "settings.json"), "{");
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toEqual(activeRegistration("existing"));
+    runtime.close();
+  });
+
+  it("does not quarantine invalid source settings and inherits on retry", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-config-operation-",
+    );
+    const settingsPath = join(fixture.sourceStoreRoot, "settings.json");
+    await writeFile(settingsPath, "{");
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toBeInstanceOf(CyclotomyConfigError);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+
+    await writeFile(settingsPath, "{}");
     await expectExternalForkInheritance(fixture);
   });
 

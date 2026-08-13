@@ -666,20 +666,15 @@ describe("workspace lock", () => {
     ]);
   });
 
-  it("returns a completed action value even when lock cleanup fails", async () => {
+  it("reports stray release residue without losing a completed action", async () => {
     const root = await storeRoot();
+    const lockPath = join(root, "workspace.lock");
+    const strayName = "unexpected-entry";
     const execution = await runWithWorkspaceLock(
       root,
       "settled-release-test",
       async () => {
-        const lockPath = join(root, "workspace.lock");
-        const heartbeat = (await readdir(lockPath)).find((name) =>
-          name.startsWith("heartbeat-"),
-        );
-        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
-        const heartbeatPath = join(lockPath, heartbeat);
-        await rm(heartbeatPath);
-        await mkdir(heartbeatPath);
+        await writeFile(join(lockPath, strayName), "preserve");
         return { effect: "committed" as const };
       },
     );
@@ -689,6 +684,7 @@ describe("workspace lock", () => {
       value: { effect: "committed" },
       cleanup: { kind: "failed" },
     });
+    expect(await readdir(lockPath)).toEqual([strayName]);
   });
 
   it("returns an action failure independently from lock cleanup", async () => {
@@ -837,10 +833,12 @@ describe("workspace lock", () => {
     ]);
   });
 
-  it("returns an ordered action value with the exact cleanup root", async () => {
+  it("reports ordered stray residue at the exact cleanup root", async () => {
     const root = await storeRoot();
     const firstRoot = join(root, "a");
     const secondRoot = join(root, "z");
+    const secondLockPath = join(secondRoot, "workspace.lock");
+    const strayName = "unexpected-entry";
     await mkdir(firstRoot);
     await mkdir(secondRoot);
 
@@ -848,14 +846,7 @@ describe("workspace lock", () => {
       [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
       "ordered-settled-release-test",
       async () => {
-        const lockPath = join(secondRoot, "workspace.lock");
-        const heartbeat = (await readdir(lockPath)).find((name) =>
-          name.startsWith("heartbeat-"),
-        );
-        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
-        const heartbeatPath = join(lockPath, heartbeat);
-        await rm(heartbeatPath);
-        await mkdir(heartbeatPath);
+        await writeFile(join(secondLockPath, strayName), "preserve");
         return { effect: "committed" as const };
       },
     );
@@ -868,6 +859,10 @@ describe("workspace lock", () => {
         failures: [{ storeRoot: secondRoot }],
       },
     });
+    expect(await readdir(secondLockPath)).toEqual([strayName]);
+    await expect(
+      lstat(join(firstRoot, "workspace.lock")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("releases an earlier ordered member when later acquisition fails", async () => {

@@ -340,7 +340,6 @@ export class CheckpointAdmission {
       this.closeArrival(attempt);
       return false;
     }
-    if (source === undefined) return false;
     return this.#settleArrival(attempt, view, node).kind === "settled";
   }
 

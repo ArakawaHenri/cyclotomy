@@ -1,29 +1,26 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  treeArrivalResult,
-  type TreeArrivalResult,
-} from "../src/pi/tree-arrival-outcome.ts";
+import { treeArrivalResult } from "../src/pi/tree-arrival-outcome.ts";
 
 describe("tree arrival result", () => {
   it("carries safety settlement independently from presentation", () => {
-    const protectedResult = {
-      execution: { kind: "protected" },
-      arrival: {
-        kind: "protected",
-        evidence: {
-          kind: "session-barrier",
-          admission: {
-            kind: "failed",
-            cause: new Error("ephemeral admission failed"),
-          },
+    const execution = { kind: "protected" } as const;
+    const arrival = {
+      kind: "protected",
+      evidence: {
+        kind: "session-barrier",
+        admission: {
+          kind: "failed",
+          cause: new Error("ephemeral admission failed"),
         },
       },
-      workspaceLockCleanup: { kind: "settled" },
-    } satisfies TreeArrivalResult;
+    } as const;
+    const cleanup = { kind: "settled" } as const;
+    const protectedResult = treeArrivalResult(execution, arrival, cleanup);
 
-    expect(protectedResult.execution.kind).toBe("protected");
-    expect(protectedResult.arrival.kind).toBe("protected");
+    expect(protectedResult.execution).toBe(execution);
+    expect(protectedResult.arrival).toBe(arrival);
+    expect(protectedResult.workspaceLockCleanup).toBe(cleanup);
     if (
       protectedResult.arrival.kind === "protected" &&
       protectedResult.arrival.evidence.admission.kind === "failed"
@@ -97,6 +94,41 @@ describe("tree arrival result", () => {
     expect(result.execution).toMatchObject({
       kind: "post-mutation-conflict",
       workspaceLockCleanup: { kind: "failed", cause: recoveryCleanup },
+    });
+  });
+
+  it("keeps a mutation outcome's canonical cleanup receipt", () => {
+    const canonicalCleanup = {
+      kind: "failed",
+      cause: new Error("combined cleanup failed"),
+    } as const;
+    const result = treeArrivalResult(
+      {
+        kind: "outcome",
+        outcome: {
+          kind: "restored",
+          treeOid: "a".repeat(64),
+          report: {
+            created: [],
+            updated: [],
+            deleted: [],
+            renamed: [],
+            unchangedCount: 1,
+            problems: [],
+          },
+        },
+        cutover: { kind: "not-requested" },
+        stagingCleanup: { kind: "settled" },
+        workspaceLockCleanup: canonicalCleanup,
+      },
+      { kind: "admitted" },
+      { kind: "failed", cause: new Error("outer cleanup failed") },
+    );
+
+    expect(result.workspaceLockCleanup).toBe(canonicalCleanup);
+    expect(result.execution).toMatchObject({
+      kind: "outcome",
+      workspaceLockCleanup: canonicalCleanup,
     });
   });
 });

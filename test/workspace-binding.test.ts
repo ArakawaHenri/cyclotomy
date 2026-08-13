@@ -12,8 +12,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  assertDirectoryStillBound,
   assertSessionWorkspaceStillBound,
+  bindDirectory,
   bindSessionWorkspace,
+  directoryStillBound,
   sessionWorkspaceStillBound,
 } from "../src/pi/workspace-binding.ts";
 
@@ -94,6 +97,7 @@ describe("session workspace binding", () => {
     const displaced = join(root, "displaced");
     await mkdir(workspace);
     const binding = await bindSessionWorkspace(workspace, workspace);
+    const directoryBinding = await bindDirectory(workspace);
 
     await rename(workspace, displaced);
     await mkdir(workspace);
@@ -104,5 +108,15 @@ describe("session workspace binding", () => {
     await expect(
       sessionWorkspaceStillBound(binding, workspace, workspace),
     ).resolves.toBe(false);
+    await expect(
+      directoryStillBound(directoryBinding, workspace),
+    ).resolves.toBe(false);
+    expect(() =>
+      assertDirectoryStillBound(
+        directoryBinding,
+        workspace,
+        "checkpoint store",
+      ),
+    ).toThrow("checkpoint store changed");
   });
 });

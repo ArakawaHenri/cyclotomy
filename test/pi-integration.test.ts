@@ -8,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -32,6 +33,7 @@ import {
   openObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
+import { acquireWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import {
@@ -4623,7 +4625,8 @@ describe("checkpoint authority lifecycle", () => {
 
     it("preserves a completed navigation outcome when post-restore admission throws", async () => {
       const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
       const { first } = await twoStates(pi);
       const before = metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
@@ -4653,10 +4656,16 @@ describe("checkpoint authority lifecycle", () => {
           }
           return original.call(this, view, resolution);
         });
+      const recoveryAdmissionFailure = vi
+        .spyOn(runtime.admission, "admit")
+        .mockImplementationOnce(() => {
+          throw new Error("recovery admission failed");
+        });
 
       try {
         expect(await pi.navigate(first)).toBe("done");
       } finally {
+        recoveryAdmissionFailure.mockRestore();
         admissionFailure.mockRestore();
       }
 
@@ -4666,6 +4675,18 @@ describe("checkpoint authority lifecycle", () => {
           pi,
           "restorePostMutationControlProtected",
           "post-restore admission failed",
+        ),
+      ).toBe(true);
+      expect(
+        pi.notifications.filter(({ message }) =>
+          message.includes(messageFor("arrivalAdmissionUnavailable")),
+        ),
+      ).toHaveLength(1);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "arrivalAdmissionUnavailable",
+          "recovery admission failed",
         ),
       ).toBe(true);
       expect(notified(pi, "restoreSuccessOne")).toBe(true);
@@ -5393,10 +5414,16 @@ describe("checkpoint authority lifecycle", () => {
           }
           return result;
         });
+      const recoveryAdmissionFailure = vi
+        .spyOn(runtime.admission, "admit")
+        .mockImplementationOnce(() => {
+          throw new Error("initialization recovery admission failed");
+        });
 
       try {
         expect(await pi.navigate(intended.id)).toBe("done");
       } finally {
+        recoveryAdmissionFailure.mockRestore();
         raced.mockRestore();
       }
 
@@ -5412,6 +5439,18 @@ describe("checkpoint authority lifecycle", () => {
       );
       db.close();
       expect(notified(pi, "checkpointInitializedConflictProtected")).toBe(true);
+      expect(
+        pi.notifications.filter(({ message }) =>
+          message.includes(messageFor("arrivalAdmissionUnavailable")),
+        ),
+      ).toHaveLength(1);
+      expect(
+        notifiedWithDetail(
+          pi,
+          "arrivalAdmissionUnavailable",
+          "initialization recovery admission failed",
+        ),
+      ).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
     });
 
@@ -6913,7 +6952,7 @@ describe("checkpoint authority lifecycle", () => {
         process.platform === "win32",
         "Windows symlink creation is privilege-dependent",
       );
-      const targetWorkspace = await mkdtemp(
+      let targetWorkspace = await mkdtemp(
         join(tmpdir(), "cyclotomy-pi-fork-rebound-target-"),
       );
       const storageA = join(home, "fork-storage-a");
@@ -6929,6 +6968,7 @@ describe("checkpoint authority lifecycle", () => {
           JSON.stringify({
             storageDir: storageAlias,
             locale: "zh-CN",
+            lockTimeoutMs: 10_000,
             gc: { intervalMs: 0 },
           }),
         );
@@ -6966,6 +7006,28 @@ describe("checkpoint authority lifecycle", () => {
         )!.treeOid;
         sourceMetadata.close();
 
+        let targetHash = createHash("sha256")
+          .update(await realpath(targetWorkspace))
+          .digest("hex");
+        for (
+          let attempt = 0;
+          Buffer.from(targetHash).compare(Buffer.from(sourceHash)) >= 0 &&
+          attempt < 100;
+          attempt += 1
+        ) {
+          await rm(targetWorkspace, { recursive: true, force: true });
+          targetWorkspace = await mkdtemp(
+            join(tmpdir(), "cyclotomy-pi-fork-rebound-target-"),
+          );
+          targetHash = createHash("sha256")
+            .update(await realpath(targetWorkspace))
+            .digest("hex");
+        }
+        if (Buffer.from(targetHash).compare(Buffer.from(sourceHash)) >= 0) {
+          throw new Error("failed to choose a target ordered before source");
+        }
+        const targetStoreRoot = join(canonicalStorageA, targetHash);
+
         await writeFile(join(targetWorkspace, "state.txt"), "target state");
         const child = new FakePi(targetWorkspace);
         child.manager = new FakeSessionManager(
@@ -6979,35 +7041,64 @@ describe("checkpoint authority lifecycle", () => {
         }
         child.manager.setLeaf(retained);
 
-        const globalConfig = loadCyclotomyConfig(home);
-        let rebound = false;
-        const identifyProcess = vi.fn(async () => {
-          await rm(storageAlias);
-          await symlink(storageB, storageAlias);
-          rebound = true;
-          return "rebound-test-process";
-        });
-        const lock = { ...globalConfig.lock, identifyProcess };
         const runtime = new CyclotomyRuntime(
-          { ...globalConfig, lock },
+          loadCyclotomyConfig(home),
           TEST_I18N,
         );
         registerCyclotomyLifecycle(child.api, runtime);
 
-        await child.startSession("fork", parentFile);
+        const sourceLock = await acquireWorkspaceLock(
+          sourceStoreRoot,
+          "hold-source-before-rebound",
+        );
+        const starting = child.startSession("fork", parentFile);
+        try {
+          const targetLockPath = join(targetStoreRoot, "workspace.lock");
+          let importLockObserved = false;
+          for (let attempt = 0; attempt < 800; attempt += 1) {
+            try {
+              for (const name of await readdir(targetLockPath)) {
+                if (!name.startsWith("owner-") || !name.endsWith(".json")) {
+                  continue;
+                }
+                const record = JSON.parse(
+                  await readFile(join(targetLockPath, name), "utf8"),
+                ) as { operation?: unknown };
+                if (record.operation === "fork-import") {
+                  importLockObserved = true;
+                  break;
+                }
+              }
+            } catch (error) {
+              if (
+                typeof error !== "object" ||
+                error === null ||
+                !["ENOENT", "ENOTDIR"].includes(
+                  String(Reflect.get(error, "code")),
+                )
+              ) {
+                throw error;
+              }
+            }
+            if (importLockObserved) break;
+            await new Promise<void>((resolveWait) =>
+              setTimeout(resolveWait, 5),
+            );
+          }
+          expect(importLockObserved).toBe(true);
+          await rm(storageAlias);
+          await symlink(storageB, storageAlias);
+        } finally {
+          await sourceLock.release();
+        }
+        await starting;
 
-        expect(identifyProcess).toHaveBeenCalledTimes(1);
-        expect(rebound).toBe(true);
         expect(notified(child, "forkImportFailed")).toBe(true);
         expect(notified(child, "forkInheritanceSkipped")).toBe(false);
         expect(await readFile(join(targetWorkspace, "state.txt"), "utf8")).toBe(
           "target state",
         );
 
-        const targetHash = createHash("sha256")
-          .update(await realpath(targetWorkspace))
-          .digest("hex");
-        const targetStoreRoot = join(canonicalStorageA, targetHash);
         const targetMetadata = createCurrentMetadataStore(
           join(targetStoreRoot, "state.db"),
         );

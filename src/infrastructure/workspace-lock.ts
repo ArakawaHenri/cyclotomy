@@ -530,6 +530,27 @@ async function removeDirectoryIfSame(
   }
 }
 
+async function releaseDirectoryIfSame(
+  path: string,
+  expected: LockObservation,
+): Promise<void> {
+  let current: Awaited<ReturnType<typeof lstat>>;
+  try {
+    current = await lstat(path);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+  if (current.dev !== expected.device || current.ino !== expected.inode) {
+    return;
+  }
+  try {
+    await rmdir(path);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+}
+
 async function removeStaleStealClaim(
   claimPath: string,
   staleMs: number,
@@ -768,7 +789,8 @@ export async function acquireWorkspaceLock(
   const ownerPath = join(lockPath, ownerFileName(owner.token));
   const heartbeatPath = join(lockPath, heartbeatFileName(owner.token));
 
-  while (true) {
+  let acquired: LockObservation | undefined;
+  while (acquired === undefined) {
     try {
       await mkdir(lockPath, { mode: 0o700 });
       const created = await observeLock(lockPath);
@@ -796,6 +818,7 @@ export async function acquireWorkspaceLock(
         ) {
           throw new WorkspaceLockFormationChangedError();
         }
+        acquired = published;
       } catch (error) {
         await unlinkOwnedFile(heartbeatPath);
         await unlinkOwnedFile(ownerPath);
@@ -805,7 +828,6 @@ export async function acquireWorkspaceLock(
         }
         throw error;
       }
-      break;
     } catch (error) {
       if (error instanceof WorkspaceLockFormationChangedError) {
         continue;
@@ -873,8 +895,11 @@ export async function acquireWorkspaceLock(
 
         const current = await observeLock(lockPath);
         if (
-          current?.owner.kind !== "valid" ||
-          current.owner.record.owner.token !== owner.token
+          current === undefined ||
+          current.device !== acquired.device ||
+          current.inode !== acquired.inode ||
+          (current.owner.kind === "valid" &&
+            current.owner.record.owner.token !== owner.token)
         ) {
           return;
         }
@@ -885,7 +910,7 @@ export async function acquireWorkspaceLock(
         // non-empty lock.
         await unlinkOwnedFile(heartbeatPath);
         await unlinkOwnedFile(ownerPath);
-        await removeEmptyDirectory(lockPath);
+        await releaseDirectoryIfSame(lockPath, acquired);
       })();
       return releaseInFlight;
     },
