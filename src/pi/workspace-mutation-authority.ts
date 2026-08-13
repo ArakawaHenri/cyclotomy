@@ -70,6 +70,7 @@ type MutationAdmission = Pick<
 
 export interface WorkspaceMutationAuthorityOptions {
   readonly admission: MutationAdmission;
+  readonly participationIsActive: () => boolean;
   readonly registrations: RegistrationAuthority;
   readonly checkpoints: () => CheckpointService;
   readonly metadata: () => CurrentMetadataStore;
@@ -257,11 +258,31 @@ export class WorkspaceMutationAuthority {
   async recoverUncertainLocation(
     context: ExtensionContext,
   ): Promise<ArrivalRecoveryExecution> {
+    return this.#recoverUncertainLocation(context, true);
+  }
+
+  /** Durably close the current location without reopening runtime authority. */
+  async protectCurrentLocationForRetirement(
+    context: ExtensionContext,
+  ): Promise<ArrivalRecoveryExecution> {
+    return this.#recoverUncertainLocation(context, false);
+  }
+
+  async #recoverUncertainLocation(
+    context: ExtensionContext,
+    restoreAdmission: boolean,
+  ): Promise<ArrivalRecoveryExecution> {
     this.quarantineAdmission();
     try {
       const execution = await this.#options.enqueueWorkspaceExecution(
-        "recover-uncertain-location",
-        async () => this.recoverUncertainLocationInWorkspaceLock(context),
+        restoreAdmission
+          ? "recover-uncertain-location"
+          : "protect-location-for-retirement",
+        async () =>
+          this.#recoverUncertainLocationInWorkspaceLock(
+            context,
+            restoreAdmission,
+          ),
       );
       const workspaceLockCleanup =
         execution.cleanup.kind === "failed"
@@ -297,6 +318,13 @@ export class WorkspaceMutationAuthority {
   recoverUncertainLocationInWorkspaceLock(
     context: ExtensionContext,
   ): ArrivalProtection {
+    return this.#recoverUncertainLocationInWorkspaceLock(context, true);
+  }
+
+  #recoverUncertainLocationInWorkspaceLock(
+    context: ExtensionContext,
+    restoreAdmission: boolean,
+  ): ArrivalProtection {
     this.quarantineAdmission();
     let current: SessionView;
     try {
@@ -325,8 +353,16 @@ export class WorkspaceMutationAuthority {
           new Error("registered session authority is unavailable"),
         ]);
       }
-      // The slot is now durably closed against capture. Keep the authenticated
-      // snapshot live so the user may leave it or append a genuine descendant.
+      if (!restoreAdmission || !this.#options.participationIsActive()) {
+        return {
+          kind: "exact-slot",
+          slot: protection.protectedSlot,
+          admission: { kind: "settled" },
+        };
+      }
+      // The slot is now durably closed against capture. Recovery keeps the
+      // authenticated snapshot live so a still-running engine may leave it or
+      // append a genuine descendant. Retirement deliberately skips this step.
       try {
         this.#options.admission.admit(current, node);
         return {

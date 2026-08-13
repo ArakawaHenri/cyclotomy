@@ -61,6 +61,7 @@ function authority(options: {
   readonly cutoverMutation?: () => boolean;
   readonly arrivalSettlement?: () => EphemeralArrivalSettlement;
   readonly workspaceCleanupFailure?: unknown;
+  readonly participationIsActive?: () => boolean;
 }) {
   const events = options.events ?? [];
   const admission = {
@@ -102,6 +103,7 @@ function authority(options: {
   return {
     service: new WorkspaceMutationAuthority({
       admission,
+      participationIsActive: options.participationIsActive ?? (() => true),
       registrations,
       checkpoints: () => checkpoints,
       metadata: () => metadata,
@@ -247,6 +249,37 @@ describe("workspace mutation authority", () => {
       },
       workspaceLockCleanup: { kind: "failed", cause: cleanup },
     });
+  });
+
+  it("protects retirement without reopening ephemeral admission", async () => {
+    const { service, admission } = authority({});
+
+    await expect(
+      service.protectCurrentLocationForRetirement(context()),
+    ).resolves.toMatchObject({
+      protection: {
+        kind: "exact-slot",
+        slot: protectedLocation.protectedSlot,
+      },
+    });
+    expect(admission.admit).not.toHaveBeenCalled();
+    expect(admission.reset).toHaveBeenCalled();
+  });
+
+  it("does not reopen admission after participation is withdrawn", async () => {
+    const { service, admission } = authority({
+      participationIsActive: () => false,
+    });
+
+    await expect(
+      service.recoverUncertainLocation(context()),
+    ).resolves.toMatchObject({
+      protection: {
+        kind: "exact-slot",
+        slot: protectedLocation.protectedSlot,
+      },
+    });
+    expect(admission.admit).not.toHaveBeenCalled();
   });
 
   it("keeps exact durable protection when ephemeral admission settlement fails", () => {

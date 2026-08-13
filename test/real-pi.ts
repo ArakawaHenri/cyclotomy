@@ -42,7 +42,15 @@ const MODEL_ID = "cyclotomy-test-model";
 /** Yield one deterministic assistant turn without touching the network. */
 type RealPiModelOutcome = "success" | "error" | "aborted";
 
-function fixedAssistantTurn(outcome: RealPiModelOutcome) {
+interface RealPiModelPause {
+  readonly started: () => void;
+  readonly released: Promise<void>;
+}
+
+function fixedAssistantTurn(
+  outcome: RealPiModelOutcome,
+  pause?: RealPiModelPause,
+) {
   if (outcome !== "success") {
     const error = {
       role: "assistant",
@@ -93,6 +101,8 @@ function fixedAssistantTurn(outcome: RealPiModelOutcome) {
   };
   async function* stream() {
     yield { type: "start", partial: { role: "assistant", content: [] } };
+    pause?.started();
+    await pause?.released;
     yield { type: "text_start", contentIndex: 0, partial: {} };
     yield { type: "text_delta", contentIndex: 0, delta: "ok", partial: {} };
     yield { type: "text_end", contentIndex: 0, partial: {} };
@@ -121,6 +131,8 @@ export class RealPiHarness {
   #previousAgentDirEnv: string | undefined;
   #agentDirEnvWasSet = false;
   #commandNames: readonly string[] | undefined;
+  #nextModelPause: RealPiModelPause | undefined;
+  #releaseModelPause: (() => void) | undefined;
 
   get session(): AgentSession {
     if (this.#runtime === undefined) throw new Error("harness is not started");
@@ -179,6 +191,34 @@ export class RealPiHarness {
       throw new Error("real Pi session has no leaf entry");
     }
     return leaf;
+  }
+
+  /** Pause the next in-process model after Pi has entered streaming state. */
+  pauseNextModelTurn(): {
+    readonly started: Promise<void>;
+    readonly release: () => void;
+  } {
+    if (this.#nextModelPause !== undefined) {
+      throw new Error("a real-Pi model pause is already pending");
+    }
+    let markStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let didRelease = false;
+    const releaseOnce = () => {
+      if (didRelease) return;
+      didRelease = true;
+      release();
+      this.#releaseModelPause = undefined;
+    };
+    this.#nextModelPause = { started: markStarted, released };
+    this.#releaseModelPause = releaseOnce;
+    return { started, release: releaseOnce };
   }
 
   #uiContext(): ExtensionUIContext {
@@ -290,7 +330,11 @@ export class RealPiHarness {
       authHeader: false,
       // Required even with streamSimple, but never contacted.
       baseUrl: "http://127.0.0.1:1/v1",
-      streamSimple: () => fixedAssistantTurn(this.modelOutcome) as never,
+      streamSimple: () => {
+        const pause = this.#nextModelPause;
+        this.#nextModelPause = undefined;
+        return fixedAssistantTurn(this.modelOutcome, pause) as never;
+      },
       models: [
         {
           id: MODEL_ID,
@@ -486,6 +530,7 @@ export class RealPiHarness {
   }
 
   async dispose(): Promise<void> {
+    this.#releaseModelPause?.();
     try {
       await this.#runtime?.dispose();
     } catch {
@@ -508,6 +553,8 @@ export class RealPiHarness {
     this.#commandNames = undefined;
     this.#storeRoot = undefined;
     this.#initialUserEntryId = undefined;
+    this.#nextModelPause = undefined;
+    this.#releaseModelPause = undefined;
     this.modelOutcome = "success";
     this.extensionErrors.length = 0;
     this.#workspaceRoots.length = 0;

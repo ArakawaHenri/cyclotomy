@@ -145,7 +145,11 @@ try {
   assert.deepEqual(loaded.errors, []);
   assert.equal(loaded.extensions.length, 1);
   const extension = loaded.extensions[0];
-  assert.deepEqual([...extension.commands.keys()].sort(), ["drift", "restore"]);
+  assert.deepEqual([...extension.commands.keys()].sort(), [
+    "cyclotomy",
+    "drift",
+    "restore",
+  ]);
   assert.equal(
     await realpath(extension.path),
     await realpath(join(installedRoot, "src", "index.ts")),

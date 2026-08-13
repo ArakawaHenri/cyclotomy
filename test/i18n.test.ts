@@ -17,15 +17,19 @@ function plan(
 }
 
 describe("Cyclotomy Pi localization", () => {
-  it("exposes the two top-level commands in both locales", () => {
+  it("exposes the top-level commands in both locales", () => {
     const en = new CyclotomyI18n("en");
     const zh = new CyclotomyI18n("zh-CN");
     expect(en.t("restoreUsage")).toBe("Usage: /restore");
     expect(zh.t("restoreUsage")).toBe("用法：/restore");
     expect(en.t("driftUsage")).toBe("Usage: /drift");
     expect(zh.t("driftUsage")).toBe("用法：/drift");
+    expect(en.t("cyclotomyUsage")).toBe("Usage: /cyclotomy [stop|resume]");
+    expect(zh.t("cyclotomyUsage")).toBe("用法：/cyclotomy [stop|resume]");
     expect(en.t("restoreCommandDescription")).toContain("checkpoint");
     expect(zh.t("driftCommandDescription")).toContain("/restore");
+    expect(en.t("cyclotomyCommandDescription")).toContain("resume");
+    expect(zh.t("cyclotomyCommandDescription")).toContain("恢复");
   });
 
   it("keeps command references and session-identity failures localized", () => {
@@ -63,7 +67,8 @@ describe("Cyclotomy Pi localization", () => {
       message: "来源忙碌",
     });
 
-    for (const message of [en, zh]) expect(message).toContain("/reload");
+    for (const message of [en, zh])
+      expect(message).toContain("/cyclotomy resume");
     expect(en).toContain("retry");
     expect(zh).toContain("重试");
   });

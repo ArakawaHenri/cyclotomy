@@ -9,6 +9,7 @@ import {
   type ConfirmedRestoreResult,
 } from "./confirmed-restore.ts";
 import {
+  notifyArrivalProtectionFailure,
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
   notifyRestorePreparationConflict,
@@ -289,6 +290,13 @@ async function runCommand(
     }
     await action(runtime, context, view);
   } catch (error) {
+    const recovery = await runtime.withdrawFromParticipation(context, error);
+    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      recovery.workspaceLockCleanup,
+    );
     runtime.notify(
       context,
       runtime.i18n.t("commandFailed", { message: messageOf(error) }),

@@ -68,8 +68,6 @@ export interface GuardedHandlerOptions<Event extends GuardedPiEvent> {
   ) => GuardedPiEventResult<Event> | Promise<GuardedPiEventResult<Event>>;
   /** Ordinary Pi behavior when this extension is intentionally absent/closed. */
   readonly pass: GuardedPiEventResult<Event>;
-  /** Explicit veto/replacement when safety authority cannot make a decision. */
-  readonly block: GuardedPiEventResult<Event>;
 }
 
 export type TotalGuardedHandler<Event extends GuardedPiEvent> = (
@@ -105,7 +103,7 @@ export class PiHostAdapter {
         activation = this.#options.activation();
       } catch (cause) {
         await this.#report({ stage: "activation", event, cause }, context);
-        return options.block;
+        return options.pass;
       }
       switch (activation.kind) {
         case "intentionally-inactive":
@@ -116,13 +114,13 @@ export class PiHostAdapter {
             { stage: "activation", event, cause: activation.cause },
             context,
           );
-          return options.block;
+          return options.pass;
         case "active":
           try {
             return await options.active(event, context);
           } catch (cause) {
             await this.#report({ stage: "handler", event, cause }, context);
-            return options.block;
+            return options.pass;
           }
       }
     };

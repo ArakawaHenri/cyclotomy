@@ -93,6 +93,7 @@ type SourceCaptureFailure =
       readonly phase: "before" | "during";
     }
   | { readonly kind: "not-admitted"; readonly subject: "source" | "turn" }
+  | { readonly kind: "workspace-unavailable" }
   | { readonly kind: "capture"; readonly value: CaptureFailure }
   | { readonly kind: "exception"; readonly cause: unknown };
 
@@ -107,12 +108,40 @@ function formatSourceCaptureFailure(
         : "active location changed during source capture";
     case "not-admitted":
       return `${failure.subject} location is not admitted for checkpointing`;
+    case "workspace-unavailable":
+      return "workspace storage binding is no longer available";
     case "capture":
       return formatCaptureFailure(runtime.i18n, failure.value);
     case "exception":
       return messageOf(failure.cause);
     default:
       return assertNever(failure, "unhandled source capture failure");
+  }
+}
+
+function sourceCaptureFailureIsOperational(
+  failure: SourceCaptureFailure,
+): boolean {
+  switch (failure.kind) {
+    case "exception":
+    case "workspace-unavailable":
+      return true;
+    case "location-changed":
+    case "not-admitted":
+      return false;
+    case "capture":
+      switch (failure.value.kind) {
+        case "scan-incomplete":
+        case "scan-failed":
+        case "publish-failed":
+        case "metadata-failed":
+          return true;
+        case "workspace-changed":
+          return failure.value.reason === "root";
+        case "state-changed":
+        case "write-protected":
+          return false;
+      }
   }
 }
 
@@ -176,6 +205,9 @@ async function captureSourceOrCancel(
           ? { kind: "failed", cause: execution.cleanup.cause }
           : { kind: "settled" },
       );
+      if (execution.cleanup.kind === "failed") {
+        runtime.markSessionUnavailable(execution.cleanup.cause);
+      }
       return execution.kind === "completed"
         ? execution.value
         : ({
@@ -234,6 +266,11 @@ function sourceCaptureResult(
         kind: "failed",
         failure: { kind: "not-admitted", subject },
       };
+    case "workspace-unavailable":
+      return {
+        kind: "failed",
+        failure: { kind: "workspace-unavailable" },
+      };
     case "capture-failed":
       return {
         kind: "failed",
@@ -290,10 +327,14 @@ async function recoverLoadedArrival(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
 ) {
-  const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
-    runtime.workspaceMutations,
-    context,
-  );
+  const recovery = runtime.isActive
+    ? await protectCurrentArrivalAfterWorkspaceFailure(
+        runtime.workspaceMutations,
+        context,
+      )
+    : await runtime.workspaceMutations.protectCurrentLocationForRetirement(
+        context,
+      );
   notifyArrivalProtectionFailure(runtime, context, recovery.protection);
   notifyWorkspaceLockCleanupFailure(
     runtime,
@@ -950,12 +991,13 @@ function blockedBashResult(runtime: CyclotomyRuntime, render: () => string) {
 
 /** Register the complete checkpoint lifecycle. */
 export function registerCyclotomyLifecycle(
-  pi: ExtensionAPI,
+  pi: Pick<ExtensionAPI, "on">,
   runtime: CyclotomyRuntime,
 ): void {
   const views = new SessionViewTracker();
   let automaticGcFailureNotified = false;
   const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
+    if (!runtime.isActive) return;
     try {
       const execution = await runtime.maybeRunAutomaticGc();
       notifyWorkspaceLockCleanupFailure(
@@ -979,33 +1021,69 @@ export function registerCyclotomyLifecycle(
     }
   };
 
-  const recoverNonCancellableFailure = async (
+  const recoverLifecycleFailure = async (
     context: ExtensionContext,
   ): Promise<void> => {
     const recovery =
-      await runtime.workspaceMutations.recoverUncertainLocation(context);
+      runtime.activation.kind === "active"
+        ? await runtime.workspaceMutations.recoverUncertainLocation(context)
+        : await runtime.workspaceMutations.protectCurrentLocationForRetirement(
+            context,
+          );
     notifyArrivalProtectionFailure(runtime, context, recovery.protection);
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,
       recovery.workspaceLockCleanup,
     );
+    if (recovery.protection.kind === "unavailable") {
+      runtime.markSessionUnavailable(recovery.protection.cause);
+    } else if (recovery.workspaceLockCleanup.kind === "failed") {
+      runtime.markSessionUnavailable(recovery.workspaceLockCleanup.cause);
+    }
+  };
+
+  const withdrawAfterPreparationFailure = async (
+    context: ExtensionContext,
+    cause: unknown,
+  ): Promise<void> => {
+    const protection = await runtime.withdrawFromParticipation(context, cause);
+    notifyArrivalProtectionFailure(runtime, context, protection.protection);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      protection.workspaceLockCleanup,
+    );
+  };
+
+  const withdrawAfterSourceCaptureFailure = async (
+    context: ExtensionContext,
+    failure: SourceCaptureFailure,
+  ): Promise<boolean> => {
+    if (!sourceCaptureFailureIsOperational(failure)) return false;
+    const cause = new Error(formatSourceCaptureFailure(runtime, failure));
+    await withdrawAfterPreparationFailure(context, cause);
+    return true;
   };
 
   const host = new PiHostAdapter({
     activation: () => runtime.activation,
     reportFailure: async (failure, context) => {
-      const cancellable =
-        failure.event.type === "input" ||
-        failure.event.type === "user_bash" ||
-        failure.event.type === "tool_call" ||
-        failure.event.type.startsWith("session_before_");
-      if (
-        failure.stage === "handler" &&
-        !cancellable &&
-        runtime.activation.kind === "active"
-      ) {
-        await recoverNonCancellableFailure(context);
+      if (failure.stage === "handler" && runtime.activation.kind === "active") {
+        if (
+          failure.event.type === "input" ||
+          failure.event.type === "user_bash" ||
+          failure.event.type === "session_before_compact" ||
+          failure.event.type === "session_before_tree" ||
+          failure.event.type === "session_before_fork" ||
+          failure.event.type === "session_before_switch"
+        ) {
+          await withdrawAfterPreparationFailure(context, failure.cause);
+        } else {
+          await recoverLifecycleFailure(context);
+        }
+      } else if (failure.stage === "activation") {
+        runtime.markSessionUnavailable(failure.cause);
       }
       runtime.notifyCaptureResult(context, false, messageOf(failure.cause));
     },
@@ -1090,9 +1168,6 @@ export function registerCyclotomyLifecycle(
         });
       if (preparation === undefined) return;
       if (!(await runtime.ensureRegistrationStore(view.cwd, preparation))) {
-        runtime.markSessionUnavailable(
-          new Error("Cyclotomy workspace initialization failed"),
-        );
         runtime.notifyInitFailure(context);
         return;
       }
@@ -1158,11 +1233,7 @@ export function registerCyclotomyLifecycle(
       }
       await runAutomaticGc(context);
     } catch (error) {
-      if (runtime.activation.kind === "active") {
-        await recoverNonCancellableFailure(context);
-      } else {
-        runtime.markSessionUnavailable(error);
-      }
+      await withdrawAfterPreparationFailure(context, error);
       runtime.notifyBestEffort(
         context,
         () =>
@@ -1229,7 +1300,7 @@ export function registerCyclotomyLifecycle(
         );
         if (execution.kind === "action-failed") throw execution.cause;
       } catch (error) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyCaptureResult(context, false, messageOf(error));
       }
     }),
@@ -1243,12 +1314,12 @@ export function registerCyclotomyLifecycle(
         view = views.observe(context);
         runtime.assertSessionUsable(view);
       } catch (error) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyCaptureResult(context, false, messageOf(error));
         return;
       }
       if (!(await runtime.ensureStore(view.cwd))) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyInitFailure(context);
         return;
       }
@@ -1267,7 +1338,7 @@ export function registerCyclotomyLifecycle(
       if (result.kind === "captured") {
         runtime.notifyCaptureResult(context, true);
       } else if (result.kind === "failed") {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyCaptureResult(
           context,
           false,
@@ -1290,7 +1361,6 @@ export function registerCyclotomyLifecycle(
     "input",
     host.guard<InputEvent>({
       pass: { action: "continue" },
-      block: { action: "handled" },
       active: async (event, context) => {
         try {
           const boundaryView = views.observe(context);
@@ -1304,7 +1374,7 @@ export function registerCyclotomyLifecycle(
               runtime.assertSessionUsable(view);
               if (!(await runtime.ensureStore(view.cwd))) {
                 runtime.notifyInitFailure(context);
-                return { action: "handled" as const };
+                return { action: "continue" as const };
               }
               const capture = await captureSourceOrCancel(
                 runtime,
@@ -1316,6 +1386,14 @@ export function registerCyclotomyLifecycle(
               if (capture.kind !== "failed") {
                 return { action: "continue" as const };
               }
+              if (
+                await withdrawAfterSourceCaptureFailure(
+                  context,
+                  capture.failure,
+                )
+              ) {
+                return { action: "continue" as const };
+              }
               runtime.notify(
                 context,
                 runtime.i18n.t("inputCaptureFailed"),
@@ -1325,6 +1403,9 @@ export function registerCyclotomyLifecycle(
             },
           );
           if (preparation.kind !== "completed") {
+            if (runtime.activation.kind !== "active") {
+              return { action: "continue" as const };
+            }
             runtime.notify(
               context,
               runtime.i18n.t("transitionInProgress"),
@@ -1334,6 +1415,7 @@ export function registerCyclotomyLifecycle(
           }
           return preparation.value;
         } catch (error) {
+          await withdrawAfterPreparationFailure(context, error);
           runtime.notifyBestEffort(
             context,
             () =>
@@ -1345,7 +1427,7 @@ export function registerCyclotomyLifecycle(
               ),
             "error",
           );
-          return { action: "handled" as const };
+          return { action: "continue" as const };
         }
       },
     }),
@@ -1363,12 +1445,12 @@ export function registerCyclotomyLifecycle(
         view = views.observe(context);
         runtime.assertSessionUsable(view);
       } catch (error) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyCaptureResult(context, false, messageOf(error));
         return;
       }
       if (!(await runtime.ensureStore(view.cwd))) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyInitFailure(context);
         return;
       }
@@ -1380,7 +1462,7 @@ export function registerCyclotomyLifecycle(
         view.leafId,
       );
       if (capture.kind === "failed") {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
       }
     }),
   );
@@ -1389,9 +1471,6 @@ export function registerCyclotomyLifecycle(
     "user_bash",
     host.guard<UserBashEvent>({
       pass: undefined,
-      block: blockedBashResult(runtime, () =>
-        runtime.i18n.t("sessionIdentityUnavailable"),
-      ),
       active: async (_event, context) => {
         try {
           const view = views.observe(context);
@@ -1404,9 +1483,7 @@ export function registerCyclotomyLifecycle(
           const hadConflict = runtime.admission.rejectTransitionConflict();
           if (!(await runtime.ensureStore(view.cwd))) {
             runtime.notifyInitFailure(context);
-            return blockedBashResult(runtime, () =>
-              runtime.i18n.t("initFailure"),
-            );
+            return undefined;
           }
           const capture = await captureSourceOrCancel(
             runtime,
@@ -1416,21 +1493,26 @@ export function registerCyclotomyLifecycle(
             view.leafId,
           );
           if (capture.kind === "failed") {
-            await recoverNonCancellableFailure(context);
-            return blockedBashResult(runtime, () =>
-              runtime.i18n.t("sourceCaptureFailed"),
-            );
+            if (
+              !(await withdrawAfterSourceCaptureFailure(
+                context,
+                capture.failure,
+              ))
+            ) {
+              return blockedBashResult(runtime, () =>
+                runtime.i18n.t("sourceCaptureFailed"),
+              );
+            }
+            return undefined;
           }
           if (!hadConflict) return undefined;
           return blockedBashResult(runtime, () =>
             runtime.i18n.t("bashWhileBusy"),
           );
         } catch (error) {
-          await recoverNonCancellableFailure(context);
+          await withdrawAfterPreparationFailure(context, error);
           runtime.notifyCaptureResult(context, false, messageOf(error));
-          return blockedBashResult(runtime, () =>
-            runtime.i18n.t("sourceCaptureFailed"),
-          );
+          return undefined;
         }
       },
     }),
@@ -1440,7 +1522,6 @@ export function registerCyclotomyLifecycle(
     "session_before_compact",
     host.guard<SessionBeforeCompactEvent>({
       pass: undefined,
-      block: { cancel: true },
       active: async (_event, context) => {
         try {
           const view = views.observe(context);
@@ -1449,7 +1530,7 @@ export function registerCyclotomyLifecycle(
             async () => {
               if (!(await runtime.ensureStore(view.cwd))) {
                 runtime.notifyInitFailure(context);
-                return { cancel: true } as const;
+                return undefined;
               }
               const capture = await captureSourceOrCancel(
                 runtime,
@@ -1458,7 +1539,14 @@ export function registerCyclotomyLifecycle(
                 view,
                 view.leafId,
               );
-              if (capture.kind === "failed") return { cancel: true } as const;
+              if (capture.kind === "failed") {
+                return (await withdrawAfterSourceCaptureFailure(
+                  context,
+                  capture.failure,
+                ))
+                  ? undefined
+                  : ({ cancel: true } as const);
+              }
               // Automatic threshold/overflow compaction is itself part of an active
               // agent run, so Pi's public `isIdle()` is expected to be false here.
               // The cancellable compaction event plus the exact public snapshot and
@@ -1474,6 +1562,7 @@ export function registerCyclotomyLifecycle(
             },
           );
           if (preparation.kind !== "completed") {
+            if (runtime.activation.kind !== "active") return undefined;
             runtime.notify(
               context,
               runtime.i18n.t("transitionInProgress"),
@@ -1483,6 +1572,7 @@ export function registerCyclotomyLifecycle(
           }
           return preparation.value;
         } catch (error) {
+          await withdrawAfterPreparationFailure(context, error);
           runtime.notifyBestEffort(
             context,
             () =>
@@ -1491,7 +1581,7 @@ export function registerCyclotomyLifecycle(
               }),
             "warning",
           );
-          return { cancel: true };
+          return undefined;
         }
       },
     }),
@@ -1504,7 +1594,7 @@ export function registerCyclotomyLifecycle(
         const view = views.observe(context);
         runtime.assertSessionUsable(view);
         if (!(await runtime.ensureStore(view.cwd))) {
-          await recoverNonCancellableFailure(context);
+          await recoverLifecycleFailure(context);
           runtime.notifyInitFailure(context);
           return;
         }
@@ -1516,10 +1606,10 @@ export function registerCyclotomyLifecycle(
           view.leafId,
         );
         if (capture.kind === "failed") {
-          await recoverNonCancellableFailure(context);
+          await recoverLifecycleFailure(context);
         }
       } catch (error) {
-        await recoverNonCancellableFailure(context);
+        await recoverLifecycleFailure(context);
         runtime.notifyCaptureResult(context, false, messageOf(error));
       }
     }),
@@ -1530,7 +1620,6 @@ export function registerCyclotomyLifecycle(
     "session_before_fork",
     host.guard<SessionBeforeForkEvent>({
       pass: undefined,
-      block: { cancel: true },
       active: async (_event, context) => {
         try {
           const view = views.observe(context);
@@ -1547,7 +1636,7 @@ export function registerCyclotomyLifecycle(
             async () => {
               if (!(await runtime.ensureStore(view.cwd))) {
                 runtime.notifyInitFailure(context);
-                return { cancel: true } as const;
+                return undefined;
               }
               const capture = await captureSourceOrCancel(
                 runtime,
@@ -1556,11 +1645,19 @@ export function registerCyclotomyLifecycle(
                 view,
                 view.leafId,
               );
-              if (capture.kind === "failed") return { cancel: true } as const;
+              if (capture.kind === "failed") {
+                return (await withdrawAfterSourceCaptureFailure(
+                  context,
+                  capture.failure,
+                ))
+                  ? undefined
+                  : ({ cancel: true } as const);
+              }
               return undefined;
             },
           );
           if (preparation.kind !== "completed") {
+            if (runtime.activation.kind !== "active") return undefined;
             runtime.notify(
               context,
               runtime.i18n.t("transitionInProgress"),
@@ -1570,6 +1667,7 @@ export function registerCyclotomyLifecycle(
           }
           return preparation.value;
         } catch (error) {
+          await withdrawAfterPreparationFailure(context, error);
           runtime.notifyBestEffort(
             context,
             () =>
@@ -1578,7 +1676,7 @@ export function registerCyclotomyLifecycle(
               }),
             "warning",
           );
-          return { cancel: true };
+          return undefined;
         }
       },
     }),
@@ -1588,7 +1686,6 @@ export function registerCyclotomyLifecycle(
     "session_before_switch",
     host.guard<SessionBeforeSwitchEvent>({
       pass: undefined,
-      block: { cancel: true },
       active: async (_event, context) => {
         try {
           const view = views.observe(context);
@@ -1605,7 +1702,7 @@ export function registerCyclotomyLifecycle(
             async () => {
               if (!(await runtime.ensureStore(view.cwd))) {
                 runtime.notifyInitFailure(context);
-                return { cancel: true } as const;
+                return undefined;
               }
               const capture = await captureSourceOrCancel(
                 runtime,
@@ -1614,7 +1711,14 @@ export function registerCyclotomyLifecycle(
                 view,
                 view.leafId,
               );
-              if (capture.kind === "failed") return { cancel: true } as const;
+              if (capture.kind === "failed") {
+                return (await withdrawAfterSourceCaptureFailure(
+                  context,
+                  capture.failure,
+                ))
+                  ? undefined
+                  : ({ cancel: true } as const);
+              }
               if (
                 readExactRegisteredView(runtime, views, context, view) ===
                 undefined
@@ -1625,6 +1729,7 @@ export function registerCyclotomyLifecycle(
             },
           );
           if (preparation.kind !== "completed") {
+            if (runtime.activation.kind !== "active") return undefined;
             runtime.notify(
               context,
               runtime.i18n.t("transitionInProgress"),
@@ -1634,6 +1739,7 @@ export function registerCyclotomyLifecycle(
           }
           return preparation.value;
         } catch (error) {
+          await withdrawAfterPreparationFailure(context, error);
           runtime.notifyBestEffort(
             context,
             () =>
@@ -1642,13 +1748,9 @@ export function registerCyclotomyLifecycle(
               }),
             "warning",
           );
-          return { cancel: true };
+          return undefined;
         }
       },
     }),
   );
-
-  pi.on("session_shutdown", () => {
-    runtime.close();
-  });
 }

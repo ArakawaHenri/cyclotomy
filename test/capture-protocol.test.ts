@@ -105,4 +105,15 @@ describe("capture protocol", () => {
       phase: "during-capture",
     });
   });
+
+  it("distinguishes a lost workspace binding from an ordinary location race", async () => {
+    const expected = view();
+
+    await expect(
+      runCaptureProtocol(
+        { ...deps(expected), workspaceStillBound: async () => false },
+        { expected },
+      ),
+    ).resolves.toEqual({ kind: "workspace-unavailable" });
+  });
 });

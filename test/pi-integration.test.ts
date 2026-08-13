@@ -296,13 +296,16 @@ async function leavePendingNoNodeAfterRestore(pi: FakePi): Promise<string> {
 
 describe("checkpoint authority lifecycle", () => {
   describe("registration and configuration", () => {
-    it("registers only the two top-level commands", () => {
+    it("registers the three top-level commands", () => {
       const pi = new FakePi(workspace);
 
       registerCyclotomy(pi.api);
 
-      expect(pi.registeredCommandNames()).toEqual(["drift", "restore"]);
-      expect(pi.registeredCommandNames()).not.toContain("cyclotomy");
+      expect(pi.registeredCommandNames()).toEqual([
+        "cyclotomy",
+        "drift",
+        "restore",
+      ]);
     });
 
     it("reports a new automatic GC failure after a successful recovery", async () => {
@@ -450,7 +453,11 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
 
       expect(() => registerCyclotomy(pi.api)).not.toThrow();
-      expect(pi.registeredCommandNames()).toEqual(["drift", "restore"]);
+      expect(pi.registeredCommandNames()).toEqual([
+        "cyclotomy",
+        "drift",
+        "restore",
+      ]);
 
       pi.manager.appendEntry();
       await pi.startSession("startup");
@@ -459,7 +466,7 @@ describe("checkpoint authority lifecycle", () => {
       // the auto-detected language. Assert only on verbatim text.
       expect(notifiedVerbatim(pi, "settings.json")).toBe(true);
       expect(notifiedVerbatim(pi, "maxFileMiB")).toBe(true);
-      expect(notifiedVerbatim(pi, "/reload")).toBe(true);
+      expect(notifiedVerbatim(pi, "/cyclotomy resume")).toBe(true);
 
       // A completed turn must neither throw nor record any checkpoint.
       await expect(pi.endTurn()).resolves.toBeUndefined();
@@ -1509,6 +1516,13 @@ describe("checkpoint authority lifecycle", () => {
         ),
       ).toBe(true);
 
+      // The first operational failure retires Cyclotomy. Exercise the restore
+      // presenter with a fresh runtime so both commands prove their own boundary.
+      const restoreRuntime = await preparedRuntime();
+      await pi.replaceRuntime(
+        (api) => registerPreparedRuntime(api, restoreRuntime),
+        "reload",
+      );
       await pi.runCommand("restore");
       expect(
         notifiedWithDetail(
@@ -1725,6 +1739,36 @@ describe("checkpoint authority lifecycle", () => {
         "still-current",
       );
       expect(pi.notifications.at(-1)?.message).toContain("/restore");
+    });
+
+    it("does not apply a restore after its preparation lock cleanup fails", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      const leaf = pi.manager.getLeafId()!;
+      await writeFile(join(workspace, "a.txt"), "current");
+      const selectionsBefore = pi.selections.length;
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "manual-restore-prepare",
+        new Error("restore preparation lock release failed"),
+      );
+
+      try {
+        await pi.runCommand("restore");
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
+      expect(pi.selections).toHaveLength(selectionsBefore);
+      const db = metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
+      db.close();
+      expect(notified(pi, "workspaceLockCleanupFailed")).toBe(true);
+      await pi.runCommand("cyclotomy");
+      expect(notified(pi, "cyclotomyStoppedWithError")).toBe(true);
     });
 
     it("does not widen a rejected metadata pin into post-mutation protection", async () => {
@@ -2830,7 +2874,96 @@ describe("checkpoint authority lifecycle", () => {
   });
 
   describe("tree navigation preparation", () => {
-    it("preserves source capture but cancels departure when commit lock cleanup fails", async () => {
+    it("protects the source and passes navigation when its store becomes unavailable", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first, second } = await twoStates(pi);
+      const cause = new Error("injected navigation store failure");
+      const ensureStore = vi
+        .spyOn(runtime, "ensureStore")
+        .mockImplementationOnce(async () => {
+          runtime.markSessionUnavailable(cause);
+          return false;
+        });
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+      } finally {
+        ensureStore.mockRestore();
+      }
+
+      expect(pi.manager.getLeafId()).toBe(first);
+      expect(runtime.activation).toEqual({ kind: "unavailable", cause });
+      const db = metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
+      db.close();
+    });
+
+    it.each(["acquisition", "action"] as const)(
+      "protects the source and passes navigation when tree-prepare lock %s fails",
+      async (phase) => {
+        const pi = new FakePi(workspace);
+        const runtime = await preparedRuntime();
+        registerPreparedRuntime(pi.api, runtime);
+        const { first, second } = await twoStates(pi);
+        const cause = new Error(`injected tree-prepare ${phase} failure`);
+        const execution = vi.spyOn(runtime, "enqueueWorkspaceExecution");
+        if (phase === "acquisition") {
+          execution.mockRejectedValueOnce(cause);
+        } else {
+          execution.mockResolvedValueOnce({
+            kind: "action-failed",
+            cause,
+            cleanup: { kind: "released" },
+          });
+        }
+
+        try {
+          expect(await pi.navigate(first)).toBe("done");
+        } finally {
+          execution.mockRestore();
+        }
+
+        expect(pi.manager.getLeafId()).toBe(first);
+        expect(runtime.activation).toEqual({ kind: "unavailable", cause });
+        const db = metadata();
+        expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(
+          true,
+        );
+        db.close();
+      },
+    );
+
+    it("protects the source and passes navigation when source publication fails", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first, second } = await twoStates(pi);
+      await writeFile(join(workspace, "a.txt"), "unpublished-source");
+      const cause = new Error("injected source publication failure");
+      const publication = vi
+        .spyOn(runtime.checkpoints, "prepareObserved")
+        .mockResolvedValueOnce({
+          ok: false,
+          error: { kind: "publish-failed", cause },
+        });
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+      } finally {
+        publication.mockRestore();
+      }
+
+      expect(pi.manager.getLeafId()).toBe(first);
+      expect(runtime.activation.kind).toBe("unavailable");
+      expect(notified(pi, "sourceCaptureFailed")).toBe(true);
+      const db = metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
+      db.close();
+    });
+
+    it("preserves source capture and lets Pi depart when commit lock cleanup fails", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
@@ -2848,12 +2981,12 @@ describe("checkpoint authority lifecycle", () => {
       );
 
       try {
-        expect(await pi.navigate(first)).toBe("cancelled");
+        expect(await pi.navigate(first)).toBe("done");
       } finally {
         cleanupFailure.mockRestore();
       }
 
-      expect(pi.manager.getLeafId()).toBe(second);
+      expect(pi.manager.getLeafId()).toBe(first);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-current",
       );
@@ -3079,7 +3212,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
     });
 
-    it("cancels Detached navigation when a protected source loses its workspace binding", async () => {
+    it("lets Pi depart when a protected source loses its workspace binding", async () => {
       const pi = new FakePi(workspace);
       const initialRuntime = await preparedRuntime();
       registerPreparedRuntime(pi.api, initialRuntime);
@@ -3102,15 +3235,16 @@ describe("checkpoint authority lifecycle", () => {
       };
 
       try {
-        expect(await pi.navigate(first)).toBe("cancelled");
+        expect(await pi.navigate(first)).toBe("done");
       } finally {
         for (const spy of spies) spy.mockRestore();
       }
 
-      expect(pi.manager.getLeafId()).toBe(second);
+      expect(pi.manager.getLeafId()).toBe(first);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "protected-source",
       );
+      expect(runtime.activation.kind).toBe("unavailable");
       const db = metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
@@ -3155,6 +3289,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(pi.manager.getLeafId()).toBe(second);
+      expect(runtime.activation.kind).toBe("active");
       const after = metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
@@ -3243,7 +3378,7 @@ describe("checkpoint authority lifecycle", () => {
       after.close();
     });
 
-    it("rejects a physical excluded alias in navigation preview before offering destructive actions", async (context) => {
+    it("retires Cyclotomy on an incomplete navigation preview without offering destructive actions", async (context) => {
       context.skip(
         !(await workspaceAliasesCase()),
         "requires a case-insensitive physical namespace",
@@ -3288,9 +3423,9 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "delete-me"), "must survive preview");
       const selectionsBefore = pi.selections.length;
 
-      expect(await pi.navigate(targetNode.id)).toBe("cancelled");
+      expect(await pi.navigate(targetNode.id)).toBe("done");
 
-      expect(pi.manager.getLeafId()).toBe(sourceNode.id);
+      expect(pi.manager.getLeafId()).toBe(targetNode.id);
       expect(pi.selections).toHaveLength(selectionsBefore);
       expect(notified(pi, "navigationScanIncomplete")).toBe(true);
       expect(await readFile(join(workspace, "X"), "utf8")).toBe(
@@ -3299,6 +3434,15 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "delete-me"), "utf8")).toBe(
         "must survive preview",
       );
+      const protectedSource = metadata();
+      expect(
+        checkpointIsBlocked(
+          protectedSource,
+          pi.manager.sessionId,
+          sourceNode.id,
+        ),
+      ).toBe(true);
+      protectedSource.close();
     });
 
     it("captures safely even when selecting a child prompt leaves the leaf unchanged", async () => {
@@ -3366,7 +3510,7 @@ describe("checkpoint authority lifecycle", () => {
       after.close();
     });
 
-    it("fails closed when navigation confirmation or notification UI throws", async () => {
+    it("retires Cyclotomy and lets Pi navigate when confirmation UI throws", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
@@ -3376,12 +3520,16 @@ describe("checkpoint authority lifecycle", () => {
       };
       pi.notifyThrows = true;
 
-      expect(await pi.navigate(first)).toBe("cancelled");
+      expect(await pi.navigate(first)).toBe("done");
 
-      expect(pi.manager.getLeafId()).toBe(second);
+      expect(pi.manager.getLeafId()).toBe(first);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "still-current",
       );
+      const db = metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
+      db.close();
+      expect(await pi.submitInput()).toBe("continued");
     });
 
     it("directs a stale pre-departure preview back to navigation", async () => {
@@ -3517,7 +3665,7 @@ describe("checkpoint authority lifecycle", () => {
       );
     });
 
-    it("cancels navigation when a non-null source entry is unreadable", async () => {
+    it("retires Cyclotomy when a non-null source entry is unreadable", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
@@ -3531,7 +3679,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.manager.entries.delete(second);
       await writeFile(join(workspace, "a.txt"), "unowned-edit");
 
-      expect(await pi.navigate(first)).toBe("cancelled");
+      expect(await pi.navigate(first)).toBe("done");
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "unowned-edit",
@@ -3543,7 +3691,7 @@ describe("checkpoint authority lifecycle", () => {
       after.close();
     });
 
-    it("cancels navigation when an active label has no readable parent", async () => {
+    it("retires Cyclotomy when an active label has no readable parent", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
@@ -3557,17 +3705,15 @@ describe("checkpoint authority lifecycle", () => {
       pi.manager.setLeaf(brokenLabel.id);
       await writeFile(join(workspace, "a.txt"), "unowned-label-edit");
 
-      expect(await pi.navigate(first)).toBe("cancelled");
+      expect(await pi.navigate(first)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "unowned-label-edit",
       );
     });
 
-    it("fails closed when Pi session context and diagnostic rendering throw", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
+    it("retires Cyclotomy and leaves Pi usable when session context and diagnostics throw", async () => {
+      const pi = new FakePi(workspace, registerCyclotomy);
       const { first } = await twoStates(pi);
-      const target = pi.newDetachedSession();
       pi.sessionContextThrows = true;
       let bashRan = false;
       const rendering = throwTranslations(
@@ -3577,18 +3723,17 @@ describe("checkpoint authority lifecycle", () => {
       );
 
       try {
-        expect(await pi.navigate(first)).toBe("cancelled");
-        expect(await pi.compact()).toBe("cancelled");
-        expect(await pi.fork(first)).toBe("cancelled");
-        expect(await pi.resumeTo(target)).toBe("cancelled");
-        expect(await pi.submitInput()).toBe("handled");
+        expect(await pi.navigate(first)).toBe("done");
+        expect(await pi.compact()).toBe("done");
+        expect(await pi.fork(first)).toBe("done");
+        expect(await pi.submitInput()).toBe("continued");
         await pi.executeUserBash("must-not-run", async () => {
           bashRan = true;
         });
       } finally {
         rendering.mockRestore();
       }
-      expect(bashRan).toBe(false);
+      expect(bashRan).toBe(true);
     });
 
     it("rejects a reentrant tree request while the first preview is open", async () => {
@@ -4726,8 +4871,9 @@ describe("checkpoint authority lifecycle", () => {
       "temporarily-unusable",
       "matcher-accessor",
       "protection-lock",
+      "protection-cleanup",
     ] as const)(
-      "keeps an existing descendant checkpoint closed after a %s arrival failure",
+      "preserves an existing descendant checkpoint after a %s arrival failure",
       async (fault) => {
         const pi = new FakePi(workspace);
         const runtime = await preparedRuntime();
@@ -4759,7 +4905,11 @@ describe("checkpoint authority lifecycle", () => {
 
         const spies: Array<{ mockRestore(): void }> = [];
         pi.beforeTreeCommit = async () => {
-          if (fault === "view-read" || fault === "protection-lock") {
+          if (
+            fault === "view-read" ||
+            fault === "protection-lock" ||
+            fault === "protection-cleanup"
+          ) {
             spies.push(
               vi.spyOn(pi.manager, "getEntries").mockImplementationOnce(() => {
                 throw new Error("injected arrival snapshot failure");
@@ -4782,6 +4932,14 @@ describe("checkpoint authority lifecycle", () => {
                 ),
             );
           }
+          if (fault === "protection-cleanup") {
+            spies.push(
+              failWorkspaceLockCleanup(
+                "recover-uncertain-location",
+                new Error("injected protection lock cleanup failure"),
+              ),
+            );
+          }
           poisonMatcher = fault === "matcher-accessor";
         };
 
@@ -4793,22 +4951,29 @@ describe("checkpoint authority lifecycle", () => {
         }
 
         // The failed arrival left v1 live at an existing v2 coordinate. A
-        // zero-entry turn must guard it, never reinterpret it as a naturally
-        // appended child and overwrite the target checkpoint.
+        // successful recovery closes it durably; unavailable recovery instead
+        // retires the runtime so no later capture can rewrite the checkpoint.
         await pi.endTurn(0);
         const after = metadata();
         expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
           targetBefore,
         );
         expect(checkpointIsBlocked(after, pi.manager.sessionId, second)).toBe(
-          true,
+          fault !== "protection-lock",
         );
         after.close();
+        if (fault === "protection-lock" || fault === "protection-cleanup") {
+          expect(runtime.activation.kind).toBe("unavailable");
+        } else {
+          expect(runtime.activation.kind).toBe("active");
+        }
         if (fault === "protection-lock") {
           const unavailable = pi.notifications.find(({ message }) =>
             message.includes(messageFor("arrivalProtectionUnavailable")),
           );
           expect(unavailable?.level).toBe("error");
+        } else if (fault === "protection-cleanup") {
+          expect(notified(pi, "workspaceLockCleanupFailed")).toBe(true);
         }
       },
     );
@@ -5075,7 +5240,7 @@ describe("checkpoint authority lifecycle", () => {
       );
     });
 
-    it("cancels navigation when the authoritative target is corrupt", async () => {
+    it("retires Cyclotomy and lets Pi navigate when the authoritative target is corrupt", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
@@ -5094,7 +5259,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "v3");
       await pi.endTurn();
 
-      expect(await pi.navigate(second)).toBe("cancelled");
+      expect(await pi.navigate(second)).toBe("done");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v3");
       expect(
         notifiedWithDetail(
@@ -5507,7 +5672,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
     });
 
-    it("cancels a transition when a complete source snapshot is impossible", async () => {
+    it("retires Cyclotomy when a complete source snapshot is impossible", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
@@ -5523,8 +5688,8 @@ describe("checkpoint authority lifecycle", () => {
         messageFor("scanProblemHardlink"),
       );
 
-      expect(await pi.navigate(first)).toBe("cancelled");
-      expect(pi.manager.getLeafId()).not.toBe(first);
+      expect(await pi.navigate(first)).toBe("done");
+      expect(pi.manager.getLeafId()).toBe(first);
       expect(notified(pi, "navigationScanIncomplete")).toBe(true);
     });
   });
@@ -6034,7 +6199,7 @@ describe("checkpoint authority lifecycle", () => {
     });
 
     it.each([true, false])(
-      "blocks bash after capture failure whether result persistence is %s",
+      "protects the source and allows bash after capture failure whether result persistence is %s",
       async (persistResultEntry) => {
         const pi = new FakePi(workspace);
         registerCyclotomy(pi.api);
@@ -6055,10 +6220,15 @@ describe("checkpoint authority lifecycle", () => {
           persistResultEntry,
         );
 
-        expect(executed).toBe(false);
+        expect(executed).toBe(true);
         expect(pi.manager.getLeafId() === source).toBe(!persistResultEntry);
-        await expect(stat(join(workspace, "ran"))).rejects.toThrow();
+        await expect(stat(join(workspace, "ran"))).resolves.toBeDefined();
         expect(notified(pi, "sourceCaptureFailed")).toBe(true);
+        const after = metadata();
+        expect(checkpointIsBlocked(after, pi.manager.sessionId, source)).toBe(
+          true,
+        );
+        after.close();
       },
     );
 
@@ -6099,7 +6269,7 @@ describe("checkpoint authority lifecycle", () => {
       ["busy", false, undefined],
       ["streaming", true, "steer"],
     ] as const)(
-      "blocks %s input when the active runtime no longer owns Pi's identity",
+      "allows %s input after protecting an identity-mismatched runtime",
       async (_case, idle, streamingBehavior) => {
         const pi = new FakePi(workspace);
         const runtime = await preparedRuntime();
@@ -6113,7 +6283,7 @@ describe("checkpoint authority lifecycle", () => {
 
         try {
           expect(await pi.preflightInput("untrusted", streamingBehavior)).toBe(
-            "handled",
+            "continued",
           );
         } finally {
           mismatch.mockRestore();

@@ -71,6 +71,42 @@ function readState(
 }
 
 describe("real Pi integration", () => {
+  it("dispatches an extension command before input while streaming", async () => {
+    let commands = 0;
+    let inputs = 0;
+    const probe: ExtensionFactory = (pi) => {
+      pi.registerCommand("escape-probe", {
+        description: "test Pi's streaming command boundary",
+        handler: async () => {
+          commands += 1;
+        },
+      });
+      pi.on("input", () => {
+        inputs += 1;
+        return { action: "continue" };
+      });
+    };
+    const pi = await startHarness({
+      includeCyclotomy: false,
+      afterCyclotomy: [{ name: "escape-probe", factory: probe }],
+    });
+    const pause = pi.pauseNextModelTurn();
+    const turn = pi.turn("enter streaming");
+    await pause.started;
+    inputs = 0;
+
+    try {
+      expect(pi.session.isStreaming).toBe(true);
+      await pi.command("/escape-probe");
+      expect(commands).toBe(1);
+      expect(inputs).toBe(0);
+      expect(pi.session.isStreaming).toBe(true);
+    } finally {
+      pause.release();
+      await turn;
+    }
+  });
+
   it("exposes cold-fork provenance through Pi's package-root API", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-realpi-fork-"));
     try {
@@ -150,11 +186,15 @@ describe("real Pi integration", () => {
     );
   });
 
-  it("loads as an extension and registers both commands", async () => {
+  it("loads as an extension and registers its three commands", async () => {
     const pi = await startHarness();
 
     // Read what Pi itself registered, so a renamed or dropped command fails.
-    expect(pi.registeredCommandNames).toEqual(["drift", "restore"]);
+    expect(pi.registeredCommandNames).toEqual([
+      "cyclotomy",
+      "drift",
+      "restore",
+    ]);
     // A concrete cold-start leaf is materialized from the first observed
     // workspace so later navigation has an honest baseline.
     await expect(stat(join(pi.storeRoot, "state.db"))).resolves.toBeDefined();

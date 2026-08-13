@@ -40,6 +40,7 @@ import {
 } from "./checkpoint-admission.ts";
 import type { PendingNavigation } from "./navigation-plan.ts";
 import type { SessionActivation } from "./pi-host-adapter.ts";
+import type { ArrivalRecoveryExecution } from "./post-mutation.ts";
 import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
 import { messageOfUnknown } from "./unknown-error.ts";
@@ -174,6 +175,7 @@ export class CyclotomyRuntime {
     });
     this.#workspaceMutations = new WorkspaceMutationAuthority({
       admission: this.#admission,
+      participationIsActive: () => this.isActive,
       registrations: this.#registrations,
       checkpoints: () => this.checkpoints,
       metadata: () => this.metadata,
@@ -243,6 +245,11 @@ export class CyclotomyRuntime {
     return this.#activation;
   }
 
+  /** Whether this engine completed registration and may accept Pi events. */
+  get isActive(): boolean {
+    return this.#activation.kind === "active";
+  }
+
   /** Assert that this Pi observation still names the registered authority. */
   assertSessionUsable(view: SessionView): void {
     if (!this.#registrations.sessionIsUsable(view)) {
@@ -262,6 +269,36 @@ export class CyclotomyRuntime {
   markSessionUnavailable(cause: unknown): void {
     this.#admission.reset();
     this.#activation = { kind: "unavailable", cause };
+  }
+
+  /**
+   * Atomically withdraw from Pi participation before durably closing the
+   * current coordinate. The early authority revocation makes concurrent Pi
+   * events pass through while the cooperative workspace lock is reacquired.
+   */
+  withdrawFromParticipation(
+    context: ExtensionContext,
+    cause: unknown,
+  ): Promise<ArrivalRecoveryExecution> {
+    this.markSessionUnavailable(cause);
+    return this.#workspaceMutations.protectCurrentLocationForRetirement(
+      context,
+    );
+  }
+
+  /**
+   * Stop accepting new protocol authority without tearing resources out from
+   * underneath an in-flight handler. The owning controller drains the engine
+   * before calling `close()`.
+   */
+  retire(): void {
+    if (this.#activation.kind === "closed") return;
+    this.markSessionIntentionallyInactive();
+  }
+
+  /** Wait for every operation already admitted to the runtime queue. */
+  async drain(): Promise<void> {
+    await this.#queue;
   }
 
   get checkpoints(): CheckpointService {
@@ -451,6 +488,7 @@ export class CyclotomyRuntime {
   ): boolean {
     if (result.kind === "failed") {
       this.#initFailureDetail = initializationDetail(result.cause);
+      this.markSessionUnavailable(result.cause);
       return false;
     }
     this.#initFailureNotified = false;
@@ -469,9 +507,24 @@ export class CyclotomyRuntime {
     operation: string,
     action: () => Promise<T>,
   ): Promise<WorkspaceLockExecution<T>> {
-    return this.enqueue(() =>
-      runWithWorkspaceLock(this.storeRoot, operation, action, this.config.lock),
-    );
+    return this.enqueue(async () => {
+      const execution = await runWithWorkspaceLock(
+        this.storeRoot,
+        operation,
+        action,
+        this.config.lock,
+      );
+      // A failed release leaves the cooperative lock's future ownership
+      // uncertain. Preserve the action's typed result, but stop this engine
+      // from admitting any later operation.
+      if (
+        execution.cleanup.kind === "failed" &&
+        this.#activation.kind === "active"
+      ) {
+        this.markSessionUnavailable(execution.cleanup.cause);
+      }
+      return execution;
+    });
   }
 
   async scanCurrentWorkspace(cwd: string): Promise<WorkspaceSnapshot> {

@@ -21,12 +21,25 @@ export type ResolvedCyclotomyLocale = "en" | "zh-CN";
 type MessageVariables = Readonly<Record<string, string | number>>;
 
 const EN = {
+  cyclotomyCommandDescription: "Show, stop, or resume Cyclotomy",
+  cyclotomyStopCompletion: "Stop Cyclotomy for this Pi runtime",
+  cyclotomyResumeCompletion: "Retry Cyclotomy without reloading Pi",
+  cyclotomyRunning: "Cyclotomy is running.",
+  cyclotomyStopped:
+    "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to restart it.",
+  cyclotomyStoppedWithError:
+    "Cyclotomy is stopped for this Pi runtime ({{message}}). Pi remains available; fix the problem, then run /cyclotomy resume.",
+  cyclotomyStopSucceeded:
+    "Cyclotomy stopped for this Pi runtime. Pi remains available.",
+  cyclotomyResumeSucceeded: "Cyclotomy resumed.",
+  cyclotomyResumeFailed:
+    "Cyclotomy could not resume ({{message}}). Pi remains available; fix the problem, then retry /cyclotomy resume.",
   driftCommandDescription: "Show what /restore would change",
   restoreCommandDescription: "Restore the current node's checkpoint",
   checkingWorkspace: "Cyclotomy · checking workspace…",
   restoringWorkspace: "Cyclotomy · restoring workspace…",
   initFailure:
-    "Cyclotomy initialization failed. Capture and restore are unavailable; files were not changed. Fix the reported configuration or storage problem, then run /reload.",
+    "Cyclotomy initialization failed. Capture and restore are unavailable; files were not changed. Pi remains available; fix the reported configuration or storage problem, then run /cyclotomy resume.",
   captureLaterFailed:
     "Cyclotomy could not complete this checkpoint. The intended checkpoint pointer was not changed.",
   arrivalProtectionUnavailable:
@@ -68,7 +81,7 @@ const EN = {
   sessionWorkspaceMismatch:
     "Pi opened this session outside the workspace recorded in its session file. Cyclotomy is paused here and did not bind or modify either workspace; create a Pi-native fork in this directory to carry the session forward safely.",
   forkImportFailed:
-    "Cyclotomy could not finish the fork ancestry registration safely ({{message}}). Workspace files were not changed; run /reload to continue or retry.",
+    "Cyclotomy could not finish the fork ancestry registration safely ({{message}}). Workspace files were not changed; run /cyclotomy resume to retry.",
   forkInheritanceSkipped:
     "Cyclotomy could not authenticate or admit the parent checkpoints ({{message}}). No parent state was imported; retained locations are blocked until a later, explicitly reviewed location can establish its own checkpoint.",
   navigationPrepareFailed:
@@ -223,18 +236,32 @@ const EN = {
   choiceNavigationRestore: "Navigate and restore",
   driftUsage: "Usage: /drift",
   restoreUsage: "Usage: /restore",
+  cyclotomyUsage: "Usage: /cyclotomy [stop|resume]",
   commandFailed: "Cyclotomy command failed: {{message}}",
 } as const;
 
 export type MessageKey = keyof typeof EN;
 
 const ZH_CN: Record<MessageKey, string> = {
+  cyclotomyCommandDescription: "查看、停止或恢复 Cyclotomy",
+  cyclotomyStopCompletion: "在当前 Pi 运行期间停止 Cyclotomy",
+  cyclotomyResumeCompletion: "仅重试 Cyclotomy，不重新载入 Pi",
+  cyclotomyRunning: "Cyclotomy 正在运行。",
+  cyclotomyStopped:
+    "Cyclotomy 已在当前 Pi 运行期间停止。执行 /cyclotomy resume 可重新启动。",
+  cyclotomyStoppedWithError:
+    "Cyclotomy 已在当前 Pi 运行期间停止（{{message}}）。Pi 仍可正常使用；请修复问题后执行 /cyclotomy resume。",
+  cyclotomyStopSucceeded:
+    "Cyclotomy 已在当前 Pi 运行期间停止；Pi 仍可正常使用。",
+  cyclotomyResumeSucceeded: "Cyclotomy 已恢复运行。",
+  cyclotomyResumeFailed:
+    "Cyclotomy 无法恢复运行（{{message}}）。Pi 仍可正常使用；请修复问题后重试 /cyclotomy resume。",
   driftCommandDescription: "显示 /restore 将执行的文件变化",
   restoreCommandDescription: "恢复当前节点的保存状态",
   checkingWorkspace: "Cyclotomy · 正在检查工作区…",
   restoringWorkspace: "Cyclotomy · 正在恢复工作区…",
   initFailure:
-    "Cyclotomy 初始化失败。捕获与恢复不可用，文件没有被改动。请修复报告的配置或存储问题，然后运行 /reload。",
+    "Cyclotomy 初始化失败。捕获与恢复不可用，文件没有被改动；Pi 仍可正常使用。请修复报告的配置或存储问题，然后执行 /cyclotomy resume。",
   captureLaterFailed:
     "Cyclotomy 未能完成这次保存；本次保存所指向的状态指针没有改变。",
   arrivalProtectionUnavailable:
@@ -268,7 +295,7 @@ const ZH_CN: Record<MessageKey, string> = {
   sessionWorkspaceMismatch:
     "Pi 在会话文件所记录工作区之外打开了此会话。Cyclotomy 已在此暂停，且没有绑定或修改任一工作区；请在当前目录创建 Pi 原生 fork，以安全延续此会话。",
   forkImportFailed:
-    "Cyclotomy 无法安全完成分支来源登记（{{message}}）；工作区文件未改变，请执行 /reload 继续或重试。",
+    "Cyclotomy 无法安全完成分支来源登记（{{message}}）；工作区文件未改变，请执行 /cyclotomy resume 重试。",
   forkInheritanceSkipped:
     "Cyclotomy 无法认证父会话的保存状态，或其未通过目标策略准入（{{message}}）；因此没有导入父会话状态，且已阻止保留落点自动接收当前工作区，直到后续明确检查的新落点建立自己的保存状态。",
   navigationPrepareFailed:
@@ -415,6 +442,7 @@ const ZH_CN: Record<MessageKey, string> = {
   choiceNavigationRestore: "跳转并恢复",
   driftUsage: "用法：/drift",
   restoreUsage: "用法：/restore",
+  cyclotomyUsage: "用法：/cyclotomy [stop|resume]",
   commandFailed: "Cyclotomy 命令失败：{{message}}",
 };
 

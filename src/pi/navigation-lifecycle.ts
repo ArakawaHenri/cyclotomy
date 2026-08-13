@@ -196,7 +196,7 @@ function preparedTargetStillMatches(
 
 /** Register the two-phase Pi tree-navigation protocol. */
 export function registerNavigationLifecycle(
-  pi: ExtensionAPI,
+  pi: Pick<ExtensionAPI, "on">,
   runtime: CyclotomyRuntime,
   views: SessionViewTracker,
   host: PiHostAdapter,
@@ -205,9 +205,36 @@ export function registerNavigationLifecycle(
     "session_before_tree",
     host.guard({
       pass: undefined,
-      block: { cancel: true },
       active: async (event, context) => {
         runtime.setStatus(context, undefined);
+        const recoverPreparationFailure = async (
+          cause: unknown,
+        ): Promise<void> => {
+          const recovery = await runtime.withdrawFromParticipation(
+            context,
+            cause,
+          );
+          notifyArrivalDispositionFailure(
+            runtime,
+            context,
+            dispositionFromArrivalProtection(recovery.protection),
+          );
+          notifyWorkspaceLockCleanupFailure(
+            runtime,
+            context,
+            recovery.workspaceLockCleanup,
+          );
+        };
+        const notifyPreparationFailure = (cause: unknown): void => {
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t("navigationPrepareFailed", {
+                message: messageOf(cause),
+              }),
+            "warning",
+          );
+        };
         let view: SessionView;
         try {
           view = views.revalidate(context);
@@ -221,15 +248,9 @@ export function registerNavigationLifecycle(
             return { cancel: true };
           }
         } catch (error) {
-          runtime.notifyBestEffort(
-            context,
-            () =>
-              runtime.i18n.t("navigationPrepareFailed", {
-                message: messageOf(error),
-              }),
-            "warning",
-          );
-          return { cancel: true };
+          await recoverPreparationFailure(error);
+          notifyPreparationFailure(error);
+          return undefined;
         }
         const preparation = await runtime.admission.runTreePreparation(
           async () => {
@@ -237,6 +258,12 @@ export function registerNavigationLifecycle(
               runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
               if (!(await runtime.ensureStore(view.cwd))) {
                 runtime.notifyInitFailure(context);
+                const activation = runtime.activation;
+                await recoverPreparationFailure(
+                  activation.kind === "unavailable"
+                    ? activation.cause
+                    : new Error("Cyclotomy store is unavailable"),
+                );
                 return undefined;
               }
               const authenticated = readExactLocation(
@@ -430,47 +457,45 @@ export function registerNavigationLifecycle(
                   cause,
                 }));
               if (preparationExecution.kind === "acquisition-failed") {
-                runtime.notify(
-                  context,
-                  runtime.i18n.t("navigationPrepareFailed", {
-                    message: messageOf(preparationExecution.cause),
-                  }),
-                  "warning",
-                );
-                return undefined;
-              }
-              notifyWorkspaceLockCleanupFailure(
-                runtime,
-                context,
-                preparationExecution.cleanup.kind === "failed"
-                  ? {
-                      kind: "failed",
-                      cause: preparationExecution.cleanup.cause,
-                    }
-                  : { kind: "settled" },
-              );
-              if (preparationExecution.kind === "action-failed") {
-                runtime.notify(
-                  context,
-                  runtime.i18n.t("navigationPrepareFailed", {
-                    message: messageOf(preparationExecution.cause),
-                  }),
-                  "warning",
-                );
+                await recoverPreparationFailure(preparationExecution.cause);
+                notifyPreparationFailure(preparationExecution.cause);
                 return undefined;
               }
               if (preparationExecution.cleanup.kind === "failed") {
+                if (preparationExecution.kind === "action-failed") {
+                  notifyPreparationFailure(preparationExecution.cause);
+                }
+                notifyWorkspaceLockCleanupFailure(runtime, context, {
+                  kind: "failed",
+                  cause: preparationExecution.cleanup.cause,
+                });
+                await recoverPreparationFailure(
+                  preparationExecution.cleanup.cause,
+                );
+                return undefined;
+              }
+              if (preparationExecution.kind === "action-failed") {
+                await recoverPreparationFailure(preparationExecution.cause);
+                notifyPreparationFailure(preparationExecution.cause);
                 return undefined;
               }
               const prepared = preparationExecution.value;
 
               if (prepared.kind === "scan-incomplete") {
+                const detail = runtime.i18n.formatScanProblems(
+                  prepared.problems,
+                );
                 runtime.notify(
                   context,
                   runtime.i18n.t("navigationScanIncomplete", {
-                    message: runtime.i18n.formatScanProblems(prepared.problems),
+                    message: detail,
                   }),
                   "warning",
+                );
+                await recoverPreparationFailure(
+                  new Error(
+                    `tree preparation workspace scan was incomplete: ${detail}`,
+                  ),
                 );
                 return undefined;
               }
@@ -521,13 +546,8 @@ export function registerNavigationLifecycle(
                     event.signal,
                   );
                 } catch (error) {
-                  runtime.notify(
-                    context,
-                    runtime.i18n.t("navigationPrepareFailed", {
-                      message: messageOf(error),
-                    }),
-                    "warning",
-                  );
+                  await recoverPreparationFailure(error);
+                  notifyPreparationFailure(error);
                   return undefined;
                 }
                 if (navigationChoice === "stay") {
@@ -715,7 +735,7 @@ export function registerNavigationLifecycle(
                         view.cwd,
                       ))
                     ) {
-                      return { kind: "location-changed" as const };
+                      return { kind: "workspace-binding-lost" as const };
                     }
                     if (!context.isIdle()) return { kind: "busy" as const };
                     const validatedView = readExactLocation(
@@ -761,7 +781,7 @@ export function registerNavigationLifecycle(
                   if (
                     !(await runtime.registrations.workspaceStillBound(view.cwd))
                   ) {
-                    return { kind: "location-changed" as const };
+                    return { kind: "workspace-binding-lost" as const };
                   }
                   if (!context.isIdle()) return { kind: "busy" as const };
                   const departureView = readExactLocation(
@@ -894,13 +914,23 @@ export function registerNavigationLifecycle(
                       }
                     : { kind: "settled" },
                 );
-                // Source publication is already authoritative, but a lock
-                // that did not cleanly release is not a sound departure gate.
-                if (
-                  commitExecution.kind === "completed" &&
-                  commitExecution.value.kind === "ready" &&
-                  commitExecution.cleanup.kind === "failed"
-                ) {
+                if (commitExecution.cleanup.kind === "failed") {
+                  runtime.markSessionUnavailable(commitExecution.cleanup.cause);
+                  if (commitExecution.kind === "action-failed") {
+                    notifyPreparationFailure(commitExecution.cause);
+                  }
+                  if (
+                    commitExecution.kind === "completed" &&
+                    commitExecution.value.kind === "ready"
+                  ) {
+                    // Source capture and the departure plan are already
+                    // authoritative. Retire without rewriting that completed
+                    // checkpoint as a protection failure.
+                    return undefined;
+                  }
+                  await recoverPreparationFailure(
+                    commitExecution.cleanup.cause,
+                  );
                   return undefined;
                 }
               }
@@ -914,15 +944,23 @@ export function registerNavigationLifecycle(
                     );
                     break;
                   case "scan-incomplete":
-                    runtime.notify(
-                      context,
-                      runtime.i18n.t("navigationScanIncomplete", {
-                        message: runtime.i18n.formatScanProblems(
-                          committed.problems,
+                    {
+                      const detail = runtime.i18n.formatScanProblems(
+                        committed.problems,
+                      );
+                      runtime.notify(
+                        context,
+                        runtime.i18n.t("navigationScanIncomplete", {
+                          message: detail,
+                        }),
+                        "warning",
+                      );
+                      await recoverPreparationFailure(
+                        new Error(
+                          `tree commit workspace scan was incomplete: ${detail}`,
                         ),
-                      }),
-                      "warning",
-                    );
+                      );
+                    }
                     break;
                   case "preview-stale":
                     runtime.notify(
@@ -939,19 +977,32 @@ export function registerNavigationLifecycle(
                     );
                     break;
                   case "capture-failed":
-                    runtime.notify(
-                      context,
-                      withDetail(
-                        runtime.i18n.t("sourceCaptureFailed"),
-                        runtime.i18n.t("captureFailureDetail", {
-                          message: formatCaptureFailure(
-                            runtime.i18n,
-                            committed.failure,
-                          ),
-                        }),
-                      ),
-                      "error",
-                    );
+                    {
+                      const detail = formatCaptureFailure(
+                        runtime.i18n,
+                        committed.failure,
+                      );
+                      runtime.notify(
+                        context,
+                        withDetail(
+                          runtime.i18n.t("sourceCaptureFailed"),
+                          runtime.i18n.t("captureFailureDetail", {
+                            message: detail,
+                          }),
+                        ),
+                        "error",
+                      );
+                      await recoverPreparationFailure(new Error(detail));
+                    }
+                    break;
+                  case "workspace-binding-lost":
+                    {
+                      const cause = new Error(
+                        "registered workspace binding was lost during tree preparation",
+                      );
+                      await recoverPreparationFailure(cause);
+                      notifyPreparationFailure(cause);
+                    }
                     break;
                   case "source-blocked":
                     runtime.notify(
@@ -973,13 +1024,8 @@ export function registerNavigationLifecycle(
                     );
                     break;
                   case "failed":
-                    runtime.notify(
-                      context,
-                      runtime.i18n.t("navigationPrepareFailed", {
-                        message: messageOf(committed.cause),
-                      }),
-                      "warning",
-                    );
+                    await recoverPreparationFailure(committed.cause);
+                    notifyPreparationFailure(committed.cause);
                     break;
                 }
                 return undefined;
@@ -1004,20 +1050,15 @@ export function registerNavigationLifecycle(
                 target: committed.target,
               };
             } catch (error) {
-              runtime.notifyBestEffort(
-                context,
-                () =>
-                  runtime.i18n.t("navigationPrepareFailed", {
-                    message: messageOf(error),
-                  }),
-                "warning",
-              );
+              await recoverPreparationFailure(error);
+              notifyPreparationFailure(error);
               return undefined;
             } finally {
               runtime.setStatus(context, undefined);
             }
           },
         );
+        if (runtime.activation.kind !== "active") return undefined;
         switch (preparation.kind) {
           case "accepted":
             return undefined;
@@ -1063,6 +1104,13 @@ export function registerNavigationLifecycle(
           context,
           recovery.workspaceLockCleanup,
         );
+        if (runtime.activation.kind === "active") {
+          if (recovery.protection.kind === "unavailable") {
+            runtime.markSessionUnavailable(recovery.protection.cause);
+          } else if (recovery.workspaceLockCleanup.kind === "failed") {
+            runtime.markSessionUnavailable(recovery.workspaceLockCleanup.cause);
+          }
+        }
         return dispositionFromArrivalProtection(recovery.protection);
       };
 

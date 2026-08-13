@@ -15,6 +15,25 @@ export type CleanupSettlement =
   | { readonly kind: "settled" }
   | { readonly kind: "failed"; readonly cause: unknown };
 
+/** Combine independent lock-release receipts without losing either failure. */
+export function mergeCleanupSettlements(
+  ...settlements: readonly CleanupSettlement[]
+): CleanupSettlement {
+  const failures = settlements.flatMap((settlement) =>
+    settlement.kind === "failed" ? [settlement.cause] : [],
+  );
+  if (failures.length === 0) return { kind: "settled" };
+  if (failures.length === 1) return { kind: "failed", cause: failures[0] };
+  return {
+    kind: "failed",
+    cause: new AggregateError(
+      failures,
+      "multiple workspace-lock cleanup attempts failed",
+      { cause: failures[0] },
+    ),
+  };
+}
+
 export interface ArrivalRecoveryExecution {
   readonly protection: ArrivalProtection;
   readonly workspaceLockCleanup: CleanupSettlement;

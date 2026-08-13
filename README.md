@@ -31,16 +31,18 @@ pi remove npm:cyclotomy
 > Checkpoints contain plain, unencrypted copies of managed files. Treat the
 > storage directory as sensitive data. Removing Cyclotomy does not remove it.
 
-## Three commands, zero arguments
+## Commands
 
-| Command    | Purpose                                                                                                    |
-| ---------- | ---------------------------------------------------------------------------------------------------------- |
-| `/tree`    | Move through Pi's session tree. If the destination differs, Cyclotomy previews it and asks how to proceed. |
-| `/drift`   | Check what running `/restore` right now would change. Read-only.                                           |
-| `/restore` | Reapply the current node's exact or inherited checkpoint.                                                  |
+| Command                     | Purpose                                                                                                    |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `/tree`                     | Move through Pi's session tree. If the destination differs, Cyclotomy previews it and asks how to proceed. |
+| `/drift`                    | Check what running `/restore` right now would change. Read-only.                                           |
+| `/restore`                  | Reapply the current node's exact or inherited checkpoint.                                                  |
+| `/cyclotomy [stop\|resume]` | Show status, stop Cyclotomy for this Pi runtime, or retry it.                                              |
 
-`/tree` belongs to Pi; Cyclotomy adds `/drift` and `/restore`. All three are
-used without arguments.
+`/tree` belongs to Pi. Stopping Cyclotomy is in-memory only: every load tries
+to start it again. `resume` restarts only Cyclotomy, without reloading Pi's
+other extensions or resources.
 
 Every destructive restore uses the same preview:
 
@@ -60,8 +62,8 @@ Each point in a session has at most one checkpoint, not an undo stack. A point
 without its own checkpoint uses the nearest recorded ancestor in the same
 session.
 
-Cyclotomy records the workspace as Pi runs. If it cannot observe the complete
-workspace, it stops rather than recording a partial state.
+Cyclotomy records the workspace as Pi runs. If it cannot work safely, Cyclotomy
+stops itself and Pi continues normally rather than recording a partial state.
 
 When `/tree` moves to another point, Cyclotomy checks the destination and asks
 how to proceed if files differ. If the session tree or workspace changes while
@@ -154,7 +156,8 @@ Per-workspace overrides live at
 
 Settings files are JSON. Unknown properties are ignored; invalid values for
 recognized settings disable Cyclotomy without preventing Pi from starting.
-After editing, run Pi's `/reload`.
+If Cyclotomy is stopped, fix the setting and run `/cyclotomy resume`. To apply
+settings while it is running, stop and resume it.
 
 Changing `storageDir` selects a different store; it does not move existing
 data. Pi's `PI_CODING_AGENT_DIR` changes the location of both the agent

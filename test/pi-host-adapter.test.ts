@@ -29,7 +29,6 @@ describe("PiHostAdapter", () => {
     const handler = adapter.guard<SessionBeforeSwitchEvent>({
       active,
       pass: { cancel: false },
-      block: { cancel: true },
     });
 
     await expect(handler(switchEvent, context)).resolves.toEqual({
@@ -46,7 +45,6 @@ describe("PiHostAdapter", () => {
       const handler = adapter.guard<SessionBeforeSwitchEvent>({
         active,
         pass: { cancel: false },
-        block: { cancel: true },
       });
 
       await expect(handler(switchEvent, context)).resolves.toEqual({
@@ -56,7 +54,7 @@ describe("PiHostAdapter", () => {
     },
   );
 
-  it("returns the explicit veto and reports unavailable activation", async () => {
+  it("passes through and reports unavailable activation", async () => {
     const unavailable = new Error("registration unavailable");
     const reportFailure = vi.fn();
     const adapter = new PiHostAdapter({
@@ -66,11 +64,10 @@ describe("PiHostAdapter", () => {
     const handler = adapter.guard<SessionBeforeSwitchEvent>({
       active: () => ({ cancel: false }),
       pass: { cancel: false },
-      block: { cancel: true },
     });
 
     await expect(handler(switchEvent, context)).resolves.toEqual({
-      cancel: true,
+      cancel: false,
     });
     expect(reportFailure).toHaveBeenCalledWith(
       { stage: "activation", event: switchEvent, cause: unavailable },
@@ -94,15 +91,14 @@ describe("PiHostAdapter", () => {
         throw new Error("handler failed");
       },
       pass: { cancel: false },
-      block: { cancel: true },
     });
 
     await expect(handler(switchEvent, context)).resolves.toEqual({
-      cancel: true,
+      cancel: false,
     });
     activation = () => ({ kind: "active" });
     await expect(handler(switchEvent, context)).resolves.toEqual({
-      cancel: true,
+      cancel: false,
     });
     expect(reportFailure).toHaveBeenCalledTimes(2);
   });

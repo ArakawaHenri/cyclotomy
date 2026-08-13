@@ -17,6 +17,7 @@ import type {
 } from "../infrastructure/workspace-scan.ts";
 import {
   checkpointInitializationDispositionConflict,
+  mergeCleanupSettlements,
   restorePreparationConflict,
   type CheckpointInitializationConflict,
   type PostMutationConflict,
@@ -67,6 +68,24 @@ interface PreparedRestore {
   readonly resolution: ResolvedNodeState;
   readonly snapshot: WorkspaceSnapshot;
   readonly drift: WorkspaceRestorePlan;
+}
+
+async function withdrawAfterRestorePreparationFailure(
+  runtime: CyclotomyRuntime,
+  context: ExtensionContext,
+  cause: unknown,
+  cleanupCause: unknown,
+): Promise<RestorePreparationConflict> {
+  const recovery = await runtime.withdrawFromParticipation(context, cause);
+  return {
+    kind: "preparation-conflict",
+    cause,
+    arrivalProtection: recovery.protection,
+    workspaceLockCleanup: mergeCleanupSettlements(
+      { kind: "failed", cause: cleanupCause },
+      recovery.workspaceLockCleanup,
+    ),
+  };
 }
 
 function readExactTarget(
@@ -301,23 +320,23 @@ export async function runConfirmedRestore(
         };
       },
     );
-    if (execution.kind === "action-failed") {
-      notifyWorkspaceLockCleanupFailure(
+    if (execution.cleanup.kind === "failed") {
+      const cause =
+        execution.kind === "action-failed"
+          ? new AggregateError(
+              [execution.cause, execution.cleanup.cause],
+              "restore preparation and workspace-lock cleanup failed",
+              { cause: execution.cause },
+            )
+          : execution.cleanup.cause;
+      return withdrawAfterRestorePreparationFailure(
         runtime,
         context,
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed", cause: execution.cleanup.cause }
-          : { kind: "settled" },
+        cause,
+        execution.cleanup.cause,
       );
-      throw execution.cause;
     }
-    notifyWorkspaceLockCleanupFailure(
-      runtime,
-      context,
-      execution.cleanup.kind === "failed"
-        ? { kind: "failed", cause: execution.cleanup.cause }
-        : { kind: "settled" },
-    );
+    if (execution.kind === "action-failed") throw execution.cause;
     const result = execution.value;
     if (result.kind !== "prepared") return result;
     prepared = result;

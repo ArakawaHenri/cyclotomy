@@ -228,6 +228,10 @@ export class FakePi {
   hasUI = true;
   mode: "tui" | "rpc" | "json" | "print" = "tui";
   idle = true;
+  waitForIdleCalls = 0;
+  reloadCalls = 0;
+  waitForIdleHook: (() => Promise<void>) | undefined;
+  reloadHook: (() => Promise<void>) | undefined;
   /** Test-only hook for changes after before_tree but before session_tree. */
   beforeTreeCommit: (() => Promise<void>) | undefined;
   /** Test-only hook for host work after input acceptance but before user append. */
@@ -360,6 +364,14 @@ export class FakePi {
       },
       ui,
       isIdle: () => self.idle,
+      async waitForIdle() {
+        self.waitForIdleCalls += 1;
+        await self.waitForIdleHook?.();
+      },
+      async reload() {
+        self.reloadCalls += 1;
+        await self.reloadHook?.();
+      },
       get sessionManager() {
         if (self.sessionContextThrows) {
           throw new Error("test session context failure");
@@ -809,6 +821,24 @@ export class FakePi {
     this.#installRuntime(runtimeFactory);
     await this.startSession("resume", previous.getSessionFile());
     return "done";
+  }
+
+  /** Run only Pi's cancellable session-switch preparation hook. */
+  async prepareSwitch(
+    reason: "new" | "resume" = "new",
+  ): Promise<"ready" | "cancelled"> {
+    const before = await this.#emit("session_before_switch", {
+      type: "session_before_switch",
+      reason,
+    });
+    return before.some(
+      (result) =>
+        typeof result === "object" &&
+        result !== null &&
+        (result as { cancel?: boolean }).cancel === true,
+    )
+      ? "cancelled"
+      : "ready";
   }
 
   async navigate(targetId: string): Promise<"done" | "cancelled"> {

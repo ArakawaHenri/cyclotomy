@@ -606,7 +606,7 @@ describe("Cyclotomy runtime", () => {
     // path cannot hide the actionable setting name.
     expect(notifications[0]!.message).toContain(basename(settingsPath));
     expect(notifications[0]!.message).toContain("maxFileMiB");
-    expect(notifications[0]!.message).toContain("/reload");
+    expect(notifications[0]!.message).toContain("/cyclotomy resume");
 
     // Repeated lifecycle reports stay deduplicated; commands force a re-report.
     runtime.notifyInitFailure(context);

@@ -12,6 +12,7 @@ export type CaptureProtocolFailure =
       readonly kind: "location-changed";
       readonly phase: "before-capture" | "during-capture";
     }
+  | { readonly kind: "workspace-unavailable" }
   | { readonly kind: "not-admitted" }
   | { readonly kind: "capture-failed"; readonly failure: CaptureFailure }
   | { readonly kind: "failed"; readonly cause: unknown };
@@ -109,7 +110,7 @@ export async function runCaptureProtocol(
       return { kind: "capture-failed", failure: prepared.error };
     }
     if (!(await deps.workspaceStillBound(admittedView.cwd))) {
-      return { kind: "location-changed", phase: "during-capture" };
+      return { kind: "workspace-unavailable" };
     }
     const current = exactCurrentView(deps, request.expected);
     if (

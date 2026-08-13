@@ -17,6 +17,7 @@ import type { ArrivalAttempt } from "./checkpoint-admission.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import { dispositionFromArrivalProtection } from "./arrival-settlement.ts";
 import {
+  mergeCleanupSettlements,
   protectCurrentArrivalAfterWorkspaceFailure,
   protectCurrentArrivalInWorkspaceLock,
   postMutationControlFailure,
@@ -78,24 +79,6 @@ interface RestoreSettlement {
     resolution: ResolvedNodeState,
   ) => boolean | ArrivalDisposition;
   readonly noOpConflict: "target-changed";
-}
-
-function mergeWorkspaceLockCleanup(
-  ...settlements: readonly CleanupSettlement[]
-): CleanupSettlement {
-  const failures = settlements.flatMap((settlement) =>
-    settlement.kind === "failed" ? [settlement.cause] : [],
-  );
-  if (failures.length === 0) return { kind: "settled" };
-  if (failures.length === 1) return { kind: "failed", cause: failures[0] };
-  return {
-    kind: "failed",
-    cause: new AggregateError(
-      failures,
-      "multiple workspace-lock cleanup attempts failed",
-      { cause: failures[0] },
-    ),
-  };
 }
 
 /** The protocol deliberately cannot reach Runtime's UI, queue, or lifecycle. */
@@ -316,7 +299,7 @@ export class WorkspaceMutationProtocol {
         result?.kind === "outcome"
           ? {
               ...result,
-              workspaceLockCleanup: mergeWorkspaceLockCleanup(
+              workspaceLockCleanup: mergeCleanupSettlements(
                 result.workspaceLockCleanup,
                 workspaceLockCleanup,
               ),
@@ -332,7 +315,7 @@ export class WorkspaceMutationProtocol {
       "released",
     ).then((conflict) => ({
       ...conflict,
-      workspaceLockCleanup: mergeWorkspaceLockCleanup(
+      workspaceLockCleanup: mergeCleanupSettlements(
         conflict.workspaceLockCleanup,
         workspaceLockCleanup,
       ),
@@ -347,7 +330,7 @@ export class WorkspaceMutationProtocol {
     if (conflict.arrivalProtection.kind !== "unavailable") {
       return {
         ...conflict,
-        workspaceLockCleanup: mergeWorkspaceLockCleanup(
+        workspaceLockCleanup: mergeCleanupSettlements(
           conflict.workspaceLockCleanup,
           workspaceLockCleanup,
         ),
@@ -359,7 +342,7 @@ export class WorkspaceMutationProtocol {
     );
     return {
       ...conflict,
-      workspaceLockCleanup: mergeWorkspaceLockCleanup(
+      workspaceLockCleanup: mergeCleanupSettlements(
         conflict.workspaceLockCleanup,
         workspaceLockCleanup,
         recovery.workspaceLockCleanup,

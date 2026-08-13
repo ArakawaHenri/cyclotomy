@@ -78,6 +78,7 @@ describe("Pi runtime replacement", () => {
       }),
     );
     const pi = new FakePi(workspace, registerCyclotomy);
+    await pi.startSession("startup");
     await writeFile(
       settingsPath,
       JSON.stringify({
@@ -86,7 +87,6 @@ describe("Pi runtime replacement", () => {
         gc: { intervalMs: 0 },
       }),
     );
-    await pi.startSession("startup");
     const contents = Buffer.alloc(2 * 1024, 0x61);
     await writeFile(join(workspace, "large.bin"), contents);
 
@@ -127,7 +127,9 @@ describe("Pi runtime replacement", () => {
     const disabledLeaf = pi.manager.getLeafId()!;
 
     expect(
-      pi.notifications.some(({ message }) => message.includes("/reload")),
+      pi.notifications.some(({ message }) =>
+        message.includes("/cyclotomy resume"),
+      ),
     ).toBe(true);
     // The disabled runtime must not have created the hashed store at all.
     expect(() => metadata()).toThrow();
