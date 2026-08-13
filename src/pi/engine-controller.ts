@@ -1,9 +1,12 @@
+type EngineInitializationResult =
+  { readonly kind: "ready" } | { readonly kind: "inactive" };
+
 export interface EngineLifecycle<Engine, Initialization> {
   readonly create: (initialization: Initialization) => Engine | Promise<Engine>;
   readonly initialize: (
     engine: Engine,
     initialization: Initialization,
-  ) => void | Promise<void>;
+  ) => EngineInitializationResult | Promise<EngineInitializationResult>;
   /** Synchronously revoke authority before waiting for in-flight users. */
   readonly retire: (engine: Engine) => void;
   readonly drain: (engine: Engine) => void | Promise<void>;
@@ -30,8 +33,16 @@ export type EngineResumeResult<Engine> =
       readonly engine: Engine;
       readonly generation: number;
     }
+  | { readonly kind: "inactive" }
   | { readonly kind: "failed"; readonly cause: unknown }
   | { readonly kind: "superseded" };
+
+function normalizeLifecycleFailure(cause: unknown, operation: string): unknown {
+  return (
+    cause ??
+    new Error(`Cyclotomy engine ${operation} failed without an error value`)
+  );
+}
 
 /**
  * Own one replaceable Cyclotomy engine behind Pi's permanently registered API.
@@ -162,8 +173,9 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
       if (this.#closed || attempt !== this.#epoch) {
         return { kind: "superseded" };
       }
-      if (attempt === this.#epoch) this.#stopCause = cause;
-      return { kind: "failed", cause };
+      const failure = normalizeLifecycleFailure(cause, "creation");
+      if (attempt === this.#epoch) this.#stopCause = failure;
+      return { kind: "failed", cause: failure };
     }
 
     if (this.#closed || attempt !== this.#epoch) {
@@ -171,22 +183,43 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
       return { kind: "superseded" };
     }
 
+    let initializationResult: EngineInitializationResult;
     try {
-      await this.#lifecycle.initialize(engine, initialization);
+      initializationResult = await this.#lifecycle.initialize(
+        engine,
+        initialization,
+      );
     } catch (cause) {
       const cleanup = await this.#disposeCandidate(engine);
       if (this.#closed || attempt !== this.#epoch) {
         return { kind: "superseded" };
       }
+      const initializationFailure = normalizeLifecycleFailure(
+        cause,
+        "initialization",
+      );
       const failure =
         cleanup === undefined
-          ? cause
+          ? initializationFailure
           : new AggregateError(
-              [cause, cleanup.cause],
+              [initializationFailure, cleanup.cause],
               "Cyclotomy initialization and cleanup failed",
             );
       if (attempt === this.#epoch) this.#stopCause = failure;
       return { kind: "failed", cause: failure };
+    }
+
+    if (initializationResult.kind === "inactive") {
+      const cleanup = await this.#disposeCandidate(engine);
+      if (this.#closed || attempt !== this.#epoch) {
+        return { kind: "superseded" };
+      }
+      if (cleanup !== undefined) {
+        if (attempt === this.#epoch) this.#stopCause = cleanup.cause;
+        return { kind: "failed", cause: cleanup.cause };
+      }
+      this.#stopCause = undefined;
+      return { kind: "inactive" };
     }
 
     if (this.#closed || attempt !== this.#epoch) {
@@ -212,7 +245,7 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
     try {
       this.#lifecycle.retire(record.engine);
     } catch (cause) {
-      this.#stopCause = cause;
+      this.#stopCause = normalizeLifecycleFailure(cause, "retirement");
     }
     return record;
   }
@@ -229,12 +262,12 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
       try {
         await this.#lifecycle.drain(record.engine);
       } catch (cause) {
-        failures.push(cause);
+        failures.push(normalizeLifecycleFailure(cause, "drain"));
       }
       try {
         await this.#lifecycle.close(record.engine);
       } catch (cause) {
-        failures.push(cause);
+        failures.push(normalizeLifecycleFailure(cause, "close"));
       }
       if (failures.length > 0) {
         throw new AggregateError(failures, "Cyclotomy engine cleanup failed");
@@ -243,7 +276,7 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
     // The barrier must never remain rejected and poison every future resume.
     // The caller still observes this retirement's error through `cleanup`.
     this.#retirement = cleanup.catch((cause: unknown) => {
-      this.#stopCause = cause;
+      this.#stopCause = normalizeLifecycleFailure(cause, "cleanup");
     });
     return cleanup;
   }
@@ -255,17 +288,17 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
     try {
       this.#lifecycle.retire(engine);
     } catch (cause) {
-      failures.push(cause);
+      failures.push(normalizeLifecycleFailure(cause, "retirement"));
     }
     try {
       await this.#lifecycle.drain(engine);
     } catch (cause) {
-      failures.push(cause);
+      failures.push(normalizeLifecycleFailure(cause, "drain"));
     }
     try {
       await this.#lifecycle.close(engine);
     } catch (cause) {
-      failures.push(cause);
+      failures.push(normalizeLifecycleFailure(cause, "close"));
     }
     if (failures.length === 0) return undefined;
     return {

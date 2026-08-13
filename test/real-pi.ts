@@ -5,6 +5,7 @@ import {
   ModelRuntime,
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
+  type ExtensionCommandContextActions,
   type ExtensionError,
   type InlineExtension,
   SessionManager,
@@ -120,6 +121,9 @@ export class RealPiHarness {
   readonly selections: { prompt: string; options: readonly string[] }[] = [];
   /** Outcome returned by the in-process model on its next calls. */
   modelOutcome: RealPiModelOutcome = "success";
+  /** Calls made through Pi's bound command context, for host-contract assertions. */
+  waitForIdleCalls = 0;
+  reloadCalls = 0;
 
   #runtime: AgentSessionRuntime | undefined;
   #createRuntime: CreateAgentSessionRuntimeFactory | undefined;
@@ -256,9 +260,36 @@ export class RealPiHarness {
   }
 
   async #bindSession(session: AgentSession): Promise<void> {
+    const runtime = () => {
+      if (this.#runtime === undefined)
+        throw new Error("harness is not started");
+      return this.#runtime;
+    };
+    const commandContextActions: ExtensionCommandContextActions = {
+      waitForIdle: async () => {
+        this.waitForIdleCalls += 1;
+        await session.waitForIdle();
+      },
+      newSession: (options) => runtime().newSession(options),
+      fork: async (entryId, options) => {
+        const result = await runtime().fork(entryId, options);
+        return { cancelled: result.cancelled };
+      },
+      navigateTree: async (targetId, options) => {
+        const result = await session.navigateTree(targetId, options);
+        return { cancelled: result.cancelled };
+      },
+      switchSession: (sessionPath, options) =>
+        runtime().switchSession(sessionPath, options),
+      reload: async () => {
+        this.reloadCalls += 1;
+        await session.reload();
+      },
+    };
     await session.bindExtensions({
       uiContext: this.#uiContext(),
       mode: "tui",
+      commandContextActions,
       onError: (error) => {
         this.extensionErrors.push({ ...error });
       },
@@ -556,6 +587,8 @@ export class RealPiHarness {
     this.#nextModelPause = undefined;
     this.#releaseModelPause = undefined;
     this.modelOutcome = "success";
+    this.waitForIdleCalls = 0;
+    this.reloadCalls = 0;
     this.extensionErrors.length = 0;
     this.#workspaceRoots.length = 0;
     await Promise.all(

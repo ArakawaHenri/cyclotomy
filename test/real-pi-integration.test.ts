@@ -6,7 +6,7 @@ import {
 import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import {
@@ -105,6 +105,56 @@ describe("real Pi integration", () => {
       pause.release();
       await turn;
     }
+  });
+
+  it("stops during generation, lets the turn finish, and resumes locally once Pi is idle", async () => {
+    const pi = await startHarness();
+    const pause = pi.pauseNextModelTurn();
+    const turn = pi.turn("keep streaming while Cyclotomy stops");
+    await pause.started;
+
+    expect(pi.session.isStreaming).toBe(true);
+    await pi.command("/cyclotomy stop");
+    expect(pi.session.isStreaming).toBe(true);
+    expect(
+      pi.notifications.some(({ message }) =>
+        message.includes("Cyclotomy stopped for this Pi runtime"),
+      ),
+    ).toBe(true);
+
+    let resumed = false;
+    const resuming = pi.command("/cyclotomy resume").then(() => {
+      resumed = true;
+    });
+    try {
+      await vi.waitFor(() => expect(pi.waitForIdleCalls).toBe(1));
+      expect(resumed).toBe(false);
+      expect(pi.session.isStreaming).toBe(true);
+    } finally {
+      pause.release();
+    }
+    await turn;
+    await resuming;
+
+    expect(pi.session.isStreaming).toBe(false);
+    expect(pi.reloadCalls).toBe(0);
+    expect(
+      pi.notifications.some(({ message }) => message === "Cyclotomy resumed."),
+    ).toBe(true);
+    expect(
+      pi.session.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (part) => part.type === "text" && part.text === "ok",
+          ),
+      ),
+    ).toBe(true);
+
+    await pi.writeWorkspaceFile("after-resume.txt", "captured");
+    await pi.turn("capture after local resume");
+    expect(readState(pi, pi.sessionId, pi.leafId)).toBeDefined();
   });
 
   it("exposes cold-fork provenance through Pi's package-root API", async () => {

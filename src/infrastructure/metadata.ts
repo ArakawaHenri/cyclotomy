@@ -340,12 +340,11 @@ function checkedRegularMetadataPath(path: string): Stats {
   }
 }
 
-function optionalMetadataSidecar(path: string): boolean {
-  validation: for (
-    let attempt = 0;
-    attempt < SIDECAR_VALIDATION_ATTEMPTS;
-    attempt += 1
-  ) {
+function optionalMetadataSidecar(
+  path: string,
+  attempts = SIDECAR_VALIDATION_ATTEMPTS,
+): boolean {
+  validation: for (let attempt = 0; attempt < attempts; attempt += 1) {
     let before: Stats;
     try {
       before = lstatSync(path);
@@ -353,10 +352,7 @@ function optionalMetadataSidecar(path: string): boolean {
       // SQLite is allowed to delete a WAL/SHM sidecar as the last connection
       // closes. Disappearance at any observation point is a valid absence.
       if (systemErrorCode(error) === "ENOENT") return false;
-      if (
-        isTransientSidecarAccess(error) &&
-        attempt + 1 < SIDECAR_VALIDATION_ATTEMPTS
-      ) {
+      if (isTransientSidecarAccess(error) && attempt + 1 < attempts) {
         Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
         continue;
       }
@@ -386,10 +382,7 @@ function optionalMetadataSidecar(path: string): boolean {
         after = lstatSync(path);
       } catch (error) {
         if (systemErrorCode(error) === "ENOENT") return false;
-        if (
-          isTransientSidecarAccess(error) &&
-          attempt + 1 < SIDECAR_VALIDATION_ATTEMPTS
-        ) {
+        if (isTransientSidecarAccess(error) && attempt + 1 < attempts) {
           Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
           continue validation;
         }
@@ -438,7 +431,7 @@ function optionalMetadataSidecar(path: string): boolean {
       if (descriptor !== undefined) closeSync(descriptor);
     }
 
-    if (changed && attempt + 1 < SIDECAR_VALIDATION_ATTEMPTS) {
+    if (changed && attempt + 1 < attempts) {
       Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
     }
   }
@@ -448,11 +441,14 @@ function optionalMetadataSidecar(path: string): boolean {
   );
 }
 
-function metadataSidecars(path: string): MetadataSidecarSet {
+function metadataSidecars(
+  path: string,
+  attempts = SIDECAR_VALIDATION_ATTEMPTS,
+): MetadataSidecarSet {
   return {
-    journal: optionalMetadataSidecar(`${path}-journal`),
-    shm: optionalMetadataSidecar(`${path}-shm`),
-    wal: optionalMetadataSidecar(`${path}-wal`),
+    journal: optionalMetadataSidecar(`${path}-journal`, attempts),
+    shm: optionalMetadataSidecar(`${path}-shm`, attempts),
+    wal: optionalMetadataSidecar(`${path}-wal`, attempts),
   };
 }
 
@@ -465,6 +461,30 @@ function sameMetadataSidecars(
     left.shm === right.shm &&
     left.wal === right.wal
   );
+}
+
+function sidecarsRequireRecovery(sidecars: MetadataSidecarSet): boolean {
+  return sidecars.journal || sidecars.wal !== sidecars.shm;
+}
+
+/** Allow SQLite's last-connection sidecar teardown to reach a stable shape. */
+function stabilizeMetadataSidecars(
+  path: string,
+  initial: MetadataSidecarSet,
+): MetadataSidecarSet {
+  let sidecars = initial;
+  for (
+    let attempt = 1;
+    sidecarsRequireRecovery(sidecars) && attempt < SIDECAR_VALIDATION_ATTEMPTS;
+    attempt += 1
+  ) {
+    Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
+    // The outer loop owns this retry budget. Each reobservation performs one
+    // complete no-follow validation so nested retry loops cannot amplify a
+    // hostile sidecar churn into seconds of synchronous blocking.
+    sidecars = metadataSidecars(path, 1);
+  }
+  return sidecars;
 }
 
 function canonicalMetadataPath(path: string): string {
@@ -733,11 +753,15 @@ export function inspectMetadataSessionIdentity(
   requireNonEmpty(sessionId, "session id");
   requireNonEmpty(sessionFile, "session file");
   try {
-    const prepared = prepareExistingMetadataPath(path);
-    if (
-      prepared.sidecars.journal ||
-      prepared.sidecars.wal !== prepared.sidecars.shm
-    ) {
+    const observed = prepareExistingMetadataPath(path);
+    const prepared = {
+      ...observed,
+      sidecars: stabilizeMetadataSidecars(
+        observed.canonicalPath,
+        observed.sidecars,
+      ),
+    };
+    if (sidecarsRequireRecovery(prepared.sidecars)) {
       return {
         kind: "recovery-required",
         cause: metadataPathError(

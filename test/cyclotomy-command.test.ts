@@ -46,7 +46,7 @@ describe("/cyclotomy command presentation", () => {
     });
     expect(presentCyclotomyStatus({ running: false }, en)).toEqual({
       message:
-        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to restart it.",
+        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
       level: "info",
     });
 

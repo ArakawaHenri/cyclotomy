@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -30,10 +30,12 @@ function send(message: ChildMessage): Promise<void> {
   });
 }
 
-function waitForStart(): Promise<void> {
+function waitForMessage(
+  expected: "start" | "settle" | "finish",
+): Promise<void> {
   return new Promise<void>((resolveStart) => {
     process.once("message", (message) => {
-      if (message === "start") resolveStart();
+      if (message === expected) resolveStart();
     });
   });
 }
@@ -82,7 +84,8 @@ if (
   mode !== "write" &&
   mode !== "gated-write" &&
   mode !== "open-only" &&
-  mode !== "legacy-live"
+  mode !== "legacy-live" &&
+  mode !== "settle-sidecar"
 ) {
   throw new Error(`unsupported metadata child mode: ${mode}`);
 }
@@ -100,8 +103,9 @@ try {
       `UPDATE node_state SET tree_oid = ?
        WHERE session_id = 'legacy-process' AND entry_id = 'entry'`,
     );
+    const started = waitForMessage("start");
     await send({ type: "ready", pid: process.pid });
-    await waitForStart();
+    await started;
     await send({ type: "opening", pid: process.pid });
     try {
       staleUpdate.run("b".repeat(64));
@@ -117,9 +121,22 @@ try {
     } finally {
       legacy.close();
     }
-  } else {
+  } else if (mode === "settle-sidecar") {
+    const started = waitForMessage("start");
     await send({ type: "ready", pid: process.pid });
-    await waitForStart();
+    await started;
+    const settled = waitForMessage("settle");
+    await send({ type: "opening", pid: process.pid });
+    await settled;
+    Atomics.wait(gateWaitCell, 0, 0, 10);
+    rmSync(`${path}-wal`, { force: true });
+    const finished = waitForMessage("finish");
+    await send({ type: "opened", pid: process.pid });
+    await finished;
+  } else {
+    const started = waitForMessage("start");
+    await send({ type: "ready", pid: process.pid });
+    await started;
     await send({ type: "opening", pid: process.pid });
     for (let iteration = 0; iteration < iterations; iteration += 1) {
       const store = await (mode === "gated-write" && iteration === 0

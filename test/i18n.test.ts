@@ -30,6 +30,8 @@ describe("Cyclotomy Pi localization", () => {
     expect(zh.t("driftCommandDescription")).toContain("/restore");
     expect(en.t("cyclotomyCommandDescription")).toContain("resume");
     expect(zh.t("cyclotomyCommandDescription")).toContain("恢复");
+    expect(en.t("cyclotomyInactive")).toContain("not active");
+    expect(zh.t("cyclotomyInactive")).toContain("未在当前 Pi 会话中启用");
   });
 
   it("keeps command references and session-identity failures localized", () => {

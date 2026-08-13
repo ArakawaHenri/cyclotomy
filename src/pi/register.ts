@@ -402,6 +402,8 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           }
           if (result.kind === "running") {
             notify(context, i18n.t("cyclotomyResumeSucceeded"));
+          } else if (result.kind === "inactive") {
+            notify(context, i18n.t("cyclotomyInactive"));
           } else if (result.kind === "failed") {
             notify(
               context,

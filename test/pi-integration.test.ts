@@ -116,6 +116,14 @@ function registerPreparedRuntime(
   runtime: CyclotomyRuntime,
 ): void {
   registerCyclotomyLifecycle(api, runtime);
+  api.on("session_shutdown", async () => {
+    runtime.retire();
+    try {
+      await runtime.drain();
+    } finally {
+      runtime.close();
+    }
+  });
   api.registerCommand("drift", {
     handler: createDriftCommandHandler(runtime),
   });
@@ -5454,6 +5462,42 @@ describe("checkpoint authority lifecycle", () => {
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
     });
 
+    it("reports a failed session-barrier admission exactly once for an initialization conflict", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      await pi.startSession("startup");
+      const intended = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "source-state");
+      await pi.endTurn();
+
+      const admissionFailure = new Error("barrier admission failed");
+      const admission = vi
+        .spyOn(runtime.workspaceMutations, "admitTreeArrivalIfResolution")
+        .mockReturnValueOnce({
+          kind: "protected",
+          evidence: {
+            kind: "session-barrier",
+            admission: { kind: "failed", cause: admissionFailure },
+          },
+        });
+
+      try {
+        expect(await pi.navigate(intended.id)).toBe("done");
+      } finally {
+        admission.mockRestore();
+      }
+
+      expect(notified(pi, "checkpointInitializedConflictBarrier")).toBe(true);
+      const admissionNotifications = pi.notifications.filter(({ message }) =>
+        message.includes(messageFor("arrivalAdmissionUnavailable")),
+      );
+      expect(admissionNotifications).toHaveLength(1);
+      expect(admissionNotifications[0]?.message).toContain(
+        "barrier admission failed",
+      );
+    });
+
     it("uses an authenticated root summary when the logical destination is null", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -7045,7 +7089,7 @@ describe("checkpoint authority lifecycle", () => {
           loadCyclotomyConfig(home),
           TEST_I18N,
         );
-        registerCyclotomyLifecycle(child.api, runtime);
+        registerPreparedRuntime(child.api, runtime);
 
         const sourceLock = await acquireWorkspaceLock(
           sourceStoreRoot,
@@ -7057,13 +7101,29 @@ describe("checkpoint authority lifecycle", () => {
           let importLockObserved = false;
           for (let attempt = 0; attempt < 800; attempt += 1) {
             try {
-              for (const name of await readdir(targetLockPath)) {
+              const names = await readdir(targetLockPath);
+              for (const name of names) {
                 if (!name.startsWith("owner-") || !name.endsWith(".json")) {
                   continue;
                 }
-                const record = JSON.parse(
-                  await readFile(join(targetLockPath, name), "utf8"),
-                ) as { operation?: unknown };
+                let record: { operation?: unknown };
+                try {
+                  record = JSON.parse(
+                    await readFile(join(targetLockPath, name), "utf8"),
+                  ) as { operation?: unknown };
+                } catch (error) {
+                  const token = name.slice("owner-".length, -".json".length);
+                  if (
+                    error instanceof SyntaxError &&
+                    !names.includes(`heartbeat-${token}`)
+                  ) {
+                    // writeFile publishes the owner before its heartbeat. A
+                    // parse failure is transient only in that formation gap;
+                    // malformed records with a published heartbeat still fail.
+                    continue;
+                  }
+                  throw error;
+                }
                 if (record.operation === "fork-import") {
                   importLockObserved = true;
                   break;

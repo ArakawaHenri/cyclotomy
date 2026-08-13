@@ -16,7 +16,7 @@ import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { CyclotomyEngine } from "../src/pi/cyclotomy-engine.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
-import { FakePi } from "./fake-pi.ts";
+import { FakePi, FakeSessionManager } from "./fake-pi.ts";
 import { checkpointIsBlocked, checkpointState } from "./metadata-fixture.ts";
 
 let workspace: string;
@@ -266,5 +266,67 @@ describe("Cyclotomy participation boundary", () => {
       checkpointState(db, pi.manager.sessionId, pi.manager.getLeafId()!),
     ).toBeDefined();
     db.close();
+  });
+
+  it("treats an in-memory session as intentional non-participation", async () => {
+    const pi = new FakePi(workspace, registerCyclotomy);
+    pi.manager = pi.newInMemorySession();
+    pi.manager.appendEntry();
+
+    await pi.startSession("startup");
+    await pi.runCommand("cyclotomy");
+    expect(pi.notifications.at(-1)).toEqual({
+      message:
+        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+      level: "info",
+    });
+
+    pi.notifications.length = 0;
+    await pi.runCommand("cyclotomy", "resume");
+    expect(pi.notifications.at(-1)).toEqual({
+      message:
+        "Cyclotomy is not active for this Pi session. Pi remains available.",
+      level: "info",
+    });
+    expect(
+      pi.notifications.some(({ message }) =>
+        message.includes("fix the problem"),
+      ),
+    ).toBe(false);
+  });
+
+  it("treats a workspace-mismatched session as intentional non-participation", async () => {
+    const recordedWorkspace = join(agentDir, "recorded-workspace");
+    await mkdir(recordedWorkspace);
+    const pi = new FakePi(workspace, registerCyclotomy);
+    pi.manager = new FakeSessionManager(
+      "workspace-mismatch",
+      join(agentDir, "workspace-mismatch.jsonl"),
+      workspace,
+      null,
+      recordedWorkspace,
+    );
+    pi.manager.appendEntry();
+
+    await pi.startSession("resume");
+    await pi.runCommand("cyclotomy");
+    expect(pi.notifications.at(-1)).toEqual({
+      message:
+        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+      level: "info",
+    });
+
+    pi.notifications.length = 0;
+    await pi.runCommand("cyclotomy", "resume");
+    expect(pi.notifications.at(-1)).toEqual({
+      message:
+        "Cyclotomy is not active for this Pi session. Pi remains available.",
+      level: "info",
+    });
+    expect(
+      pi.notifications.some(({ message }) =>
+        message.includes("fix the problem"),
+      ),
+    ).toBe(false);
   });
 });

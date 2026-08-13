@@ -25,8 +25,10 @@ const EN = {
   cyclotomyStopCompletion: "Stop Cyclotomy for this Pi runtime",
   cyclotomyResumeCompletion: "Retry Cyclotomy without reloading Pi",
   cyclotomyRunning: "Cyclotomy is running.",
+  cyclotomyInactive:
+    "Cyclotomy is not active for this Pi session. Pi remains available.",
   cyclotomyStopped:
-    "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to restart it.",
+    "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
   cyclotomyStoppedWithError:
     "Cyclotomy is stopped for this Pi runtime ({{message}}). Pi remains available; fix the problem, then run /cyclotomy resume.",
   cyclotomyStopSucceeded:
@@ -247,8 +249,9 @@ const ZH_CN: Record<MessageKey, string> = {
   cyclotomyStopCompletion: "在当前 Pi 运行期间停止 Cyclotomy",
   cyclotomyResumeCompletion: "仅重试 Cyclotomy，不重新载入 Pi",
   cyclotomyRunning: "Cyclotomy 正在运行。",
+  cyclotomyInactive: "Cyclotomy 未在当前 Pi 会话中启用；Pi 仍可正常使用。",
   cyclotomyStopped:
-    "Cyclotomy 已在当前 Pi 运行期间停止。执行 /cyclotomy resume 可重新启动。",
+    "Cyclotomy 已在当前 Pi 运行期间停止。可执行 /cyclotomy resume 尝试重新启动。",
   cyclotomyStoppedWithError:
     "Cyclotomy 已在当前 Pi 运行期间停止（{{message}}）。Pi 仍可正常使用；请修复问题后执行 /cyclotomy resume。",
   cyclotomyStopSucceeded:

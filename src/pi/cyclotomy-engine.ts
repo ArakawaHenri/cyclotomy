@@ -131,18 +131,15 @@ export class CyclotomyEngine {
     return new CyclotomyEngine(runtime, handlers);
   }
 
-  async initialize(
-    event: SessionStartEvent,
-    context: ExtensionContext,
-  ): Promise<void> {
+  async initialize(event: SessionStartEvent, context: ExtensionContext) {
     await this.#handlers.invoke(event, context);
     switch (this.runtime.activation.kind) {
       case "active":
-        return;
+        return { kind: "ready" } as const;
       case "unavailable":
         throw this.runtime.activation.cause;
       case "intentionally-inactive":
-        throw new Error("Cyclotomy cannot participate in this Pi session");
+        return { kind: "inactive" } as const;
       case "closed":
         throw new Error("Cyclotomy runtime closed during initialization");
     }

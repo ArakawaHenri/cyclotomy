@@ -6,13 +6,15 @@ interface Engine {
   readonly id: number;
 }
 
+const ready = { kind: "ready" } as const;
+
 describe("CyclotomyEngineController", () => {
   it("detaches synchronously and drains acquired work before close", async () => {
     let nextId = 0;
     const calls: string[] = [];
     const controller = new CyclotomyEngineController<Engine>({
       create: () => ({ id: ++nextId }),
-      initialize: () => {},
+      initialize: () => ready,
       retire: ({ id }) => {
         calls.push(`retire:${id}`);
       },
@@ -46,6 +48,7 @@ describe("CyclotomyEngineController", () => {
       create: () => ({ id: ++nextId }),
       initialize: () => {
         if (fail) throw new Error("not ready");
+        return ready;
       },
       retire: () => {},
       drain: () => {},
@@ -65,8 +68,8 @@ describe("CyclotomyEngineController", () => {
   });
 
   it("prevents a superseded candidate and stale generation from winning", async () => {
-    let finish!: () => void;
-    const initialization = new Promise<void>((resolve) => {
+    let finish!: (result: typeof ready) => void;
+    const initialization = new Promise<typeof ready>((resolve) => {
       finish = resolve;
     });
     const close = vi.fn();
@@ -87,7 +90,7 @@ describe("CyclotomyEngineController", () => {
     });
     await Promise.resolve();
     expect(stopSettled).toBe(false);
-    finish();
+    finish(ready);
     await expect(starting).resolves.toEqual({ kind: "superseded" });
     await stopping;
     expect(controller.current).toBeUndefined();
@@ -99,15 +102,15 @@ describe("CyclotomyEngineController", () => {
   });
 
   it("serializes a new resume behind cleanup of a superseded candidate", async () => {
-    let finishFirst!: () => void;
-    const firstGate = new Promise<void>((resolve) => {
+    let finishFirst!: (result: typeof ready) => void;
+    const firstGate = new Promise<typeof ready>((resolve) => {
       finishFirst = resolve;
     });
     let nextId = 0;
     const close = vi.fn();
     const controller = new CyclotomyEngineController<Engine>({
       create: () => ({ id: ++nextId }),
-      initialize: ({ id }) => (id === 1 ? firstGate : undefined),
+      initialize: ({ id }) => (id === 1 ? firstGate : ready),
       retire: () => {},
       drain: () => {},
       close,
@@ -120,7 +123,7 @@ describe("CyclotomyEngineController", () => {
     await Promise.resolve();
     expect(nextId).toBe(1);
 
-    finishFirst();
+    finishFirst(ready);
     await expect(first).resolves.toEqual({ kind: "superseded" });
     await stopped;
     await expect(second).resolves.toMatchObject({
@@ -128,5 +131,114 @@ describe("CyclotomyEngineController", () => {
       engine: { id: 2 },
     });
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes an intentionally inactive candidate without recording a failure", async () => {
+    const retire = vi.fn();
+    const drain = vi.fn();
+    const close = vi.fn();
+    const controller = new CyclotomyEngineController<Engine>({
+      create: () => ({ id: 1 }),
+      initialize: () => ({ kind: "inactive" }),
+      retire,
+      drain,
+      close,
+    });
+
+    await expect(controller.resume(undefined)).resolves.toEqual({
+      kind: "inactive",
+    });
+    expect(controller.current).toBeUndefined();
+    expect(controller.stopCause).toBeUndefined();
+    expect(retire).toHaveBeenCalledOnce();
+    expect(drain).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("reports failure when an inactive candidate cannot be cleaned up", async () => {
+    const controller = new CyclotomyEngineController<Engine>({
+      create: () => ({ id: 1 }),
+      initialize: () => ({ kind: "inactive" }),
+      retire: () => {},
+      drain: () => {},
+      close: () => {
+        throw undefined;
+      },
+    });
+
+    const result = await controller.resume(undefined);
+    expect(result.kind).toBe("failed");
+    if (result.kind !== "failed") return;
+    expect(result.cause).toBeInstanceOf(Error);
+    expect((result.cause as Error).message).toContain("close");
+    expect(controller.stopCause).toBe(result.cause);
+    expect(controller.current).toBeUndefined();
+  });
+
+  it.each(["creation", "initialization"] as const)(
+    "normalizes a missing %s failure cause",
+    async (operation) => {
+      const controller = new CyclotomyEngineController<Engine>({
+        create: () => {
+          if (operation === "creation") throw undefined;
+          return { id: 1 };
+        },
+        initialize: () => {
+          if (operation === "initialization") throw undefined;
+          return ready;
+        },
+        retire: () => {},
+        drain: () => {},
+        close: () => {},
+      });
+
+      const result = await controller.resume(undefined);
+      expect(result.kind).toBe("failed");
+      if (result.kind !== "failed") return;
+      expect(result.cause).toBeInstanceOf(Error);
+      expect(result.cause).toBe(controller.stopCause);
+      expect((result.cause as Error).message).toContain(operation);
+    },
+  );
+
+  it("normalizes a missing retirement failure cause", async () => {
+    const controller = new CyclotomyEngineController<Engine>({
+      create: () => ({ id: 1 }),
+      initialize: () => ready,
+      retire: () => {
+        throw undefined;
+      },
+      drain: () => {},
+      close: () => {},
+    });
+    await controller.resume(undefined);
+
+    await controller.stop();
+    expect(controller.stopCause).toBeInstanceOf(Error);
+    expect((controller.stopCause as Error).message).toContain("retirement");
+  });
+
+  it("normalizes missing drain and close failure causes", async () => {
+    const controller = new CyclotomyEngineController<Engine>({
+      create: () => ({ id: 1 }),
+      initialize: () => ready,
+      retire: () => {},
+      drain: () => {
+        throw undefined;
+      },
+      close: () => {
+        throw undefined;
+      },
+    });
+    await controller.resume(undefined);
+
+    await expect(controller.stop()).rejects.toBeInstanceOf(AggregateError);
+    const failure = controller.stopCause;
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(2);
+    for (const cause of (failure as AggregateError).errors) {
+      expect(cause).toBeInstanceOf(Error);
+      expect((cause as Error).message).toMatch(/drain|close/u);
+    }
   });
 });
