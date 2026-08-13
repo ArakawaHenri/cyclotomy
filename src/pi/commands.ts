@@ -2,6 +2,8 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
 import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
+import { assertNever } from "./assert-never.ts";
+import { formatCaptureFailure } from "./capture-failure.ts";
 import {
   runConfirmedRestore,
   type ConfirmedRestoreResult,
@@ -9,10 +11,13 @@ import {
 import {
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
-  notifyRestoreOutcome,
+  notifyRestorePreparationConflict,
+  notifyRestoreProtocolOutcome,
+  notifyWorkspaceLockCleanupFailure,
 } from "./restore-outcome.ts";
-import { messageOf, type CyclotomyRuntime } from "./runtime.ts";
+import type { CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 
 function finishRestore(
   runtime: CyclotomyRuntime,
@@ -25,6 +30,9 @@ function finishRestore(
       break;
     case "post-mutation-conflict":
       notifyPostMutationConflict(runtime, context, execution);
+      break;
+    case "preparation-conflict":
+      notifyRestorePreparationConflict(runtime, context, execution);
       break;
     case "location-changed":
       runtime.notify(
@@ -47,13 +55,13 @@ function finishRestore(
       runtime.notify(
         context,
         runtime.i18n.t("restoreScanIncomplete", {
-          message: execution.message,
+          message: runtime.i18n.formatScanProblems(execution.problems),
         }),
         "warning",
       );
       break;
     case "outcome":
-      notifyRestoreOutcome(runtime, context, execution.outcome);
+      notifyRestoreProtocolOutcome(runtime, context, execution);
       break;
     case "missing":
       runtime.notify(context, runtime.i18n.t("restoreMissing"), "info");
@@ -83,11 +91,22 @@ function finishRestore(
           execution.phase === "prepare"
             ? "restorePrepareFailed"
             : "restoreFailed",
-          { message: execution.message },
+          { message: messageOf(execution.cause) },
         ),
         "error",
       );
       break;
+    case "capture-failed":
+      runtime.notify(
+        context,
+        runtime.i18n.t("restorePrepareFailed", {
+          message: formatCaptureFailure(runtime.i18n, execution.failure),
+        }),
+        "error",
+      );
+      break;
+    default:
+      assertNever(execution, "unhandled confirmed restore result");
   }
 }
 
@@ -100,11 +119,11 @@ async function restoreCommand(
     runtime.notify(context, runtime.i18n.t("waitIdleRestore"), "warning");
     return;
   }
-  if (runtime.transitions.rejectConflict()) {
+  if (runtime.admission.rejectTransitionConflict()) {
     runtime.notify(context, runtime.i18n.t("transitionInProgress"), "warning");
     return;
   }
-  const node = runtime.captureAnchor(view);
+  const node = runtime.checkpoints.captureAnchor(view);
   if (node === undefined) {
     runtime.notify(context, runtime.i18n.t("locationUnknown"), "warning");
     return;
@@ -125,7 +144,7 @@ async function driftCommand(
   context: ExtensionCommandContext,
   view: SessionView,
 ): Promise<void> {
-  const node = runtime.captureAnchor(view);
+  const node = runtime.checkpoints.captureAnchor(view);
   if (node === undefined) {
     runtime.notify(context, runtime.i18n.t("locationUnknown"), "warning");
     return;
@@ -133,32 +152,46 @@ async function driftCommand(
   const prepared = await (async () => {
     runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
     try {
-      return await runtime.enqueueWorkspace("drift", async () => {
-        const readable = await runtime.resolveReadableTreeIn(view, node);
-        if (readable === undefined) {
+      const execution = await runtime.enqueueWorkspaceExecution(
+        "drift",
+        async () => {
+          if (
+            runtime.workspaceMutations.reconcileSessionBarrier(view, node) ===
+            "unregistered"
+          ) {
+            throw new Error(
+              "current session registration changed before drift",
+            );
+          }
+          const readable = await runtime.resolveReadableTreeIn(view, node);
+          if (readable === undefined) {
+            return {
+              kind: "missing" as const,
+              writeProtected: runtime.checkpoints.locationIsBlocked(node),
+            };
+          }
+          const { resolution, manifest } = readable;
+          const snapshot = await runtime.scanCurrentWorkspaceForScope(
+            view.cwd,
+            manifest.scope,
+          );
           return {
-            kind: "missing" as const,
-            writeProtected: runtime.metadata.isNodeWriteProtected(
-              node.sessionId,
-              node.entryId,
-            ),
+            kind: "checkpoint" as const,
+            resolution,
+            drift: (await prepareWorkspaceRestorePlan(snapshot, manifest)).plan,
+            writeProtected: runtime.checkpoints.locationIsBlocked(node),
           };
-        }
-        const { resolution, manifest } = readable;
-        const snapshot = await runtime.scanCurrentWorkspaceForScope(
-          view.cwd,
-          manifest.scope,
-        );
-        return {
-          kind: "checkpoint" as const,
-          resolution,
-          drift: (await prepareWorkspaceRestorePlan(snapshot, manifest)).plan,
-          writeProtected: runtime.metadata.isNodeWriteProtected(
-            node.sessionId,
-            node.entryId,
-          ),
-        };
-      });
+        },
+      );
+      notifyWorkspaceLockCleanupFailure(
+        runtime,
+        context,
+        execution.cleanup.kind === "failed"
+          ? { kind: "failed", cause: execution.cleanup.cause }
+          : { kind: "settled" },
+      );
+      if (execution.kind === "action-failed") throw execution.cause;
+      return execution.value;
     } finally {
       runtime.setStatus(context, undefined);
     }
@@ -195,9 +228,16 @@ async function driftCommand(
   }
   runtime.notify(
     context,
-    runtime.i18n.t(inherited ? "driftTitleInherited" : "driftTitle", {
-      preview: runtime.i18n.formatRestorePreview(prepared.drift),
-    }),
+    runtime.i18n.t(
+      prepared.writeProtected
+        ? "driftTitleDetached"
+        : inherited
+          ? "driftTitleInherited"
+          : "driftTitle",
+      {
+        preview: runtime.i18n.formatRestorePreview(prepared.drift),
+      },
+    ),
     prepared.drift.problems.length > 0 ? "warning" : "info",
   );
 }
@@ -223,6 +263,14 @@ async function runCommand(
       );
       return;
     }
+    if (!(await runtime.registrations.sessionOwnsCurrentWorkspace(view))) {
+      runtime.notify(
+        context,
+        runtime.i18n.t("sessionWorkspaceMismatch"),
+        "warning",
+      );
+      return;
+    }
     // Bind before the session-identity check: an initialization failure also
     // blocks registration, and its actionable configuration/storage detail is
     // the closer root cause. Explicit user commands always re-report it, so an
@@ -231,7 +279,7 @@ async function runCommand(
       runtime.notifyInitFailure(context, { force: true });
       return;
     }
-    if (!runtime.sessionIsUsable(view)) {
+    if (!runtime.registrations.sessionIsUsable(view)) {
       runtime.notify(
         context,
         runtime.i18n.t("sessionIdentityUnavailable"),

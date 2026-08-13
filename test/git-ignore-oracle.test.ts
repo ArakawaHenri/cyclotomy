@@ -24,6 +24,7 @@ import {
   type GitIgnorePath,
 } from "../src/infrastructure/git-ignore-oracle.ts";
 import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
   MAX_GITIGNORE_POLICY_BYTES,
   MAX_GITIGNORE_SOURCES,
   MAX_GITIGNORE_SOURCE_BYTES,
@@ -121,10 +122,14 @@ describe("workspace Git scope", () => {
       workspaceScopeBytes(left.gitignoreSources[1]!.contentsBase64),
     ).toEqual(Buffer.from([0xff, 0x0a]));
     expect(
-      workspaceScopesEqual(left, {
-        ...left,
-        gitignoreSources: [...left.gitignoreSources].reverse(),
-      }),
+      workspaceScopesEqual(
+        left,
+        {
+          ...left,
+          gitignoreSources: [...left.gitignoreSources].reverse(),
+        },
+        ABSOLUTE_WORKSPACE_PATH_LIMITS,
+      ),
     ).toBe(true);
   });
 

@@ -1,9 +1,24 @@
 import type {
+  ContextEvent,
   ExtensionAPI,
   ExtensionContext,
+  InputEvent,
+  MessageEndEvent,
+  SessionBeforeCompactEvent,
+  SessionBeforeForkEvent,
+  SessionBeforeSwitchEvent,
+  SessionCompactEvent,
+  TurnEndEvent,
+  UserBashEvent,
 } from "@earendil-works/pi-coding-agent";
 
 import type { NodeKey } from "../domain/model.ts";
+import type { CaptureFailure } from "../application/capture.ts";
+import type { ResolvedReadableTree } from "../application/checkpoint-service.ts";
+import {
+  checkpointSlotIsBlocked,
+  checkpointSlotTreeOid,
+} from "../domain/checkpoint-slot.ts";
 import type { ResolvedNodeState } from "../application/resolve.ts";
 import {
   restorePlanHasChanges,
@@ -12,155 +27,179 @@ import {
 import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
 import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
 import {
-  checkpointInitializationConflict,
+  checkpointInitializationDispositionConflict,
+  protectCurrentArrivalAfterWorkspaceFailure,
   protectCurrentArrivalInWorkspaceLock,
+  restorePreparationConflict,
 } from "./post-mutation.ts";
 import {
+  locationInitializationAdmission,
+  settleCheckpointInitialization,
+} from "./checkpoint-initialization-protocol.ts";
+import {
+  notifyArrivalProtectionFailure,
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
-  notifyRestoreOutcome,
+  notifyRestorePreparationConflict,
+  notifyRestoreProtocolOutcome,
+  notifyWorkspaceLockCleanupFailure,
 } from "./restore-outcome.ts";
 import { registerNavigationLifecycle } from "./navigation-lifecycle.ts";
 import {
-  CyclotomyRuntime,
-  messageOf,
-  type ResolvedReadableTree,
-} from "./runtime.ts";
-import { runConfirmedRestore } from "./confirmed-restore.ts";
-import { readSessionView, type SessionView } from "./session-view.ts";
+  messageEndNeedsSourceCapture,
+  sessionStartPolicy,
+  type SessionStartPolicy,
+} from "./host-event-contract.ts";
+import { CyclotomyRuntime } from "./runtime.ts";
+import {
+  runConfirmedRestore,
+  type ConfirmedRestoreResult,
+} from "./confirmed-restore.ts";
+import {
+  readSessionView,
+  SessionViewTracker,
+  type SessionView,
+} from "./session-view.ts";
+import { assertNever } from "./assert-never.ts";
+import { formatCaptureFailure } from "./capture-failure.ts";
+import {
+  runCaptureProtocol,
+  type CaptureProtocolResult,
+} from "./capture-protocol.ts";
+import { PiHostAdapter } from "./pi-host-adapter.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 
 function withDetail(message: string, detail: string): string {
   return `${message} ${detail}`;
 }
 
-function stillAt(
-  context: ExtensionContext,
-  sessionId: string,
-  leafId: string | null,
-  cwd: string,
-): boolean {
-  const current = readSessionView(context);
-  return (
-    current.sessionId === sessionId &&
-    current.leafId === leafId &&
-    current.cwd === cwd
-  );
-}
-
-/** Re-authenticate the complete registered Pi location after an async phase. */
-function registeredSessionStillAt(
+/** Re-authenticate the complete registered Pi snapshot after an async phase. */
+function readExactRegisteredView(
   runtime: CyclotomyRuntime,
+  views: SessionViewTracker,
   context: ExtensionContext,
   expected: SessionView,
-): boolean {
-  const current = readSessionView(context);
-  return (
-    runtime.sessionIsUsable(current) &&
-    current.sessionId === expected.sessionId &&
-    current.sessionFile === expected.sessionFile &&
-    current.leafId === expected.leafId &&
-    current.cwd === expected.cwd
-  );
+): SessionView | undefined {
+  const current = views.observe(context);
+  return runtime.registrations.sessionIsUsable(current) &&
+    current.isSameSnapshotAs(expected)
+    ? current
+    : undefined;
+}
+
+type SourceCaptureFailure =
+  | {
+      readonly kind: "location-changed";
+      readonly phase: "before" | "during";
+    }
+  | { readonly kind: "not-admitted"; readonly subject: "source" | "turn" }
+  | { readonly kind: "capture"; readonly value: CaptureFailure }
+  | { readonly kind: "exception"; readonly cause: unknown };
+
+function formatSourceCaptureFailure(
+  runtime: CyclotomyRuntime,
+  failure: SourceCaptureFailure,
+): string {
+  switch (failure.kind) {
+    case "location-changed":
+      return failure.phase === "before"
+        ? "active location changed before source capture"
+        : "active location changed during source capture";
+    case "not-admitted":
+      return `${failure.subject} location is not admitted for checkpointing`;
+    case "capture":
+      return formatCaptureFailure(runtime.i18n, failure.value);
+    case "exception":
+      return messageOf(failure.cause);
+    default:
+      return assertNever(failure, "unhandled source capture failure");
+  }
 }
 
 async function captureSourceOrCancel(
   runtime: CyclotomyRuntime,
+  views: SessionViewTracker,
   context: ExtensionContext,
   view: SessionView,
   entryId: string | null,
+  options: {
+    readonly subject?: "source" | "turn";
+    readonly operation?: string;
+    readonly announceFailure?: boolean;
+  } = {},
 ): Promise<
   | { readonly kind: "captured" | "protected" | "no-node" }
-  | { readonly kind: "failed"; readonly message: string }
+  | { readonly kind: "failed"; readonly failure: SourceCaptureFailure }
 > {
-  // Any independent source-capture boundary proves that an unconsumed tree
-  // plan is no longer attributable to a future session_tree event. This is a
-  // no-op while a before hook is actively preparing its own transition.
-  runtime.transitions.retireOrphanedNavigation();
-  let detail: string | undefined;
-  let node: NodeKey | undefined;
-  try {
-    node = runtime.captureAnchor(view, entryId);
-  } catch (error) {
-    detail = messageOf(error);
-    runtime.notify(
-      context,
-      withDetail(
-        runtime.i18n.t("sourceCaptureFailed"),
-        runtime.i18n.t("captureFailureDetail", { message: detail }),
-      ),
-      "error",
-    );
-    return { kind: "failed", message: detail };
-  }
   const result = await runtime
-    .enqueueWorkspace("capture-before-transition", async () => {
-      if (!stillAt(context, view.sessionId, entryId, view.cwd)) {
-        return {
-          kind: "failed" as const,
-          message: "active location changed before source capture",
-        };
-      }
-      const admission = runtime.captureAdmission(view, node);
-      if (admission.kind === "no-node") return admission;
-      if (admission.kind === "protected") return admission;
-      if (admission.kind === "blocked" || node === undefined) {
-        return {
-          kind: "failed" as const,
-          message: "source location is not admitted for checkpointing",
-        };
-      }
-      const expectedTreeOid = runtime.metadata.getState(
-        node.sessionId,
-        node.entryId,
-      )?.treeOid;
-      const prepared = await runtime.prepareCaptureResult(view);
-      if (!prepared.ok) {
-        return {
-          kind: "failed" as const,
-          message: prepared.error.message,
-        };
-      }
-      const current = readSessionView(context);
-      if (
-        !stillAt(context, view.sessionId, entryId, view.cwd) ||
-        !(await runtime.workspaceStillBound(view.cwd)) ||
-        !runtime.captureLeaseIsCurrent(admission.lease, current, node)
-      ) {
-        return {
-          kind: "failed" as const,
-          message: "active location changed during source capture",
-        };
-      }
-      const committed = runtime.commitPreparedCapture({
-        source: node,
-        prepared: prepared.value,
-        expectedTreeOid,
-      });
-      if (!committed.ok) {
-        if (committed.error.kind === "write-protected") {
-          runtime.protectNode(view, node);
-          return { kind: "protected" as const };
-        }
-        return {
-          kind: "failed" as const,
-          message: committed.error.message,
-        };
-      }
-      return { kind: "captured" as const };
+    .enqueueWorkspaceExecution(
+      options.operation ?? "capture-before-transition",
+      async () => {
+        const execution = await runCaptureProtocol(
+          {
+            readCurrentView: () => views.observe(context),
+            sessionIsUsable: (current) =>
+              runtime.registrations.sessionIsUsable(current),
+            captureAnchor: (current, leafId) =>
+              runtime.checkpoints.captureAnchor(current, leafId),
+            captureAdmission: (current, node) =>
+              runtime.workspaceMutations.captureAdmission(current, node),
+            checkpointSlot: (node) => runtime.checkpoints.checkpointSlot(node),
+            prepareCurrent: (current) =>
+              runtime.checkpoints.prepareCurrent(current),
+            workspaceStillBound: (cwd) =>
+              runtime.registrations.workspaceStillBound(cwd),
+            captureLeaseIsCurrent: (lease, current, node) =>
+              runtime.workspaceMutations.captureLeaseIsCurrent(
+                lease,
+                current,
+                node,
+              ),
+            commitPrepared: (current, node, prepared, expectedSlot) =>
+              runtime.commitPreparedCapture(
+                current,
+                node,
+                prepared,
+                expectedSlot,
+              ),
+          },
+          { expected: view, leafId: entryId },
+        );
+        return sourceCaptureResult(execution, options.subject ?? "source");
+      },
+    )
+    .then((execution) => {
+      notifyWorkspaceLockCleanupFailure(
+        runtime,
+        context,
+        execution.cleanup.kind === "failed"
+          ? { kind: "failed", cause: execution.cleanup.cause }
+          : { kind: "settled" },
+      );
+      return execution.kind === "completed"
+        ? execution.value
+        : ({
+            kind: "failed" as const,
+            failure: {
+              kind: "exception" as const,
+              cause: execution.cause,
+            },
+          } as const);
     })
     .catch((error: unknown) => ({
       kind: "failed" as const,
-      message: messageOf(error),
+      failure: { kind: "exception" as const, cause: error },
     }));
-  if (result.kind === "failed") {
-    runtime.notify(
+  if (result.kind === "failed" && options.announceFailure !== false) {
+    runtime.notifyBestEffort(
       context,
-      withDetail(
-        runtime.i18n.t("sourceCaptureFailed"),
-        runtime.i18n.t("captureFailureDetail", {
-          message: result.message,
-        }),
-      ),
+      () =>
+        withDetail(
+          runtime.i18n.t("sourceCaptureFailed"),
+          runtime.i18n.t("captureFailureDetail", {
+            message: formatSourceCaptureFailure(runtime, result.failure),
+          }),
+        ),
       "error",
     );
   } else if (result.kind === "captured" || result.kind === "no-node") {
@@ -169,44 +208,159 @@ async function captureSourceOrCancel(
   return result;
 }
 
-const SESSION_PENDING_NODE_GUARD = "pending-node-guard" as const;
+function sourceCaptureResult(
+  result: CaptureProtocolResult,
+  subject: "source" | "turn",
+):
+  | { readonly kind: "captured" | "protected" | "no-node" }
+  | { readonly kind: "failed"; readonly failure: SourceCaptureFailure } {
+  switch (result.kind) {
+    case "captured":
+      return { kind: "captured" };
+    case "no-coordinate":
+      return { kind: "no-node" };
+    case "write-protected":
+      return { kind: "protected" };
+    case "location-changed":
+      return {
+        kind: "failed",
+        failure: {
+          kind: "location-changed",
+          phase: result.phase === "before-capture" ? "before" : "during",
+        },
+      };
+    case "not-admitted":
+      return {
+        kind: "failed",
+        failure: { kind: "not-admitted", subject },
+      };
+    case "capture-failed":
+      return {
+        kind: "failed",
+        failure: { kind: "capture", value: result.failure },
+      };
+    case "failed":
+      return {
+        kind: "failed",
+        failure: { kind: "exception", cause: result.cause },
+      };
+    default:
+      return assertNever(result, "unhandled capture protocol result");
+  }
+}
+
+const SESSION_CAPTURE_BARRIER = "session-capture-barrier" as const;
 const SESSION_RECONCILED = "reconciled" as const;
 const RELOAD_PROTECTED_MISSING = "protected-missing" as const;
 const RELOAD_PROTECTED = "reload-protected" as const;
 type SessionReconciliation =
-  typeof SESSION_RECONCILED | typeof SESSION_PENDING_NODE_GUARD;
+  typeof SESSION_RECONCILED | typeof SESSION_CAPTURE_BARRIER;
+
+function loadedRestoreNeedsRecovery(result: ConfirmedRestoreResult): boolean {
+  switch (result.kind) {
+    case "needs-ui":
+    case "cancelled":
+    case "location-changed":
+    case "target-changed":
+    case "preview-stale":
+    case "scan-incomplete":
+    case "failed":
+    case "capture-failed":
+      return true;
+    case "outcome":
+      if (result.cutover.kind === "rejected") return true;
+      return (
+        result.outcome.kind !== "restored" &&
+        result.cutover.kind === "not-requested"
+      );
+    case "initialization-conflict":
+    case "post-mutation-conflict":
+    case "preparation-conflict":
+    case "missing":
+    case "protected-missing":
+    case "initialized":
+    case "matches":
+      return false;
+    default:
+      return assertNever(result, "unhandled loaded-session settlement");
+  }
+}
+
+async function recoverLoadedArrival(
+  runtime: CyclotomyRuntime,
+  context: ExtensionContext,
+) {
+  const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
+    runtime.workspaceMutations,
+    context,
+  );
+  notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+  notifyWorkspaceLockCleanupFailure(
+    runtime,
+    context,
+    recovery.workspaceLockCleanup,
+  );
+  return recovery.protection;
+}
 
 async function reconcileLoadedSession(
   runtime: CyclotomyRuntime,
+  views: SessionViewTracker,
   context: ExtensionContext,
   view: SessionView,
 ): Promise<SessionReconciliation> {
-  const node = runtime.captureAnchor(view);
-  if (node === undefined) {
-    if (runtime.pendingNodeGuard(view) !== false) {
-      runtime.quarantineAdmission();
-      return SESSION_PENDING_NODE_GUARD;
+  let node: NodeKey | undefined;
+  try {
+    node = runtime.checkpoints.captureAnchor(view);
+    if (node === undefined) {
+      if (runtime.workspaceMutations.sessionHasBarrier(view) !== false) {
+        runtime.workspaceMutations.quarantineAdmission();
+        return SESSION_CAPTURE_BARRIER;
+      }
+      if (!runtime.workspaceMutations.admitCurrentLocation(view)) {
+        throw new Error("node-free loaded arrival could not be admitted");
+      }
+      return SESSION_RECONCILED;
     }
-    runtime.admitLocation(view);
-    return SESSION_RECONCILED;
+  } catch (cause) {
+    const protection = await recoverLoadedArrival(runtime, context);
+    runtime.notifyCaptureResult(context, false, messageOf(cause));
+    return protection.kind === "session-barrier"
+      ? SESSION_CAPTURE_BARRIER
+      : SESSION_RECONCILED;
   }
-  await reconcileLoadedConcreteSession(runtime, context, view, node);
+  await reconcileLoadedConcreteSession(runtime, views, context, view, node);
   return SESSION_RECONCILED;
 }
 
 async function reconcileLoadedConcreteSession(
   runtime: CyclotomyRuntime,
+  views: SessionViewTracker,
   context: ExtensionContext,
   view: SessionView,
   node: NodeKey,
 ): Promise<void> {
-  const result = await runConfirmedRestore(
-    runtime,
-    context,
-    view,
-    node,
-    "loaded-session",
-  );
+  let result: ConfirmedRestoreResult;
+  try {
+    result = await runConfirmedRestore(
+      runtime,
+      context,
+      view,
+      node,
+      "loaded-session",
+    );
+  } catch (cause) {
+    result = await restorePreparationConflict(
+      runtime.workspaceMutations,
+      context,
+      cause,
+      "released",
+    );
+  }
+
+  if (loadedRestoreNeedsRecovery(result)) {
+    await recoverLoadedArrival(runtime, context);
+  }
 
   switch (result.kind) {
     case "initialization-conflict":
@@ -215,22 +369,24 @@ async function reconcileLoadedConcreteSession(
     case "post-mutation-conflict":
       notifyPostMutationConflict(runtime, context, result);
       return;
+    case "preparation-conflict":
+      notifyRestorePreparationConflict(runtime, context, result);
+      return;
     case "missing": {
-      let anchor: NodeKey | undefined;
-      try {
-        anchor = runtime.captureAnchor(view);
-      } catch (error) {
-        runtime.notifyCaptureResult(context, false, messageOf(error));
-        return;
-      }
-      if (anchor === undefined) return;
-      let initializedCheckpointCommitted = false;
-      const initialized = await runtime
-        .enqueueWorkspace("initialize-missing-session", async () => {
-          if (
-            !stillAt(context, view.sessionId, view.leafId, view.cwd) ||
-            !(await runtime.workspaceStillBound(view.cwd))
-          ) {
+      const anchor = node;
+      const locked = await runtime.enqueueWorkspaceExecution(
+        "initialize-missing-session",
+        async () => {
+          if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
+            return { kind: "location-changed" as const };
+          }
+          const observed = readExactRegisteredView(
+            runtime,
+            views,
+            context,
+            view,
+          );
+          if (observed === undefined) {
             return { kind: "location-changed" as const };
           }
 
@@ -239,95 +395,123 @@ async function reconcileLoadedConcreteSession(
           // first-observed state; structural errors and unreadable candidates
           // throw and therefore remain fail-closed.
           if (
-            (await runtime.resolveReadableTreeIn(view, anchor)) !== undefined
+            (await runtime.resolveReadableTreeIn(observed, anchor)) !==
+            undefined
           ) {
             return { kind: "target-changed" as const };
           }
-          const prepared = await runtime.prepareCaptureResult(view);
+          const prepared = await runtime.checkpoints.prepareCurrent(observed);
           if (!prepared.ok) {
             return {
               kind: "capture-failed" as const,
-              message: prepared.error.message,
+              failure: prepared.error,
             };
           }
           if (
-            !(await runtime.workspaceStillBound(view.cwd)) ||
-            !stillAt(context, view.sessionId, view.leafId, view.cwd)
+            !(await runtime.registrations.workspaceStillBound(observed.cwd))
           ) {
             return { kind: "location-changed" as const };
           }
-          if (!runtime.resolutionStillAuthoritative(view, anchor, undefined)) {
+          const current = readExactRegisteredView(
+            runtime,
+            views,
+            context,
+            view,
+          );
+          if (current === undefined) {
+            return { kind: "location-changed" as const };
+          }
+          if (
+            !runtime.workspaceMutations.locationIsUnresolved(current, anchor)
+          ) {
             return { kind: "target-changed" as const };
           }
-          const committed = runtime.commitPreparedMissingCapture(
+          const committed = runtime.commitMissingCapture(
+            current,
             anchor,
             prepared.value,
             "initialize-fresh",
           );
           if (!committed.ok) {
-            if (
-              committed.error.kind === "state-changed" &&
-              runtime.metadata.getState(anchor.sessionId, anchor.entryId) ===
-                undefined &&
-              runtime.metadata.isNodeWriteProtected(
-                anchor.sessionId,
-                anchor.entryId,
-              )
-            ) {
-              runtime.protectNode(view, anchor);
-              return { kind: "protected" as const };
+            if (committed.error.kind === "state-changed") {
+              const currentSlot = runtime.checkpoints.checkpointSlot(anchor);
+              if (
+                checkpointSlotTreeOid(currentSlot) === undefined &&
+                checkpointSlotIsBlocked(currentSlot)
+              ) {
+                runtime.workspaceMutations.protectCurrentNode(current, anchor);
+                return { kind: "protected" as const };
+              }
             }
             return {
               kind: "capture-failed" as const,
-              message: committed.error.message,
+              failure: committed.error,
             };
           }
-          initializedCheckpointCommitted = true;
-          try {
-            const current = readSessionView(context);
-            const currentAnchor = runtime.captureAnchor(current);
-            if (
-              !runtime.sessionIsUsable(current) ||
-              current.sessionId !== view.sessionId ||
-              current.sessionFile !== view.sessionFile ||
-              current.leafId !== view.leafId ||
-              current.cwd !== view.cwd ||
-              currentAnchor?.sessionId !== anchor.sessionId ||
-              currentAnchor.entryId !== anchor.entryId
-            ) {
-              return checkpointInitializationConflict(
-                runtime,
-                context,
-                "active location changed after checkpoint initialization",
+          const resolution = {
+            treeOid: prepared.value.treeOid,
+            foundAt: anchor,
+          };
+          const arrival = await settleCheckpointInitialization(
+            {
+              readCurrentView: () => views.observe(context),
+              sessionIsUsable: (candidate) =>
+                runtime.registrations.sessionIsUsable(candidate),
+              captureAnchor: (candidate) =>
+                runtime.checkpoints.captureAnchor(candidate),
+              protectCommittedArrival: (_cause) =>
+                runtime.workspaceMutations.recoverUncertainLocationInWorkspaceLock(
+                  context,
+                ),
+            },
+            {
+              expected: current,
+              node: anchor,
+              resolution,
+              admit: (candidate, target) =>
+                locationInitializationAdmission(
+                  runtime.workspaceMutations.admitLocationIfResolution(
+                    candidate,
+                    target,
+                  ),
+                ),
+            },
+          );
+          return arrival.kind === "admitted"
+            ? ({ kind: "materialized" } as const)
+            : checkpointInitializationDispositionConflict(
+                arrival.kind === "unsettled"
+                  ? arrival.cause
+                  : new Error(
+                      "checkpoint initialization completed under durable protection",
+                    ),
+                arrival,
               );
-            }
-            if (!runtime.admitLocation(current, prepared.value.treeOid)) {
-              return checkpointInitializationConflict(
-                runtime,
-                context,
-                "checkpoint admission changed after initialization",
-              );
-            }
-          } catch (error) {
-            return checkpointInitializationConflict(runtime, context, error);
-          }
-          return { kind: "materialized" as const };
-        })
-        // `async` normalizes the helper promise and immediate capture failure
-        // into the one execution union consumed below.
-        .catch(async (error: unknown) =>
-          initializedCheckpointCommitted
-            ? checkpointInitializationConflict(
-                runtime,
-                context,
-                error,
-                "initialize-missing-post-failure-protect",
-              )
-            : {
-                kind: "capture-failed" as const,
-                message: messageOf(error),
-              },
-        );
+        },
+      );
+      const initialized =
+        locked.kind === "action-failed"
+          ? ({
+              kind: "failed" as const,
+              cause: locked.cause,
+            } as const)
+          : locked.value;
+      notifyWorkspaceLockCleanupFailure(
+        runtime,
+        context,
+        locked.cleanup.kind === "failed"
+          ? { kind: "failed", cause: locked.cleanup.cause }
+          : { kind: "settled" },
+      );
+
+      if (
+        initialized.kind === "location-changed" ||
+        initialized.kind === "target-changed" ||
+        initialized.kind === "capture-failed" ||
+        initialized.kind === "failed"
+      ) {
+        await recoverLoadedArrival(runtime, context);
+      }
 
       switch (initialized.kind) {
         case "initialization-conflict":
@@ -358,8 +542,24 @@ async function reconcileLoadedConcreteSession(
           );
           break;
         case "capture-failed":
-          runtime.notifyCaptureResult(context, false, initialized.message);
+          runtime.notifyCaptureResult(
+            context,
+            false,
+            formatCaptureFailure(runtime.i18n, initialized.failure),
+          );
           break;
+        case "failed":
+          runtime.notifyCaptureResult(
+            context,
+            false,
+            messageOf(initialized.cause),
+          );
+          break;
+        default:
+          assertNever(
+            initialized,
+            "unhandled loaded checkpoint initialization",
+          );
       }
       return;
     }
@@ -395,7 +595,7 @@ async function reconcileLoadedConcreteSession(
       runtime.notify(
         context,
         runtime.i18n.t("restoreScanIncomplete", {
-          message: result.message,
+          message: runtime.i18n.formatScanProblems(result.problems),
         }),
         "warning",
       );
@@ -403,7 +603,16 @@ async function reconcileLoadedConcreteSession(
     case "failed":
       runtime.notify(
         context,
-        runtime.i18n.t("restoreFailed", { message: result.message }),
+        runtime.i18n.t("restoreFailed", { message: messageOf(result.cause) }),
+        "warning",
+      );
+      break;
+    case "capture-failed":
+      runtime.notify(
+        context,
+        runtime.i18n.t("restoreFailed", {
+          message: formatCaptureFailure(runtime.i18n, result.failure),
+        }),
         "warning",
       );
       break;
@@ -425,122 +634,212 @@ async function reconcileLoadedConcreteSession(
       );
       break;
     case "outcome":
-      notifyRestoreOutcome(runtime, context, result.outcome);
+      notifyRestoreProtocolOutcome(runtime, context, result);
       return;
+    default:
+      assertNever(result, "unhandled loaded-session restore result");
   }
 }
 
 /**
- * Reload preserves the live workspace but cannot trust an absent guard as a
- * cross-runtime handoff (the previous runtime may have been disabled). Match
+ * Reload only restarts the extension: it neither grants workspace ownership
+ * nor clears a session capture barrier. For a concrete location, authenticate
  * the existing checkpoint without capturing, prompting, or restoring; any
- * uncertainty leaves the node protected.
+ * uncertainty leaves that exact location blocked.
  */
 async function reconcileReloadedSession(
   runtime: CyclotomyRuntime,
+  views: SessionViewTracker,
   context: ExtensionContext,
   view: SessionView,
 ): Promise<SessionReconciliation> {
-  const node = runtime.captureAnchor(view);
-  if (node === undefined) {
-    const reconciled = await runtime.enqueueWorkspace(
-      "reload-empty-session",
-      async () => {
-        if (!registeredSessionStillAt(runtime, context, view)) return false;
-        const current = readSessionView(context);
-        if (
-          runtime.captureAnchor(current) !== undefined ||
-          !runtime.clearPendingNodeGuard(current)
-        ) {
-          return false;
-        }
-        return runtime.admitLocation(current);
-      },
-    );
-    if (!reconciled) {
-      runtime.quarantineAdmission();
-      return SESSION_PENDING_NODE_GUARD;
+  let node: NodeKey | undefined;
+  try {
+    node = runtime.checkpoints.captureAnchor(view);
+    if (node === undefined) {
+      // A node-free public observation cannot materialize a durable session
+      // barrier. Keep it intact until a complete concrete ancestry is observed.
+      if (runtime.workspaceMutations.sessionHasBarrier(view) !== false) {
+        runtime.workspaceMutations.quarantineAdmission();
+        return SESSION_CAPTURE_BARRIER;
+      }
+      if (!runtime.workspaceMutations.admitCurrentLocation(view)) {
+        throw new Error("node-free reload arrival could not be admitted");
+      }
+      return SESSION_RECONCILED;
     }
-    return SESSION_RECONCILED;
+  } catch (cause) {
+    const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
+      runtime.workspaceMutations,
+      context,
+    );
+    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      recovery.workspaceLockCleanup,
+    );
+    runtime.notifyCaptureResult(context, false, messageOf(cause));
+    return recovery.protection.kind === "session-barrier"
+      ? SESSION_CAPTURE_BARRIER
+      : SESSION_RECONCILED;
   }
-
+  const recoverReloadFailure = async (
+    error: unknown,
+  ): Promise<SessionReconciliation | typeof RELOAD_PROTECTED> => {
+    runtime.workspaceMutations.quarantineAdmission();
+    const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
+      runtime.workspaceMutations,
+      context,
+    );
+    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      recovery.workspaceLockCleanup,
+    );
+    runtime.notifyCaptureResult(context, false, messageOf(error));
+    switch (recovery.protection.kind) {
+      case "exact-slot":
+        return RELOAD_PROTECTED;
+      case "session-barrier":
+        return SESSION_CAPTURE_BARRIER;
+      case "unavailable":
+        return SESSION_RECONCILED;
+      default:
+        return assertNever(
+          recovery.protection,
+          "unhandled reload failure protection",
+        );
+    }
+  };
   const reconciliation = await runtime
-    .enqueueWorkspace("reload-reconcile", async () => {
-      const stillCurrent = (): SessionView | undefined => {
-        const current = readSessionView(context);
-        if (
-          !runtime.sessionIsUsable(current) ||
-          current.sessionId !== view.sessionId ||
-          current.sessionFile !== view.sessionFile ||
-          current.leafId !== view.leafId ||
-          current.cwd !== view.cwd
-        ) {
-          return undefined;
-        }
-        const anchor = runtime.captureAnchor(current);
-        return anchor?.sessionId === node.sessionId &&
-          anchor.entryId === node.entryId
-          ? current
-          : undefined;
-      };
+    .enqueueWorkspaceExecution("reload-reconcile", async () => {
+      const readCurrent = (): SessionView | undefined =>
+        readExactRegisteredView(runtime, views, context, view);
       const protectCurrent = async (
-        resolution?: ResolvedNodeState,
-        missing = false,
+        current: SessionView | undefined,
+        expectation:
+          | {
+              readonly kind: "current";
+              readonly state: "present" | "missing";
+            }
+          | {
+              readonly kind: "exact-resolution";
+              readonly resolution: ResolvedNodeState;
+            },
       ): Promise<
         | SessionReconciliation
         | typeof RELOAD_PROTECTED
         | typeof RELOAD_PROTECTED_MISSING
       > => {
-        const current = stillCurrent();
-        if (current === undefined) {
-          const protection = await protectCurrentArrivalInWorkspaceLock(
+        const classifyProtection = (
+          recovery: Awaited<
+            ReturnType<typeof protectCurrentArrivalInWorkspaceLock>
+          >,
+        ) => {
+          notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+          notifyWorkspaceLockCleanupFailure(
             runtime,
             context,
+            recovery.workspaceLockCleanup,
           );
-          if (protection.kind === "protected") return RELOAD_PROTECTED;
-          if (protection.kind === "pending-node-guard") {
-            return SESSION_PENDING_NODE_GUARD;
+          switch (recovery.protection.kind) {
+            case "exact-slot":
+              return expectation.kind === "current" &&
+                expectation.state === "missing"
+                ? RELOAD_PROTECTED_MISSING
+                : RELOAD_PROTECTED;
+            case "session-barrier":
+              return SESSION_CAPTURE_BARRIER;
+            case "unavailable":
+              return SESSION_RECONCILED;
+            default:
+              return assertNever(
+                recovery.protection,
+                "unhandled reload arrival protection",
+              );
           }
-          runtime.notifyCaptureResult(context, false, protection.message);
-          return SESSION_RECONCILED;
+        };
+        if (current === undefined) {
+          return classifyProtection(
+            await protectCurrentArrivalInWorkspaceLock(
+              runtime.workspaceMutations,
+              context,
+            ),
+          );
         }
-        // A stale inherited pin returns false while still installing the exact
-        // guard. Notification follows the durable fact, not the pin outcome.
-        runtime.protectNode(current, node, resolution);
-        if (
-          !runtime.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
-        ) {
-          return SESSION_RECONCILED;
+        // A stale inherited pin returns false while still blocking the exact
+        // slot. Notification follows the durable fact, not the pin outcome.
+        if (expectation.kind === "exact-resolution") {
+          runtime.workspaceMutations.protectNodeIfResolution(
+            current,
+            node,
+            expectation.resolution,
+          );
+        } else {
+          runtime.workspaceMutations.protectCurrentNode(current, node);
         }
-        return missing ? RELOAD_PROTECTED_MISSING : RELOAD_PROTECTED;
+        if (!runtime.checkpoints.locationIsBlocked(node)) {
+          return classifyProtection(
+            await protectCurrentArrivalInWorkspaceLock(
+              runtime.workspaceMutations,
+              context,
+            ),
+          );
+        }
+        return expectation.kind === "current" && expectation.state === "missing"
+          ? RELOAD_PROTECTED_MISSING
+          : RELOAD_PROTECTED;
       };
 
-      if (stillCurrent() === undefined) return protectCurrent();
-      if (!(await runtime.workspaceStillBound(view.cwd))) {
-        return protectCurrent();
+      if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
+        return protectCurrent(readCurrent(), {
+          kind: "current",
+          state: "present",
+        });
+      }
+      let current = readCurrent();
+      if (current === undefined) {
+        return protectCurrent(undefined, {
+          kind: "current",
+          state: "present",
+        });
       }
 
       let readable: ResolvedReadableTree | undefined;
       try {
-        readable = await runtime.resolveReadableTreeIn(view, node);
+        readable = await runtime.resolveReadableTreeIn(current, node);
       } catch {
-        return protectCurrent();
+        return protectCurrent(readCurrent(), {
+          kind: "current",
+          state: "present",
+        });
+      }
+      current = readCurrent();
+      if (current === undefined) {
+        return protectCurrent(undefined, {
+          kind: "current",
+          state: "present",
+        });
       }
       if (readable === undefined) {
-        if (
-          runtime.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
-        ) {
-          return protectCurrent(undefined, true);
+        if (runtime.checkpoints.locationIsBlocked(node)) {
+          return protectCurrent(current, {
+            kind: "current",
+            state: "missing",
+          });
         }
-        const current = stillCurrent();
         if (
-          current !== undefined &&
-          runtime.resolutionStillAuthoritative(current, node, undefined) &&
-          runtime.admitLocation(current)
+          runtime.workspaceMutations.locationIsUnresolved(current, node) &&
+          runtime.workspaceMutations.admitCurrentLocation(current)
         ) {
           return SESSION_RECONCILED;
         }
-        return protectCurrent(undefined, true);
+        return protectCurrent(current, {
+          kind: "current",
+          state: "missing",
+        });
       }
 
       let snapshot: WorkspaceSnapshot;
@@ -550,40 +849,77 @@ async function reconcileReloadedSession(
           readable.manifest.scope,
         );
       } catch {
-        return protectCurrent(readable.resolution);
+        return protectCurrent(readCurrent(), {
+          kind: "exact-resolution",
+          resolution: readable.resolution,
+        });
       }
       if (snapshot.problems.length > 0) {
-        return protectCurrent(readable.resolution);
+        return protectCurrent(readCurrent(), {
+          kind: "exact-resolution",
+          resolution: readable.resolution,
+        });
       }
       let drift: WorkspaceRestorePlan;
       try {
         drift = (await prepareWorkspaceRestorePlan(snapshot, readable.manifest))
           .plan;
       } catch {
-        return protectCurrent(readable.resolution);
+        return protectCurrent(readCurrent(), {
+          kind: "exact-resolution",
+          resolution: readable.resolution,
+        });
       }
-      const current = stillCurrent();
-      if (current === undefined) return protectCurrent(readable.resolution);
-      const authoritative = runtime.resolutionStillAuthoritative(
-        current,
-        node,
-        readable.resolution,
-      );
+      current = readCurrent();
+      if (current === undefined) {
+        return protectCurrent(undefined, {
+          kind: "exact-resolution",
+          resolution: readable.resolution,
+        });
+      }
+      const authoritative =
+        runtime.workspaceMutations.resolutionStillAuthoritative(
+          current,
+          node,
+          readable.resolution,
+        );
       if (
         drift.problems.length === 0 &&
         !restorePlanHasChanges(drift) &&
         authoritative &&
-        runtime.admitLocation(current, readable.resolution.treeOid)
+        runtime.workspaceMutations.admitLocationIfResolution(
+          current,
+          readable.resolution,
+        )
       ) {
         return SESSION_RECONCILED;
       }
-      return protectCurrent(authoritative ? readable.resolution : undefined);
+      return protectCurrent(
+        current,
+        authoritative
+          ? {
+              kind: "exact-resolution",
+              resolution: readable.resolution,
+            }
+          : { kind: "current", state: "present" },
+      );
     })
-    .catch((error: unknown) => {
-      runtime.quarantineAdmission();
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-      return SESSION_RECONCILED;
-    });
+    .then(async (execution) => {
+      const result =
+        execution.kind === "completed"
+          ? execution.value
+          : await recoverReloadFailure(execution.cause);
+      notifyWorkspaceLockCleanupFailure(
+        runtime,
+        context,
+        execution.cleanup.kind === "failed"
+          ? { kind: "failed", cause: execution.cleanup.cause }
+          : { kind: "settled" },
+      );
+      return result;
+    })
+    // Acquisition is the only failure without an execution receipt.
+    .catch(recoverReloadFailure);
   if (reconciliation === RELOAD_PROTECTED_MISSING) {
     runtime.notify(
       context,
@@ -592,16 +928,19 @@ async function reconcileReloadedSession(
     );
   } else if (reconciliation === RELOAD_PROTECTED) {
     runtime.notify(context, runtime.i18n.t("reloadProtected"), "warning");
-  } else if (reconciliation === SESSION_PENDING_NODE_GUARD) {
-    return SESSION_PENDING_NODE_GUARD;
+  } else if (reconciliation === SESSION_CAPTURE_BARRIER) {
+    return SESSION_CAPTURE_BARRIER;
   }
   return SESSION_RECONCILED;
 }
 
-function blockedBashResult(message: string) {
+function blockedBashResult(runtime: CyclotomyRuntime, render: () => string) {
   return {
     result: {
-      output: message,
+      output: runtime.renderBestEffort(
+        render,
+        "Cyclotomy blocked user bash because its safety diagnostic could not be rendered.",
+      ),
       exitCode: 1,
       cancelled: false,
       truncated: false,
@@ -609,500 +948,705 @@ function blockedBashResult(message: string) {
   } as const;
 }
 
-/** Register the complete single-state lifecycle. */
+/** Register the complete checkpoint lifecycle. */
 export function registerCyclotomyLifecycle(
   pi: ExtensionAPI,
   runtime: CyclotomyRuntime,
 ): void {
+  const views = new SessionViewTracker();
   let automaticGcFailureNotified = false;
   const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
     try {
-      await runtime.maybeRunAutomaticGc();
+      const execution = await runtime.maybeRunAutomaticGc();
+      notifyWorkspaceLockCleanupFailure(
+        runtime,
+        context,
+        execution.cleanup.kind === "failed"
+          ? { kind: "failed", cause: execution.cleanup.cause }
+          : { kind: "settled" },
+      );
+      if (execution.kind === "action-failed") throw execution.cause;
       automaticGcFailureNotified = false;
     } catch (error) {
       if (automaticGcFailureNotified) return;
       automaticGcFailureNotified = true;
-      runtime.notify(
+      runtime.notifyBestEffort(
         context,
-        runtime.i18n.t("automaticGcFailed", { message: messageOf(error) }),
+        () =>
+          runtime.i18n.t("automaticGcFailed", { message: messageOf(error) }),
         "warning",
       );
     }
   };
 
-  pi.on("session_start", async (event, context) => {
-    runtime.beginSessionRegistration();
-    const view = readSessionView(context);
-    if (view.sessionFile === null) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("memorySessionUnsupported"),
-        "warning",
-      );
-      return;
-    }
-    if (!(await runtime.ensureStore(view.cwd))) {
-      runtime.notifyInitFailure(context);
-      return;
-    }
-    const registered = await runtime
-      .enqueueWorkspace("session-register", async () => {
-        runtime.metadata.touchSession(view.sessionId, view.sessionFile!);
-        runtime.importForkAncestry(view);
-        return true;
-      })
-      .catch((error: unknown) => {
-        runtime.notify(
-          context,
-          runtime.i18n.t(
-            view.parentSessionFile === null
-              ? "sessionRegistrationFailed"
-              : "forkImportFailed",
-            { message: messageOf(error) },
-          ),
-          "warning",
-        );
-        return false;
-      });
-    if (!registered) return;
-    runtime.completeSessionRegistration(view);
-    try {
-      runtime.beginAdmission(view);
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-      return;
-    }
+  const recoverNonCancellableFailure = async (
+    context: ExtensionContext,
+  ): Promise<void> => {
+    const recovery =
+      await runtime.workspaceMutations.recoverUncertainLocation(context);
+    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      recovery.workspaceLockCleanup,
+    );
+  };
 
-    const reconciliation =
-      event.reason === "reload"
-        ? await reconcileReloadedSession(runtime, context, view)
-        : await reconcileLoadedSession(runtime, context, view);
-    if (reconciliation === SESSION_PENDING_NODE_GUARD) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("sessionPendingNodeGuard"),
-        "warning",
-      );
-    }
-    await runAutomaticGc(context);
+  const host = new PiHostAdapter({
+    activation: () => runtime.activation,
+    reportFailure: async (failure, context) => {
+      const cancellable =
+        failure.event.type === "input" ||
+        failure.event.type === "user_bash" ||
+        failure.event.type === "tool_call" ||
+        failure.event.type.startsWith("session_before_");
+      if (
+        failure.stage === "handler" &&
+        !cancellable &&
+        runtime.activation.kind === "active"
+      ) {
+        await recoverNonCancellableFailure(context);
+      }
+      runtime.notifyCaptureResult(context, false, messageOf(failure.cause));
+    },
   });
 
-  // A custom trigger can bypass the cancellable input hook and persist its
-  // first concrete message before Pi builds provider context. Consume a
-  // pending session-level guard at that earliest post-persistence hook. The
-  // durable flag remains authoritative if the process stops before this event.
-  pi.on("context", async (_event, context) => {
-    let view: SessionView;
+  pi.on("session_start", async (event, context) => {
+    runtime.markSessionUnavailable(
+      new Error("Pi session registration is in progress"),
+    );
     try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return;
-      const node = runtime.captureAnchor(view);
-      if (node === undefined || runtime.pendingNodeGuard(view) !== true) return;
-      if (!(await runtime.ensureStore(view.cwd))) {
+      let startPolicy: SessionStartPolicy;
+      try {
+        startPolicy = sessionStartPolicy(event.reason);
+      } catch (error) {
+        runtime.markSessionUnavailable(error);
+        runtime.notifyBestEffort(
+          context,
+          () =>
+            runtime.i18n.t("sessionRegistrationFailed", {
+              message: messageOf(error),
+            }),
+          "warning",
+        );
+        return;
+      }
+      let view: SessionView;
+      try {
+        view = views.bootstrap(context);
+      } catch (error) {
+        runtime.markSessionUnavailable(error);
+        runtime.notifyBestEffort(
+          context,
+          () =>
+            runtime.i18n.t("sessionRegistrationFailed", {
+              message: messageOf(error),
+            }),
+          "warning",
+        );
+        return;
+      }
+      if (view.sessionFile === null) {
+        runtime.markSessionIntentionallyInactive();
+        runtime.notifyBestEffort(
+          context,
+          () => runtime.i18n.t("memorySessionUnsupported"),
+          "warning",
+        );
+        return;
+      }
+      if (!(await runtime.registrations.sessionOwnsCurrentWorkspace(view))) {
+        runtime.markSessionIntentionallyInactive();
+        runtime.notifyBestEffort(
+          context,
+          () => runtime.i18n.t("sessionWorkspaceMismatch"),
+          "warning",
+        );
+        return;
+      }
+      const preparation = await runtime.registrations
+        .prepare(
+          view,
+          startPolicy.registration === "fork"
+            ? {
+                kind: "fork",
+                ...(event.previousSessionFile === undefined
+                  ? {}
+                  : { previousSessionFile: event.previousSessionFile }),
+              }
+            : { kind: "independent" },
+        )
+        .catch((error: unknown) => {
+          runtime.markSessionUnavailable(error);
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t("sessionRegistrationFailed", {
+                message: messageOf(error),
+              }),
+            "warning",
+          );
+          return undefined;
+        });
+      if (preparation === undefined) return;
+      if (!(await runtime.ensureRegistrationStore(view.cwd, preparation))) {
+        runtime.markSessionUnavailable(
+          new Error("Cyclotomy workspace initialization failed"),
+        );
         runtime.notifyInitFailure(context);
         return;
       }
-      await runtime.enqueueWorkspace("protect-pending-node", async () => {
-        const current = readSessionView(context);
-        const currentNode = runtime.captureAnchor(current);
-        if (
-          !runtime.sessionIsUsable(current) ||
-          runtime.pendingNodeGuard(current) !== true ||
-          current.sessionId !== view.sessionId ||
-          current.sessionFile !== view.sessionFile ||
-          current.cwd !== view.cwd ||
-          current.leafId !== view.leafId ||
-          currentNode?.sessionId !== node.sessionId ||
-          currentNode.entryId !== node.entryId
-        ) {
-          return;
-        }
-        runtime.captureAdmission(current, currentNode);
-        if (
-          !runtime.metadata.isNodeWriteProtected(
-            currentNode.sessionId,
-            currentNode.entryId,
-          )
-        ) {
-          throw new Error("pending checkpoint guard was not installed");
-        }
-      });
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-    }
-  });
-
-  pi.on("turn_end", async (_event, context) => {
-    let view: SessionView;
-    let node: NodeKey | undefined;
-    try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return;
-      node = runtime.captureAnchor(view);
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-      return;
-    }
-    if (node === undefined) return;
-    if (!(await runtime.ensureStore(view.cwd))) {
-      runtime.notifyInitFailure(context);
-      return;
-    }
-    const result = await runtime
-      .enqueueWorkspace("capture-turn", async () => {
-        if (!registeredSessionStillAt(runtime, context, view)) {
-          return {
-            kind: "failed" as const,
-            message: "active location changed before turn capture",
-          };
-        }
-        const admission = runtime.captureAdmission(view, node);
-        if (admission.kind === "protected") return admission;
-        if (admission.kind !== "capture") {
-          return {
-            kind: "failed" as const,
-            message: "turn location is not admitted for checkpointing",
-          };
-        }
-        const expectedTreeOid = runtime.metadata.getState(
-          node.sessionId,
-          node.entryId,
-        )?.treeOid;
-        const prepared = await runtime.prepareCaptureResult(view);
-        if (!prepared.ok) {
-          return {
-            kind: "failed" as const,
-            message: prepared.error.message,
-          };
-        }
-        const current = readSessionView(context);
-        if (
-          !(await runtime.workspaceStillBound(view.cwd)) ||
-          !registeredSessionStillAt(runtime, context, view) ||
-          !runtime.captureLeaseIsCurrent(admission.lease, current, node)
-        ) {
-          return {
-            kind: "failed" as const,
-            message: "active location changed during turn capture",
-          };
-        }
-        const committed = runtime.commitPreparedCapture({
-          source: node,
-          prepared: prepared.value,
-          expectedTreeOid,
+      const registration = await runtime.registrations
+        .register(view, () => readSessionView(context), preparation)
+        .catch((error: unknown) => {
+          runtime.markSessionUnavailable(error);
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t(
+                view.parentSession.kind === "absent"
+                  ? "sessionRegistrationFailed"
+                  : "forkImportFailed",
+                { message: messageOf(error) },
+              ),
+            "warning",
+          );
+          return undefined;
         });
-        if (!committed.ok) {
-          if (committed.error.kind === "write-protected") {
-            runtime.protectNode(view, node);
-            return { kind: "protected" as const };
-          }
-          return {
-            kind: "failed" as const,
-            message: committed.error.message,
-          };
-        }
-        runtime.touchCapturedSession(view);
-        return { kind: "captured" as const };
-      })
-      .catch((error: unknown) => ({
-        kind: "failed" as const,
-        message: messageOf(error),
-      }));
-    if (result.kind === "captured") {
-      runtime.notifyCaptureResult(context, true);
-    } else if (result.kind === "failed") {
-      runtime.notifyCaptureResult(context, false, result.message);
-    }
-    // GC runs only after the turn's authoritative checkpoint is durable. Its
-    // interval gate makes this cheap; failure is hygiene-only and never turns
-    // a successful agent turn into a failed one.
-    await runAutomaticGc(context);
-  });
-
-  // Idle input is the one cancellable point before Pi appends a new user node.
-  // It assigns between-turn manual edits to the source instead of the new turn.
-  pi.on("input", async (event, context) => {
-    try {
-      if (event.streamingBehavior !== undefined || !context.isIdle()) {
-        return { action: "continue" as const };
-      }
-      if (!runtime.transitions.tryBegin("input")) {
-        runtime.notify(
+      if (registration === undefined) return;
+      if (registration.kind === "durable-but-inactive") {
+        runtime.markSessionUnavailable(registration.cause);
+        runtime.notifyBestEffort(
           context,
-          runtime.i18n.t("transitionInProgress"),
+          () =>
+            runtime.i18n.t("sessionRegistrationFailed", {
+              message: messageOf(registration.cause),
+            }),
+          "error",
+        );
+        return;
+      }
+      runtime.markSessionActive();
+      if (registration.advisory !== undefined) {
+        notifyWorkspaceLockCleanupFailure(runtime, context, {
+          kind: "failed",
+          cause: registration.advisory.cause,
+        });
+      }
+
+      const reconciliation =
+        startPolicy.reconciliation === "reloaded"
+          ? await reconcileReloadedSession(runtime, views, context, view)
+          : await reconcileLoadedSession(runtime, views, context, view);
+      const disposition = registration.disposition;
+      if (disposition.kind === "quarantined") {
+        runtime.notifyBestEffort(
+          context,
+          () =>
+            runtime.i18n.t("forkInheritanceSkipped", {
+              message: messageOf(disposition.rejection.cause),
+            }),
           "warning",
         );
-        return { action: "handled" as const };
       }
+      if (reconciliation === SESSION_CAPTURE_BARRIER) {
+        runtime.notifyBestEffort(
+          context,
+          () => runtime.i18n.t("sessionCaptureBarrier"),
+          "warning",
+        );
+      }
+      await runAutomaticGc(context);
+    } catch (error) {
+      if (runtime.activation.kind === "active") {
+        await recoverNonCancellableFailure(context);
+      } else {
+        runtime.markSessionUnavailable(error);
+      }
+      runtime.notifyBestEffort(
+        context,
+        () =>
+          runtime.i18n.t("sessionRegistrationFailed", {
+            message: messageOf(error),
+          }),
+        "error",
+      );
+    }
+  });
+
+  // Any public lifecycle observation with a complete concrete ancestry may
+  // project a durable session barrier onto exact slots. No event ordering or
+  // persistence timing is inferred here; the observed graph is the authority.
+  pi.on(
+    "context",
+    host.observe<ContextEvent>(async (_event, context) => {
+      let view: SessionView;
       try {
-        const view = readSessionView(context);
-        if (!runtime.sessionIsUsable(view)) {
-          return { action: "continue" as const };
-        }
+        view = views.observe(context);
+        runtime.assertSessionUsable(view);
+        const node = runtime.checkpoints.captureAnchor(view);
+        if (
+          node === undefined ||
+          runtime.workspaceMutations.sessionHasBarrier(view) !== true
+        )
+          return;
         if (!(await runtime.ensureStore(view.cwd))) {
           runtime.notifyInitFailure(context);
+          return;
+        }
+        const execution = await runtime.enqueueWorkspaceExecution(
+          "project-session-capture-barrier",
+          async () => {
+            const current = readExactRegisteredView(
+              runtime,
+              views,
+              context,
+              view,
+            );
+            if (current === undefined) return;
+            const currentNode = runtime.checkpoints.captureAnchor(current);
+            if (
+              runtime.workspaceMutations.sessionHasBarrier(current) !== true ||
+              currentNode?.sessionId !== node.sessionId ||
+              currentNode.entryId !== node.entryId
+            ) {
+              return;
+            }
+            runtime.workspaceMutations.captureAdmission(current, currentNode);
+            if (!runtime.checkpoints.locationIsBlocked(currentNode)) {
+              throw new Error(
+                "session capture barrier was not projected onto the current location",
+              );
+            }
+          },
+        );
+        notifyWorkspaceLockCleanupFailure(
+          runtime,
+          context,
+          execution.cleanup.kind === "failed"
+            ? { kind: "failed", cause: execution.cleanup.cause }
+            : { kind: "settled" },
+        );
+        if (execution.kind === "action-failed") throw execution.cause;
+      } catch (error) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyCaptureResult(context, false, messageOf(error));
+      }
+    }),
+  );
+
+  pi.on(
+    "turn_end",
+    host.observe<TurnEndEvent>(async (_event, context) => {
+      let view: SessionView;
+      try {
+        view = views.observe(context);
+        runtime.assertSessionUsable(view);
+      } catch (error) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyCaptureResult(context, false, messageOf(error));
+        return;
+      }
+      if (!(await runtime.ensureStore(view.cwd))) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyInitFailure(context);
+        return;
+      }
+      const result = await captureSourceOrCancel(
+        runtime,
+        views,
+        context,
+        view,
+        view.leafId,
+        {
+          subject: "turn",
+          operation: "capture-turn",
+          announceFailure: false,
+        },
+      );
+      if (result.kind === "captured") {
+        runtime.notifyCaptureResult(context, true);
+      } else if (result.kind === "failed") {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyCaptureResult(
+          context,
+          false,
+          runtime.renderBestEffort(
+            () => formatSourceCaptureFailure(runtime, result.failure),
+            "checkpoint failure details could not be rendered",
+          ),
+        );
+      }
+      // GC runs only after the turn's authoritative checkpoint is durable. Its
+      // interval gate makes this cheap; failure is hygiene-only and never turns
+      // a successful agent turn into a failed one.
+      await runAutomaticGc(context);
+    }),
+  );
+
+  // Interactive input is a cancellable public boundary. Capture its currently
+  // exposed source before allowing the host operation to continue.
+  pi.on(
+    "input",
+    host.guard<InputEvent>({
+      pass: { action: "continue" },
+      block: { action: "handled" },
+      active: async (event, context) => {
+        try {
+          const boundaryView = views.observe(context);
+          runtime.assertSessionUsable(boundaryView);
+          if (event.streamingBehavior !== undefined || !context.isIdle()) {
+            return { action: "continue" as const };
+          }
+          const preparation = await runtime.admission.runPreparation(
+            async () => {
+              const view = views.observe(context);
+              runtime.assertSessionUsable(view);
+              if (!(await runtime.ensureStore(view.cwd))) {
+                runtime.notifyInitFailure(context);
+                return { action: "handled" as const };
+              }
+              const capture = await captureSourceOrCancel(
+                runtime,
+                views,
+                context,
+                view,
+                view.leafId,
+              );
+              if (capture.kind !== "failed") {
+                return { action: "continue" as const };
+              }
+              runtime.notify(
+                context,
+                runtime.i18n.t("inputCaptureFailed"),
+                "error",
+              );
+              return { action: "handled" as const };
+            },
+          );
+          if (preparation.kind !== "completed") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { action: "handled" as const };
+          }
+          return preparation.value;
+        } catch (error) {
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              withDetail(
+                runtime.i18n.t("inputCaptureFailed"),
+                runtime.i18n.t("captureFailureDetail", {
+                  message: messageOf(error),
+                }),
+              ),
+            "error",
+          );
           return { action: "handled" as const };
+        }
+      },
+    }),
+  );
+
+  // A custom message can bypass the cancellable input hook. Capture only the
+  // location exposed by Pi at this public observation; whether the host has
+  // already appended the message is deliberately irrelevant.
+  pi.on(
+    "message_end",
+    host.observe<MessageEndEvent>(async (event, context) => {
+      let view: SessionView;
+      try {
+        if (!messageEndNeedsSourceCapture(event.message.role)) return;
+        view = views.observe(context);
+        runtime.assertSessionUsable(view);
+      } catch (error) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyCaptureResult(context, false, messageOf(error));
+        return;
+      }
+      if (!(await runtime.ensureStore(view.cwd))) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyInitFailure(context);
+        return;
+      }
+      const capture = await captureSourceOrCancel(
+        runtime,
+        views,
+        context,
+        view,
+        view.leafId,
+      );
+      if (capture.kind === "failed") {
+        await recoverNonCancellableFailure(context);
+      }
+    }),
+  );
+
+  pi.on(
+    "user_bash",
+    host.guard<UserBashEvent>({
+      pass: undefined,
+      block: blockedBashResult(runtime, () =>
+        runtime.i18n.t("sessionIdentityUnavailable"),
+      ),
+      active: async (_event, context) => {
+        try {
+          const view = views.observe(context);
+          runtime.assertSessionUsable(view);
+          if (!context.isIdle()) {
+            return blockedBashResult(runtime, () =>
+              runtime.i18n.t("bashWhileBusy"),
+            );
+          }
+          const hadConflict = runtime.admission.rejectTransitionConflict();
+          if (!(await runtime.ensureStore(view.cwd))) {
+            runtime.notifyInitFailure(context);
+            return blockedBashResult(runtime, () =>
+              runtime.i18n.t("initFailure"),
+            );
+          }
+          const capture = await captureSourceOrCancel(
+            runtime,
+            views,
+            context,
+            view,
+            view.leafId,
+          );
+          if (capture.kind === "failed") {
+            await recoverNonCancellableFailure(context);
+            return blockedBashResult(runtime, () =>
+              runtime.i18n.t("sourceCaptureFailed"),
+            );
+          }
+          if (!hadConflict) return undefined;
+          return blockedBashResult(runtime, () =>
+            runtime.i18n.t("bashWhileBusy"),
+          );
+        } catch (error) {
+          await recoverNonCancellableFailure(context);
+          runtime.notifyCaptureResult(context, false, messageOf(error));
+          return blockedBashResult(runtime, () =>
+            runtime.i18n.t("sourceCaptureFailed"),
+          );
+        }
+      },
+    }),
+  );
+
+  pi.on(
+    "session_before_compact",
+    host.guard<SessionBeforeCompactEvent>({
+      pass: undefined,
+      block: { cancel: true },
+      active: async (_event, context) => {
+        try {
+          const view = views.observe(context);
+          runtime.assertSessionUsable(view);
+          const preparation = await runtime.admission.runPreparation(
+            async () => {
+              if (!(await runtime.ensureStore(view.cwd))) {
+                runtime.notifyInitFailure(context);
+                return { cancel: true } as const;
+              }
+              const capture = await captureSourceOrCancel(
+                runtime,
+                views,
+                context,
+                view,
+                view.leafId,
+              );
+              if (capture.kind === "failed") return { cancel: true } as const;
+              // Automatic threshold/overflow compaction is itself part of an active
+              // agent run, so Pi's public `isIdle()` is expected to be false here.
+              // The cancellable compaction event plus the exact public snapshot and
+              // capture lease are the authority boundary; `isIdle` is not a host
+              // transition mutex.
+              if (
+                readExactRegisteredView(runtime, views, context, view) ===
+                undefined
+              ) {
+                return { cancel: true } as const;
+              }
+              return undefined;
+            },
+          );
+          if (preparation.kind !== "completed") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { cancel: true };
+          }
+          return preparation.value;
+        } catch (error) {
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t("navigationPrepareFailed", {
+                message: messageOf(error),
+              }),
+            "warning",
+          );
+          return { cancel: true };
+        }
+      },
+    }),
+  );
+
+  pi.on(
+    "session_compact",
+    host.observe<SessionCompactEvent>(async (_event, context) => {
+      try {
+        const view = views.observe(context);
+        runtime.assertSessionUsable(view);
+        if (!(await runtime.ensureStore(view.cwd))) {
+          await recoverNonCancellableFailure(context);
+          runtime.notifyInitFailure(context);
+          return;
         }
         const capture = await captureSourceOrCancel(
           runtime,
+          views,
           context,
           view,
           view.leafId,
         );
-        if (capture.kind !== "failed" && context.isIdle()) {
-          return { action: "continue" as const };
+        if (capture.kind === "failed") {
+          await recoverNonCancellableFailure(context);
         }
-        runtime.notify(context, runtime.i18n.t("inputCaptureFailed"), "error");
-        return { action: "handled" as const };
-      } finally {
-        runtime.transitions.finish("input");
+      } catch (error) {
+        await recoverNonCancellableFailure(context);
+        runtime.notifyCaptureResult(context, false, messageOf(error));
       }
-    } catch (error) {
-      runtime.notify(
-        context,
-        withDetail(
-          runtime.i18n.t("inputCaptureFailed"),
-          runtime.i18n.t("captureFailureDetail", {
-            message: messageOf(error),
-          }),
-        ),
-        "error",
-      );
-      return { action: "handled" as const };
-    }
-  });
+    }),
+  );
 
-  // sendMessage({ triggerTurn: true }) bypasses input when Pi is idle. A
-  // custom message_end is the last observable hook before Pi persists that
-  // leaf. Capture the currently active node there. Earlier/later handlers may
-  // change which exact bytes are observed, but no post-append state is ever
-  // written backward to the parent.
-  pi.on("message_end", async (event, context) => {
-    if (event.message.role !== "custom") return;
-    let view: SessionView;
-    try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return;
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-      return;
-    }
-    if (!(await runtime.ensureStore(view.cwd))) {
-      runtime.notifyInitFailure(context);
-      return;
-    }
-    await captureSourceOrCancel(runtime, context, view, view.leafId);
-  });
+  registerNavigationLifecycle(pi, runtime, views, host);
+  pi.on(
+    "session_before_fork",
+    host.guard<SessionBeforeForkEvent>({
+      pass: undefined,
+      block: { cancel: true },
+      active: async (_event, context) => {
+        try {
+          const view = views.observe(context);
+          runtime.assertSessionUsable(view);
+          if (!context.isIdle()) {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { cancel: true };
+          }
+          const preparation = await runtime.admission.runPreparation(
+            async () => {
+              if (!(await runtime.ensureStore(view.cwd))) {
+                runtime.notifyInitFailure(context);
+                return { cancel: true } as const;
+              }
+              const capture = await captureSourceOrCancel(
+                runtime,
+                views,
+                context,
+                view,
+                view.leafId,
+              );
+              if (capture.kind === "failed") return { cancel: true } as const;
+              return undefined;
+            },
+          );
+          if (preparation.kind !== "completed") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { cancel: true };
+          }
+          return preparation.value;
+        } catch (error) {
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t("navigationPrepareFailed", {
+                message: messageOf(error),
+              }),
+            "warning",
+          );
+          return { cancel: true };
+        }
+      },
+    }),
+  );
 
-  pi.on("user_bash", async (_event, context) => {
-    try {
-      const view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return undefined;
-      if (!context.isIdle()) {
-        return blockedBashResult(runtime.i18n.t("bashWhileBusy"));
-      }
-      // Pi persists an extension-provided failure as a bash-result leaf. Even
-      // when this call merely retires an orphaned transition, source must be
-      // captured before returning that failure or the leaf movement would
-      // strand the current workspace on the old node.
-      const hadConflict = runtime.transitions.rejectConflict();
-      if (!(await runtime.ensureStore(view.cwd))) {
-        runtime.notifyInitFailure(context);
-        return blockedBashResult(runtime.i18n.t("initFailure"));
-      }
-      const capture = await captureSourceOrCancel(
-        runtime,
-        context,
-        view,
-        view.leafId,
-      );
-      if (capture.kind === "failed" || !context.isIdle()) {
-        return blockedBashResult(runtime.i18n.t("sourceCaptureFailed"));
-      }
-      if (!hadConflict) return undefined;
-      return blockedBashResult(runtime.i18n.t("bashWhileBusy"));
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-      return blockedBashResult(runtime.i18n.t("sourceCaptureFailed"));
-    }
-  });
-
-  pi.on("session_before_compact", async (_event, context) => {
-    let view: SessionView;
-    try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return undefined;
-      if (!runtime.transitions.tryBegin("compaction")) {
-        runtime.notify(
-          context,
-          runtime.i18n.t("transitionInProgress"),
-          "warning",
-        );
-        return { cancel: true };
-      }
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    }
-    try {
-      if (!(await runtime.ensureStore(view.cwd))) {
-        runtime.notifyInitFailure(context);
-        return { cancel: true };
-      }
-      const capture = await captureSourceOrCancel(
-        runtime,
-        context,
-        view,
-        view.leafId,
-      );
-      if (capture.kind === "failed") return { cancel: true };
-      return undefined;
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    } finally {
-      runtime.transitions.finish("compaction");
-    }
-  });
-
-  pi.on("session_compact", async (_event, context) => {
-    try {
-      const view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return;
-      if (!(await runtime.ensureStore(view.cwd))) {
-        runtime.notifyInitFailure(context);
-        return;
-      }
-      await captureSourceOrCancel(runtime, context, view, view.leafId);
-    } catch (error) {
-      runtime.notifyCaptureResult(context, false, messageOf(error));
-    }
-  });
-
-  registerNavigationLifecycle(pi, runtime);
-  pi.on("session_before_fork", async (_event, context) => {
-    let view: SessionView;
-    try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return undefined;
-      if (!context.isIdle() || !runtime.transitions.tryBegin("fork")) {
-        runtime.notify(
-          context,
-          runtime.i18n.t("transitionInProgress"),
-          "warning",
-        );
-        return { cancel: true };
-      }
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    }
-    try {
-      if (!(await runtime.ensureStore(view.cwd))) {
-        runtime.notifyInitFailure(context);
-        return { cancel: true };
-      }
-      const capture = await captureSourceOrCancel(
-        runtime,
-        context,
-        view,
-        view.leafId,
-      );
-      if (capture.kind === "failed") return { cancel: true };
-      if (
-        !context.isIdle() ||
-        !stillAt(context, view.sessionId, view.leafId, view.cwd)
-      ) {
-        return { cancel: true };
-      }
-      return undefined;
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    } finally {
-      runtime.transitions.finish("fork");
-    }
-  });
-
-  pi.on("session_before_switch", async (_event, context) => {
-    let view: SessionView;
-    try {
-      view = readSessionView(context);
-      if (!runtime.sessionIsUsable(view)) return undefined;
-      if (!context.isIdle() || !runtime.transitions.tryBegin("switch")) {
-        runtime.notify(
-          context,
-          runtime.i18n.t("transitionInProgress"),
-          "warning",
-        );
-        return { cancel: true };
-      }
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    }
-    try {
-      if (!(await runtime.ensureStore(view.cwd))) {
-        runtime.notifyInitFailure(context);
-        return { cancel: true };
-      }
-      const capture = await captureSourceOrCancel(
-        runtime,
-        context,
-        view,
-        view.leafId,
-      );
-      if (capture.kind === "failed") return { cancel: true };
-      if (
-        !context.isIdle() ||
-        !stillAt(context, view.sessionId, view.leafId, view.cwd)
-      ) {
-        return { cancel: true };
-      }
-      return undefined;
-    } catch (error) {
-      runtime.notify(
-        context,
-        runtime.i18n.t("navigationPrepareFailed", {
-          message: messageOf(error),
-        }),
-        "warning",
-      );
-      return { cancel: true };
-    } finally {
-      runtime.transitions.finish("switch");
-    }
-  });
+  pi.on(
+    "session_before_switch",
+    host.guard<SessionBeforeSwitchEvent>({
+      pass: undefined,
+      block: { cancel: true },
+      active: async (_event, context) => {
+        try {
+          const view = views.observe(context);
+          runtime.assertSessionUsable(view);
+          if (!context.isIdle()) {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { cancel: true };
+          }
+          const preparation = await runtime.admission.runPreparation(
+            async () => {
+              if (!(await runtime.ensureStore(view.cwd))) {
+                runtime.notifyInitFailure(context);
+                return { cancel: true } as const;
+              }
+              const capture = await captureSourceOrCancel(
+                runtime,
+                views,
+                context,
+                view,
+                view.leafId,
+              );
+              if (capture.kind === "failed") return { cancel: true } as const;
+              if (
+                readExactRegisteredView(runtime, views, context, view) ===
+                undefined
+              ) {
+                return { cancel: true } as const;
+              }
+              return undefined;
+            },
+          );
+          if (preparation.kind !== "completed") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("transitionInProgress"),
+              "warning",
+            );
+            return { cancel: true };
+          }
+          return preparation.value;
+        } catch (error) {
+          runtime.notifyBestEffort(
+            context,
+            () =>
+              runtime.i18n.t("navigationPrepareFailed", {
+                message: messageOf(error),
+              }),
+            "warning",
+          );
+          return { cancel: true };
+        }
+      },
+    }),
+  );
 
   pi.on("session_shutdown", () => {
     runtime.close();

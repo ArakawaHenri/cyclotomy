@@ -1,6 +1,10 @@
+import { existsSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
-import { MetadataStore } from "../../src/infrastructure/metadata.ts";
+import {
+  openCurrentMetadataStore,
+  type CurrentMetadataStore,
+} from "../../src/infrastructure/metadata.ts";
 import { commitTestNodeState } from "../metadata-fixture.ts";
 
 interface ChildMessage {
@@ -34,6 +38,35 @@ function waitForStart(): Promise<void> {
   });
 }
 
+const gateWaitCell = new Int32Array(new SharedArrayBuffer(4));
+
+async function openAtSchemaGate(
+  path: string,
+  pausedPath: string,
+  releasePath: string,
+): Promise<CurrentMetadataStore> {
+  const originalExec = DatabaseSync.prototype.exec;
+  let paused = false;
+  DatabaseSync.prototype.exec = function (sql: string): void {
+    if (!paused && /^\s*BEGIN IMMEDIATE\s*;?\s*$/u.test(sql)) {
+      paused = true;
+      writeFileSync(pausedPath, "", { flag: "wx" });
+      while (!existsSync(releasePath)) {
+        Atomics.wait(gateWaitCell, 0, 0, 10);
+      }
+    }
+    originalExec.call(this, sql);
+  };
+  try {
+    return await openCurrentMetadataStore(path, {
+      prepareTreeOidUpgrades: async (roots, _targetFormat) =>
+        new Map(roots.map((treeOid) => [treeOid, treeOid])),
+    });
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+  }
+}
+
 const path = process.argv[2];
 if (path === undefined) {
   throw new Error("metadata path is required");
@@ -43,8 +76,21 @@ if (!Number.isSafeInteger(iterations) || iterations < 1) {
   throw new Error("metadata open iterations must be a positive integer");
 }
 const mode = process.argv[4] ?? "write";
-if (mode !== "write" && mode !== "open-only" && mode !== "legacy-live") {
+const pausedPath = process.argv[5];
+const releasePath = process.argv[6];
+if (
+  mode !== "write" &&
+  mode !== "gated-write" &&
+  mode !== "open-only" &&
+  mode !== "legacy-live"
+) {
   throw new Error(`unsupported metadata child mode: ${mode}`);
+}
+if (
+  mode === "gated-write" &&
+  (pausedPath === undefined || releasePath === undefined)
+) {
+  throw new Error("gated metadata child requires pause and release paths");
 }
 
 try {
@@ -76,11 +122,16 @@ try {
     await waitForStart();
     await send({ type: "opening", pid: process.pid });
     for (let iteration = 0; iteration < iterations; iteration += 1) {
-      const store = new MetadataStore(path);
-      if (mode === "write") {
+      const store = await (mode === "gated-write" && iteration === 0
+        ? openAtSchemaGate(path, pausedPath!, releasePath!)
+        : openCurrentMetadataStore(path, {
+            prepareTreeOidUpgrades: async (roots, _targetFormat) =>
+              new Map(roots.map((treeOid) => [treeOid, treeOid])),
+          }));
+      if (mode === "write" || mode === "gated-write") {
         commitTestNodeState(
           store,
-          "concurrent-open",
+          `concurrent-open-${process.pid}`,
           `${process.pid}-${iteration}`,
           "a".repeat(64),
         );

@@ -21,6 +21,19 @@ export class BlobStagingError extends Error {
   }
 }
 
+/** Preserve a staging failure separately from failure to remove partial bytes. */
+export class BlobStagingCleanupError extends Error {
+  readonly primary: unknown;
+  readonly cleanup: unknown;
+
+  constructor(primary: unknown, cleanup: unknown) {
+    super("restore staging and cleanup both failed", { cause: primary });
+    this.name = "BlobStagingCleanupError";
+    this.primary = primary;
+    this.cleanup = cleanup;
+  }
+}
+
 async function writeStagedFile(
   path: string,
   content: Uint8Array,
@@ -175,7 +188,11 @@ export async function stageBlobs(
       staged.set(oid, { path, observation });
     }
   } catch (error) {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    try {
+      await rm(root, { recursive: true, force: true });
+    } catch (cleanup) {
+      throw new BlobStagingCleanupError(error, cleanup);
+    }
     throw error;
   }
 

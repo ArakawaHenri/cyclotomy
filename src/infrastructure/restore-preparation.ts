@@ -2,7 +2,7 @@ import type { Stats } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import type { TreeManifest } from "./tree-manifest.ts";
+import type { TreeManifest } from "./tree-formats/manifest-codec.ts";
 import {
   planWorkspaceRestore,
   type RestoreScopeBlocker,

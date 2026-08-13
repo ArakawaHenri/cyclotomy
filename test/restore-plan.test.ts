@@ -2,16 +2,18 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  TREE_MANIFEST_FORMAT,
-  type TreeManifest,
-} from "../src/infrastructure/object-store.ts";
+import type { TreeManifest } from "../src/infrastructure/tree-formats/manifest-codec.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   planWorkspaceRestore,
   restorePlanHasChanges,
   workspaceSnapshotAsManifest,
 } from "../src/infrastructure/restore-plan.ts";
 import type { WorkspaceState } from "../src/infrastructure/workspace-scan.ts";
+import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
+  canonicalizeWorkspaceScope,
+} from "../src/infrastructure/workspace-scope.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const oid = (content: string): string =>
@@ -44,7 +46,7 @@ describe("workspace restore plan", () => {
       scope: gitScope({ ignoreCase: true }),
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [],
       scope: gitScope(),
     };
@@ -56,6 +58,33 @@ describe("workspace restore plan", () => {
       detail: expect.stringContaining("target workspace scope"),
     });
     expect(plan.deleted).toEqual([]);
+  });
+
+  it("compares already authenticated scopes against the durable path contract", () => {
+    const repositoryPrefix = Array.from({ length: 257 }, () => "a").join("/");
+    const durableScope = canonicalizeWorkspaceScope(
+      {
+        kind: "git",
+        repositoryPrefix,
+        ignoreCase: false,
+        gitignoreSources: [],
+        infoExcludeBase64: "",
+        globalExcludeBase64: "",
+      },
+      ABSOLUTE_WORKSPACE_PATH_LIMITS,
+    );
+    const current = state({
+      entries: [],
+      problems: [],
+      scope: durableScope,
+    });
+    const target: TreeManifest = {
+      format: CURRENT_TREE_MANIFEST_FORMAT,
+      entries: [],
+      scope: durableScope,
+    };
+
+    expect(planWorkspaceRestore(current, target).problems).toEqual([]);
   });
 
   it("classifies actions and required blobs from the target's point of view", () => {
@@ -80,7 +109,7 @@ describe("workspace restore plan", () => {
       scope,
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: "changed.txt",
@@ -125,7 +154,7 @@ describe("workspace restore plan", () => {
       scope,
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: "run.sh",
@@ -145,7 +174,7 @@ describe("workspace restore plan", () => {
   it("deduplicates and sorts required blobs", () => {
     const blobOid = oid("shared");
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: ["b.txt", "a.txt"].map((path) => ({
         path,
         type: "regular" as const,
@@ -188,7 +217,7 @@ describe("workspace restore plan", () => {
       scope: targetScope,
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: ".gitignore",
@@ -216,7 +245,7 @@ describe("workspace restore plan", () => {
       scope: targetScope,
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: "a",
@@ -284,7 +313,7 @@ describe("workspace restore plan", () => {
       scope,
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: targetEntries,
       scope,
     };

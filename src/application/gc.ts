@@ -1,240 +1,31 @@
-import { lstat } from "node:fs/promises";
-
 import { collectGarbage, type GcReport } from "../infrastructure/object-gc.ts";
-import type {
-  MetadataStore,
-  SessionMetadataRemovalReport,
-} from "../infrastructure/metadata.ts";
-import type { ObjectStore } from "../infrastructure/object-store.ts";
+import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
+import type { NativeObjectStore } from "../infrastructure/object-store.ts";
 
-/** New session metadata is retained for at least a long operator-visible window. */
-export const DEFAULT_SESSION_METADATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-
-export type SessionFileProbe = (
-  sessionFile: string,
-) => Promise<"present" | "missing" | "unknown">;
-
-export interface SessionMetadataGcOptions {
+export interface CyclotomyGcOptions {
   readonly now?: number;
-  readonly retentionMs?: number;
-  /** Test/host seam. `unknown` must preserve metadata conservatively. */
-  readonly probeSessionFile?: SessionFileProbe;
-}
-
-export interface SessionMetadataGcReport extends SessionMetadataRemovalReport {
-  readonly inspectedSessions: number;
-  readonly presentSessions: number;
-  readonly newlyMissingSessions: number;
-  readonly stillMissingSessions: number;
-  readonly unknownSessions: number;
-  readonly staleObservations: number;
-}
-
-export interface CyclotomyGcOptions extends SessionMetadataGcOptions {
   readonly objectGraceMs?: number;
 }
 
-/** Object counts remain separate from session/row metadata counts. */
-export interface CyclotomyGcReport extends GcReport {
-  readonly metadata: SessionMetadataGcReport;
-}
-
-type SessionClassification =
-  "present" | "newly-missing" | "still-missing" | "unknown";
-
-interface SessionInspection {
-  readonly sessionFile: string;
-  classification: SessionClassification | undefined;
-}
-
-function isMissingError(error: unknown): boolean {
-  if (typeof error !== "object" || error === null || !("code" in error)) {
-    return false;
-  }
-  return error.code === "ENOENT" || error.code === "ENOTDIR";
-}
-
-async function defaultProbeSessionFile(
-  sessionFile: string,
-): Promise<"present" | "missing" | "unknown"> {
-  try {
-    // Any existing filesystem entry protects metadata. Pi normally provides a
-    // regular JSONL file, but GC must not turn a type surprise into deletion.
-    await lstat(sessionFile);
-    return "present";
-  } catch (error) {
-    return isMissingError(error) ? "missing" : "unknown";
-  }
-}
-
 /**
- * Observe registered persisted Pi sessions and conservatively prune metadata.
- * Filesystem I/O deliberately lives here rather than in the synchronous
- * SQLite boundary.
- */
-export async function collectSessionMetadataGarbage(
-  metadata: MetadataStore,
-  options: SessionMetadataGcOptions = {},
-): Promise<SessionMetadataGcReport> {
-  const now = options.now ?? Date.now();
-  const retentionMs =
-    options.retentionMs ?? DEFAULT_SESSION_METADATA_RETENTION_MS;
-  const probe = options.probeSessionFile ?? defaultProbeSessionFile;
-  const registered = metadata.listRegisteredSessions();
-  const inspections = new Map<string, SessionInspection>();
-  let staleObservations = 0;
-
-  for (const session of registered) {
-    const inspection: SessionInspection = {
-      sessionFile: session.sessionFile,
-      classification: undefined,
-    };
-    inspections.set(session.sessionId, inspection);
-    const state = await probe(session.sessionFile).catch(
-      (): "unknown" => "unknown",
-    );
-    if (state === "unknown") {
-      inspection.classification = "unknown";
-      continue;
-    }
-    const applied =
-      state === "present"
-        ? metadata.observeSessionPresent(session.sessionId, session.sessionFile)
-        : metadata.observeSessionMissing(
-            session.sessionId,
-            session.sessionFile,
-            now,
-          );
-    if (!applied) {
-      staleObservations += 1;
-      continue;
-    }
-    if (state === "present") {
-      inspection.classification = "present";
-    } else if (session.missingSince === null) {
-      inspection.classification = "newly-missing";
-    } else {
-      inspection.classification = "still-missing";
-    }
-  }
-
-  // Re-probe only rows that are now eligible for destructive pruning. A Pi
-  // resume can recreate its session file after the first lstat but before it
-  // acquires Cyclotomy's workspace lock and touches the registry. Prune each
-  // exact observation synchronously after its final probe instead of leaving a
-  // batch-sized probe-to-delete window.
-  const cutoff = now - retentionMs;
-  let removedSessions = 0;
-  let removedNodeStates = 0;
-  let removedNodeWriteGuards = 0;
-  let removedMetadataRows = 0;
-  for (const session of metadata.listRegisteredSessions()) {
-    const inspection = inspections.get(session.sessionId);
-    // Concurrently added, replaced, or stale rows wait for the next GC cycle.
-    if (
-      inspection === undefined ||
-      inspection.sessionFile !== session.sessionFile ||
-      inspection.classification === undefined ||
-      session.missingSince === null ||
-      session.missingObservedAt === null ||
-      session.missingSince > cutoff ||
-      session.missingObservedAt <= session.missingSince
-    ) {
-      continue;
-    }
-    const state = await probe(session.sessionFile).catch(
-      (): "unknown" => "unknown",
-    );
-    if (state === "missing") {
-      inspection.classification = "still-missing";
-      const pruned = metadata.pruneMissingSession({
-        expectedSessionId: session.sessionId,
-        expectedSessionFile: session.sessionFile,
-        expectedMissingSince: session.missingSince,
-        expectedMissingObservedAt: session.missingObservedAt,
-        now,
-        retentionMs,
-      });
-      removedSessions += pruned.removedSessions;
-      removedNodeStates += pruned.removedNodeStates;
-      removedNodeWriteGuards += pruned.removedNodeWriteGuards;
-      removedMetadataRows += pruned.removedMetadataRows;
-      if (pruned.removedSessions === 0) staleObservations += 1;
-      continue;
-    }
-    if (state === "present") {
-      const applied = metadata.observeSessionPresent(
-        session.sessionId,
-        session.sessionFile,
-      );
-      if (!applied) staleObservations += 1;
-      inspection.classification = "present";
-    } else {
-      inspection.classification = "unknown";
-    }
-  }
-
-  let presentSessions = 0;
-  let newlyMissingSessions = 0;
-  let stillMissingSessions = 0;
-  let unknownSessions = 0;
-  for (const inspection of inspections.values()) {
-    switch (inspection.classification) {
-      case "present":
-        presentSessions += 1;
-        break;
-      case "newly-missing":
-        newlyMissingSessions += 1;
-        break;
-      case "still-missing":
-        stillMissingSessions += 1;
-        break;
-      case "unknown":
-        unknownSessions += 1;
-        break;
-      case undefined:
-        break;
-    }
-  }
-  return {
-    removedSessions,
-    removedNodeStates,
-    removedNodeWriteGuards,
-    removedMetadataRows,
-    inspectedSessions: registered.length,
-    presentSessions,
-    newlyMissingSessions,
-    stillMissingSessions,
-    unknownSessions,
-    staleObservations,
-  };
-}
-
-/**
- * Sweep objects first so an unreadable durable root aborts before metadata is
- * changed. Session cleanup then unroots objects for a later GC cycle; that
- * one-cycle delay is the conservative price of a fail-closed control plane.
+ * Collect only objects that are already unreferenced by durable metadata.
+ *
+ * Pi intentionally permits a live persisted session to have no JSONL file
+ * until its first assistant response. File absence therefore is not a session
+ * lifetime proof and cannot authorize automatic deletion of registrations,
+ * checkpoint slots, or capture barriers. A future metadata-pruning feature
+ * needs an explicit cross-process lifetime authority, not another filesystem
+ * probe.
  */
 export async function collectCyclotomyGarbage(
-  storeRoot: string,
-  store: ObjectStore,
-  metadata: MetadataStore,
+  store: NativeObjectStore,
+  metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
   options: CyclotomyGcOptions = {},
-): Promise<CyclotomyGcReport> {
-  const now = options.now ?? Date.now();
-  const objectReport = await collectGarbage(
-    storeRoot,
-    store,
-    metadata,
-    options.objectGraceMs,
-    now,
-  );
-  const metadataReport = await collectSessionMetadataGarbage(metadata, {
-    now,
-    retentionMs: options.retentionMs ?? DEFAULT_SESSION_METADATA_RETENTION_MS,
-    ...(options.probeSessionFile === undefined
+): Promise<GcReport> {
+  return collectGarbage(store, metadata, {
+    ...(options.objectGraceMs === undefined
       ? {}
-      : { probeSessionFile: options.probeSessionFile }),
+      : { graceMs: options.objectGraceMs }),
+    now: options.now ?? Date.now(),
   });
-  return { ...objectReport, metadata: metadataReport };
 }

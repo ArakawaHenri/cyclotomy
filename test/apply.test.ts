@@ -24,14 +24,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApplyError,
-  applyTreeToWorkspace,
+  applyTreeToWorkspace as applyTreeToWorkspaceWithMutationAuthority,
 } from "../src/infrastructure/apply.ts";
 import {
-  TREE_MANIFEST_FORMAT,
   type FileRecreationMode,
   type TreeEntry,
   type TreeManifest,
-} from "../src/infrastructure/object-store.ts";
+} from "../src/infrastructure/tree-formats/manifest-codec.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   scanWorkspace as scanRealWorkspace,
   scanWorkspaceForScope,
@@ -105,7 +105,7 @@ function snapshot(entries: readonly WorkspaceEntry[]): WorkspaceSnapshot {
 
 function manifest(entries: readonly TreeEntry[]): TreeManifest {
   return {
-    format: TREE_MANIFEST_FORMAT,
+    format: CURRENT_TREE_MANIFEST_FORMAT,
     entries,
     scope: completeScope,
   };
@@ -126,6 +126,22 @@ async function readBlob(oid: string): Promise<Uint8Array> {
     throw new Error(`missing blob: ${oid}`);
   }
   return content;
+}
+
+function applyTreeToWorkspace(
+  workspaceRoot: string,
+  target: TreeManifest,
+  read: (oid: string) => Promise<Uint8Array>,
+  current: WorkspaceSnapshot,
+  beforeFirstMutation: () => void = () => {},
+) {
+  return applyTreeToWorkspaceWithMutationAuthority(
+    workspaceRoot,
+    target,
+    read,
+    current,
+    beforeFirstMutation,
+  );
 }
 
 async function withSimulatedWindows<T>(action: () => Promise<T>): Promise<T> {
@@ -219,6 +235,103 @@ describe("applyTreeToWorkspace", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("crosses mutation authority after asynchronous preflight and rejects every write together", async () => {
+    await writeFile(join(root, "a.txt"), "current a");
+    await writeFile(join(root, "b.txt"), "current b");
+    const current = await scanRealWorkspace(root);
+    const target = manifest([
+      regularTarget("a.txt", "target a"),
+      regularTarget("b.txt", "target b"),
+    ]);
+    let releaseBlobRead: (() => void) | undefined;
+    const blobReadReleased = new Promise<void>((resolve) => {
+      releaseBlobRead = resolve;
+    });
+    let observeBlobRead: (() => void) | undefined;
+    const blobReadObserved = new Promise<void>((resolve) => {
+      observeBlobRead = resolve;
+    });
+    let cutovers = 0;
+
+    const applying = applyTreeToWorkspace(
+      root,
+      target,
+      async (oid) => {
+        observeBlobRead?.();
+        await blobReadReleased;
+        return readBlob(oid);
+      },
+      current,
+      () => {
+        cutovers += 1;
+        throw new Error("authority drifted during apply preflight");
+      },
+    );
+
+    await blobReadObserved;
+    expect(cutovers).toBe(0);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("current a");
+    expect(await readFile(join(root, "b.txt"), "utf8")).toBe("current b");
+    releaseBlobRead?.();
+
+    await expect(applying).rejects.toThrow(
+      "authority drifted during apply preflight",
+    );
+    expect(cutovers).toBe(1);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("current a");
+    expect(await readFile(join(root, "b.txt"), "utf8")).toBe("current b");
+  });
+
+  it("does not cross mutation authority when apply has nothing to change", async () => {
+    await writeFile(join(root, "same.txt"), "same");
+    const current = await scanRealWorkspace(root);
+    let cutovers = 0;
+
+    const report = await applyTreeToWorkspace(
+      root,
+      manifest([regularTarget("same.txt", "same")]),
+      readBlob,
+      current,
+      () => {
+        cutovers += 1;
+      },
+    );
+
+    expect(report).toMatchObject({
+      created: [],
+      updated: [],
+      deleted: [],
+      renamed: [],
+      problems: [],
+    });
+    expect(cutovers).toBe(0);
+  });
+
+  it("crosses mutation authority exactly once for a multi-path apply", async () => {
+    await writeFile(join(root, "a.txt"), "current a");
+    await writeFile(join(root, "b.txt"), "current b");
+    const current = await scanRealWorkspace(root);
+    let cutovers = 0;
+
+    const report = await applyTreeToWorkspace(
+      root,
+      manifest([
+        regularTarget("a.txt", "target a"),
+        regularTarget("b.txt", "target b"),
+      ]),
+      readBlob,
+      current,
+      () => {
+        cutovers += 1;
+      },
+    );
+
+    expect(report.problems).toEqual([]);
+    expect(cutovers).toBe(1);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("target a");
+    expect(await readFile(join(root, "b.txt"), "utf8")).toBe("target b");
+  });
+
   it("refuses to delete an unmanaged descendant for an ancestor type replacement", async () => {
     await mkdir(join(root, "a"));
     await writeFile(join(root, "a", "b"), "secret");
@@ -240,7 +353,7 @@ describe("applyTreeToWorkspace", () => {
       scope: targetScope,
     };
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         regularTarget(".gitignore", "a/b\n"),
         regularTarget("a", "target"),
@@ -304,7 +417,7 @@ describe("applyTreeToWorkspace", () => {
         gitignoreSources: [{ path: ".gitignore", contents: policy }],
       });
       const target: TreeManifest = {
-        format: TREE_MANIFEST_FORMAT,
+        format: CURRENT_TREE_MANIFEST_FORMAT,
         entries: [regularTarget(".gitignore", policy), targetEntry()],
         scope,
       };
@@ -333,7 +446,6 @@ describe("applyTreeToWorkspace", () => {
         );
       }
     },
-    15_000,
   );
 
   it("preflights excluded-occupancy identity drift before every mutation", async () => {
@@ -345,7 +457,7 @@ describe("applyTreeToWorkspace", () => {
       gitignoreSources: [{ path: ".gitignore", contents: policy }],
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         regularTarget(".gitignore", policy),
         regularTarget("p/child", "target child"),
@@ -371,7 +483,7 @@ describe("applyTreeToWorkspace", () => {
       gitignoreSources: [{ path: ".gitignore", contents: policy }],
     });
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         regularTarget(".gitignore", policy),
         regularTarget("p/child", "target child"),
@@ -393,7 +505,7 @@ describe("applyTreeToWorkspace", () => {
     const currentEntry = await seedRegular("keep.txt", "current");
     const current = snapshot([currentEntry]);
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [regularTarget("keep.txt", "target")],
       scope: gitScope({ ignoreCase: true }),
     };
@@ -690,7 +802,7 @@ describe("applyTreeToWorkspace", () => {
     await writeFile(join(root, "hidden", "file.txt"), "unobserved");
     const hiddenDirectory = await lstat(join(root, "hidden"));
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         regularTarget(".gitignore", ""),
         regularTarget("hidden/file.txt", "checkpoint"),
@@ -1649,7 +1761,7 @@ describe("applyTreeToWorkspace", () => {
     const scope = gitScope({ globalExclude: `${spellings.from}\n` });
     const current = await scanWorkspaceForScope(root, scope);
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [regularTarget(spellings.to, "target")],
       scope,
     };
@@ -1683,7 +1795,7 @@ describe("applyTreeToWorkspace", () => {
     });
     const current = await scanWorkspaceForScope(root, scope);
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [regularTarget(`${spellings.to}/child`, "target")],
       scope,
     };
@@ -1995,7 +2107,7 @@ describe("applyTreeToWorkspace", () => {
       const scope = gitScope({ globalExclude: policy });
       const current = await scanWorkspaceForScope(root, scope);
       const target: TreeManifest = {
-        format: TREE_MANIFEST_FORMAT,
+        format: CURRENT_TREE_MANIFEST_FORMAT,
         entries: [targetEntry()],
         scope,
       };
@@ -2017,7 +2129,6 @@ describe("applyTreeToWorkspace", () => {
         await expectRegular("Dir/hidden", "ignored");
       }
     },
-    15_000,
   );
 
   it("returns an excluded directory alias blocker without probing omitted descendants", async () => {
@@ -2028,7 +2139,7 @@ describe("applyTreeToWorkspace", () => {
     const scope = gitScope({ globalExclude: "Dir/\n" });
     const current = await scanWorkspaceForScope(root, scope);
     const target: TreeManifest = {
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [regularTarget("dir/managed", "target")],
       scope,
     };

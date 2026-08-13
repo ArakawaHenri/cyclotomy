@@ -5,6 +5,9 @@ on:
     branches:
       - "**"
   pull_request:
+  schedule:
+    # Exercise the unbounded Pi peer range even when Cyclotomy itself is idle.
+    - cron: "23 5 * * 1"
   workflow_call:
 
 permissions:
@@ -12,6 +15,7 @@ permissions:
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     name: Node 24.15 · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
@@ -48,6 +52,40 @@ jobs:
       - name: Verify installed package loads through Pi
         run: npm run test:package
 
+  minimum-pi:
+    if: github.event_name != 'schedule'
+    name: Minimum Pi 0.84.0 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Replace the host with the minimum supported Pi
+        run: npm install --no-save --package-lock=false --ignore-scripts @earendil-works/pi-coding-agent@0.84.0
+
+      - name: Verify the minimum host version
+        run: test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "0.84.0"
+
+      - name: Type-check against the minimum host
+        run: npm run check
+
+      - name: Run real-Pi integration against the minimum host
+        run: npm run test:real-pi
+
+      - name: Verify the package loads through the minimum host
+        run: npm run test:package
+
   latest-pi:
     # Advisory probe, not a gate. The locked host is already covered by `test`;
     # this job answers whether the newest published Pi still integrates, so an
@@ -56,7 +94,9 @@ jobs:
     if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true
+    # Pull requests get an advisory compatibility signal. The scheduled
+    # canary is intentionally hard-failing so an upstream break is visible.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
 
     steps:
       - name: Check out repository
@@ -71,14 +111,23 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Install the latest published Pi
-        run: npm install --no-save --ignore-scripts @earendil-works/pi-coding-agent@latest
+      - name: Resolve the latest published Pi
+        id: latest
+        shell: bash
+        run: echo "version=$(npm view @earendil-works/pi-coding-agent@latest version)" >> "$GITHUB_OUTPUT"
 
-      - name: Report the resolved host version
-        run: npm ls @earendil-works/pi-coding-agent || true
+      - name: Install the resolved latest Pi
+        run: npm install --no-save --package-lock=false --ignore-scripts @earendil-works/pi-coding-agent@${{ steps.latest.outputs.version }}
+
+      - name: Verify the resolved host version
+        shell: bash
+        run: test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "${{ steps.latest.outputs.version }}"
 
       - name: Type-check against the latest host
         run: npm run check
 
       - name: Probe real-Pi integration
         run: npm run test:real-pi
+
+      - name: Verify the package loads through the latest host
+        run: npm run test:package

@@ -11,6 +11,7 @@ import { openWorkspaceRegularCandidate } from "../src/infrastructure/workspace-f
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
+const CHILD_PROCESS_WATCHDOG_MS = 30_000;
 
 async function scratch(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "cyclotomy-workspace-open-"));
@@ -74,8 +75,8 @@ describe("workspace regular-file candidate opening", () => {
     const result = await execFileAsync(
       process.execPath,
       ["--input-type=module", "--eval", script],
-      { timeout: 8_000 },
+      { timeout: CHILD_PROCESS_WATCHDOG_MS },
     );
     expect(result.stdout).toBe("fifo");
-  }, 15_000);
+  });
 });

@@ -1,5 +1,16 @@
 import { fork, type ChildProcess } from "node:child_process";
-import { link, mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,12 +18,27 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  createCurrentMetadataStore,
+  inspectMetadataSessionIdentity,
   MetadataError,
-  MetadataStore,
+  openAuthenticatedCurrentMetadataStore,
+  openCurrentMetadataStore,
+  type CurrentMetadataStore,
 } from "../src/infrastructure/metadata.ts";
-import { commitTestNodeState } from "./metadata-fixture.ts";
+import { CURRENT_METADATA_VERSION } from "../src/infrastructure/metadata/current.ts";
+import { initializeMetadataVersionWithinTransaction } from "../src/infrastructure/metadata/migration-engine.ts";
+import {
+  checkpointIsBlocked,
+  checkpointState,
+  commitTestNodeState,
+  protectTestLocation,
+  readTestSessionRegistration,
+  readTestSessionRegistrations,
+  registerTestSession,
+} from "./metadata-fixture.ts";
 
 const roots: string[] = [];
+const CHILD_PROCESS_WATCHDOG_MS = 30_000;
 const metadataOpenFixture = fileURLToPath(
   new URL("./fixtures/metadata-open-child.ts", import.meta.url),
 );
@@ -31,6 +57,11 @@ interface MetadataChild {
   readonly stderr: () => string;
 }
 
+interface MetadataOpenGate {
+  readonly pausedPath: string;
+  readonly releasePath: string;
+}
+
 function waitForChildMessage(
   child: ChildProcess,
   expected: "ready" | "opening" | "opened",
@@ -44,7 +75,7 @@ function waitForChildMessage(
           `timed out waiting for metadata child ${expected}\n${stderr()}`,
         ),
       );
-    }, 10_000);
+    }, CHILD_PROCESS_WATCHDOG_MS);
     const cleanup = (): void => {
       clearTimeout(timer);
       child.off("message", onMessage);
@@ -86,12 +117,22 @@ function waitForChildMessage(
 function startMetadataChild(
   path: string,
   iterations = 1,
-  mode: "write" | "open-only" | "legacy-live" = "write",
+  mode: "write" | "gated-write" | "open-only" | "legacy-live" = "write",
+  gate?: MetadataOpenGate,
 ): MetadataChild {
-  const child = fork(metadataOpenFixture, [path, String(iterations), mode], {
-    execArgv: ["--experimental-strip-types", "--no-warnings"],
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
+  const child = fork(
+    metadataOpenFixture,
+    [
+      path,
+      String(iterations),
+      mode,
+      ...(gate === undefined ? [] : [gate.pausedPath, gate.releasePath]),
+    ],
+    {
+      execArgv: ["--experimental-strip-types", "--no-warnings"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    },
+  );
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer | string) => {
     stderr += chunk.toString();
@@ -104,26 +145,76 @@ function startMetadataChild(
   };
 }
 
-function waitForChildExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
+async function waitForGatePause(
+  child: MetadataChild,
+  pausedPath: string,
+): Promise<void> {
+  const deadline = Date.now() + CHILD_PROCESS_WATCHDOG_MS;
+  while (true) {
+    try {
+      await stat(pausedPath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (child.process.exitCode !== null || child.process.signalCode !== null) {
+      throw new Error(
+        `metadata child exited before reaching the schema gate\n${child.stderr()}`,
+      );
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(
+        `timed out waiting for metadata child schema gate\n${child.stderr()}`,
+      );
+    }
+    await new Promise<void>((resolveWait) =>
+      setTimeout(resolveWait, Math.min(10, remaining)),
+    );
+  }
+}
+
+function waitForChildExit(child: MetadataChild): Promise<void> {
+  if (child.process.exitCode !== null || child.process.signalCode !== null) {
     return Promise.resolve();
   }
-  return new Promise<void>((resolveExit) =>
-    child.once("exit", () => {
+  return new Promise<void>((resolveExit, rejectExit) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
       resolveExit();
-    }),
-  );
+    };
+    const timer = setTimeout(() => {
+      child.process.off("exit", onExit);
+      rejectExit(
+        new Error(
+          `timed out waiting for metadata child exit\n${child.stderr()}`,
+        ),
+      );
+    }, CHILD_PROCESS_WATCHDOG_MS);
+    child.process.once("exit", onExit);
+  });
 }
 
 async function createStore(): Promise<{
   root: string;
   path: string;
-  store: MetadataStore;
+  store: CurrentMetadataStore;
 }> {
   const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-"));
   roots.push(root);
   const path = join(root, "state.db");
-  return { root, path, store: new MetadataStore(path) };
+  return { root, path, store: createCurrentMetadataStore(path) };
+}
+
+function openCurrentWithTreeUpgrades(
+  path: string,
+  prepareTreeOidUpgrades: (
+    roots: readonly string[],
+    targetFormat: string,
+  ) => Promise<ReadonlyMap<string, string>> = async (treeOids) =>
+    new Map(treeOids.map((treeOid) => [treeOid, treeOid])),
+): Promise<CurrentMetadataStore> {
+  return openCurrentMetadataStore(path, { prepareTreeOidUpgrades });
 }
 
 /** Reproduce the exact metadata schema published in cyclotomy@0.0.1. */
@@ -152,14 +243,84 @@ function openPublishedV1Metadata(path: string): DatabaseSync {
   return db;
 }
 
+/** Reproduce the exact metadata schema published in cyclotomy@0.0.2. */
+function openPublishedV2Metadata(path: string): DatabaseSync {
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE node_state(
+      session_id TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      tree_oid TEXT NOT NULL,
+      PRIMARY KEY(session_id, entry_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE node_write_guard(
+      session_id TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      PRIMARY KEY(session_id, entry_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE session_registry(
+      session_id TEXT NOT NULL PRIMARY KEY,
+      session_file TEXT NOT NULL UNIQUE,
+      missing_since INTEGER,
+      missing_observed_at INTEGER,
+      pending_node_guard INTEGER NOT NULL DEFAULT 0
+        CHECK(pending_node_guard IN (0, 1))
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE INDEX session_registry_missing
+    ON session_registry(missing_since, missing_observed_at);
+
+    ${["node_state", "node_write_guard", "session_registry"]
+      .flatMap((table) =>
+        ["DELETE", "INSERT", "UPDATE"].map(
+          (event) => `
+            CREATE TRIGGER cyclotomy_writer_fence_${table}_${event.toLowerCase()}
+            BEFORE ${event} ON ${table}
+            WHEN cyclotomy_writer_protocol() IS NOT 2
+            BEGIN
+              SELECT RAISE(ABORT, 'Cyclotomy metadata writer protocol mismatch');
+            END;
+          `,
+        ),
+      )
+      .join("\n")}
+
+    PRAGMA user_version = 2;
+  `);
+  db.function(
+    "cyclotomy_writer_protocol",
+    { deterministic: true, directOnly: false },
+    () => 2,
+  );
+  return db;
+}
+
+async function snapshotDirectory(root: string): Promise<{
+  readonly names: readonly string[];
+  readonly contents: Readonly<Record<string, string>>;
+}> {
+  const names = (await readdir(root)).sort();
+  const contents = Object.fromEntries(
+    await Promise.all(
+      names.map(async (name) => [
+        name,
+        (await readFile(join(root, name))).toString("base64"),
+      ]),
+    ),
+  );
+  return { names, contents };
+}
+
 afterEach(async () => {
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 
-describe("single-state metadata", () => {
-  it("creates fresh stores directly at the current v2 schema", async () => {
+describe("checkpoint slot metadata", () => {
+  it("creates fresh stores directly at the current v3 schema", async () => {
     const { path, store } = await createStore();
     store.close();
     const db = new DatabaseSync(path);
@@ -172,8 +333,8 @@ describe("single-state metadata", () => {
       .all()
       .map((row) => String(row.name));
     expect(tables).toEqual([
-      "node_state",
-      "node_write_guard",
+      "checkpoint_slot",
+      "session_capture_barrier",
       "session_registry",
     ]);
     expect(
@@ -181,19 +342,13 @@ describe("single-state metadata", () => {
         (db.prepare("PRAGMA user_version").get() as { user_version: number })
           .user_version,
       ),
-    ).toBe(2);
+    ).toBe(3);
     expect(
       db
         .prepare("PRAGMA table_info(session_registry)")
         .all()
         .map((row) => String(row.name)),
-    ).toEqual([
-      "session_id",
-      "session_file",
-      "missing_since",
-      "missing_observed_at",
-      "pending_node_guard",
-    ]);
+    ).toEqual(["session_id", "session_file", "registration_state"]);
     expect(
       db
         .prepare(
@@ -206,7 +361,15 @@ describe("single-state metadata", () => {
     db.close();
   });
 
-  it("atomically migrates the published v1 schema without losing data", async () => {
+  it("requires the caller's writer transaction for direct initialization", () => {
+    const db = new DatabaseSync(":memory:");
+    expect(() => initializeMetadataVersionWithinTransaction(db)).toThrow(
+      /active writer transaction/u,
+    );
+    db.close();
+  });
+
+  it("keeps published v1 deferred until the atomic tree/schema cutover", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v1-"));
     roots.push(root);
     const path = join(root, "state.db");
@@ -227,18 +390,17 @@ describe("single-state metadata", () => {
       .run("legacy", "/sessions/legacy.jsonl", 100, 200);
     legacy.close();
 
-    const migrated = new MetadataStore(path);
-    expect(migrated.getState("legacy", "entry")).toEqual({ treeOid });
-    expect(migrated.listRegisteredSessions()).toEqual([
+    const migrated = await openCurrentWithTreeUpgrades(path);
+    expect(checkpointState(migrated, "legacy", "entry")).toEqual({ treeOid });
+    expect(readTestSessionRegistrations(path)).toEqual([
       {
         sessionId: "legacy",
         sessionFile: "/sessions/legacy.jsonl",
-        missingSince: 100,
-        missingObservedAt: 200,
-        pendingNodeGuard: false,
+        captureBarrier: false,
+        registrationState: "pending",
       },
     ]);
-    expect(migrated.isNodeWriteProtected("legacy", "entry")).toBe(false);
+    expect(checkpointIsBlocked(migrated, "legacy", "entry")).toBe(false);
     migrated.close();
 
     const db = new DatabaseSync(path);
@@ -247,24 +409,21 @@ describe("single-state metadata", () => {
         (db.prepare("PRAGMA user_version").get() as { user_version: number })
           .user_version,
       ),
-    ).toBe(2);
+    ).toBe(3);
     expect(
       db
         .prepare("PRAGMA table_info(session_registry)")
         .all()
         .map((row) => String(row.name)),
-    ).toEqual([
-      "session_id",
-      "session_file",
-      "missing_since",
-      "missing_observed_at",
-      "pending_node_guard",
-    ]);
+    ).toEqual(["session_id", "session_file", "registration_state"]);
     expect(
       Number(
         (
           db
-            .prepare("SELECT count(*) AS count FROM node_write_guard")
+            .prepare(
+              `SELECT count(*) AS count FROM checkpoint_slot
+               WHERE capture_state = 'blocked'`,
+            )
             .get() as {
             count: number;
           }
@@ -274,7 +433,7 @@ describe("single-state metadata", () => {
     expect(() =>
       db
         .prepare(
-          `UPDATE session_registry SET pending_node_guard = 2
+          `UPDATE session_registry SET registration_state = 'invalid'
            WHERE session_id = 'legacy'`,
         )
         .run(),
@@ -282,7 +441,975 @@ describe("single-state metadata", () => {
     db.close();
   });
 
-  it("can defer the published-v1 cutover until tree objects are preflighted", async () => {
+  it("migrates the published v2 schema through its adjacent v2-to-v3 step", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v2-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("legacy", "/sessions/legacy.jsonl");
+    legacy
+      .prepare(
+        `INSERT INTO node_state(session_id, entry_id, tree_oid)
+         VALUES (?, ?, ?)`,
+      )
+      .run("legacy", "known", "a".repeat(64));
+
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /schema version 2 requires openCurrentMetadataStore/u,
+    );
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(readTestSessionRegistration(path, "legacy")).toEqual({
+      sessionId: "legacy",
+      sessionFile: "/sessions/legacy.jsonl",
+      captureBarrier: false,
+      registrationState: "pending",
+    });
+    expect(() =>
+      legacy
+        .prepare(
+          `UPDATE node_state SET tree_oid = ?
+           WHERE session_id = 'legacy' AND entry_id = 'known'`,
+        )
+        .run("b".repeat(64)),
+    ).toThrow(/writer protocol mismatch|no such table/u);
+    current.close();
+    legacy.close();
+  });
+
+  it("maps every published-v2 state/guard combination into one v3 slot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v2-slots-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at,
+           pending_node_guard
+         ) VALUES ('s', '/sessions/s.jsonl', NULL, NULL, 1)`,
+      )
+      .run();
+    const insertState = legacy.prepare(
+      `INSERT INTO node_state(session_id, entry_id, tree_oid)
+       VALUES ('s', ?, ?)`,
+    );
+    insertState.run("open", "a".repeat(64));
+    insertState.run("blocked", "b".repeat(64));
+    const insertGuard = legacy.prepare(
+      `INSERT INTO node_write_guard(session_id, entry_id) VALUES ('s', ?)`,
+    );
+    insertGuard.run("blocked");
+    insertGuard.run("missing");
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(current.getCheckpointSlot("s", "absent")).toEqual({
+      kind: "open-missing",
+    });
+    expect(current.getCheckpointSlot("s", "open")).toEqual({
+      kind: "open-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(current.getCheckpointSlot("s", "missing")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(current.getCheckpointSlot("s", "blocked")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: "b".repeat(64),
+    });
+    expect(readTestSessionRegistration(path, "s")).toMatchObject({
+      captureBarrier: true,
+      registrationState: "pending",
+    });
+    current.close();
+  });
+
+  it("claims and conservatively verifies published-v2 slots whose registry update was lost", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v2-claim-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    const insertState = legacy.prepare(
+      `INSERT INTO node_state(session_id, entry_id, tree_oid)
+       VALUES ('s', ?, ?)`,
+    );
+    insertState.run("open", "a".repeat(64));
+    insertState.run("blocked", "b".repeat(64));
+    const insertGuard = legacy.prepare(
+      `INSERT INTO node_write_guard(session_id, entry_id) VALUES ('s', ?)`,
+    );
+    insertGuard.run("blocked");
+    insertGuard.run("missing");
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(
+      current.finalizeSessionProjection({
+        targetSessionId: "s",
+        targetSessionFile: "/sessions/s.jsonl",
+        retainedEntryIds: ["open", "blocked", "missing", "unclassified"],
+        activeAncestryEntryIds: ["open", "unclassified"],
+        // An orphan claim is a migrated recovery path and must not
+        // interpret a new-registration seed.
+        seed: { kind: "fresh" },
+      }),
+    ).toEqual({ kind: "existing" });
+    expect(current.getCheckpointSlot("s", "open")).toEqual({
+      kind: "open-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(current.getCheckpointSlot("s", "blocked")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: "b".repeat(64),
+    });
+    expect(current.getCheckpointSlot("s", "missing")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(current.getCheckpointSlot("s", "unclassified")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(readTestSessionRegistration(path, "s")).toMatchObject({
+      sessionFile: "/sessions/s.jsonl",
+      registrationState: "verified",
+    });
+
+    expect(
+      current.finalizeSessionProjection({
+        targetSessionId: "s",
+        targetSessionFile: "/sessions/s.jsonl",
+        retainedEntryIds: ["open", "blocked", "missing", "unclassified"],
+        activeAncestryEntryIds: ["open", "unclassified"],
+        seed: { kind: "untrusted-parent" },
+      }),
+    ).toEqual({ kind: "existing" });
+    current.close();
+  });
+
+  it("claims a published-v1 state only after the atomic tree/schema cutover", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v1-claim-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const treeOid = "a".repeat(64);
+    const legacy = openPublishedV1Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO node_state(session_id, entry_id, tree_oid)
+         VALUES ('s', 'known', ?)`,
+      )
+      .run(treeOid);
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(
+      current.finalizeSessionProjection({
+        targetSessionId: "s",
+        targetSessionFile: "/sessions/s.jsonl",
+        retainedEntryIds: ["known", "unclassified"],
+        activeAncestryEntryIds: ["known", "unclassified"],
+        seed: { kind: "fresh" },
+      }),
+    ).toEqual({ kind: "existing" });
+    expect(current.getCheckpointSlot("s", "known")).toEqual({
+      kind: "open-checkpoint",
+      treeOid,
+    });
+    expect(current.getCheckpointSlot("s", "unclassified")).toEqual({
+      kind: "blocked-missing",
+    });
+    current.close();
+  });
+
+  it("rolls back an orphan claim whose coordinates are outside the trusted graph", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "cyclotomy-metadata-claim-rollback-"),
+    );
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO node_state(session_id, entry_id, tree_oid)
+         VALUES ('s', 'orphan', ?)`,
+      )
+      .run("a".repeat(64));
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(() =>
+      current.finalizeSessionProjection({
+        targetSessionId: "s",
+        targetSessionFile: "/sessions/s.jsonl",
+        retainedEntryIds: ["trusted"],
+        activeAncestryEntryIds: ["trusted"],
+        seed: { kind: "fresh" },
+      }),
+    ).toThrow(/outside the trusted session graph/u);
+    expect(readTestSessionRegistration(path, "s")).toBeUndefined();
+    expect(current.getCheckpointSlot("s", "orphan")).toEqual({
+      kind: "open-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(current.getCheckpointSlot("s", "trusted")).toEqual({
+      kind: "open-missing",
+    });
+    current.close();
+  });
+
+  it("refuses to reinterpret a claimed v2 layout before its adjacent migration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v2-forged-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const forged = openPublishedV2Metadata(path);
+    forged.exec("DROP TRIGGER cyclotomy_writer_fence_node_state_update");
+    forged.close();
+
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /v2 does not match the published v2 layout/u,
+    );
+    const check = new DatabaseSync(path);
+    expect(
+      Number(
+        (
+          check.prepare("PRAGMA user_version").get() as {
+            user_version: number;
+          }
+        ).user_version,
+      ),
+    ).toBe(2);
+    expect(
+      check
+        .prepare("PRAGMA table_info(session_registry)")
+        .all()
+        .map((row) => String(row.name)),
+    ).not.toContain("registration_state");
+    check.close();
+  });
+
+  it("verifies migrated rows from the trusted retained graph", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-legacy-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at,
+           pending_node_guard
+         ) VALUES (?, ?, NULL, NULL, 1)`,
+      )
+      .run("child", "/sessions/child.jsonl");
+    legacy
+      .prepare(
+        `INSERT INTO node_state(session_id, entry_id, tree_oid)
+         VALUES (?, ?, ?)`,
+      )
+      .run("child", "known", "a".repeat(64));
+    legacy
+      .prepare(
+        `INSERT INTO node_write_guard(session_id, entry_id)
+         VALUES (?, ?)`,
+      )
+      .run("child", "guarded");
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(
+      current.finalizeSessionProjection({
+        targetSessionId: "child",
+        targetSessionFile: "/sessions/child.jsonl",
+        retainedEntryIds: ["known", "guarded", "parent-only"],
+        activeAncestryEntryIds: ["known", "parent-only"],
+        seed: { kind: "fresh" },
+      }),
+    ).toEqual({ kind: "existing" });
+    expect(checkpointState(current, "child", "known")).toEqual({
+      treeOid: "a".repeat(64),
+    });
+    expect(checkpointState(current, "child", "parent-only")).toBeUndefined();
+    expect(checkpointIsBlocked(current, "child", "known")).toBe(true);
+    expect(checkpointIsBlocked(current, "child", "guarded")).toBe(true);
+    expect(checkpointIsBlocked(current, "child", "parent-only")).toBe(true);
+    expect(
+      current.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(false);
+    expect(readTestSessionRegistration(path, "child")?.registrationState).toBe(
+      "verified",
+    );
+    current.close();
+  });
+
+  it("rolls back pending verification when coordinates are outside the trusted graph", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-orphan-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("child", "/sessions/child.jsonl");
+    legacy
+      .prepare(
+        `INSERT INTO node_state(session_id, entry_id, tree_oid)
+         VALUES (?, ?, ?)`,
+      )
+      .run("child", "orphan", "a".repeat(64));
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(() =>
+      current.finalizeSessionProjection({
+        targetSessionId: "child",
+        targetSessionFile: "/sessions/child.jsonl",
+        retainedEntryIds: ["trusted"],
+        activeAncestryEntryIds: ["trusted"],
+        seed: { kind: "fresh" },
+      }),
+    ).toThrow(/outside the trusted session graph/u);
+    expect(readTestSessionRegistration(path, "child")?.registrationState).toBe(
+      "pending",
+    );
+    expect(checkpointIsBlocked(current, "child", "trusted")).toBe(false);
+    expect(() =>
+      protectTestLocation(
+        current,
+        {
+          sessionId: "child",
+          sessionFile: "/sessions/child.jsonl",
+        },
+        "trusted",
+      ),
+    ).toThrow(/not verified/u);
+    current.close();
+  });
+
+  it("keeps a migrated capture barrier until a stable active ancestry exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-pending-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at,
+           pending_node_guard
+         ) VALUES (?, ?, NULL, NULL, 1)`,
+      )
+      .run("child", "/sessions/child.jsonl");
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    current.finalizeSessionProjection({
+      targetSessionId: "child",
+      targetSessionFile: "/sessions/child.jsonl",
+      retainedEntryIds: [],
+      activeAncestryEntryIds: [],
+      seed: { kind: "fresh" },
+    });
+    expect(
+      current.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(true);
+    expect(
+      current.reconcileSessionBarrier(
+        { sessionId: "child", sessionFile: "/sessions/child.jsonl" },
+        ["first"],
+      ),
+    ).toBe("reconciled");
+    expect(checkpointIsBlocked(current, "child", "first")).toBe(true);
+    current.close();
+  });
+
+  it("reconciles a session barrier against the effective checkpoint lineage", async () => {
+    const { store } = await createStore();
+    registerTestSession(store, "s", "/sessions/s.jsonl", ["root"]);
+    commitTestNodeState(store, "s", "root", "a".repeat(64));
+    expect(
+      protectTestLocation(
+        store,
+        { sessionId: "s", sessionFile: "/sessions/s.jsonl" },
+        "gap",
+      ).kind,
+    ).toBe("protected");
+    expect(
+      store.raiseSessionBarrier({
+        sessionId: "s",
+        sessionFile: "/sessions/s.jsonl",
+      }),
+    ).toBe(true);
+
+    expect(
+      store.reconcileSessionBarrier(
+        { sessionId: "s", sessionFile: "/sessions/s.jsonl" },
+        ["root", "gap", "leaf"],
+      ),
+    ).toBe("reconciled");
+    expect(store.getCheckpointSlot("s", "root")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(store.getCheckpointSlot("s", "gap")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(
+      store.hasSessionBarrier({
+        sessionId: "s",
+        sessionFile: "/sessions/s.jsonl",
+      }),
+    ).toBe(false);
+    store.close();
+  });
+
+  it("resolves an exact blocked-missing target without erasing descendant inheritance", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const rootTree = "a".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["root"]);
+    commitTestNodeState(store, "s", "root", rootTree);
+    expect(
+      protectTestLocation(store, { sessionId: "s", sessionFile }, "gap").kind,
+    ).toBe("protected");
+
+    expect(store.getCheckpointSlot("s", "gap")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "open-missing",
+    });
+    expect(store.getCheckpointSlot("s", "root")).toEqual({
+      kind: "open-checkpoint",
+      treeOid: rootTree,
+    });
+    store.close();
+  });
+
+  it("atomically pins an inherited resolution at the target location", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const rootTree = "a".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["root"]);
+    commitTestNodeState(store, "s", "root", rootTree);
+
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectation: {
+          kind: "exact-resolution",
+          resolution: {
+            kind: "checkpoint",
+            entryId: "root",
+            treeOid: rootTree,
+          },
+        },
+      }),
+    ).toEqual({
+      kind: "protected",
+      protectedSlot: { kind: "blocked-checkpoint", treeOid: rootTree },
+    });
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: rootTree,
+    });
+    store.close();
+  });
+
+  it("atomically rejects stale inherited provenance and pins the current ancestor", async () => {
+    const { path, store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const before = "a".repeat(64);
+    const after = "b".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["root"]);
+    commitTestNodeState(store, "s", "root", before);
+
+    const concurrent = createCurrentMetadataStore(path);
+    expect(
+      concurrent.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "root",
+        activeAncestryEntryIds: ["root"],
+        treeOid: after,
+        expectedSlot: { kind: "open-checkpoint", treeOid: before },
+      }),
+    ).toBe("committed");
+    concurrent.close();
+
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectation: {
+          kind: "exact-resolution",
+          resolution: {
+            kind: "checkpoint",
+            entryId: "root",
+            treeOid: before,
+          },
+        },
+      }),
+    ).toEqual({
+      kind: "stale",
+      protectedSlot: { kind: "blocked-checkpoint", treeOid: after },
+    });
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: after,
+    });
+    expect(store.getCheckpointSlot("s", "root")).toEqual({
+      kind: "open-checkpoint",
+      treeOid: after,
+    });
+    store.close();
+  });
+
+  it("keeps a session barrier authoritative while pinning its inherited target", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const treeOid = "a".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["root"]);
+    commitTestNodeState(store, "s", "root", treeOid);
+    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      true,
+    );
+
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectation: {
+          kind: "exact-resolution",
+          resolution: {
+            kind: "checkpoint",
+            entryId: "root",
+            treeOid,
+          },
+        },
+      }),
+    ).toEqual({
+      kind: "stale",
+      protectedSlot: { kind: "blocked-checkpoint", treeOid },
+    });
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid,
+    });
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(true);
+    store.close();
+  });
+
+  it("accepts an existing block only for the same exact resolution", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const actual = "a".repeat(64);
+    const other = "b".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["leaf"]);
+    commitTestNodeState(store, "s", "leaf", actual);
+    expect(
+      protectTestLocation(store, { sessionId: "s", sessionFile }, "leaf").kind,
+    ).toBe("protected");
+
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["leaf"],
+        expectation: {
+          kind: "exact-resolution",
+          resolution: {
+            kind: "checkpoint",
+            entryId: "leaf",
+            treeOid: actual,
+          },
+        },
+      }).kind,
+    ).toBe("protected");
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["leaf"],
+        expectation: {
+          kind: "exact-resolution",
+          resolution: {
+            kind: "checkpoint",
+            entryId: "leaf",
+            treeOid: other,
+          },
+        },
+      }).kind,
+    ).toBe("stale");
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: actual,
+    });
+    store.close();
+  });
+
+  it("admits inherited open locations without materializing them", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const rootTree = "a".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["root"]);
+    commitTestNodeState(store, "s", "root", rootTree);
+
+    expect(
+      store.admitResolvedLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectedResolution: {
+          kind: "checkpoint",
+          entryId: "root",
+          treeOid: rootTree,
+        },
+      }),
+    ).toBe("admitted");
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "open-missing",
+    });
+    expect(
+      store.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "root",
+        activeAncestryEntryIds: ["root"],
+        treeOid: "b".repeat(64),
+        expectedSlot: { kind: "open-checkpoint", treeOid: rootTree },
+      }),
+    ).toBe("committed");
+    expect(
+      store.admitResolvedLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectedResolution: {
+          kind: "checkpoint",
+          entryId: "root",
+          treeOid: rootTree,
+        },
+      }),
+    ).toBe("slot-changed");
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "open-missing",
+    });
+    store.close();
+  });
+
+  it("reports a concurrently protected capture slot as blocked", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    registerTestSession(store, "s", sessionFile, ["leaf"]);
+
+    expect(
+      store.protectLocation({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["leaf"],
+        expectation: { kind: "any-current" },
+      }),
+    ).toMatchObject({ protectedSlot: { kind: "blocked-missing" } });
+    expect(
+      store.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "leaf",
+        activeAncestryEntryIds: ["leaf"],
+        treeOid: "a".repeat(64),
+        expectedSlot: { kind: "open-missing" },
+      }),
+    ).toBe("blocked");
+    store.close();
+  });
+
+  it("releases only an exact matching blocked checkpoint without a session barrier", async () => {
+    const { store } = await createStore();
+    const sessionFile = "/sessions/s.jsonl";
+    const treeOid = "a".repeat(64);
+    registerTestSession(store, "s", sessionFile, ["leaf"]);
+    commitTestNodeState(store, "s", "leaf", treeOid);
+    protectTestLocation(store, { sessionId: "s", sessionFile }, "leaf");
+
+    store.raiseSessionBarrier({ sessionId: "s", sessionFile });
+    const input = {
+      identity: { sessionId: "s", sessionFile },
+      entryId: "leaf",
+      activeAncestryEntryIds: ["leaf"],
+      expectedResolution: {
+        kind: "checkpoint" as const,
+        entryId: "leaf",
+        treeOid,
+      },
+    };
+    expect(store.admitResolvedLocation(input)).toBe("slot-changed");
+    expect(store.getCheckpointSlot("s", "leaf").kind).toBe(
+      "blocked-checkpoint",
+    );
+    expect(
+      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, ["leaf"]),
+    ).toBe("reconciled");
+    expect(store.admitResolvedLocation(input)).toBe("admitted");
+    expect(store.getCheckpointSlot("s", "leaf")).toEqual({
+      kind: "open-checkpoint",
+      treeOid,
+    });
+    store.close();
+  });
+
+  it("projects authenticated missing slots and blocks unproven child coordinates", async () => {
+    const { store } = await createStore();
+    registerTestSession(store, "source", "/sessions/source.jsonl", ["root"]);
+    commitTestNodeState(store, "source", "root", "a".repeat(64));
+    expect(
+      protectTestLocation(
+        store,
+        {
+          sessionId: "source",
+          sessionFile: "/sessions/source.jsonl",
+        },
+        "root",
+      ).kind,
+    ).toBe("protected");
+    expect(
+      protectTestLocation(
+        store,
+        {
+          sessionId: "source",
+          sessionFile: "/sessions/source.jsonl",
+        },
+        "missing",
+      ).kind,
+    ).toBe("protected");
+    store.raiseSessionBarrier({
+      sessionId: "source",
+      sessionFile: "/sessions/source.jsonl",
+    });
+
+    const projection = store.exportForkProjection({
+      parentSessionFile: "/sessions/source.jsonl",
+      retainedEntryIds: ["root", "missing", "open"],
+    });
+    expect(projection).toEqual({
+      sourceSessionId: "source",
+      barrier: true,
+      coordinates: [
+        {
+          entryId: "root",
+          slot: {
+            kind: "blocked-checkpoint",
+            treeOid: "a".repeat(64),
+          },
+        },
+        { entryId: "missing", slot: { kind: "blocked-missing" } },
+        { entryId: "open", slot: { kind: "open-missing" } },
+      ],
+    });
+
+    store.finalizeSessionProjection({
+      targetSessionId: "child",
+      targetSessionFile: "/sessions/child.jsonl",
+      seed: { kind: "fork", projection: projection! },
+      retainedEntryIds: ["root", "missing", "open", "child-only"],
+      activeAncestryEntryIds: ["root", "child-only"],
+    });
+    expect(store.getCheckpointSlot("child", "root")).toEqual({
+      kind: "blocked-checkpoint",
+      treeOid: "a".repeat(64),
+    });
+    expect(store.getCheckpointSlot("child", "missing")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(store.getCheckpointSlot("child", "open")).toEqual({
+      kind: "open-missing",
+    });
+    expect(store.getCheckpointSlot("child", "child-only")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(
+      store.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(true);
+    store.close();
+  });
+
+  it("exports a consistent fork projection while another writer is reserved", async () => {
+    const { path, store } = await createStore();
+    registerTestSession(store, "source", "/sessions/source.jsonl", ["root"]);
+    commitTestNodeState(store, "source", "root", "a".repeat(64));
+
+    const writer = new DatabaseSync(path);
+    writer.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+    try {
+      expect(
+        store.exportForkProjection({
+          parentSessionFile: "/sessions/source.jsonl",
+          retainedEntryIds: ["root", "missing"],
+        }),
+      ).toEqual({
+        sourceSessionId: "source",
+        barrier: false,
+        coordinates: [
+          {
+            entryId: "root",
+            slot: { kind: "open-checkpoint", treeOid: "a".repeat(64) },
+          },
+          { entryId: "missing", slot: { kind: "open-missing" } },
+        ],
+      });
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+      store.close();
+    }
+  });
+
+  it("commits an untrusted parent as blocked coordinates plus one session barrier", async () => {
+    const { store } = await createStore();
+
+    expect(
+      store.finalizeSessionProjection({
+        targetSessionId: "child",
+        targetSessionFile: "/sessions/child.jsonl",
+        seed: { kind: "untrusted-parent" },
+        retainedEntryIds: ["root", "leaf"],
+        activeAncestryEntryIds: ["root", "leaf"],
+      }),
+    ).toEqual({ kind: "registered" });
+    expect(store.getCheckpointSlot("child", "root")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(store.getCheckpointSlot("child", "leaf")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(
+      store.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(true);
+    store.close();
+  });
+
+  it("keeps an untrusted empty parent barrier until a concrete ancestry exists", async () => {
+    const { store } = await createStore();
+    store.finalizeSessionProjection({
+      targetSessionId: "child",
+      targetSessionFile: "/sessions/child.jsonl",
+      seed: { kind: "untrusted-parent" },
+      retainedEntryIds: [],
+      activeAncestryEntryIds: [],
+    });
+
+    expect(
+      store.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(true);
+    expect(() =>
+      store.reconcileSessionBarrier(
+        { sessionId: "child", sessionFile: "/sessions/child.jsonl" },
+        [],
+      ),
+    ).toThrow(/without a stable ancestry/u);
+    expect(
+      store.hasSessionBarrier({
+        sessionId: "child",
+        sessionFile: "/sessions/child.jsonl",
+      }),
+    ).toBe(true);
+    store.close();
+  });
+
+  it("treats a migrated source as unavailable until it is verified", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-export-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV2Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    legacy.close();
+
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(
+      current.exportForkProjection({
+        parentSessionFile: "/sessions/source.jsonl",
+        retainedEntryIds: [],
+      }),
+    ).toBeUndefined();
+    current.finalizeSessionProjection({
+      targetSessionId: "source",
+      targetSessionFile: "/sessions/source.jsonl",
+      retainedEntryIds: [],
+      activeAncestryEntryIds: [],
+      seed: { kind: "fresh" },
+    });
+    expect(
+      current.exportForkProjection({
+        parentSessionFile: "/sessions/source.jsonl",
+        retainedEntryIds: [],
+      }),
+    ).toEqual({
+      sourceSessionId: "source",
+      barrier: false,
+      coordinates: [],
+    });
+    current.close();
+  });
+
+  it("rejects non-string identifiers before SQLite can coerce coordinates", async () => {
+    const { path, store } = await createStore();
+    expect(() =>
+      store.finalizeSessionProjection({
+        targetSessionId: 1 as unknown as string,
+        targetSessionFile: "/sessions/numeric.jsonl",
+        retainedEntryIds: [],
+        activeAncestryEntryIds: [],
+        seed: { kind: "fresh" },
+      }),
+    ).toThrow(/non-empty string/u);
+    registerTestSession(store, "1.0", "/sessions/string.jsonl");
+    expect(() =>
+      store.commitCapture({
+        identity: {
+          sessionId: 1 as unknown as string,
+          sessionFile: "/sessions/string.jsonl",
+        },
+        entryId: "entry",
+        activeAncestryEntryIds: ["entry"],
+        treeOid: "a".repeat(64),
+        expectedSlot: { kind: "open-missing" },
+      }),
+    ).toThrow(/non-empty string/u);
+    expect(readTestSessionRegistrations(path)).toHaveLength(1);
+    store.close();
+  });
+
+  it("always defers the published-v1 cutover until tree objects are preflighted", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-deferred-"));
     roots.push(root);
     const path = join(root, "state.db");
@@ -296,12 +1423,13 @@ describe("single-state metadata", () => {
       .run("legacy", "entry", treeOid);
     legacy.close();
 
-    const deferred = new MetadataStore(path, {
-      deferPublishedV1Migration: true,
-    });
-    expect(deferred.isSchemaCurrent()).toBe(false);
-    expect(deferred.listReferencedTreeOids()).toEqual([treeOid]);
-    deferred.close();
+    if (false) {
+      // @ts-expect-error The factory accepts no hidden compatibility options.
+      createCurrentMetadataStore(path, {});
+    }
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /schema version 1 requires openCurrentMetadataStore/u,
+    );
 
     const untouched = new DatabaseSync(path);
     expect(
@@ -313,24 +1441,65 @@ describe("single-state metadata", () => {
         ).user_version,
       ),
     ).toBe(1);
+    expect(untouched.prepare("PRAGMA journal_mode").get()).toEqual({
+      journal_mode: "delete",
+    });
+    expect(untouched.prepare("SELECT tree_oid FROM node_state").all()).toEqual([
+      { tree_oid: treeOid },
+    ]);
     untouched.close();
 
-    const resumed = new MetadataStore(path, {
-      deferPublishedV1Migration: true,
-    });
-    resumed.migrateSchemaToCurrent();
-    expect(resumed.isSchemaCurrent()).toBe(true);
-    expect(resumed.getState("legacy", "entry")).toEqual({ treeOid });
+    const resumed = await openCurrentWithTreeUpgrades(path);
+    expect(checkpointState(resumed, "legacy", "entry")).toEqual({ treeOid });
     resumed.close();
   });
 
-  it("rolls back the SQL cutover when authenticated tree roots became stale", async () => {
+  it("retargets many shared roots with one set-based mapping cutover", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-mapping-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const mappings = Array.from({ length: 128 }, (_, index) => ({
+      oldTreeOid: (index + 1).toString(16).padStart(64, "0"),
+      newTreeOid: (index + 257).toString(16).padStart(64, "0"),
+    }));
+    const legacy = openPublishedV1Metadata(path);
+    const insert = legacy.prepare(
+      `INSERT INTO node_state(session_id, entry_id, tree_oid)
+       VALUES (?, ?, ?)`,
+    );
+    for (const [index, mapping] of mappings.entries()) {
+      insert.run("legacy", `first-${index}`, mapping.oldTreeOid);
+      insert.run("legacy", `second-${index}`, mapping.oldTreeOid);
+    }
+    legacy.close();
+
+    const upgraded = new Map(
+      mappings.map(({ oldTreeOid, newTreeOid }) => [oldTreeOid, newTreeOid]),
+    );
+    const metadata = await openCurrentWithTreeUpgrades(
+      path,
+      async (treeOids) =>
+        new Map(treeOids.map((treeOid) => [treeOid, upgraded.get(treeOid)!])),
+    );
+    for (const [index, mapping] of mappings.entries()) {
+      expect(checkpointState(metadata, "legacy", `first-${index}`)).toEqual({
+        treeOid: mapping.newTreeOid,
+      });
+      expect(checkpointState(metadata, "legacy", `second-${index}`)).toEqual({
+        treeOid: mapping.newTreeOid,
+      });
+    }
+    metadata.close();
+  });
+
+  it("retries the SQL cutover when authenticated tree roots become stale", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-tree-cas-"));
     roots.push(root);
     const path = join(root, "state.db");
     const originalTreeOid = "a".repeat(64);
     const lateTreeOid = "b".repeat(64);
     const migratedTreeOid = "c".repeat(64);
+    const migratedLateTreeOid = "d".repeat(64);
     const legacy = openPublishedV1Metadata(path);
     legacy
       .prepare(
@@ -340,40 +1509,40 @@ describe("single-state metadata", () => {
       .run("legacy", "original", originalTreeOid);
     legacy.close();
 
-    const deferred = new MetadataStore(path, {
-      deferPublishedV1Migration: true,
-    });
-    const authenticatedRoots = deferred.listReferencedTreeOids();
-    const interveningWriter = new DatabaseSync(path);
-    interveningWriter
-      .prepare(
-        `INSERT INTO node_state(session_id, entry_id, tree_oid)
-         VALUES (?, ?, ?)`,
-      )
-      .run("legacy", "late", lateTreeOid);
-    interveningWriter.close();
-
-    expect(() =>
-      deferred.migrateSchemaAndReplaceTreeOidReferences(
-        [{ oldTreeOid: originalTreeOid, newTreeOid: migratedTreeOid }],
-        authenticatedRoots,
-      ),
-    ).toThrowError(
-      new MetadataError(
-        "tree references changed while object-format migration was preparing",
-      ),
+    let preparation = 0;
+    const metadata = await openCurrentWithTreeUpgrades(
+      path,
+      async (authenticatedRoots) => {
+        preparation += 1;
+        if (preparation === 2) {
+          expect(authenticatedRoots).toEqual([originalTreeOid, lateTreeOid]);
+          return new Map([
+            [originalTreeOid, migratedTreeOid],
+            [lateTreeOid, migratedLateTreeOid],
+          ]);
+        }
+        expect(authenticatedRoots).toEqual([originalTreeOid]);
+        const interveningWriter = new DatabaseSync(path);
+        interveningWriter
+          .prepare(
+            `INSERT INTO node_state(session_id, entry_id, tree_oid)
+             VALUES (?, ?, ?)`,
+          )
+          .run("legacy", "late", lateTreeOid);
+        interveningWriter.close();
+        return new Map([[originalTreeOid, migratedTreeOid]]);
+      },
     );
-    expect(deferred.isSchemaCurrent()).toBe(false);
-    expect(deferred.listReferencedTreeOids()).toEqual([
-      originalTreeOid,
-      lateTreeOid,
-    ]);
-    expect(deferred.getState("legacy", "original")).toEqual({
-      treeOid: originalTreeOid,
+    expect(preparation).toBe(2);
+    expect(checkpointState(metadata, "legacy", "original")).toEqual({
+      treeOid: migratedTreeOid,
     });
-    deferred.close();
+    expect(checkpointState(metadata, "legacy", "late")).toEqual({
+      treeOid: migratedLateTreeOid,
+    });
+    metadata.close();
 
-    const check = new DatabaseSync(path);
+    const check = new DatabaseSync(path, { readOnly: true });
     expect(
       Number(
         (
@@ -382,15 +1551,7 @@ describe("single-state metadata", () => {
           }
         ).user_version,
       ),
-    ).toBe(1);
-    expect(
-      check
-        .prepare(
-          `SELECT 1 FROM sqlite_schema
-           WHERE type = 'table' AND name = 'node_write_guard'`,
-        )
-        .get(),
-    ).toBeUndefined();
+    ).toBe(3);
     check.close();
   });
 
@@ -415,8 +1576,36 @@ describe("single-state metadata", () => {
       )
       .run("legacy", "/sessions/legacy.jsonl");
 
-    const current = new MetadataStore(path);
-    expect(current.protectNodeWrite("legacy", "entry")).toBe("protected");
+    const current = await openCurrentWithTreeUpgrades(path);
+    expect(() =>
+      protectTestLocation(
+        current,
+        {
+          sessionId: "legacy",
+          sessionFile: "/sessions/legacy.jsonl",
+        },
+        "entry",
+      ),
+    ).toThrow(/not verified/u);
+    expect(
+      current.finalizeSessionProjection({
+        targetSessionId: "legacy",
+        targetSessionFile: "/sessions/legacy.jsonl",
+        retainedEntryIds: ["entry"],
+        activeAncestryEntryIds: ["entry"],
+        seed: { kind: "fresh" },
+      }),
+    ).toEqual({ kind: "existing" });
+    expect(
+      protectTestLocation(
+        current,
+        {
+          sessionId: "legacy",
+          sessionFile: "/sessions/legacy.jsonl",
+        },
+        "entry",
+      ).kind,
+    ).toBe("protected");
 
     const staleMutations = [
       () =>
@@ -482,22 +1671,23 @@ describe("single-state metadata", () => {
           .run(),
     ];
     for (const mutate of staleMutations) {
-      expect(mutate).toThrow(/no such function: cyclotomy_writer_protocol/u);
+      expect(mutate).toThrow(
+        /no such function: cyclotomy_writer_protocol|no such table|no (?:such column:|column named) missing_since/u,
+      );
     }
 
-    expect(current.getState("legacy", "entry")).toEqual({
+    expect(checkpointState(current, "legacy", "entry")).toEqual({
       treeOid: original,
     });
-    expect(current.getState("legacy", "new-entry")).toBeUndefined();
-    expect(current.isNodeWriteProtected("legacy", "entry")).toBe(true);
-    expect(current.isNodeWriteProtected("legacy", "new-guard")).toBe(false);
-    expect(current.listRegisteredSessions()).toEqual([
+    expect(checkpointState(current, "legacy", "new-entry")).toBeUndefined();
+    expect(checkpointIsBlocked(current, "legacy", "entry")).toBe(true);
+    expect(checkpointIsBlocked(current, "legacy", "new-guard")).toBe(false);
+    expect(readTestSessionRegistrations(path)).toEqual([
       {
         sessionId: "legacy",
         sessionFile: "/sessions/legacy.jsonl",
-        missingSince: null,
-        missingObservedAt: null,
-        pendingNodeGuard: false,
+        captureBarrier: false,
+        registrationState: "verified",
       },
     ]);
     current.close();
@@ -518,6 +1708,13 @@ describe("single-state metadata", () => {
          VALUES ('legacy-process', 'entry', ?)`,
       )
       .run(original);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES ('legacy-process', '/sessions/legacy-process.jsonl', NULL, NULL)`,
+      )
+      .run();
     legacy.close();
 
     const child = startMetadataChild(path, 1, "legacy-live");
@@ -525,28 +1722,42 @@ describe("single-state metadata", () => {
       await child.ready;
       const opened = waitForChildMessage(child.process, "opened", child.stderr);
 
-      const current = new MetadataStore(path);
-      expect(current.protectNodeWrite("legacy-process", "entry")).toBe(
-        "protected",
-      );
+      const current = await openCurrentWithTreeUpgrades(path);
+      current.finalizeSessionProjection({
+        targetSessionId: "legacy-process",
+        targetSessionFile: "/sessions/legacy-process.jsonl",
+        retainedEntryIds: ["entry"],
+        activeAncestryEntryIds: ["entry"],
+        seed: { kind: "fresh" },
+      });
+      expect(
+        protectTestLocation(
+          current,
+          {
+            sessionId: "legacy-process",
+            sessionFile: "/sessions/legacy-process.jsonl",
+          },
+          "entry",
+        ).kind,
+      ).toBe("protected");
       child.process.send?.("start");
       const result = await opened;
-      await waitForChildExit(child.process);
+      await waitForChildExit(child);
 
       expect(result.blocked).toBe(true);
       expect(result.message).toMatch(
-        /no such function: cyclotomy_writer_protocol/u,
+        /no such function: cyclotomy_writer_protocol|no such table/u,
       );
-      expect(current.getState("legacy-process", "entry")).toEqual({
+      expect(checkpointState(current, "legacy-process", "entry")).toEqual({
         treeOid: original,
       });
-      expect(current.isNodeWriteProtected("legacy-process", "entry")).toBe(
+      expect(checkpointIsBlocked(current, "legacy-process", "entry")).toBe(
         true,
       );
       current.close();
     } finally {
       if (child.process.exitCode === null) child.process.kill("SIGKILL");
-      await waitForChildExit(child.process);
+      await waitForChildExit(child);
     }
   });
 
@@ -563,8 +1774,15 @@ describe("single-state metadata", () => {
       gate.exec("PRAGMA journal_mode=WAL;");
       gate.exec("BEGIN IMMEDIATE;");
       let gateOpen = true;
-      const children = Array.from({ length: 4 }, () =>
-        startMetadataChild(path),
+      const releasePath = join(root, "schema-gate-release");
+      const pausedPaths = Array.from({ length: 4 }, (_, index) =>
+        join(root, `schema-gate-paused-${index}`),
+      );
+      const children = pausedPaths.map((pausedPath) =>
+        startMetadataChild(path, 1, "gated-write", {
+          pausedPath,
+          releasePath,
+        }),
       );
 
       try {
@@ -572,21 +1790,25 @@ describe("single-state metadata", () => {
         const opening = children.map((child) =>
           waitForChildMessage(child.process, "opening", child.stderr),
         );
+        for (const child of children) child.process.send?.("start");
+        await Promise.all(opening);
+        // Each child has opened the old schema and is paused immediately
+        // before either fresh initialization or the explicit v1 cutover takes
+        // the write lock. Releasing them exercises the locked version recheck.
+        await Promise.all(
+          children.map((child, index) =>
+            waitForGatePause(child, pausedPaths[index]!),
+          ),
+        );
         const opened = children.map((child) =>
           waitForChildMessage(child.process, "opened", child.stderr),
         );
-        for (const child of children) child.process.send?.("start");
-        await Promise.all(opening);
-        // Keep the starting version visible while every process enters its open
-        // path; they then queue on the same schema-migration writer lock.
-        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 100));
         gate.exec("COMMIT;");
         gateOpen = false;
+        await writeFile(releasePath, "", { flag: "wx" });
 
         const results = await Promise.all(opened);
-        await Promise.all(
-          children.map((child) => waitForChildExit(child.process)),
-        );
+        await Promise.all(children.map((child) => waitForChildExit(child)));
         const check = new DatabaseSync(path);
         expect(
           Number(
@@ -596,13 +1818,17 @@ describe("single-state metadata", () => {
               }
             ).user_version,
           ),
-        ).toBe(2);
+        ).toBe(3);
         check.close();
-        const store = new MetadataStore(path);
+        const store = createCurrentMetadataStore(path);
         for (const result of results) {
-          expect(store.getState("concurrent-open", `${result.pid}-0`)).toEqual({
-            treeOid: "a".repeat(64),
-          });
+          expect(
+            checkpointState(
+              store,
+              `concurrent-open-${result.pid}`,
+              `${result.pid}-0`,
+            ),
+          ).toEqual({ treeOid: "a".repeat(64) });
         }
         store.close();
       } finally {
@@ -617,9 +1843,7 @@ describe("single-state metadata", () => {
         for (const child of children) {
           if (child.process.exitCode === null) child.process.kill("SIGKILL");
         }
-        await Promise.all(
-          children.map((child) => waitForChildExit(child.process)),
-        );
+        await Promise.all(children.map((child) => waitForChildExit(child)));
       }
     },
   );
@@ -628,7 +1852,7 @@ describe("single-state metadata", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-churn-"));
     roots.push(root);
     const path = join(root, "state.db");
-    const initial = new MetadataStore(path);
+    const initial = createCurrentMetadataStore(path);
     initial.close();
 
     const iterations = 20;
@@ -646,436 +1870,388 @@ describe("single-state metadata", () => {
       for (const child of children) child.process.send?.("start");
       await Promise.all(opening);
       await Promise.all(opened);
-      await Promise.all(
-        children.map((child) => waitForChildExit(child.process)),
-      );
+      await Promise.all(children.map((child) => waitForChildExit(child)));
 
-      const store = new MetadataStore(path);
-      expect(store.getState("concurrent-open", "unused")).toBeUndefined();
+      const store = createCurrentMetadataStore(path);
+      expect(
+        checkpointState(store, "concurrent-open", "unused"),
+      ).toBeUndefined();
       store.close();
     } finally {
       for (const child of children) {
         if (child.process.exitCode === null) child.process.kill("SIGKILL");
       }
-      await Promise.all(
-        children.map((child) => waitForChildExit(child.process)),
-      );
+      await Promise.all(children.map((child) => waitForChildExit(child)));
     }
   });
 
-  it("keeps exactly one overwritable state per session node", async () => {
-    const { store } = await createStore();
-    const first = "a".repeat(64);
-    const second = "b".repeat(64);
-    commitTestNodeState(store, "s", "e", first);
-    expect(store.getState("s", "e")).toEqual({ treeOid: first });
-    commitTestNodeState(store, "s", "e", second);
-    expect(store.getState("s", "e")).toEqual({ treeOid: second });
-    expect(store.getState("other", "e")).toBeUndefined();
-    expect(() => commitTestNodeState(store, "s", "bad", "not-an-oid")).toThrow(
-      MetadataError,
+  it("does not expose historical capabilities through the current factory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-identity-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV1Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    legacy.close();
+
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /schema version 1 requires openCurrentMetadataStore/u,
+    );
+    const store = await openCurrentWithTreeUpgrades(path);
+    expect(store.matchSessionIdentity("missing", "/missing.jsonl")).toBe(
+      "absent",
+    );
+    expect(store.matchSessionIdentity("source", "/sessions/source.jsonl")).toBe(
+      "exact",
+    );
+    expect(store.matchSessionIdentity("other", "/sessions/source.jsonl")).toBe(
+      "conflict",
+    );
+    expect(store.matchSessionIdentity("source", "/sessions/other.jsonl")).toBe(
+      "conflict",
     );
     store.close();
   });
 
-  it("persists write protection and keeps repeated protection idempotent", async () => {
-    const { path, store } = await createStore();
-    const original = "a".repeat(64);
-    commitTestNodeState(store, "s", "e", original);
-    expect(store.protectNodeWrite("s", "e")).toBe("protected");
+  it("authenticates a clean current store without changing any files", async () => {
+    const { root, path, store } = await createStore();
+    registerTestSession(store, "source", "/sessions/source.jsonl");
     store.close();
+    const before = await snapshotDirectory(root);
 
-    const reopened = new MetadataStore(path);
-    expect(reopened.isNodeWriteProtected("s", "e")).toBe(true);
-    expect(
-      reopened.protectNodeWrite("s", "e", {
-        treeOid: "b".repeat(64),
-        expectedTreeOid: original,
-      }),
-    ).toBe("protected");
-    expect(reopened.getState("s", "e")).toEqual({ treeOid: original });
-    reopened.close();
-  });
-
-  it("rejects both guarded inserts and guarded updates", async () => {
-    const { store } = await createStore();
-    const original = "a".repeat(64);
-    const replacement = "b".repeat(64);
-    store.protectNodeWrite("s", "missing");
-    expect(
-      store.commitNodeState("s", "missing", replacement, {
-        treeOid: undefined,
-      }),
-    ).toBe("write-protected");
-    expect(store.getState("s", "missing")).toBeUndefined();
-
-    commitTestNodeState(store, "s", "existing", original);
-    store.protectNodeWrite("s", "existing");
-    expect(
-      store.commitNodeState("s", "existing", replacement, {
-        treeOid: original,
-      }),
-    ).toBe("write-protected");
-    expect(store.getState("s", "existing")).toEqual({ treeOid: original });
-    store.close();
-  });
-
-  it("pins an inherited checkpoint while installing protection", async () => {
-    const { store } = await createStore();
-    const inherited = "a".repeat(64);
-    expect(
-      store.protectNodeWrite("s", "child", {
-        treeOid: inherited,
-        expectedTreeOid: undefined,
-      }),
-    ).toBe("protected");
-    expect(store.getState("s", "child")).toEqual({ treeOid: inherited });
-    expect(store.isNodeWriteProtected("s", "child")).toBe(true);
-    store.close();
-  });
-
-  it("keeps a concurrent exact state when a pin is stale, but still protects it", async () => {
-    const { store } = await createStore();
-    const inherited = "a".repeat(64);
-    const concurrent = "b".repeat(64);
-    commitTestNodeState(store, "s", "child", concurrent);
-    expect(
-      store.protectNodeWrite("s", "child", {
-        treeOid: inherited,
-        expectedTreeOid: undefined,
-      }),
-    ).toBe("state-changed");
-    expect(store.getState("s", "child")).toEqual({ treeOid: concurrent });
-    expect(store.isNodeWriteProtected("s", "child")).toBe(true);
-    store.close();
-  });
-
-  it("clears protection only for the expected exact checkpoint", async () => {
-    const { store } = await createStore();
-    const expected = "a".repeat(64);
-    commitTestNodeState(store, "s", "e", expected);
-    store.protectNodeWrite("s", "e");
-    expect(store.clearNodeWriteProtection("s", "e", "b".repeat(64))).toBe(
-      "state-changed",
+    const inspection = inspectMetadataSessionIdentity(
+      path,
+      "source",
+      "/sessions/source.jsonl",
     );
-    expect(store.isNodeWriteProtected("s", "e")).toBe(true);
-    expect(store.clearNodeWriteProtection("s", "e", expected)).toBe("cleared");
-    expect(store.isNodeWriteProtected("s", "e")).toBe(false);
-    expect(store.clearNodeWriteProtection("s", "e", expected)).toBe(
-      "unguarded",
+    expect(inspection.kind).toBe("exact");
+    expect(await snapshotDirectory(root)).toEqual(before);
+    if (inspection.kind !== "exact") throw new Error("expected exact proof");
+
+    const authenticated = await openAuthenticatedCurrentMetadataStore(
+      inspection.proof,
+      {
+        prepareTreeOidUpgrades: async (roots) =>
+          new Map(roots.map((treeOid) => [treeOid, treeOid])),
+      },
     );
-    store.close();
+    expect(
+      authenticated.matchSessionIdentity("source", "/sessions/source.jsonl"),
+    ).toBe("exact");
+    authenticated.close();
   });
 
-  it("materializes a missing node only while the requested guard state holds", async () => {
-    const { store } = await createStore();
-    const fresh = "a".repeat(64);
-    const adopted = "b".repeat(64);
-
-    expect(
-      store.materializeMissingNodeState(
-        "s",
-        "fresh",
-        fresh,
-        "initialize-fresh",
-      ),
-    ).toBe("committed");
-    expect(store.getState("s", "fresh")).toEqual({ treeOid: fresh });
-
-    store.protectNodeWrite("s", "guarded");
-    expect(
-      store.materializeMissingNodeState(
-        "s",
-        "guarded",
-        adopted,
-        "initialize-fresh",
-      ),
-    ).toBe("state-changed");
-    expect(store.getState("s", "guarded")).toBeUndefined();
-    expect(store.isNodeWriteProtected("s", "guarded")).toBe(true);
-    expect(
-      store.materializeMissingNodeState(
-        "s",
-        "guarded",
-        adopted,
-        "adopt-protected",
-      ),
-    ).toBe("committed");
-    expect(store.getState("s", "guarded")).toEqual({ treeOid: adopted });
-    expect(store.isNodeWriteProtected("s", "guarded")).toBe(false);
-
-    expect(
-      store.materializeMissingNodeState(
-        "s",
-        "unguarded-adoption",
-        adopted,
-        "adopt-protected",
-      ),
-    ).toBe("state-changed");
-    expect(store.getState("s", "unguarded-adoption")).toBeUndefined();
-    store.close();
-  });
-
-  it("copies only a fork's actual ancestry and never overwrites it", async () => {
-    const { store } = await createStore();
-    const root = "a".repeat(64);
-    const selected = "b".repeat(64);
-    const sibling = "c".repeat(64);
-    const destinationWins = "d".repeat(64);
-    store.touchSession("source", "/sessions/source.jsonl");
-    store.touchSession("fork", "/sessions/fork.jsonl");
-    commitTestNodeState(store, "source", "root", root);
-    commitTestNodeState(store, "source", "selected", selected);
-    commitTestNodeState(store, "source", "sibling", sibling);
-    commitTestNodeState(store, "fork", "selected", destinationWins);
-
-    const copied = store.copyForkAncestry({
-      targetSessionId: "fork",
-      parentSessionFile: "/sessions/source.jsonl",
-      ancestryEntryIds: ["root", "selected"],
-    });
-    expect(copied).toEqual({ sourceSessionId: "source", copiedStates: 1 });
-    expect(store.getState("fork", "root")).toEqual({ treeOid: root });
-    expect(store.getState("fork", "selected")?.treeOid).toBe(destinationWins);
-    expect(store.getState("fork", "sibling")).toBeUndefined();
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/sessions/source.jsonl",
-        ancestryEntryIds: ["root", "selected"],
-      }).copiedStates,
-    ).toBe(0);
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/sessions/source.jsonl",
-        ancestryEntryIds: [],
-      }),
-    ).toEqual({ sourceSessionId: "source", copiedStates: 0 });
-    store.close();
-  });
-
-  it("copies a pinned fork checkpoint without copying its write guard", async () => {
-    const { store } = await createStore();
-    const pinned = "a".repeat(64);
-    store.touchSession("source", "/sessions/source.jsonl");
-    store.protectNodeWrite("source", "child", {
-      treeOid: pinned,
-      expectedTreeOid: undefined,
-    });
-
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/sessions/source.jsonl",
-        ancestryEntryIds: ["child"],
-      }),
-    ).toEqual({ sourceSessionId: "source", copiedStates: 1 });
-    expect(store.getState("fork", "child")).toEqual({ treeOid: pinned });
-    expect(store.isNodeWriteProtected("source", "child")).toBe(true);
-    expect(store.isNodeWriteProtected("fork", "child")).toBe(false);
-    store.close();
-  });
-
-  it("copies guarded Missing ancestry without overriding target truth", async () => {
-    const { store } = await createStore();
-    const sourceFile = "/sessions/source.jsonl";
-    const pinned = "a".repeat(64);
-    const targetOwned = "b".repeat(64);
-    store.touchSession("source", sourceFile);
-    store.touchSession("fork", "/sessions/fork.jsonl");
-    store.protectNodeWrite("source", "selected-missing");
-    store.protectNodeWrite("source", "unselected-missing");
-    store.protectNodeWrite("source", "pinned", {
-      treeOid: pinned,
-      expectedTreeOid: undefined,
-    });
-    store.protectNodeWrite("source", "target-owned");
-    commitTestNodeState(store, "fork", "target-owned", targetOwned);
-
-    const input = {
-      targetSessionId: "fork",
-      parentSessionFile: sourceFile,
-      ancestryEntryIds: ["selected-missing", "pinned", "target-owned"],
-    } as const;
-    expect(store.copyForkAncestry(input)).toEqual({
-      sourceSessionId: "source",
-      copiedStates: 1,
-    });
-    expect(store.getState("fork", "selected-missing")).toBeUndefined();
-    expect(store.isNodeWriteProtected("fork", "selected-missing")).toBe(true);
-    expect(store.getState("fork", "pinned")).toEqual({ treeOid: pinned });
-    expect(store.isNodeWriteProtected("fork", "pinned")).toBe(false);
-    expect(store.getState("fork", "target-owned")).toEqual({
-      treeOid: targetOwned,
-    });
-    expect(store.isNodeWriteProtected("fork", "target-owned")).toBe(false);
-    expect(store.isNodeWriteProtected("fork", "unselected-missing")).toBe(
-      false,
-    );
-    expect(store.copyForkAncestry(input).copiedStates).toBe(0);
-    expect(store.isNodeWriteProtected("fork", "selected-missing")).toBe(true);
-    store.close();
-  });
-
-  it("rolls back fork states when guarded-Missing copying fails", async () => {
-    const { path, store } = await createStore();
-    const sourceFile = "/sessions/source.jsonl";
-    store.touchSession("source", sourceFile);
-    store.touchSession("fork", "/sessions/fork.jsonl");
-    commitTestNodeState(store, "source", "state", "a".repeat(64));
-    store.protectNodeWrite("source", "missing");
-    const sabotage = new DatabaseSync(path);
-    sabotage.exec(`
-      CREATE TRIGGER fail_fork_guard
-      BEFORE INSERT ON node_write_guard
-      WHEN NEW.session_id = 'fork'
-      BEGIN
-        SELECT RAISE(ABORT, 'fork guard sabotage');
-      END;
-    `);
-
-    try {
-      expect(() =>
-        store.copyForkAncestry({
-          targetSessionId: "fork",
-          parentSessionFile: sourceFile,
-          ancestryEntryIds: ["state", "missing"],
-        }),
-      ).toThrow(/fork guard sabotage/u);
-      expect(store.getState("fork", "state")).toBeUndefined();
-      expect(store.isNodeWriteProtected("fork", "missing")).toBe(false);
-    } finally {
-      sabotage.exec("DROP TRIGGER fail_fork_guard");
-      sabotage.close();
+  it.each(["journal", "wal"] as const)(
+    "reports that an unrecovered metadata -%s sidecar requires recovery",
+    async (sidecar) => {
+      const { path, store } = await createStore();
+      registerTestSession(store, "source", "/sessions/source.jsonl");
       store.close();
-    }
+      if (sidecar === "wal") await rm(`${path}-shm`, { force: true });
+      await writeFile(`${path}-${sidecar}`, "unrecovered sidecar sentinel");
+
+      expect(
+        inspectMetadataSessionIdentity(
+          path,
+          "source",
+          "/sessions/source.jsonl",
+        ),
+      ).toMatchObject({
+        kind: "recovery-required",
+        cause: expect.objectContaining({
+          name: MetadataError.name,
+          message: expect.stringMatching(/require recovery/u),
+        }),
+      });
+    },
+  );
+
+  it("probes published v1 identity variants without migrating or switching journals", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-probe-v1-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV1Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    legacy.close();
+    const before = await snapshotDirectory(root);
+
+    const exact = inspectMetadataSessionIdentity(
+      path,
+      "source",
+      "/sessions/source.jsonl",
+    );
+    expect(exact.kind).toBe("exact");
+    expect(
+      inspectMetadataSessionIdentity(path, "missing", "/missing.jsonl"),
+    ).toEqual({ kind: "absent" });
+    expect(
+      inspectMetadataSessionIdentity(path, "other", "/sessions/source.jsonl"),
+    ).toEqual({ kind: "conflict" });
+    expect(await snapshotDirectory(root)).toEqual(before);
+
+    if (exact.kind !== "exact") throw new Error("expected exact proof");
+    const authenticated = await openAuthenticatedCurrentMetadataStore(
+      exact.proof,
+      {
+        prepareTreeOidUpgrades: async (roots) =>
+          new Map(roots.map((treeOid) => [treeOid, treeOid])),
+      },
+    );
+    expect(
+      authenticated.matchSessionIdentity("source", "/sessions/source.jsonl"),
+    ).toBe("exact");
+    authenticated.close();
   });
 
-  it("does not import fork ancestry while its first-node guard is pending", async () => {
-    const { store } = await createStore();
-    const parentState = "a".repeat(64);
-    store.touchSession("source", "/sessions/source.jsonl");
-    store.touchSession("fork", "/sessions/fork.jsonl");
-    commitTestNodeState(store, "source", "retained", parentState);
-    store.setPendingNodeGuard("fork", "/sessions/fork.jsonl");
+  it("authenticates published v2 through the recognized-version path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-probe-v2-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const published = openPublishedV2Metadata(path);
+    published
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    published.close();
+    const before = await snapshotDirectory(root);
 
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/sessions/source.jsonl",
-        ancestryEntryIds: ["retained"],
-      }),
-    ).toEqual({ sourceSessionId: "source", copiedStates: 0 });
-    expect(store.getState("fork", "retained")).toBeUndefined();
-    expect(store.pendingNodeGuard("fork", "/sessions/fork.jsonl")).toBe(true);
-    store.close();
+    const inspection = inspectMetadataSessionIdentity(
+      path,
+      "source",
+      "/sessions/source.jsonl",
+    );
+    expect(inspection.kind).toBe("exact");
+    expect(await snapshotDirectory(root)).toEqual(before);
+    if (inspection.kind !== "exact") throw new Error("expected exact proof");
+
+    const authenticated = await openAuthenticatedCurrentMetadataStore(
+      inspection.proof,
+      {
+        prepareTreeOidUpgrades: async (roots) =>
+          new Map(roots.map((treeOid) => [treeOid, treeOid])),
+      },
+    );
+    authenticated.close();
   });
 
-  it("atomically propagates a pending parent to a registered cold fork", async () => {
-    const { store } = await createStore();
-    const parentState = "a".repeat(64);
-    const sourceFile = "/sessions/source.jsonl";
-    const forkFile = "/sessions/fork.jsonl";
-    store.touchSession("source", sourceFile);
-    store.touchSession("fork", forkFile);
-    commitTestNodeState(store, "source", "retained", parentState);
-    expect(store.setPendingNodeGuard("source", sourceFile)).toBe(true);
+  it.each([
+    { version: 0, label: "unversioned" },
+    { version: 1, label: "forged-v1" },
+    { version: CURRENT_METADATA_VERSION.version + 1, label: "newer" },
+  ])(
+    "leaves an unrelated $label SQLite database byte-for-byte untouched",
+    async ({ version }) => {
+      const root = await mkdtemp(
+        join(tmpdir(), "cyclotomy-metadata-probe-unrelated-"),
+      );
+      roots.push(root);
+      const path = join(root, "state.db");
+      const unrelated = new DatabaseSync(path);
+      unrelated.exec(`
+        CREATE TABLE unrelated(value TEXT);
+        INSERT INTO unrelated(value) VALUES ('keep me');
+        PRAGMA user_version = ${version};
+      `);
+      unrelated.close();
+      const before = await snapshotDirectory(root);
 
-    const emptyInput = {
-      targetSessionId: "fork",
-      parentSessionFile: sourceFile,
-      ancestryEntryIds: [],
-    } as const;
-    expect(store.copyForkAncestry(emptyInput)).toEqual({
-      sourceSessionId: "source",
-      copiedStates: 0,
-    });
-    expect(store.pendingNodeGuard("fork", forkFile)).toBe(true);
-    expect(store.getState("fork", "retained")).toBeUndefined();
+      expect(
+        inspectMetadataSessionIdentity(
+          path,
+          "source",
+          "/sessions/source.jsonl",
+        ),
+      ).toEqual({ kind: "unrecognized" });
+      expect(await snapshotDirectory(root)).toEqual(before);
 
-    // Replaying startup import is idempotent: it neither clears the inherited
-    // intent nor slips parent state underneath it.
+      const check = new DatabaseSync(path, { readOnly: true });
+      expect(
+        Number(
+          (
+            check.prepare("PRAGMA user_version").get() as {
+              user_version: number;
+            }
+          ).user_version,
+        ),
+      ).toBe(version);
+      expect(check.prepare("PRAGMA journal_mode").get()).toEqual({
+        journal_mode: "delete",
+      });
+      expect(check.prepare("SELECT value FROM unrelated").get()).toEqual({
+        value: "keep me",
+      });
+      check.close();
+      expect((await readdir(root)).sort()).toEqual(["state.db"]);
+    },
+  );
+
+  it("reads a live WAL without changing its durable database bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-probe-wal-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const live = openPublishedV1Metadata(path);
+    live.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+    live
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    const namesBefore = (await readdir(root)).sort();
+    const databaseBefore = await readFile(path);
+    const walBefore = await readFile(`${path}-wal`);
+
     expect(
-      store.copyForkAncestry({
-        ...emptyInput,
-        ancestryEntryIds: ["retained"],
-      }),
-    ).toEqual({
-      sourceSessionId: "source",
-      copiedStates: 0,
-    });
-    expect(store.pendingNodeGuard("fork", forkFile)).toBe(true);
-    expect(store.getState("fork", "retained")).toBeUndefined();
-    store.close();
+      inspectMetadataSessionIdentity(path, "source", "/sessions/source.jsonl")
+        .kind,
+    ).toBe("exact");
+    expect((await readdir(root)).sort()).toEqual(namesBefore);
+    expect(await readFile(path)).toEqual(databaseBefore);
+    expect(await readFile(`${path}-wal`)).toEqual(walBefore);
+    live.close();
   });
 
-  it("does not create orphan fork metadata for a pending parent", async () => {
-    const { store } = await createStore();
-    const sourceFile = "/sessions/source.jsonl";
-    store.touchSession("source", sourceFile);
-    commitTestNodeState(store, "source", "retained", "a".repeat(64));
-    expect(store.setPendingNodeGuard("source", sourceFile)).toBe(true);
+  it("rejects an authenticated proof after the database pathname is rebound", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "cyclotomy-metadata-probe-rebound-"),
+    );
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV1Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    legacy.close();
+    const inspection = inspectMetadataSessionIdentity(
+      path,
+      "source",
+      "/sessions/source.jsonl",
+    );
+    if (inspection.kind !== "exact") throw new Error("expected exact proof");
 
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "unregistered-fork",
-        parentSessionFile: sourceFile,
-        ancestryEntryIds: ["retained"],
-      }),
-    ).toEqual({ sourceSessionId: "source", copiedStates: 0 });
-    expect(store.getState("unregistered-fork", "retained")).toBeUndefined();
-    expect(store.listRegisteredSessions()).toHaveLength(1);
-    store.close();
+    await rename(path, `${path}.authenticated`);
+    const replacement = new DatabaseSync(path);
+    replacement.exec("CREATE TABLE unrelated(value TEXT)");
+    replacement.close();
+    const before = await snapshotDirectory(root);
+
+    await expect(
+      Promise.resolve().then(() =>
+        openAuthenticatedCurrentMetadataStore(inspection.proof, {
+          prepareTreeOidUpgrades: async (roots) =>
+            new Map(roots.map((treeOid) => [treeOid, treeOid])),
+        }),
+      ),
+    ).rejects.toThrow(/changed after identity was authenticated/u);
+    expect(await snapshotDirectory(root)).toEqual(before);
   });
 
-  it("does not assign later parent state to a guarded missing fork node", async () => {
-    const { store } = await createStore();
-    const laterParentState = "a".repeat(64);
-    store.touchSession("source", "/sessions/source.jsonl");
-    store.protectNodeWrite("fork", "child");
-    commitTestNodeState(store, "source", "child", laterParentState);
+  it("rechecks an authenticated identity before WAL when the inode changed in place", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "cyclotomy-metadata-probe-rewritten-"),
+    );
+    roots.push(root);
+    const path = join(root, "state.db");
+    const legacy = openPublishedV1Metadata(path);
+    legacy
+      .prepare(
+        `INSERT INTO session_registry(
+           session_id, session_file, missing_since, missing_observed_at
+         ) VALUES (?, ?, NULL, NULL)`,
+      )
+      .run("source", "/sessions/source.jsonl");
+    legacy.close();
+    const inspection = inspectMetadataSessionIdentity(
+      path,
+      "source",
+      "/sessions/source.jsonl",
+    );
+    if (inspection.kind !== "exact") throw new Error("expected exact proof");
 
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/sessions/source.jsonl",
-        ancestryEntryIds: ["child"],
-      }),
-    ).toEqual({ sourceSessionId: "source", copiedStates: 0 });
-    expect(store.getState("fork", "child")).toBeUndefined();
-    expect(store.isNodeWriteProtected("fork", "child")).toBe(true);
-    store.close();
+    const replacementPath = join(root, "replacement.db");
+    const replacement = new DatabaseSync(replacementPath);
+    replacement.exec("CREATE TABLE unrelated(value TEXT)");
+    replacement.close();
+    const inode = (await stat(path)).ino;
+    await writeFile(path, await readFile(replacementPath));
+    expect((await stat(path)).ino).toBe(inode);
+    const before = await snapshotDirectory(root);
+
+    await expect(
+      Promise.resolve().then(() =>
+        openAuthenticatedCurrentMetadataStore(inspection.proof, {
+          prepareTreeOidUpgrades: async (roots) =>
+            new Map(roots.map((treeOid) => [treeOid, treeOid])),
+        }),
+      ),
+    ).rejects.toThrow(/identity changed before authenticated write access/u);
+    expect(await snapshotDirectory(root)).toEqual(before);
   });
 
-  it("does not guess when a fork parent was never registered", async () => {
-    const { store } = await createStore();
-    expect(
-      store.copyForkAncestry({
-        targetSessionId: "fork",
-        parentSessionFile: "/missing.jsonl",
-        ancestryEntryIds: ["root"],
+  it("never registers a fork under its parent's session id", async () => {
+    const { path, store } = await createStore();
+    expect(() =>
+      store.finalizeSessionProjection({
+        targetSessionId: "same",
+        targetSessionFile: "/sessions/child.jsonl",
+        retainedEntryIds: [],
+        activeAncestryEntryIds: [],
+        seed: {
+          kind: "fork",
+          projection: {
+            sourceSessionId: "same",
+            barrier: false,
+            coordinates: [],
+          },
+        },
       }),
-    ).toEqual({ sourceSessionId: undefined, copiedStates: 0 });
-    expect(store.getState("fork", "root")).toBeUndefined();
+    ).toThrow(/source and target session ids must differ/u);
+    expect(readTestSessionRegistration(path, "same")).toBeUndefined();
     store.close();
   });
 
   it("enforces unique ownership of a persisted session file", async () => {
-    const { store } = await createStore();
-    store.touchSession("s1", "/sessions/shared.jsonl");
-    expect(() => store.touchSession("s2", "/sessions/shared.jsonl")).toThrow();
-    expect(store.listRegisteredSessions()).toHaveLength(1);
+    const { path, store } = await createStore();
+    registerTestSession(store, "s1", "/sessions/shared.jsonl");
+    expect(() =>
+      registerTestSession(store, "s2", "/sessions/shared.jsonl"),
+    ).toThrow();
+    expect(readTestSessionRegistrations(path)).toHaveLength(1);
     store.close();
   });
 
   it("never remaps one session id to a different persisted file", async () => {
-    const { store } = await createStore();
-    store.touchSession("same", "/sessions/original.jsonl");
+    const { path, store } = await createStore();
+    registerTestSession(store, "same", "/sessions/original.jsonl");
     expect(() =>
-      store.touchSession("same", "/sessions/duplicate.jsonl"),
+      store.finalizeSessionProjection({
+        targetSessionId: "same",
+        targetSessionFile: "/sessions/duplicate.jsonl",
+        retainedEntryIds: [],
+        activeAncestryEntryIds: [],
+        seed: { kind: "fresh" },
+      }),
     ).toThrow(MetadataError);
-    expect(store.listRegisteredSessions()).toEqual([
+    expect(readTestSessionRegistrations(path)).toEqual([
       expect.objectContaining({
         sessionId: "same",
         sessionFile: "/sessions/original.jsonl",
@@ -1084,170 +2260,115 @@ describe("single-state metadata", () => {
     store.close();
   });
 
-  it("moves a pending session guard onto the first observed ancestry atomically", async () => {
+  it("moves a session capture barrier onto the first observed ancestry atomically", async () => {
     const { path, store } = await createStore();
     const sessionFile = "/sessions/s.jsonl";
-    store.touchSession("s", sessionFile);
-    expect(store.pendingNodeGuard("s", sessionFile)).toBe(false);
-    expect(store.setPendingNodeGuard("s", sessionFile)).toBe(true);
-    // Registration refreshes liveness but must not discard safety intent.
-    expect(store.touchSession("s", sessionFile).pendingNodeGuard).toBe(true);
+    registerTestSession(store, "s", sessionFile);
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      false,
+    );
+    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      true,
+    );
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(true);
 
-    const second = new MetadataStore(path);
+    const second = createCurrentMetadataStore(path);
     expect(
-      second.consumePendingNodeGuard("s", sessionFile, [
+      second.reconcileSessionBarrier({ sessionId: "s", sessionFile }, [
         "first-child",
         "second-child",
       ]),
-    ).toBe("protected");
-    expect(store.pendingNodeGuard("s", sessionFile)).toBe(false);
-    expect(store.isNodeWriteProtected("s", "first-child")).toBe(true);
-    expect(store.isNodeWriteProtected("s", "second-child")).toBe(true);
+    ).toBe("reconciled");
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      false,
+    );
+    expect(checkpointIsBlocked(store, "s", "first-child")).toBe(true);
+    expect(checkpointIsBlocked(store, "s", "second-child")).toBe(true);
     expect(
-      store.materializeMissingNodeState(
-        "s",
-        "first-child",
-        "a".repeat(64),
-        "initialize-fresh",
-      ),
-    ).toBe("state-changed");
+      store.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "first-child",
+        activeAncestryEntryIds: ["first-child"],
+        treeOid: "a".repeat(64),
+        expectedSlot: store.getCheckpointSlot("s", "first-child"),
+      }),
+    ).toBe("blocked");
     expect(
-      store.consumePendingNodeGuard("s", sessionFile, ["later-child"]),
-    ).toBe("not-pending");
-    expect(store.isNodeWriteProtected("s", "later-child")).toBe(false);
+      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, [
+        "later-child",
+      ]),
+    ).toBe("absent");
+    expect(checkpointIsBlocked(store, "s", "later-child")).toBe(false);
 
     // Commit CAS operations provide the same transaction boundary if another
     // SQLite connection sets the flag after an earlier runtime observation.
-    expect(second.setPendingNodeGuard("s", sessionFile)).toBe(true);
-    expect(store.commitNodeState("s", "capture-race", "b".repeat(64))).toBe(
-      "write-protected",
+    expect(second.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      true,
     );
-    expect(store.getState("s", "capture-race")).toBeUndefined();
-    expect(store.isNodeWriteProtected("s", "capture-race")).toBe(true);
-    expect(second.setPendingNodeGuard("s", sessionFile)).toBe(true);
     expect(
-      store.materializeMissingNodeState(
-        "s",
-        "materialize-race",
-        "c".repeat(64),
-        "initialize-fresh",
-      ),
-    ).toBe("state-changed");
-    expect(store.getState("s", "materialize-race")).toBeUndefined();
-    expect(store.isNodeWriteProtected("s", "materialize-race")).toBe(true);
-    expect(store.pendingNodeGuard("s", sessionFile)).toBe(false);
+      store.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "capture-race",
+        activeAncestryEntryIds: ["capture-race"],
+        treeOid: "b".repeat(64),
+        expectedSlot: { kind: "open-missing" },
+      }),
+    ).toBe("blocked");
+    expect(checkpointState(store, "s", "capture-race")).toBeUndefined();
+    expect(checkpointIsBlocked(store, "s", "capture-race")).toBe(true);
+    expect(second.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      true,
+    );
+    expect(
+      store.commitCapture({
+        identity: { sessionId: "s", sessionFile },
+        entryId: "materialize-race",
+        activeAncestryEntryIds: ["materialize-race"],
+        treeOid: "c".repeat(64),
+        expectedSlot: { kind: "open-missing" },
+      }),
+    ).toBe("blocked");
+    expect(checkpointState(store, "s", "materialize-race")).toBeUndefined();
+    expect(checkpointIsBlocked(store, "s", "materialize-race")).toBe(true);
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      false,
+    );
     second.close();
     store.close();
   });
 
-  it("authenticates pending guard updates against the exact registered file", async () => {
+  it("authenticates capture barrier updates against the exact registered file", async () => {
     const { store } = await createStore();
     const sessionFile = "/sessions/s.jsonl";
-    store.touchSession("s", sessionFile);
+    registerTestSession(store, "s", sessionFile);
 
-    expect(store.setPendingNodeGuard("s", "/sessions/other.jsonl")).toBe(false);
     expect(
-      store.consumePendingNodeGuard("s", "/sessions/other.jsonl", ["child"]),
-    ).toBe("session-unregistered");
-    expect(
-      store.pendingNodeGuard("s", "/sessions/other.jsonl"),
+      store.hasSessionBarrier({
+        sessionId: "s",
+        sessionFile: "/sessions/other.jsonl",
+      }),
     ).toBeUndefined();
-    expect(store.clearPendingNodeGuard("s", "/sessions/other.jsonl")).toBe(
+    expect(() =>
+      store.raiseSessionBarrier({
+        sessionId: "s",
+        sessionFile: "/sessions/other.jsonl",
+      }),
+    ).toThrow(/not verified/u);
+    expect(
+      store.reconcileSessionBarrier(
+        { sessionId: "s", sessionFile: "/sessions/other.jsonl" },
+        ["child"],
+      ),
+    ).toBe("unregistered");
+    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
+      true,
+    );
+    expect(
+      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, ["child"]),
+    ).toBe("reconciled");
+    expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
       false,
     );
-    expect(store.setPendingNodeGuard("s", sessionFile)).toBe(true);
-    expect(store.clearPendingNodeGuard("s", sessionFile)).toBe(true);
-    expect(store.pendingNodeGuard("s", sessionFile)).toBe(false);
-    store.close();
-  });
-
-  it("prunes only after two missing observations beyond retention", async () => {
-    const { store } = await createStore();
-    store.touchSession("s", "/sessions/s.jsonl");
-    commitTestNodeState(store, "s", "e", "a".repeat(64));
-    store.protectNodeWrite("s", "guarded");
-    expect(store.observeSessionMissing("s", "/sessions/s.jsonl", 100)).toBe(
-      true,
-    );
-    expect(
-      store.pruneMissingSession({
-        expectedSessionId: "s",
-        expectedSessionFile: "/sessions/s.jsonl",
-        expectedMissingSince: 100,
-        expectedMissingObservedAt: 100,
-        now: 1_000,
-        retentionMs: 500,
-      }),
-    ).toMatchObject({ removedSessions: 0, removedNodeStates: 0 });
-    expect(store.observeSessionMissing("s", "/sessions/s.jsonl", 1_000)).toBe(
-      true,
-    );
-    expect(
-      store.pruneMissingSession({
-        expectedSessionId: "s",
-        expectedSessionFile: "/sessions/s.jsonl",
-        expectedMissingSince: 100,
-        expectedMissingObservedAt: 1_000,
-        now: 1_000,
-        retentionMs: 500,
-      }),
-    ).toEqual({
-      removedSessions: 1,
-      removedNodeStates: 1,
-      removedNodeWriteGuards: 1,
-      removedMetadataRows: 3,
-    });
-    expect(store.isNodeWriteProtected("s", "guarded")).toBe(false);
-    expect(store.listReferencedTreeOids()).toEqual([]);
-    store.close();
-  });
-
-  it("CAS-prunes only the exact retained missing registry row", async () => {
-    const { store } = await createStore();
-    const sessionFile = "/sessions/resumed.jsonl";
-    store.touchSession("s", sessionFile);
-    commitTestNodeState(store, "s", "e", "a".repeat(64));
-    store.observeSessionMissing("s", sessionFile, 100);
-    store.observeSessionMissing("s", sessionFile, 200);
-
-    const expected = {
-      expectedSessionId: "s",
-      expectedSessionFile: sessionFile,
-      expectedMissingSince: 100,
-      expectedMissingObservedAt: 200,
-      now: 1_000,
-      retentionMs: 500,
-    };
-    for (const stale of [
-      { ...expected, expectedSessionId: "another" },
-      { ...expected, expectedSessionFile: "/sessions/another.jsonl" },
-      { ...expected, expectedMissingSince: 101 },
-      { ...expected, expectedMissingObservedAt: 201 },
-    ]) {
-      expect(store.pruneMissingSession(stale)).toEqual({
-        removedSessions: 0,
-        removedNodeStates: 0,
-        removedNodeWriteGuards: 0,
-        removedMetadataRows: 0,
-      });
-    }
-
-    store.observeSessionPresent("s", sessionFile);
-    expect(store.pruneMissingSession(expected)).toEqual({
-      removedSessions: 0,
-      removedNodeStates: 0,
-      removedNodeWriteGuards: 0,
-      removedMetadataRows: 0,
-    });
-    expect(store.getState("s", "e")?.treeOid).toBe("a".repeat(64));
-    expect(store.listRegisteredSessions()).toEqual([
-      expect.objectContaining({
-        sessionId: "s",
-        sessionFile,
-        missingSince: null,
-        missingObservedAt: null,
-      }),
-    ]);
     store.close();
   });
 
@@ -1270,8 +2391,25 @@ describe("single-state metadata", () => {
     const outside = join(root, "outside.db");
     await symlink(outside, path);
 
-    expect(() => new MetadataStore(path)).toThrow(/single-link regular file/u);
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /single-link regular file/u,
+    );
     await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves the system cause of an unsafe identity-inspection path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-cause-"));
+    roots.push(root);
+    const path = join(root, "missing.db");
+
+    let failure: unknown;
+    try {
+      inspectMetadataSessionIdentity(path, "source", "/sessions/source.jsonl");
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(MetadataError);
+    expect((failure as MetadataError).cause).toMatchObject({ code: "ENOENT" });
   });
 
   it("refuses a hard-linked metadata database", async () => {
@@ -1283,7 +2421,9 @@ describe("single-state metadata", () => {
     const path = join(root, "state.db");
     await link(outside, path);
 
-    expect(() => new MetadataStore(path)).toThrow(/single-link regular file/u);
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /single-link regular file/u,
+    );
   });
 
   it.each(["wal", "shm"])(
@@ -1294,7 +2434,7 @@ describe("single-state metadata", () => {
       const outside = join(root, `outside-${sidecar}`);
       await symlink(outside, `${path}-${sidecar}`);
 
-      expect(() => new MetadataStore(path)).toThrow(
+      expect(() => createCurrentMetadataStore(path)).toThrow(
         /single-link regular file/u,
       );
       await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1309,7 +2449,9 @@ describe("single-state metadata", () => {
     seeded.close();
     await link(outside, `${path}-wal`);
 
-    expect(() => new MetadataStore(path)).toThrow(/single-link regular file/u);
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /single-link regular file/u,
+    );
   });
 
   it("refuses a stable non-file metadata sidecar", async () => {
@@ -1317,7 +2459,9 @@ describe("single-state metadata", () => {
     store.close();
     await mkdir(`${path}-shm`);
 
-    expect(() => new MetadataStore(path)).toThrow(/single-link regular file/u);
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /single-link regular file/u,
+    );
   });
 
   it("rejects a claimed current version whose physical schema is incomplete", async () => {
@@ -1325,11 +2469,63 @@ describe("single-state metadata", () => {
     roots.push(root);
     const path = join(root, "state.db");
     const db = new DatabaseSync(path);
-    db.exec("PRAGMA user_version = 2");
+    db.exec("PRAGMA user_version = 3");
     db.close();
 
-    expect(() => new MetadataStore(path)).toThrow(
-      /does not match the current layout/u,
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the metadata v3 layout/u,
+    );
+  });
+
+  it("authenticates string literals in the current schema exactly", async () => {
+    const { path, store } = await createStore();
+    store.close();
+    const forged = new DatabaseSync(path);
+    forged.enableDefensive(false);
+    forged.exec("PRAGMA writable_schema = ON");
+    const changed = forged
+      .prepare(
+        `UPDATE sqlite_schema
+         SET sql = replace(
+           sql,
+           '''pending'', ''verified''',
+           '''PENDING'', ''VERIFIED'''
+         )
+         WHERE name = 'session_registry'`,
+      )
+      .run();
+    forged.exec("PRAGMA writable_schema = OFF");
+    forged.close();
+    expect(Number(changed.changes)).toBe(1);
+
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the metadata v3 layout/u,
+    );
+  });
+
+  it("does not normalize whitespace inside schema string literals", async () => {
+    const { path, store } = await createStore();
+    store.close();
+    const forged = new DatabaseSync(path);
+    forged.enableDefensive(false);
+    forged.exec("PRAGMA writable_schema = ON");
+    const changed = forged
+      .prepare(
+        `UPDATE sqlite_schema
+         SET sql = replace(
+           sql,
+           'writer protocol mismatch',
+           'writer  protocol mismatch'
+         )
+         WHERE type = 'trigger'`,
+      )
+      .run();
+    forged.exec("PRAGMA writable_schema = OFF");
+    forged.close();
+    expect(Number(changed.changes)).toBe(9);
+
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the metadata v3 layout/u,
     );
   });
 
@@ -1341,8 +2537,8 @@ describe("single-state metadata", () => {
     forged.exec("ALTER TABLE node_state ADD COLUMN forged TEXT");
     forged.close();
 
-    expect(() => new MetadataStore(path)).toThrow(
-      /does not match the published layout/u,
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the published v1 layout/u,
     );
 
     const check = new DatabaseSync(path);
@@ -1402,8 +2598,8 @@ describe("single-state metadata", () => {
     `);
     forged.close();
 
-    expect(() => new MetadataStore(path)).toThrow(
-      /does not match the published layout/u,
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the published v1 layout/u,
     );
     const check = new DatabaseSync(path);
     expect(
@@ -1432,19 +2628,24 @@ describe("single-state metadata", () => {
     check.close();
   });
 
-  it("rolls back fresh initialization when current-v2 validation fails", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v0-"));
+  it("rejects a nonempty unversioned database without reinterpreting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-empty-"));
     roots.push(root);
     const path = join(root, "state.db");
     const forged = new DatabaseSync(path);
-    forged.exec("CREATE TABLE injected(value TEXT) STRICT");
+    forged.exec(`
+      CREATE TABLE injected(value TEXT) STRICT;
+      INSERT INTO injected(value) VALUES ('preserve me');
+    `);
     forged.close();
+    const before = await snapshotDirectory(root);
 
-    expect(() => new MetadataStore(path)).toThrow(
-      /does not match the current layout/u,
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /unversioned metadata database contains unexpected schema objects/u,
     );
+    expect(await snapshotDirectory(root)).toEqual(before);
 
-    const check = new DatabaseSync(path);
+    const check = new DatabaseSync(path, { readOnly: true });
     expect(
       Number(
         (
@@ -1454,6 +2655,9 @@ describe("single-state metadata", () => {
         ).user_version,
       ),
     ).toBe(0);
+    expect(check.prepare("PRAGMA journal_mode").get()).toEqual({
+      journal_mode: "delete",
+    });
     expect(
       check
         .prepare(
@@ -1464,19 +2668,26 @@ describe("single-state metadata", () => {
         .all()
         .map((row) => String(row.name)),
     ).toEqual(["injected"]);
+    expect(check.prepare("SELECT value FROM injected").all()).toEqual([
+      { value: "preserve me" },
+    ]);
     check.close();
+    expect((await readdir(root)).sort()).toEqual(["state.db"]);
   });
 
   it.each([
     [
       "trigger",
-      `CREATE TRIGGER sabotage AFTER INSERT ON node_state
-       BEGIN DELETE FROM node_state; END`,
+      `CREATE TRIGGER sabotage AFTER INSERT ON checkpoint_slot
+       BEGIN DELETE FROM checkpoint_slot; END`,
     ],
-    ["view", "CREATE VIEW leaked_node_state AS SELECT * FROM node_state"],
+    [
+      "view",
+      "CREATE VIEW leaked_checkpoint_slot AS SELECT * FROM checkpoint_slot",
+    ],
     [
       "extra index",
-      "CREATE INDEX unexpected_node_state_oid ON node_state(tree_oid)",
+      "CREATE INDEX unexpected_checkpoint_oid ON checkpoint_slot(tree_oid)",
     ],
   ])(
     "rejects an unexpected user %s in a current schema",
@@ -1484,31 +2695,34 @@ describe("single-state metadata", () => {
       const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-object-"));
       roots.push(root);
       const path = join(root, "state.db");
-      const initial = new MetadataStore(path);
+      const initial = createCurrentMetadataStore(path);
       initial.close();
       const db = new DatabaseSync(path);
       db.exec(sql);
       db.close();
 
-      expect(() => new MetadataStore(path)).toThrow(
-        /does not match the current layout/u,
+      expect(() => createCurrentMetadataStore(path)).toThrow(
+        /does not match the metadata v3 layout/u,
       );
     },
   );
 
   it.each([
-    ["is missing", "DROP TRIGGER cyclotomy_writer_fence_node_state_update"],
+    [
+      "is missing",
+      "DROP TRIGGER cyclotomy_writer_fence_checkpoint_slot_update",
+    ],
     [
       "is replaced by a no-op",
-      `DROP TRIGGER cyclotomy_writer_fence_node_state_update;
-       CREATE TRIGGER cyclotomy_writer_fence_node_state_update
-       BEFORE UPDATE ON node_state BEGIN SELECT 1; END`,
+      `DROP TRIGGER cyclotomy_writer_fence_checkpoint_slot_update;
+       CREATE TRIGGER cyclotomy_writer_fence_checkpoint_slot_update
+       BEFORE UPDATE ON checkpoint_slot BEGIN SELECT 1; END`,
     ],
     [
       "accepts the wrong protocol",
-      `DROP TRIGGER cyclotomy_writer_fence_node_state_update;
-       CREATE TRIGGER cyclotomy_writer_fence_node_state_update
-       BEFORE UPDATE ON node_state
+      `DROP TRIGGER cyclotomy_writer_fence_checkpoint_slot_update;
+       CREATE TRIGGER cyclotomy_writer_fence_checkpoint_slot_update
+       BEFORE UPDATE ON checkpoint_slot
        WHEN cyclotomy_writer_protocol() IS NOT 1
        BEGIN
          SELECT RAISE(ABORT, 'Cyclotomy metadata writer protocol mismatch');
@@ -1518,14 +2732,14 @@ describe("single-state metadata", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-fence-"));
     roots.push(root);
     const path = join(root, "state.db");
-    const initial = new MetadataStore(path);
+    const initial = createCurrentMetadataStore(path);
     initial.close();
     const db = new DatabaseSync(path);
     db.exec(sql);
     db.close();
 
-    expect(() => new MetadataStore(path)).toThrow(
-      /does not match the current layout/u,
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /does not match the metadata v3 layout/u,
     );
   });
 
@@ -1534,9 +2748,12 @@ describe("single-state metadata", () => {
     roots.push(root);
     const path = join(root, "state.db");
     const db = new DatabaseSync(path);
-    db.exec("PRAGMA user_version = 3");
+    const newerVersion = CURRENT_METADATA_VERSION.version + 1;
+    db.exec(`PRAGMA user_version = ${newerVersion}`);
     db.close();
-    expect(() => new MetadataStore(path)).toThrow(/newer than supported/u);
+    expect(() => createCurrentMetadataStore(path)).toThrow(
+      /newer than supported/u,
+    );
     const check = new DatabaseSync(path);
     expect(
       Number(
@@ -1546,7 +2763,7 @@ describe("single-state metadata", () => {
           }
         ).user_version,
       ),
-    ).toBe(3);
+    ).toBe(newerVersion);
     check.close();
   });
 });

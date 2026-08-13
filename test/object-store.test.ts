@@ -23,13 +23,20 @@ import { join, parse as parsePath } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ObjectStoreError,
   openObjectStore,
-  PUBLISHED_TREE_MANIFEST_FORMAT,
-  TREE_MANIFEST_FORMAT,
+  TreeImportAdmissionError,
+  TreeImportSourceError,
+  type NativeObjectStore,
   type ObjectStore,
-  type TreeEntry,
+  type TreeImportAdmission,
 } from "../src/infrastructure/object-store.ts";
-import { ABSOLUTE_MAX_TREE_MANIFEST_BYTES } from "../src/infrastructure/tree-manifest.ts";
+import {
+  ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
+  type TreeEntry,
+} from "../src/infrastructure/tree-formats/manifest-codec.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
+import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
 import {
   publishTestBlob,
   publishTestBlobInPublication,
@@ -37,6 +44,17 @@ import {
 } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 const completeScope = ALL_MANAGED_SCOPE;
+const TEST_BARRIER_WATCHDOG_MS = 30_000;
+const DEFAULT_IMPORT_ADMISSION = Object.freeze<TreeImportAdmission>({
+  validateImportedTree: async () => ({ kind: "accepted" }),
+  maxSnapshotBytes: Number.MAX_SAFE_INTEGER,
+});
+
+function importAdmission(
+  overrides: Partial<TreeImportAdmission> = {},
+): TreeImportAdmission {
+  return { ...DEFAULT_IMPORT_ADMISSION, ...overrides };
+}
 
 function digest(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
@@ -48,6 +66,19 @@ function physicalObjectPath(
   oid: string,
 ): string {
   return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
+}
+
+async function publishedObjectPaths(root: string): Promise<string[]> {
+  const paths: string[] = [];
+  for (const kind of ["blobs", "trees"] as const) {
+    const namespace = join(root, "objects", kind);
+    for (const shard of await readdir(namespace)) {
+      for (const name of await readdir(join(namespace, shard))) {
+        paths.push(`${kind}/${shard}/${name}`);
+      }
+    }
+  }
+  return paths.sort();
 }
 
 async function installTreeObject(
@@ -83,7 +114,7 @@ async function fileHandlePrototype(): Promise<{
 
 describe("object store", () => {
   let root: string;
-  let store: ObjectStore;
+  let store: NativeObjectStore;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "cyclotomy-object-store-"));
@@ -211,7 +242,7 @@ describe("object store", () => {
   it("migrates an authenticated published-v1 tree to a deterministic v2 object", async () => {
     const legacyBytes = Buffer.from(
       `${JSON.stringify({
-        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        format: TREE_MANIFEST_FORMAT_V1,
         entries: [],
         scope: completeScope,
       })}\n`,
@@ -219,27 +250,120 @@ describe("object store", () => {
     const oldTreeOid = await installTreeObject(root, legacyBytes);
 
     await expect(store.readTree(oldTreeOid)).resolves.toMatchObject({
-      format: PUBLISHED_TREE_MANIFEST_FORMAT,
+      format: TREE_MANIFEST_FORMAT_V1,
     });
-    const first = await store.migrateLegacyTree(oldTreeOid);
-    expect(first).toMatchObject({ kind: "migrated", oldTreeOid });
-    if (first.kind !== "migrated") throw new Error("expected migration");
+    await expect(
+      store.upgradeTree(oldTreeOid, TREE_MANIFEST_FORMAT_V1),
+    ).resolves.toEqual({ kind: "already-target", treeOid: oldTreeOid });
+    const first = await store.upgradeTree(
+      oldTreeOid,
+      CURRENT_TREE_MANIFEST_FORMAT,
+    );
+    expect(first).toMatchObject({
+      kind: "upgraded",
+      sourceTreeOid: oldTreeOid,
+    });
+    if (first.kind !== "upgraded") throw new Error("expected upgrade");
     expect(first.treeOid).not.toBe(oldTreeOid);
     expect(
       await readFile(physicalObjectPath(root, "trees", oldTreeOid)),
     ).toEqual(legacyBytes);
     expect(await store.readTree(first.treeOid)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [],
       scope: completeScope,
     });
 
     const migratedPath = physicalObjectPath(root, "trees", first.treeOid);
     const beforeRetry = await stat(migratedPath);
-    await expect(store.migrateLegacyTree(oldTreeOid)).resolves.toEqual(first);
+    await expect(
+      store.upgradeTree(oldTreeOid, CURRENT_TREE_MANIFEST_FORMAT),
+    ).resolves.toEqual(first);
     const afterRetry = await stat(migratedPath);
     expect(afterRetry.ino).toBe(beforeRetry.ino);
     expect(afterRetry.mtimeMs).toBe(beforeRetry.mtimeMs);
+  });
+
+  it("verifies durable tree closures independently of current capture limits", async () => {
+    const content = Buffer.from("historical blob", "utf8");
+    const publishingStore = await openObjectStore(root, {
+      maxFileBytes: content.byteLength,
+    });
+    const blobOid = await publishTestBlob(publishingStore, content);
+    const legacyBytes = Buffer.from(
+      `${JSON.stringify({
+        format: TREE_MANIFEST_FORMAT_V1,
+        entries: [
+          {
+            path: "historical.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        scope: completeScope,
+      })}\n`,
+    );
+    const legacyTreeOid = await installTreeObject(root, legacyBytes);
+    const limitedStore = await openObjectStore(root, { maxFileBytes: 1 });
+
+    await expect(limitedStore.readTree(legacyTreeOid)).rejects.toMatchObject({
+      code: "object-integrity",
+    });
+    const upgraded = await limitedStore.upgradeTree(
+      legacyTreeOid,
+      CURRENT_TREE_MANIFEST_FORMAT,
+    );
+    expect(upgraded).toMatchObject({
+      kind: "upgraded",
+      sourceTreeOid: legacyTreeOid,
+    });
+    if (upgraded.kind !== "upgraded") throw new Error("expected upgrade");
+    await expect(
+      limitedStore.readTreeManifest(upgraded.treeOid),
+    ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
+    await expect(limitedStore.readTree(upgraded.treeOid)).rejects.toMatchObject(
+      { code: "object-integrity" },
+    );
+    await expect(
+      limitedStore.upgradeTree(upgraded.treeOid, CURRENT_TREE_MANIFEST_FORMAT),
+    ).resolves.toEqual({
+      kind: "already-target",
+      treeOid: upgraded.treeOid,
+    });
+  });
+
+  it("authenticates the closure before returning an already-target migration", async () => {
+    const content = Buffer.from("authenticated closure", "utf8");
+    const publishingStore = await openObjectStore(root, {
+      maxFileBytes: content.byteLength,
+    });
+    const blobOid = await publishTestBlob(publishingStore, content);
+    const treeOid = await publishTestTree(
+      publishingStore,
+      [
+        {
+          path: "file.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o600,
+        },
+      ],
+      completeScope,
+    );
+    const limitedStore = await openObjectStore(root, { maxFileBytes: 1 });
+
+    await expect(
+      limitedStore.upgradeTree(treeOid, CURRENT_TREE_MANIFEST_FORMAT),
+    ).resolves.toEqual({ kind: "already-target", treeOid });
+
+    await writeFile(
+      physicalObjectPath(root, "blobs", blobOid),
+      Buffer.alloc(content.byteLength, 0x78),
+    );
+    await expect(
+      limitedStore.upgradeTree(treeOid, CURRENT_TREE_MANIFEST_FORMAT),
+    ).rejects.toMatchObject({ code: "object-integrity" });
   });
 
   it("keeps a valid v1 tree isolated when portable v2 conversion is lossy", async () => {
@@ -252,7 +376,7 @@ describe("object store", () => {
     });
     const legacyBytes = Buffer.from(
       `${JSON.stringify({
-        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        format: TREE_MANIFEST_FORMAT_V1,
         entries: [entry("Σ/a"), entry("ς/b")],
         scope: completeScope,
       })}\n`,
@@ -260,10 +384,12 @@ describe("object store", () => {
     const treeOid = await installTreeObject(root, legacyBytes);
 
     await expect(store.readTree(treeOid)).resolves.toMatchObject({
-      format: PUBLISHED_TREE_MANIFEST_FORMAT,
+      format: TREE_MANIFEST_FORMAT_V1,
     });
-    await expect(store.migrateLegacyTree(treeOid)).resolves.toMatchObject({
-      kind: "legacy-incompatible",
+    await expect(
+      store.upgradeTree(treeOid, CURRENT_TREE_MANIFEST_FORMAT),
+    ).resolves.toMatchObject({
+      kind: "incompatible",
       treeOid,
     });
     expect(await readdir(join(root, "objects", "trees"))).toEqual([
@@ -438,7 +564,7 @@ describe("object store", () => {
     expect(first).toMatch(/^[0-9a-f]{64}$/u);
     await stat(physicalObjectPath(root, "trees", first));
     expect(await store.readTree(first)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: "src/current",
@@ -500,7 +626,7 @@ describe("object store", () => {
     ];
     const oid = await publishTestTree(store, entries, scope);
     expect(await store.readTree(oid)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries,
       scope: gitScope({
         gitignoreSources: [
@@ -549,7 +675,7 @@ describe("object store", () => {
 
     expect(second).toBe(first);
     expect(await store.readTree(first)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
           path: "a.txt",
@@ -569,7 +695,7 @@ describe("object store", () => {
 
     const empty = await publishTestTree(store, [], completeScope);
     expect(await store.readTree(empty)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [],
       scope: completeScope,
     });
@@ -951,10 +1077,58 @@ describe("object store", () => {
     });
   });
 
+  it.each(["ordinary", "sparse"] as const)(
+    "rejects an oversized %s blob from its opened-handle stat before reading or hashing",
+    async (fixture) => {
+      const maxFileBytes = 4;
+      const limited = await openObjectStore(root, { maxFileBytes });
+      const oid = fixture === "ordinary" ? "1".repeat(64) : "2".repeat(64);
+      const path = physicalObjectPath(root, "blobs", oid);
+      await mkdir(join(root, "objects", "blobs", oid.slice(0, 2)), {
+        recursive: true,
+      });
+      if (fixture === "ordinary") {
+        // Deliberately does not match `oid`: the size gate must win before the
+        // digest can inspect any bytes.
+        await writeFile(path, Buffer.alloc(maxFileBytes + 1, 0x61));
+      } else {
+        await writeFile(path, "");
+        await truncate(path, maxFileBytes + 1);
+      }
+
+      const prototype = await fileHandlePrototype();
+      const readablePrototype = prototype as typeof prototype & {
+        read(...args: unknown[]): Promise<unknown>;
+      };
+      const originalRead = readablePrototype.read;
+      let reads = 0;
+      const spy = vi
+        .spyOn(readablePrototype, "read")
+        .mockImplementation(async function (
+          this: FileHandle,
+          ...args: unknown[]
+        ): Promise<unknown> {
+          reads += 1;
+          return Reflect.apply(originalRead, this, args);
+        });
+
+      await expect(limited.readBlob(oid)).rejects.toMatchObject({
+        code: "object-integrity",
+        message: expect.stringContaining(`${maxFileBytes}-byte limit`),
+      });
+      await expect(limited.verifyBlobs([oid])).rejects.toMatchObject({
+        code: "object-integrity",
+        message: expect.stringContaining(`${maxFileBytes}-byte limit`),
+      });
+      spy.mockRestore();
+      expect(reads).toBe(0);
+    },
+  );
+
   it("keeps the tree read bounded when the file grows after the initial stat", async () => {
     const content = Buffer.from(
       `${JSON.stringify({
-        format: TREE_MANIFEST_FORMAT,
+        format: CURRENT_TREE_MANIFEST_FORMAT,
         entries: [],
         scope: completeScope,
       })}\n`,
@@ -1039,7 +1213,7 @@ describe("object store", () => {
   it("rejects a noncanonical scope even when its digest matches", async () => {
     const content = Buffer.from(
       `${JSON.stringify({
-        format: TREE_MANIFEST_FORMAT,
+        format: CURRENT_TREE_MANIFEST_FORMAT,
         entries: [],
         scope: {
           kind: "git",
@@ -1069,7 +1243,7 @@ describe("object store", () => {
     const ignoreBytes = Buffer.from("secret\n");
     const content = Buffer.from(
       `${JSON.stringify({
-        format: TREE_MANIFEST_FORMAT,
+        format: CURRENT_TREE_MANIFEST_FORMAT,
         entries: [
           {
             path: ".gitignore",
@@ -1232,6 +1406,826 @@ async function publishTwoBlobTree(
   );
   return { treeOid, blobOids };
 }
+
+describe("cross-store tree import", () => {
+  it("copies authenticated deduplicated closures and preserves their ids", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("shared\n"));
+      const firstTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const secondTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "second.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      );
+      const validated: string[] = [];
+
+      await target.importTreesFrom(
+        source,
+        [firstTree, secondTree, firstTree],
+        importAdmission({
+          validateImportedTree: async (treeOid) => {
+            validated.push(treeOid);
+            return { kind: "accepted" };
+          },
+        }),
+      );
+
+      expect(validated).toEqual([firstTree, secondTree]);
+      await expect(target.readTree(firstTree)).resolves.toEqual(
+        await source.readTree(firstTree),
+      );
+      await expect(target.readTree(secondTree)).resolves.toEqual(
+        await source.readTree(secondTree),
+      );
+      expect(Buffer.from(await target.readBlob(blobOid)).toString("utf8")).toBe(
+        "shared\n",
+      );
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the target blob limit without inheriting the source's current limit", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const content = Buffer.from("historical source blob", "utf8");
+      const publishingSource = await openObjectStore(sourceRoot, {
+        maxFileBytes: content.byteLength,
+      });
+      const blobOid = await publishTestBlob(publishingSource, content);
+      const treeOid = await publishTestTree(
+        publishingSource,
+        [
+          {
+            path: "historical.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      );
+      const limitedSource = await openObjectStore(sourceRoot, {
+        maxFileBytes: 1,
+      });
+      const target = await openObjectStore(targetRoot, {
+        maxFileBytes: content.byteLength,
+      });
+
+      await expect(limitedSource.readTree(treeOid)).rejects.toMatchObject({
+        code: "object-integrity",
+      });
+      await expect(
+        target.importTreesFrom(
+          limitedSource,
+          [treeOid],
+          DEFAULT_IMPORT_ADMISSION,
+        ),
+      ).resolves.toBeUndefined();
+      await expect(target.readTree(treeOid)).resolves.toBeDefined();
+      await expect(target.readBlob(blobOid)).resolves.toEqual(content);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an asynchronous import validator mutate authenticated manifests", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("stable\n"));
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "stable.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        gitScope({
+          gitignoreSources: [{ path: ".gitignore", contents: "ignored/\n" }],
+        }),
+      );
+
+      await target.importTreesFrom(
+        source,
+        [treeOid],
+        importAdmission({
+          validateImportedTree: async (_treeOid, manifest) => {
+            await Promise.resolve();
+            expect(Object.isFrozen(manifest)).toBe(true);
+            expect(Object.isFrozen(manifest.entries)).toBe(true);
+            expect(Object.isFrozen(manifest.entries[0])).toBe(true);
+            expect(Reflect.set(manifest, "format", "forged-format")).toBe(
+              false,
+            );
+            expect(
+              Reflect.set(manifest.entries[0]!, "blobOid", "f".repeat(64)),
+            ).toBe(false);
+            expect(Reflect.deleteProperty(manifest.entries, "0")).toBe(false);
+            expect(manifest.scope.kind).toBe("git");
+            if (manifest.scope.kind === "git") {
+              expect(Object.isFrozen(manifest.scope)).toBe(true);
+              expect(Object.isFrozen(manifest.scope.gitignoreSources)).toBe(
+                true,
+              );
+              expect(Object.isFrozen(manifest.scope.gitignoreSources[0])).toBe(
+                true,
+              );
+              expect(
+                Reflect.set(manifest.scope, "repositoryPrefix", "mutated"),
+              ).toBe(false);
+              expect(
+                Reflect.set(
+                  manifest.scope.gitignoreSources[0]!,
+                  "path",
+                  "mutated",
+                ),
+              ).toBe(false);
+            }
+            return { kind: "accepted" };
+          },
+        }),
+      );
+
+      await expect(target.readTree(treeOid)).resolves.toEqual(
+        await source.readTree(treeOid),
+      );
+      await expect(target.readBlob(blobOid)).resolves.toEqual(
+        Buffer.from("stable\n"),
+      );
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a source tree removed after admission as a publication source failure", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    let syncSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("source"));
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "source.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const prototype = await fileHandlePrototype();
+      const originalSync = prototype.sync;
+      let removed = false;
+      syncSpy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+        this: FileHandle,
+      ) {
+        if (!removed && (await this.stat()).isFile()) {
+          removed = true;
+          await unlink(physicalObjectPath(sourceRoot, "trees", treeOid));
+        }
+        return originalSync.call(this);
+      });
+
+      const rejection = await target
+        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
+        .catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(TreeImportSourceError);
+      expect(rejection).not.toBeInstanceOf(TreeImportAdmissionError);
+      expect(Buffer.from(await target.readBlob(blobOid))).toEqual(
+        Buffer.from("source"),
+      );
+      await expect(target.readTree(treeOid)).rejects.toMatchObject({
+        code: "missing-object",
+      });
+    } finally {
+      syncSpy?.mockRestore();
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps target publication failures distinct from source failures", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("source"));
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "source.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const targetBlobRoot = join(targetRoot, "objects", "blobs");
+      await rm(targetBlobRoot, { recursive: true });
+      await writeFile(targetBlobRoot, "blocks target publication");
+
+      const rejection = await target
+        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
+        .catch((error: unknown) => error);
+
+      expect(rejection).toMatchObject({ code: "storage-failure" });
+      expect(rejection).not.toBeInstanceOf(TreeImportAdmissionError);
+      expect(rejection).not.toBeInstanceOf(TreeImportSourceError);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers a later target failure over the first source failure across active lanes", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    let syncSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const originalHasInstance = Object.getOwnPropertyDescriptor(
+      TreeImportSourceError,
+      Symbol.hasInstance,
+    );
+    let hasInstanceOverridden = false;
+    let sourceClassifiedTimer: NodeJS.Timeout | undefined;
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const { treeOid } = await publishTwoBlobTree(source);
+      const prototype = await fileHandlePrototype();
+      const originalSync = prototype.sync;
+      const sourceFailure = new TreeImportSourceError(
+        new Error("source lane failed first"),
+      );
+      const targetFailure = new ObjectStoreError(
+        "storage-failure",
+        "target lane failed later",
+      );
+      const events: string[] = [];
+      let signalSourceClassified: () => void = () => {};
+      const sourceClassified = new Promise<void>((resolve, reject) => {
+        sourceClassifiedTimer = setTimeout(() => {
+          reject(new Error("timed out waiting for source-lane classification"));
+        }, TEST_BARRIER_WATCHDOG_MS);
+        signalSourceClassified = () => {
+          clearTimeout(sourceClassifiedTimer);
+          sourceClassifiedTimer = undefined;
+          resolve();
+        };
+      });
+      Object.defineProperty(TreeImportSourceError, Symbol.hasInstance, {
+        configurable: true,
+        value(candidate: unknown): boolean {
+          const matches = Function.prototype[Symbol.hasInstance].call(
+            TreeImportSourceError,
+            candidate,
+          ) as boolean;
+          if (matches && candidate === sourceFailure) {
+            events.push("source-classified");
+            signalSourceClassified();
+          }
+          return matches;
+        },
+      });
+      hasInstanceOverridden = true;
+      let regularFileSyncs = 0;
+      syncSpy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+        this: FileHandle,
+      ) {
+        if (!(await this.stat()).isFile()) {
+          return originalSync.call(this);
+        }
+        regularFileSyncs += 1;
+        if (regularFileSyncs === 1) {
+          events.push("source-thrown");
+          throw sourceFailure;
+        }
+        if (regularFileSyncs === 2) {
+          await sourceClassified;
+          // Let runPool retain the classified source failure before the
+          // already-active second lane reports the target failure.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          events.push("target-thrown");
+          throw targetFailure;
+        }
+        return originalSync.call(this);
+      });
+
+      const rejection = await target
+        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
+        .catch((error: unknown) => error);
+
+      expect(events).toEqual([
+        "source-thrown",
+        "source-classified",
+        "target-thrown",
+      ]);
+      expect(rejection).toBe(targetFailure);
+      expect(rejection).not.toBeInstanceOf(TreeImportSourceError);
+    } finally {
+      clearTimeout(sourceClassifiedTimer);
+      syncSpy?.mockRestore();
+      if (hasInstanceOverridden) {
+        if (originalHasInstance === undefined) {
+          Reflect.deleteProperty(TreeImportSourceError, Symbol.hasInstance);
+        } else {
+          Object.defineProperty(
+            TreeImportSourceError,
+            Symbol.hasInstance,
+            originalHasInstance,
+          );
+        }
+      }
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes nothing when one source blob in the bundle is corrupt", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const goodBlobOid = await publishTestBlob(source, Buffer.from("good"));
+      const corruptBlobOid = await publishTestBlob(
+        source,
+        Buffer.from("intact"),
+      );
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "good.txt",
+            type: "regular",
+            blobOid: goodBlobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "corrupt.txt",
+            type: "regular",
+            blobOid: corruptBlobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      await truncate(
+        physicalObjectPath(sourceRoot, "blobs", corruptBlobOid),
+        1,
+      );
+
+      await expect(
+        target.importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION),
+      ).rejects.toMatchObject({ code: "object-integrity" });
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces target file and snapshot byte limits during import", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot, { maxFileBytes: 6 });
+      const smallBlobOid = await publishTestBlob(source, Buffer.from("ok"));
+      const blobOid = await publishTestBlob(source, Buffer.from("seven!!"));
+      const fileTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "small.txt",
+            type: "regular",
+            blobOid: smallBlobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "file.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      await expect(
+        target.importTreesFrom(source, [fileTree], DEFAULT_IMPORT_ADMISSION),
+      ).rejects.toThrow(/target file limit/u);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+
+      const snapshotTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "second.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "link",
+            type: "symlink",
+            target: "file.txt",
+            symlinkKind: "file",
+          },
+        ],
+        completeScope,
+      );
+      const snapshotTarget = await openObjectStore(targetRoot, {
+        maxFileBytes: 16,
+      });
+      await expect(
+        snapshotTarget.importTreesFrom(
+          source,
+          [snapshotTree],
+          importAdmission({ maxSnapshotBytes: 20 }),
+        ),
+      ).rejects.toThrow(/target snapshot limit/u);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized imported blob before hashing its corrupt bytes", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot, { maxFileBytes: 6 });
+      const bytes = Buffer.from("seven!!");
+      const blobOid = await publishTestBlob(source, bytes);
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "oversized.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        completeScope,
+      );
+      // Keep the oversized length but invalidate the digest. Target admission
+      // must report its byte limit without doing the otherwise failing hash.
+      await writeFile(
+        physicalObjectPath(sourceRoot, "blobs", blobOid),
+        Buffer.from("corrupt"),
+      );
+
+      await expect(
+        target.importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION),
+      ).rejects.toThrow(/target file limit/u);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preflights every manifest before publishing earlier closures", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("valid"));
+      const validTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "valid.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const invalidTree = await installTreeObject(
+        sourceRoot,
+        Buffer.from("{}\n"),
+      );
+
+      await expect(
+        target.importTreesFrom(
+          source,
+          [validTree, invalidTree],
+          DEFAULT_IMPORT_ADMISSION,
+        ),
+      ).rejects.toMatchObject({ code: "object-integrity" });
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preflights every tree policy before publishing earlier closures", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const firstBlob = await publishTestBlob(source, Buffer.from("first"));
+      const secondBlob = await publishTestBlob(source, Buffer.from("second"));
+      const firstTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid: firstBlob,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const rejectedTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "second.txt",
+            type: "regular",
+            blobOid: secondBlob,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+
+      const operationalFailure = new Error("policy evaluator unavailable");
+      const operational = await target
+        .importTreesFrom(
+          source,
+          [firstTree, rejectedTree],
+          importAdmission({
+            validateImportedTree: async () => {
+              throw operationalFailure;
+            },
+          }),
+        )
+        .catch((error: unknown) => error);
+      expect(operational).toBe(operationalFailure);
+      expect(operational).not.toBeInstanceOf(TreeImportAdmissionError);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+
+      const rejection = await target
+        .importTreesFrom(
+          source,
+          [firstTree, rejectedTree],
+          importAdmission({
+            validateImportedTree: async (treeOid) => {
+              return treeOid === rejectedTree
+                ? { kind: "rejected", cause: new Error("policy rejected") }
+                : { kind: "accepted" };
+            },
+          }),
+        )
+        .catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(TreeImportAdmissionError);
+      expect(rejection).toMatchObject({ code: "storage-failure" });
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+
+      const sourceShapedCause = new TreeImportSourceError(
+        new Error("policy diagnostic resembles a source failure"),
+      );
+      const taggedRejection = await target
+        .importTreesFrom(
+          source,
+          [rejectedTree],
+          importAdmission({
+            validateImportedTree: async () => ({
+              kind: "rejected",
+              cause: sourceShapedCause,
+            }),
+          }),
+        )
+        .catch((error: unknown) => error);
+      expect(taggedRejection).toBeInstanceOf(TreeImportAdmissionError);
+      expect(taggedRejection).not.toBeInstanceOf(TreeImportSourceError);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preflights every tree quota before publishing earlier trees", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("four"));
+      const firstTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+      const oversizedTree = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "second.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        completeScope,
+      );
+
+      await expect(
+        target.importTreesFrom(
+          source,
+          [firstTree, oversizedTree],
+          importAdmission({
+            maxSnapshotBytes: 7,
+          }),
+        ),
+      ).rejects.toThrow(/target snapshot limit/u);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("counts shared blobs per path and symlinks in UTF-8 bytes", async () => {
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-source-"),
+    );
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-import-target-"),
+    );
+    try {
+      const source = await openObjectStore(sourceRoot);
+      const target = await openObjectStore(targetRoot);
+      const blobOid = await publishTestBlob(source, Buffer.from("seven!!"));
+      const treeOid = await publishTestTree(
+        source,
+        [
+          {
+            path: "first.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "second.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+          {
+            path: "link",
+            type: "symlink",
+            target: "猫",
+            symlinkKind: "file",
+          },
+        ],
+        completeScope,
+      );
+
+      await expect(
+        target.importTreesFrom(
+          source,
+          [treeOid],
+          importAdmission({ maxSnapshotBytes: 16 }),
+        ),
+      ).rejects.toThrow(/target snapshot limit/u);
+      expect(await publishedObjectPaths(targetRoot)).toEqual([]);
+
+      await expect(
+        target.importTreesFrom(
+          source,
+          [treeOid],
+          importAdmission({ maxSnapshotBytes: 17 }),
+        ),
+      ).resolves.toBeUndefined();
+      expect(
+        (await publishedObjectPaths(targetRoot)).filter((path) =>
+          path.startsWith("blobs/"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("targeted blob verification", () => {
   let root: string;

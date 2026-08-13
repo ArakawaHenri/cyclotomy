@@ -3,41 +3,50 @@ import { constants, type Stats } from "node:fs";
 import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join, parse as parsePath, resolve } from "node:path";
 
-import { isTreeOid } from "../domain/model.ts";
-import type { WorkspaceScope } from "./workspace-scope.ts";
+import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
+  type WorkspaceScope,
+} from "./workspace-scope.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
+import {
+  isNativeObjectOid,
+  nativeObjectLayout,
+  nativeObjectNamespacePath,
+  nativeObjectPath,
+  nativeObjectShardPath,
+  nativeTemporaryObjectName,
+  type NativeObjectKind,
+  type NativeObjectLayout,
+} from "./workspace-store.ts";
 import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   ABSOLUTE_TREE_MANIFEST_LIMITS,
   assertTreeManifestLimits,
-  canonicalizeTreeManifest,
   DEFAULT_TREE_MANIFEST_LIMITS,
-  encodeTreeManifest,
-  migrateTreeManifestToCurrent,
-  parseCanonicalTreeManifest,
-  PUBLISHED_TREE_MANIFEST_FORMAT,
   TreeManifestError,
   type TreeEntry,
   type TreeManifest,
   type TreeManifestLimits,
-} from "./tree-manifest.ts";
-
-export {
-  PUBLISHED_TREE_MANIFEST_FORMAT,
-  TREE_MANIFEST_FORMAT,
-  type FileRecreationMode,
-  type SymlinkKind,
-  type TreeEntry,
-  type TreeManifest,
-  type TreeManifestLimits,
-} from "./tree-manifest.ts";
+} from "./tree-formats/manifest-codec.ts";
+import {
+  createCurrentTreeManifest,
+  encodeCurrentTreeManifest,
+  type CurrentTreeManifest,
+} from "./tree-formats/current.ts";
+import {
+  encodeTreeManifest,
+  isCurrentTreeManifest,
+  parseTreeManifest,
+  treeManifestBlobOids,
+  upgradeTreeManifest,
+} from "./tree-formats/history.ts";
 
 export type ObjectStoreErrorCode =
   | "invalid-root"
   | "invalid-blob"
   | "invalid-object-id"
   | "invalid-tree-manifest"
-  | "legacy-incompatible"
+  | "format-incompatible"
   | "missing-object"
   | "object-integrity"
   | "storage-failure";
@@ -52,6 +61,48 @@ export class ObjectStoreError extends Error {
   }
 }
 
+class ObjectSizeLimitError extends ObjectStoreError {
+  readonly observedBytes: number;
+  readonly maxBytes: number;
+
+  constructor(observedBytes: number, maxBytes: number) {
+    super(
+      "object-integrity",
+      `object size ${observedBytes} exceeds the ${maxBytes}-byte limit`,
+    );
+    this.name = "ObjectSizeLimitError";
+    this.observedBytes = observedBytes;
+    this.maxBytes = maxBytes;
+  }
+}
+
+/**
+ * Import was deterministically rejected before publication. The target object
+ * namespace is guaranteed untouched; operational validator failures are not
+ * members of this type and remain retryable by callers.
+ */
+export class TreeImportAdmissionError extends ObjectStoreError {
+  constructor(cause: unknown) {
+    const failure = asStoreError("tree import admission", cause);
+    super(failure.code, failure.message, failure);
+    this.name = "TreeImportAdmissionError";
+  }
+}
+
+/**
+ * An authenticated import source was operationally unavailable during
+ * preflight or changed while its closure was being published. The target may
+ * contain unreferenced immutable objects, but callers have not yet committed
+ * metadata that points to them.
+ */
+export class TreeImportSourceError extends ObjectStoreError {
+  constructor(cause: unknown) {
+    const failure = asStoreError("tree import source", cause);
+    super(failure.code, failure.message, failure);
+    this.name = "TreeImportSourceError";
+  }
+}
+
 /**
  * One coherent snapshot-publication session. A native store can use this
  * boundary to remember which blobs it authenticated while publishing this
@@ -62,6 +113,7 @@ export interface SnapshotPublication {
    * Materialize scanner-observed content when it is missing. Existing matching
    * objects are authenticated and reused without reopening the source path;
    * the capture boundary performs a final whole-workspace validation scan.
+   * Distinct blobs in one publication may be submitted concurrently.
    */
   publishBlobFromFile(
     sourcePath: string,
@@ -96,40 +148,96 @@ export interface ObjectStore {
    * first workspace mutation.
    */
   readTreeManifest(treeOid: string): Promise<TreeManifest>;
-  /**
-   * Publish the deterministic v2 equivalent of one authenticated v1 tree.
-   * The caller owns metadata reference replacement and the workspace lock.
-   */
-  migrateLegacyTree(treeOid: string): Promise<TreeMigrationResult>;
   /** Authenticate exactly the supplied blob ids with bounded concurrency. */
   verifyBlobs(blobOids: readonly string[]): Promise<void>;
 }
 
+interface NativeObjectAccess {
+  readObject(kind: NativeObjectKind, oid: string): Promise<Buffer>;
+  verifyObject(
+    kind: NativeObjectKind,
+    oid: string,
+    maxBlobBytes?: number,
+  ): Promise<Stats>;
+  objectPath(kind: NativeObjectKind, oid: string): Promise<string>;
+  assertStillVerified(
+    kind: NativeObjectKind,
+    oid: string,
+    expected: Stats,
+    maxBlobBytes?: number,
+  ): Promise<void>;
+}
+
+declare const NATIVE_OBJECT_STORE: unique symbol;
+
+interface NativeObjectRecord {
+  readonly access: NativeObjectAccess;
+  readonly layout: NativeObjectLayout;
+}
+
+const nativeObjectRecords = new WeakMap<object, NativeObjectRecord>();
+
+/** A store opened over Cyclotomy's authenticated native CAS layout. */
+export interface NativeObjectStore extends ObjectStore {
+  readonly [NATIVE_OBJECT_STORE]: true;
+  /** Publish an authenticated tree in one explicit supported target format. */
+  upgradeTree(
+    treeOid: string,
+    targetFormat: string,
+  ): Promise<TreeFormatUpgradeResult>;
+  /** Import authenticated closures from another native CAS capability. */
+  importTreesFrom(
+    source: NativeObjectStore,
+    treeOids: readonly string[],
+    admission: TreeImportAdmission,
+  ): Promise<void>;
+}
+
 export interface OpenObjectStoreOptions {
+  /** Maximum bytes admitted for one blob. Default 50 MiB. */
+  readonly maxFileBytes?: number;
   readonly maxEntries?: number;
   readonly maxManifestBytes?: number;
   readonly maxPathBytes?: number;
   readonly maxPathComponents?: number;
 }
 
-export type TreeMigrationResult =
-  | { readonly kind: "current"; readonly treeOid: string }
+export interface TreeImportAdmission {
+  readonly validateImportedTree: (
+    treeOid: string,
+    manifest: CurrentTreeManifest,
+  ) => Promise<TreeImportAdmissionDecision>;
+  /** Target workspace admission limit including files and symlink targets. */
+  readonly maxSnapshotBytes: number;
+}
+
+export type TreeImportAdmissionDecision =
+  | { readonly kind: "accepted" }
+  | { readonly kind: "rejected"; readonly cause: unknown };
+
+export type TreeFormatUpgradeResult =
+  | { readonly kind: "already-target"; readonly treeOid: string }
   | {
-      readonly kind: "migrated";
-      readonly oldTreeOid: string;
+      readonly kind: "upgraded";
+      readonly sourceTreeOid: string;
       readonly treeOid: string;
     }
   | {
-      readonly kind: "legacy-incompatible";
+      readonly kind: "incompatible";
       readonly treeOid: string;
-      readonly message: string;
+      readonly cause: TreeManifestError;
     };
 
-type ObjectKind = "blob" | "tree";
+interface TreeImportPlan {
+  readonly treeOids: readonly string[];
+  readonly blobOids: readonly string[];
+  readonly blobProofs: ReadonlyMap<string, Stats>;
+  readonly maxFileBytes: number;
+}
 
-const OBJECT_DIRECTORY = "objects";
-const BLOB_DIRECTORY = "blobs";
-const TREE_DIRECTORY = "trees";
+const DEFAULT_MAX_OBJECT_BLOB_BYTES = 50 * 1024 * 1024;
+/** Existing configuration has always admitted every positive safe byte size. */
+const DURABLE_BLOB_VERIFICATION_CEILING = Number.MAX_SAFE_INTEGER;
 
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) {
@@ -147,6 +255,30 @@ function asStoreError(action: string, error: unknown): ObjectStoreError {
   return new ObjectStoreError("storage-failure", `${action} failed`, error);
 }
 
+async function preflightSourceAccess<T>(
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    const failure = asStoreError("tree import source preflight", error);
+    if (failure.code === "storage-failure") {
+      throw new TreeImportSourceError(failure);
+    }
+    throw error;
+  }
+}
+
+/** Keeps an operational policy evaluator failure out of durable rejection. */
+class TreeImportValidatorFailure extends Error {
+  declare readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("tree import validator failed", { cause });
+    this.name = "TreeImportValidatorFailure";
+  }
+}
+
 function isReplaceableObjectFailure(error: unknown): boolean {
   return (
     error instanceof ObjectStoreError &&
@@ -154,12 +286,39 @@ function isReplaceableObjectFailure(error: unknown): boolean {
   );
 }
 
+function requireNativeObjectStore(
+  store: ObjectStore,
+  operation: string,
+): NativeObjectStore {
+  if (!nativeObjectRecords.has(store)) {
+    throw new ObjectStoreError(
+      "storage-failure",
+      `${operation} requires a native Cyclotomy object store`,
+    );
+  }
+  return store as NativeObjectStore;
+}
+
+function nativeObjectAccess(source: NativeObjectStore): NativeObjectAccess {
+  const native = requireNativeObjectStore(source, "tree import");
+  return nativeObjectRecords.get(native)!.access;
+}
+
+/** Return the immutable layout authenticated with this native capability. */
+export function nativeObjectStoreLayout(
+  store: ObjectStore,
+  operation: string,
+): NativeObjectLayout {
+  const native = requireNativeObjectStore(store, operation);
+  return nativeObjectRecords.get(native)!.layout;
+}
+
 function sha256(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
 function assertOid(oid: string): void {
-  if (!isTreeOid(oid)) {
+  if (!isNativeObjectOid(oid)) {
     throw new ObjectStoreError(
       "invalid-object-id",
       "object id must be a lowercase SHA-256 digest",
@@ -298,10 +457,7 @@ async function readRegularFile(
       );
     }
     if (maxBytes !== undefined && before.size > maxBytes) {
-      throw new ObjectStoreError(
-        "object-integrity",
-        `object exceeds the ${maxBytes}-byte read limit`,
-      );
+      throw new ObjectSizeLimitError(before.size, maxBytes);
     }
     let content: Buffer;
     if (maxBytes === undefined) {
@@ -354,8 +510,9 @@ async function readRegularFile(
 const VERIFICATION_CONCURRENCY = 8;
 
 /**
- * Run an async worker over every item with bounded concurrency, failing fast:
- * the first error is rethrown and remaining lanes stop picking up work.
+ * Run an async worker with bounded concurrency. On failure, remaining lanes
+ * stop taking work; in-flight failures are reported in deterministic input
+ * order after every started operation settles.
  */
 async function runPool<T>(
   items: readonly T[],
@@ -367,7 +524,8 @@ async function runPool<T>(
   }
   let next = 0;
   let failed = false;
-  let failure: unknown;
+  const failures: Array<{ readonly index: number; readonly error: unknown }> =
+    [];
   const lanes = Math.min(concurrency, items.length);
   const runners = Array.from({ length: lanes }, async () => {
     while (!failed) {
@@ -379,17 +537,16 @@ async function runPool<T>(
       try {
         await worker(items[index] as T);
       } catch (error) {
-        if (!failed) {
-          failed = true;
-          failure = error;
-        }
+        failures.push({ index, error });
+        failed = true;
         return;
       }
     }
   });
   await Promise.all(runners);
-  if (failed) {
-    throw failure;
+  if (failures.length > 0) {
+    failures.sort((left, right) => left.index - right.index);
+    throw failures[0]!.error;
   }
 }
 
@@ -434,6 +591,7 @@ async function streamRegularFile(
   path: string,
   onChunk?: (chunk: Buffer) => Promise<void>,
   pathRole: "private-object" | "stream-source" = "private-object",
+  maxBytes?: number,
 ): Promise<{
   readonly digest: string;
   readonly byteLength: number;
@@ -462,17 +620,30 @@ async function streamRegularFile(
         "path does not name a private regular file",
       );
     }
+    // The handle stat is the authoritative size observation. Reject before
+    // allocating the streaming buffer or initializing a digest so a sparse or
+    // otherwise oversized object cannot consume work proportional to its size.
+    if (maxBytes !== undefined && before.size > maxBytes) {
+      throw new ObjectSizeLimitError(before.size, maxBytes);
+    }
     const hash = createHash("sha256");
     let byteLength = 0;
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (true) {
-      const result = await handle.read(buffer, 0, buffer.byteLength, position);
+      const readLength =
+        maxBytes === undefined
+          ? buffer.byteLength
+          : Math.min(buffer.byteLength, maxBytes - byteLength + 1);
+      const result = await handle.read(buffer, 0, readLength, position);
       if (result.bytesRead === 0) {
         break;
       }
       const chunk = buffer.subarray(0, result.bytesRead);
       byteLength += chunk.byteLength;
+      if (maxBytes !== undefined && byteLength > maxBytes) {
+        throw new ObjectSizeLimitError(byteLength, maxBytes);
+      }
       hash.update(chunk);
       await onChunk?.(chunk);
       position += result.bytesRead;
@@ -566,25 +737,44 @@ async function syncRegularFile(path: string): Promise<void> {
   }
 }
 
-class FileObjectStore implements ObjectStore {
-  readonly storageRoot: string;
-  readonly #root: string;
-  readonly #blobRoot: string;
-  readonly #treeRoot: string;
+class FileObjectStore implements NativeObjectStore {
+  declare readonly [NATIVE_OBJECT_STORE]: true;
+  declare readonly storageRoot: string;
   readonly #manifestLimits: TreeManifestLimits;
+  readonly #maxFileBytes: number;
 
   constructor(
     root: string,
-    blobRoot: string,
-    treeRoot: string,
     manifestLimits: TreeManifestLimits,
+    maxFileBytes: number,
   ) {
-    this.storageRoot = root;
-    this.#root = root;
-    this.#blobRoot = blobRoot;
-    this.#treeRoot = treeRoot;
+    Object.defineProperty(this, "storageRoot", {
+      value: root,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+    const layout = nativeObjectLayout(root);
     this.#manifestLimits = manifestLimits;
+    this.#maxFileBytes = maxFileBytes;
+    nativeObjectRecords.set(
+      this,
+      Object.freeze({ access: this.#nativeObjectAccess, layout }),
+    );
   }
+
+  #layout(): NativeObjectLayout {
+    return nativeObjectRecords.get(this)!.layout;
+  }
+
+  readonly #nativeObjectAccess: NativeObjectAccess = {
+    readObject: (kind, oid) => this.#readObject(kind, oid),
+    verifyObject: (kind, oid, maxBlobBytes) =>
+      this.#verifyObject(kind, oid, maxBlobBytes),
+    objectPath: (kind, oid) => this.#objectPath(kind, oid, false),
+    assertStillVerified: (kind, oid, expected, maxBlobBytes) =>
+      this.#assertStillVerified(kind, oid, expected, maxBlobBytes),
+  };
 
   async #publishBlobFile(
     sourcePath: string,
@@ -600,6 +790,12 @@ class FileObjectStore implements ObjectStore {
       throw new ObjectStoreError(
         "invalid-blob",
         "streamed blob source must be absolute with a valid expected length",
+      );
+    }
+    if (expectedByteLength > this.#maxFileBytes) {
+      throw new ObjectStoreError(
+        "invalid-blob",
+        `streamed blob exceeds the ${this.#maxFileBytes}-byte file limit`,
       );
     }
     try {
@@ -660,6 +856,10 @@ class FileObjectStore implements ObjectStore {
         assertOpen();
         const prepared = this.#prepareTree(entries, scope);
         const checked = new Set<string>();
+        const proofs: Array<{
+          readonly oid: string;
+          readonly observation: Stats;
+        }> = [];
         for (const entry of prepared.entries) {
           if (entry.type !== "regular") {
             continue;
@@ -673,22 +873,41 @@ class FileObjectStore implements ObjectStore {
           }
           if (!checked.has(entry.blobOid)) {
             checked.add(entry.blobOid);
-            await this.#assertStillVerified("blob", entry.blobOid, proof);
+            proofs.push({ oid: entry.blobOid, observation: proof });
           }
         }
+        await runPool(
+          proofs,
+          ({ oid, observation }) =>
+            this.#assertStillVerified("blob", oid, observation),
+          VERIFICATION_CONCURRENCY,
+        );
         treePublished = true;
-        return this.#publishPreparedTree(prepared.entries, prepared.scope);
+        return this.#publishCurrentTree(prepared);
       },
     };
   }
 
-  async #publishPreparedTree(
-    entries: readonly TreeEntry[],
-    scope: WorkspaceScope,
+  async #publishCurrentTree(
+    manifest: CurrentTreeManifest,
     limits: TreeManifestLimits = this.#manifestLimits,
   ): Promise<string> {
     try {
-      const encoded = encodeTreeManifest(entries, scope, limits);
+      const encoded = encodeCurrentTreeManifest(manifest, limits);
+      const oid = sha256(encoded);
+      await this.#publishObject("tree", oid, encoded);
+      return oid;
+    } catch (error) {
+      throw asStoreError("tree publication", error);
+    }
+  }
+
+  async #publishAuthenticatedTreeManifest(
+    manifest: TreeManifest,
+    limits: TreeManifestLimits,
+  ): Promise<string> {
+    try {
+      const encoded = encodeTreeManifest(manifest, limits);
       const oid = sha256(encoded);
       await this.#publishObject("tree", oid, encoded);
       return oid;
@@ -700,12 +919,9 @@ class FileObjectStore implements ObjectStore {
   #prepareTree(
     entries: readonly TreeEntry[],
     scope: WorkspaceScope,
-  ): {
-    readonly entries: readonly TreeEntry[];
-    readonly scope: WorkspaceScope;
-  } {
+  ): CurrentTreeManifest {
     try {
-      return canonicalizeTreeManifest(entries, scope, this.#manifestLimits);
+      return createCurrentTreeManifest(entries, scope, this.#manifestLimits);
     } catch (error) {
       if (error instanceof TreeManifestError) {
         throw new ObjectStoreError(
@@ -721,9 +937,7 @@ class FileObjectStore implements ObjectStore {
   async readTree(treeOid: string): Promise<TreeManifest> {
     assertOid(treeOid);
     try {
-      const manifest = await this.readTreeManifest(treeOid);
-      await this.#verifyClosure(manifest.entries);
-      return manifest;
+      return await this.#readAuthenticatedTree(treeOid);
     } catch (error) {
       throw asStoreError("tree read", error);
     }
@@ -733,68 +947,340 @@ class FileObjectStore implements ObjectStore {
     assertOid(treeOid);
     try {
       const encoded = await this.#readObject("tree", treeOid);
-      return parseCanonicalTreeManifest(encoded);
+      return parseTreeManifest(encoded);
     } catch (error) {
       throw asStoreError("tree read", error);
     }
   }
 
-  async migrateLegacyTree(treeOid: string): Promise<TreeMigrationResult> {
+  async upgradeTree(
+    treeOid: string,
+    targetFormat: string,
+  ): Promise<TreeFormatUpgradeResult> {
     assertOid(treeOid);
     try {
       // Authenticate both the historical manifest and its complete blob
       // closure before publishing an object that metadata may later root.
-      const legacy = await this.readTree(treeOid);
-      if (legacy.format !== PUBLISHED_TREE_MANIFEST_FORMAT) {
-        return { kind: "current", treeOid };
+      const source = await this.#readAuthenticatedTree(
+        treeOid,
+        DURABLE_BLOB_VERIFICATION_CEILING,
+      );
+      if (source.format === targetFormat) {
+        return { kind: "already-target", treeOid };
       }
 
-      let current: ReturnType<typeof migrateTreeManifestToCurrent>;
+      let target: TreeManifest;
       try {
-        current = migrateTreeManifestToCurrent(legacy, {
-          maxPathBytes: this.#manifestLimits.maxPathBytes,
-          maxPathComponents: this.#manifestLimits.maxPathComponents,
-        });
+        // Durable schema conversion is independent of current capture policy.
+        // Target-workspace admission still applies its configured limits when
+        // a checkpoint is restored or imported elsewhere.
+        target = upgradeTreeManifest(
+          source,
+          targetFormat,
+          ABSOLUTE_WORKSPACE_PATH_LIMITS,
+        );
       } catch (error) {
         if (
           error instanceof TreeManifestError &&
-          error.kind === "legacy-incompatible"
+          error.kind === "format-incompatible"
         ) {
           return {
-            kind: "legacy-incompatible",
+            kind: "incompatible",
             treeOid,
-            message: error.message,
+            cause: error,
           };
         }
         throw error;
       }
 
-      // Migration is a schema conversion, not a new capture. Use the parser's
-      // absolute published limits so a user's subsequently lowered capture
-      // quota cannot strand an otherwise compatible historical checkpoint.
-      const migratedOid = await this.#publishPreparedTree(
-        current.entries,
-        current.scope,
+      const upgradedOid = await this.#publishAuthenticatedTreeManifest(
+        target,
         ABSOLUTE_TREE_MANIFEST_LIMITS,
       );
-      const verified = await this.readTree(migratedOid);
-      if (verified.format === PUBLISHED_TREE_MANIFEST_FORMAT) {
+      const verified = await this.#readAuthenticatedTree(
+        upgradedOid,
+        DURABLE_BLOB_VERIFICATION_CEILING,
+      );
+      if (verified.format !== targetFormat) {
         throw new ObjectStoreError(
           "object-integrity",
-          "tree migration published a legacy-format object",
+          "tree upgrade published an object in the wrong target format",
         );
       }
       return {
-        kind: "migrated",
-        oldTreeOid: treeOid,
-        treeOid: migratedOid,
+        kind: "upgraded",
+        sourceTreeOid: treeOid,
+        treeOid: upgradedOid,
       };
     } catch (error) {
       throw asStoreError("tree migration", error);
     }
   }
 
+  async importTreesFrom(
+    source: NativeObjectStore,
+    treeOids: readonly string[],
+    admission: TreeImportAdmission,
+  ): Promise<void> {
+    const sourceAccess = nativeObjectAccess(source);
+    const uniqueTreeOids: string[] = [];
+    const seenTrees = new Set<string>();
+    for (const treeOid of treeOids) {
+      assertOid(treeOid);
+      if (!seenTrees.has(treeOid)) {
+        seenTrees.add(treeOid);
+        uniqueTreeOids.push(treeOid);
+      }
+    }
+
+    let plan: TreeImportPlan;
+    try {
+      plan = await this.#preflightTreeImport(
+        sourceAccess,
+        uniqueTreeOids,
+        admission,
+      );
+    } catch (error) {
+      if (error instanceof TreeImportSourceError) throw error;
+      if (error instanceof TreeImportValidatorFailure) throw error.cause;
+      if (error instanceof TreeImportAdmissionError) throw error;
+      throw new TreeImportAdmissionError(error);
+    }
+    try {
+      await this.#publishTreeImport(sourceAccess, plan);
+    } catch (error) {
+      throw asStoreError("tree import", error);
+    }
+  }
+
+  /**
+   * Authenticate and admit the complete bundle before touching the target
+   * object namespace. Manifests are deliberately reread rather than retained:
+   * import memory is bounded by the distinct blob set, not historical tree
+   * size, while content-addressing binds every later read to the same bytes.
+   */
+  async #preflightTreeImport(
+    source: NativeObjectAccess,
+    treeOids: readonly string[],
+    admission: TreeImportAdmission,
+  ): Promise<TreeImportPlan> {
+    if (
+      !Number.isSafeInteger(admission.maxSnapshotBytes) ||
+      admission.maxSnapshotBytes <= 0
+    ) {
+      throw new ObjectStoreError(
+        "invalid-tree-manifest",
+        "tree import maxSnapshotBytes must be a positive safe integer",
+      );
+    }
+    const blobOids = new Set<string>();
+    for (const treeOid of treeOids) {
+      const encoded = await preflightSourceAccess(() =>
+        source.readObject("tree", treeOid),
+      );
+      const manifest = parseTreeManifest(encoded);
+      if (!isCurrentTreeManifest(manifest)) {
+        throw new ObjectStoreError(
+          "invalid-tree-manifest",
+          "non-current tree must be upgraded before cross-store import",
+        );
+      }
+      let decision: TreeImportAdmissionDecision;
+      try {
+        decision = await admission.validateImportedTree(treeOid, manifest);
+      } catch (cause) {
+        throw new TreeImportValidatorFailure(cause);
+      }
+      if (decision.kind === "rejected") {
+        throw new TreeImportAdmissionError(decision.cause);
+      }
+      if (decision.kind !== "accepted") {
+        throw new TreeImportValidatorFailure(
+          new Error("tree import validator returned an invalid decision"),
+        );
+      }
+      for (const blobOid of treeManifestBlobOids(manifest)) {
+        blobOids.add(blobOid);
+      }
+    }
+
+    const uniqueBlobOids = [...blobOids];
+    const blobProofs = new Map<string, Stats>();
+    await runPool(
+      uniqueBlobOids,
+      async (blobOid) => {
+        let proof: Stats;
+        try {
+          proof = await preflightSourceAccess(() =>
+            source.verifyObject("blob", blobOid, this.#maxFileBytes),
+          );
+        } catch (error) {
+          if (
+            error instanceof ObjectSizeLimitError &&
+            error.maxBytes === this.#maxFileBytes
+          ) {
+            throw new ObjectStoreError(
+              "invalid-tree-manifest",
+              `imported blob ${blobOid} exceeds the ${this.#maxFileBytes}-byte target file limit`,
+              error,
+            );
+          }
+          throw error;
+        }
+        if (proof.size > this.#maxFileBytes) {
+          throw new ObjectStoreError(
+            "invalid-tree-manifest",
+            `imported blob ${blobOid} exceeds the ${this.#maxFileBytes}-byte target file limit`,
+          );
+        }
+        blobProofs.set(blobOid, proof);
+      },
+      VERIFICATION_CONCURRENCY,
+    );
+
+    // Count logical content per manifest entry. Repeated paths to a shared
+    // blob consume snapshot quota independently even though CAS publishes the
+    // physical blob only once; symlink targets count their UTF-8 byte length.
+    for (const treeOid of treeOids) {
+      const manifest = parseTreeManifest(
+        await preflightSourceAccess(() => source.readObject("tree", treeOid)),
+      );
+      let snapshotBytes = 0;
+      for (const entry of manifest.entries) {
+        const entryBytes =
+          entry.type === "regular"
+            ? blobProofs.get(entry.blobOid)?.size
+            : Buffer.byteLength(entry.target, "utf8");
+        if (entryBytes === undefined) {
+          throw new ObjectStoreError(
+            "object-integrity",
+            `imported tree ${treeOid} references an unverified blob`,
+          );
+        }
+        if (entryBytes > admission.maxSnapshotBytes - snapshotBytes) {
+          throw new ObjectStoreError(
+            "invalid-tree-manifest",
+            `imported tree ${treeOid} exceeds the ${admission.maxSnapshotBytes}-byte target snapshot limit`,
+          );
+        }
+        snapshotBytes += entryBytes;
+      }
+    }
+
+    return {
+      treeOids,
+      blobOids: uniqueBlobOids,
+      blobProofs,
+      maxFileBytes: this.#maxFileBytes,
+    };
+  }
+
+  /** Publish only a bundle that passed every predictable admission check. */
+  async #publishTreeImport(
+    source: NativeObjectAccess,
+    plan: TreeImportPlan,
+  ): Promise<void> {
+    const readSource = async <T>(
+      operation: () => T | Promise<T>,
+    ): Promise<T> => {
+      try {
+        return await operation();
+      } catch (error) {
+        throw new TreeImportSourceError(error);
+      }
+    };
+
+    let targetFailure: { readonly error: unknown } | undefined;
+    try {
+      await runPool(
+        plan.blobOids,
+        async (blobOid) => {
+          try {
+            const proof = plan.blobProofs.get(blobOid);
+            if (proof === undefined) {
+              throw new ObjectStoreError(
+                "object-integrity",
+                "tree import plan omitted an authenticated blob proof",
+              );
+            }
+            const sourcePath = await readSource(() =>
+              source.objectPath("blob", blobOid),
+            );
+            try {
+              await this.#publishBlobFromFile(sourcePath, blobOid, proof.size);
+            } catch (error) {
+              if (error instanceof StreamedFileChangedError) {
+                throw new TreeImportSourceError(error);
+              }
+              throw error;
+            }
+            await readSource(() =>
+              source.assertStillVerified(
+                "blob",
+                blobOid,
+                proof,
+                plan.maxFileBytes,
+              ),
+            );
+          } catch (error) {
+            // A source failure selected by input order must not hide a target
+            // failure from another already-active lane: target failure stays
+            // fatal regardless of which lane reports first.
+            if (!(error instanceof TreeImportSourceError)) {
+              targetFailure ??= { error };
+            }
+            throw error;
+          }
+        },
+        VERIFICATION_CONCURRENCY,
+      );
+    } catch (error) {
+      if (targetFailure !== undefined) throw targetFailure.error;
+      throw error;
+    }
+
+    for (const treeOid of plan.treeOids) {
+      const manifest = await readSource(async () => {
+        const current = parseTreeManifest(
+          await source.readObject("tree", treeOid),
+        );
+        if (!isCurrentTreeManifest(current)) {
+          throw new ObjectStoreError(
+            "invalid-tree-manifest",
+            "non-current tree must be upgraded before cross-store import",
+          );
+        }
+        return current;
+      });
+      const published = await this.#publishCurrentTree(
+        manifest,
+        ABSOLUTE_TREE_MANIFEST_LIMITS,
+      );
+      if (published !== treeOid) {
+        throw new ObjectStoreError(
+          "object-integrity",
+          "imported tree did not preserve its canonical object id",
+        );
+      }
+      await this.readTreeManifest(treeOid);
+    }
+
+    // One final collective closure proof avoids retaining every large
+    // manifest or re-hashing shared blobs once per historical checkpoint.
+    await this.verifyBlobs(plan.blobOids);
+    for (const treeOid of plan.treeOids) {
+      await this.readTreeManifest(treeOid);
+    }
+  }
+
   async verifyBlobs(blobOids: readonly string[]): Promise<void> {
+    return this.#verifyBlobs(blobOids);
+  }
+
+  async #verifyBlobs(
+    blobOids: readonly string[],
+    maxBlobBytes?: number,
+  ): Promise<void> {
     const unique: string[] = [];
     const seen = new Set<string>();
     for (const oid of blobOids) {
@@ -808,7 +1294,7 @@ class FileObjectStore implements ObjectStore {
       await runPool(
         unique,
         async (oid) => {
-          await this.#verifyObject("blob", oid);
+          await this.#verifyObject("blob", oid, maxBlobBytes);
         },
         VERIFICATION_CONCURRENCY,
       );
@@ -818,31 +1304,36 @@ class FileObjectStore implements ObjectStore {
   }
 
   /** Authenticate every distinct blob referenced by the entries. */
-  async #verifyClosure(entries: readonly TreeEntry[]): Promise<void> {
-    const seen = new Set<string>();
-    const oids: string[] = [];
-    for (const entry of entries) {
-      if (entry.type === "regular" && !seen.has(entry.blobOid)) {
-        seen.add(entry.blobOid);
-        oids.push(entry.blobOid);
-      }
-    }
-    await this.verifyBlobs(oids);
+  async #verifyClosure(
+    manifest: TreeManifest,
+    maxBlobBytes?: number,
+  ): Promise<void> {
+    await this.#verifyBlobs(treeManifestBlobOids(manifest), maxBlobBytes);
+  }
+
+  async #readAuthenticatedTree(
+    treeOid: string,
+    maxBlobBytes?: number,
+  ): Promise<TreeManifest> {
+    const manifest = await this.readTreeManifest(treeOid);
+    await this.#verifyClosure(manifest, maxBlobBytes);
+    return manifest;
   }
 
   async #objectPath(
-    kind: ObjectKind,
+    kind: NativeObjectKind,
     oid: string,
     createShard: boolean,
   ): Promise<string> {
     assertOid(oid);
-    await assertDirectory(this.#root);
-    const namespace = kind === "blob" ? this.#blobRoot : this.#treeRoot;
+    const layout = this.#layout();
+    await assertDirectory(layout.root);
+    const namespace = nativeObjectNamespacePath(layout, kind);
     await assertDirectory(namespace);
     const shardName = oid.slice(0, 2);
     const shard = createShard
       ? await ensureChildDirectory(namespace, shardName)
-      : join(namespace, shardName);
+      : nativeObjectShardPath(layout, kind, shardName);
     if (!createShard) {
       try {
         await assertDirectory(shard);
@@ -857,10 +1348,10 @@ class FileObjectStore implements ObjectStore {
         throw error;
       }
     }
-    return join(shard, oid.slice(2));
+    return nativeObjectPath(layout, kind, oid);
   }
 
-  async #observeObject(kind: ObjectKind, oid: string): Promise<Stats> {
+  async #observeObject(kind: NativeObjectKind, oid: string): Promise<Stats> {
     const path = await this.#objectPath(kind, oid, false);
     try {
       return await observeRegularFile(path);
@@ -877,9 +1368,10 @@ class FileObjectStore implements ObjectStore {
   }
 
   async #assertStillVerified(
-    kind: ObjectKind,
+    kind: NativeObjectKind,
     oid: string,
     expected: Stats,
+    maxBlobBytes?: number,
   ): Promise<void> {
     const current = await this.#observeObject(kind, oid);
     if (sameFileObservation(expected, current)) {
@@ -888,16 +1380,16 @@ class FileObjectStore implements ObjectStore {
     // Metadata changed after the proof was made. Re-hash rather than trusting
     // stat identity; this accepts a benign atomic rewrite only when its bytes
     // still match the content-addressed id.
-    await this.#verifyObject(kind, oid);
+    await this.#verifyObject(kind, oid, maxBlobBytes);
   }
 
-  async #readObject(kind: ObjectKind, oid: string): Promise<Buffer> {
+  async #readObject(kind: NativeObjectKind, oid: string): Promise<Buffer> {
     const path = await this.#objectPath(kind, oid, false);
     let content: Buffer;
     try {
       content = await readRegularFile(
         path,
-        kind === "tree" ? ABSOLUTE_MAX_TREE_MANIFEST_BYTES : undefined,
+        kind === "tree" ? ABSOLUTE_MAX_TREE_MANIFEST_BYTES : this.#maxFileBytes,
       );
     } catch (error) {
       if (errorCode(error) === "ENOENT") {
@@ -918,11 +1410,30 @@ class FileObjectStore implements ObjectStore {
     return content;
   }
 
-  async #verifyObject(kind: ObjectKind, oid: string): Promise<Stats> {
+  async #verifyObject(
+    kind: NativeObjectKind,
+    oid: string,
+    maxBlobBytes?: number,
+  ): Promise<Stats> {
     const path = await this.#objectPath(kind, oid, false);
+    let maxBytes = ABSOLUTE_MAX_TREE_MANIFEST_BYTES;
+    if (kind === "blob") {
+      maxBytes = maxBlobBytes ?? this.#maxFileBytes;
+      if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+        throw new ObjectStoreError(
+          "invalid-blob",
+          "blob verification limit must be a positive safe integer",
+        );
+      }
+    }
     let observed: Awaited<ReturnType<typeof streamRegularFile>>;
     try {
-      observed = await streamRegularFile(path);
+      observed = await streamRegularFile(
+        path,
+        undefined,
+        "private-object",
+        maxBytes,
+      );
     } catch (error) {
       if (errorCode(error) === "ENOENT") {
         throw new ObjectStoreError(
@@ -955,7 +1466,11 @@ class FileObjectStore implements ObjectStore {
     expectedByteLength: number,
   ): Promise<Stats> {
     const target = await this.#objectPath("blob", oid, true);
-    const parent = join(this.#blobRoot, oid.slice(0, 2));
+    const parent = nativeObjectShardPath(
+      this.#layout(),
+      "blob",
+      oid.slice(0, 2),
+    );
 
     try {
       const observation = await this.#verifyObject("blob", oid);
@@ -970,7 +1485,7 @@ class FileObjectStore implements ObjectStore {
 
     const temporary = join(
       parent,
-      `.${oid}.${process.pid}.${randomUUID()}.tmp`,
+      nativeTemporaryObjectName(oid, process.pid, randomUUID()),
     );
     let targetHandle: Awaited<ReturnType<typeof open>> | undefined;
     try {
@@ -983,29 +1498,55 @@ class FileObjectStore implements ObjectStore {
         0o600,
       );
       let copiedBytes = 0;
-      const observed = await streamRegularFile(
-        sourcePath,
-        async (chunk) => {
-          if (targetHandle === undefined) {
-            throw new Error("temporary blob handle closed unexpectedly");
-          }
-          copiedBytes += chunk.byteLength;
-          if (copiedBytes > expectedByteLength) {
-            throw new ObjectStoreError(
-              "invalid-blob",
-              "source file grew beyond the scanned blob length",
+      let targetStreamFailure: { readonly error: unknown } | undefined;
+      let observed: Awaited<ReturnType<typeof streamRegularFile>>;
+      try {
+        observed = await streamRegularFile(
+          sourcePath,
+          async (chunk) => {
+            if (targetHandle === undefined) {
+              const error = new ObjectStoreError(
+                "storage-failure",
+                "temporary blob handle closed unexpectedly",
+              );
+              targetStreamFailure = { error };
+              throw error;
+            }
+            copiedBytes += chunk.byteLength;
+            if (copiedBytes > expectedByteLength) {
+              throw new StreamedFileChangedError(
+                "source file grew beyond the scanned blob length",
+              );
+            }
+            try {
+              await targetHandle.writeFile(chunk);
+            } catch (error) {
+              targetStreamFailure = { error };
+              throw error;
+            }
+          },
+          "stream-source",
+          // The scanned length is both an integrity fact and a tighter
+          // operation-local resource bound. A growth race is rejected on the
+          // opened handle before hashing even one byte beyond that proof.
+          Math.min(this.#maxFileBytes, expectedByteLength),
+        );
+      } catch (error) {
+        if (targetStreamFailure !== undefined) {
+          throw targetStreamFailure.error;
+        }
+        throw error instanceof StreamedFileChangedError
+          ? error
+          : new StreamedFileChangedError(
+              "source file could not be streamed",
+              error,
             );
-          }
-          await targetHandle.writeFile(chunk);
-        },
-        "stream-source",
-      );
+      }
       if (
         observed.byteLength !== expectedByteLength ||
         observed.digest !== oid
       ) {
-        throw new ObjectStoreError(
-          "invalid-blob",
+        throw new StreamedFileChangedError(
           "source file no longer matches the scanned blob digest and length",
         );
       }
@@ -1037,15 +1578,12 @@ class FileObjectStore implements ObjectStore {
   }
 
   async #publishObject(
-    kind: ObjectKind,
+    kind: NativeObjectKind,
     oid: string,
     content: Uint8Array,
   ): Promise<Stats> {
     const target = await this.#objectPath(kind, oid, true);
-    const parent =
-      kind === "blob"
-        ? join(this.#blobRoot, oid.slice(0, 2))
-        : join(this.#treeRoot, oid.slice(0, 2));
+    const parent = nativeObjectShardPath(this.#layout(), kind, oid.slice(0, 2));
 
     try {
       const observation = await this.#verifyObject(kind, oid);
@@ -1060,7 +1598,7 @@ class FileObjectStore implements ObjectStore {
 
     const temporary = join(
       parent,
-      `.${oid}.${process.pid}.${randomUUID()}.tmp`,
+      nativeTemporaryObjectName(oid, process.pid, randomUUID()),
     );
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
@@ -1126,8 +1664,9 @@ function canonicalStoreRoot(root: string): string {
 export async function openObjectStore(
   root: string,
   options: OpenObjectStoreOptions = {},
-): Promise<ObjectStore> {
+): Promise<NativeObjectStore> {
   const canonicalRoot = canonicalStoreRoot(root);
+  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_OBJECT_BLOB_BYTES;
   const manifestLimits: TreeManifestLimits = {
     maxEntries: options.maxEntries ?? DEFAULT_TREE_MANIFEST_LIMITS.maxEntries,
     maxManifestBytes:
@@ -1140,6 +1679,12 @@ export async function openObjectStore(
   };
 
   try {
+    if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0) {
+      throw new ObjectStoreError(
+        "invalid-blob",
+        "object-store maxFileBytes must be a positive safe integer",
+      );
+    }
     assertTreeManifestLimits(manifestLimits);
     await mkdir(canonicalRoot, {
       recursive: true,
@@ -1147,10 +1692,11 @@ export async function openObjectStore(
     });
     await assertDirectory(canonicalRoot);
     await syncDirectory(canonicalRoot);
-    const objects = await ensureChildDirectory(canonicalRoot, OBJECT_DIRECTORY);
-    const blobs = await ensureChildDirectory(objects, BLOB_DIRECTORY);
-    const trees = await ensureChildDirectory(objects, TREE_DIRECTORY);
-    return new FileObjectStore(canonicalRoot, blobs, trees, manifestLimits);
+    const layout = nativeObjectLayout(canonicalRoot);
+    await ensureChildDirectory(canonicalRoot, parsePath(layout.objects).base);
+    await ensureChildDirectory(layout.objects, parsePath(layout.blobs).base);
+    await ensureChildDirectory(layout.objects, parsePath(layout.trees).base);
+    return new FileObjectStore(canonicalRoot, manifestLimits, maxFileBytes);
   } catch (error) {
     throw asStoreError("object-store initialization", error);
   }

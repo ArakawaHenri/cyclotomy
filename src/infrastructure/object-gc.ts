@@ -1,9 +1,22 @@
 import type { Stats } from "node:fs";
-import { lstat, readdir, rm } from "node:fs/promises";
+import { lstat, opendir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { MetadataStore } from "./metadata.ts";
-import type { ObjectStore } from "./object-store.ts";
+import type { CurrentMetadataStore } from "./metadata.ts";
+import {
+  nativeObjectStoreLayout,
+  type NativeObjectStore,
+} from "./object-store.ts";
+import { ABSOLUTE_MAX_TREE_ENTRIES } from "./tree-formats/manifest-codec.ts";
+import { treeManifestBlobOids } from "./tree-formats/history.ts";
+import {
+  isNativeObjectShard,
+  nativeObjectEntry,
+  nativeObjectNamespacePath,
+  nativeObjectShardPath,
+  type NativeObjectKind,
+  type NativeObjectLayout,
+} from "./workspace-store.ts";
 
 export interface GcReport {
   readonly removedTrees: number;
@@ -13,8 +26,14 @@ export interface GcReport {
   readonly keptObjects: number;
 }
 
-const HEX_64 = /^[0-9a-f]{64}$/u;
-const TEMP_OBJECT = /^\.[0-9a-f]{64}\.[0-9]+\.[0-9a-f-]{36}\.tmp$/u;
+export interface GarbageCollectionOptions {
+  readonly graceMs?: number;
+  readonly now?: number;
+  /** Test/embedding override; production remains bounded by the absolute cap. */
+  readonly maxObjects?: number;
+}
+
+const ABSOLUTE_MAX_GC_OBJECTS = ABSOLUTE_MAX_TREE_ENTRIES + 1;
 
 export class GarbageCollectionMarkError extends Error {
   readonly treeOid: string;
@@ -51,7 +70,7 @@ interface GcCandidate {
   readonly shardDir: string;
   readonly shardStat: Stats;
   readonly entryStat: Stats;
-  readonly kind: "blobs" | "trees";
+  readonly kind: NativeObjectKind;
   readonly isTmp: boolean;
   readonly marked: boolean;
   readonly expired: boolean;
@@ -102,13 +121,33 @@ async function observeRealDirectory(path: string): Promise<Stats | undefined> {
   return info;
 }
 
+/** Stream directory names so the configured object budget also bounds heap use. */
+async function* directoryNames(
+  path: string,
+  detail: string,
+): AsyncGenerator<string> {
+  let directory;
+  try {
+    directory = await opendir(path);
+  } catch (error) {
+    throw new GarbageCollectionNamespaceError(path, detail, error);
+  }
+  try {
+    for await (const entry of directory) yield entry.name;
+  } catch (error) {
+    throw new GarbageCollectionNamespaceError(path, detail, error);
+  }
+}
+
 async function inventoryNamespace(
-  storeRoot: string,
-  kind: "blobs" | "trees",
+  layout: NativeObjectLayout,
+  kind: NativeObjectKind,
   marked: ReadonlySet<string>,
   graceMs: number,
   now: number,
+  budget: { count: number; readonly maximum: number },
 ): Promise<readonly GcCandidate[]> {
+  const storeRoot = layout.root;
   const storeRootStat = await observeRealDirectory(storeRoot);
   if (storeRootStat === undefined) {
     throw new GarbageCollectionNamespaceError(
@@ -116,7 +155,7 @@ async function inventoryNamespace(
       "store root disappeared",
     );
   }
-  const objectsRoot = join(storeRoot, "objects");
+  const objectsRoot = layout.objects;
   const objectsRootStat = await observeRealDirectory(objectsRoot);
   if (objectsRootStat === undefined) {
     return [];
@@ -127,7 +166,7 @@ async function inventoryNamespace(
       "cross-device objects directory is not controlled by this store",
     );
   }
-  const namespace = join(storeRoot, "objects", kind);
+  const namespace = nativeObjectNamespacePath(layout, kind);
   const namespaceStat = await observeRealDirectory(namespace);
   if (namespaceStat === undefined) {
     return [];
@@ -138,25 +177,18 @@ async function inventoryNamespace(
       "cross-device namespace is not controlled by this store",
     );
   }
-  let shards: string[];
-  try {
-    shards = await readdir(namespace);
-  } catch (error) {
-    throw new GarbageCollectionNamespaceError(
-      namespace,
-      "cannot list directory",
-      error,
-    );
-  }
   const candidates: GcCandidate[] = [];
-  for (const shard of shards) {
-    if (!/^[0-9a-f]{2}$/u.test(shard)) {
+  for await (const shard of directoryNames(
+    namespace,
+    "cannot list directory",
+  )) {
+    if (!isNativeObjectShard(shard)) {
       throw new GarbageCollectionNamespaceError(
         join(namespace, shard),
         "unexpected shard name",
       );
     }
-    const shardDir = join(namespace, shard);
+    const shardDir = nativeObjectShardPath(layout, kind, shard);
     const shardStat = await observeRealDirectory(shardDir);
     if (shardStat === undefined) {
       throw new GarbageCollectionNamespaceError(
@@ -170,26 +202,22 @@ async function inventoryNamespace(
         "cross-device shard is not controlled by this store",
       );
     }
-    let files: string[];
-    try {
-      files = await readdir(shardDir);
-    } catch (error) {
-      throw new GarbageCollectionNamespaceError(
-        shardDir,
-        "cannot list shard",
-        error,
-      );
-    }
-    for (const file of files) {
+    for await (const file of directoryNames(shardDir, "cannot list shard")) {
       const path = join(shardDir, file);
-      const oid = `${shard}${file}`;
-      const isTmp = TEMP_OBJECT.test(file);
-      if (!isTmp && !HEX_64.test(oid)) {
+      budget.count += 1;
+      if (budget.count > budget.maximum) {
+        throw new RangeError(
+          `refusing to sweep because object inventory exceeds the ${budget.maximum}-candidate limit`,
+        );
+      }
+      const entry = nativeObjectEntry(shard, file);
+      if (entry === undefined) {
         throw new GarbageCollectionNamespaceError(
           path,
           "unexpected object name",
         );
       }
+      const isTmp = entry.kind === "temporary";
       let entryStat: Stats;
       try {
         entryStat = await lstat(path);
@@ -224,7 +252,7 @@ async function inventoryNamespace(
         entryStat,
         kind,
         isTmp,
-        marked: !isTmp && marked.has(oid),
+        marked: entry.kind === "object" && marked.has(entry.oid),
         expired: entryStat.mtimeMs < now - graceMs,
       });
     }
@@ -240,27 +268,52 @@ async function inventoryNamespace(
  * is never swept mid-publish.
  */
 export async function collectGarbage(
-  storeRoot: string,
-  store: ObjectStore,
-  metadata: MetadataStore,
-  graceMs = 3_600_000,
-  now: number = Date.now(),
+  store: NativeObjectStore,
+  metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
+  options: GarbageCollectionOptions = {},
 ): Promise<GcReport> {
-  const markedTrees = new Set(metadata.listReferencedTreeOids());
+  const graceMs = options.graceMs ?? 3_600_000;
+  const now = options.now ?? Date.now();
+  const maxObjects = options.maxObjects ?? ABSOLUTE_MAX_GC_OBJECTS;
+  if (
+    !Number.isSafeInteger(graceMs) ||
+    graceMs < 0 ||
+    !Number.isFinite(now) ||
+    now < 0 ||
+    !Number.isSafeInteger(maxObjects) ||
+    maxObjects <= 0 ||
+    maxObjects > ABSOLUTE_MAX_GC_OBJECTS
+  ) {
+    throw new RangeError(
+      `garbage-collection options are outside their supported range (maximum ${ABSOLUTE_MAX_GC_OBJECTS} objects)`,
+    );
+  }
+  const layout = nativeObjectStoreLayout(store, "garbage collection");
+  const referencedTrees = metadata.listReferencedTreeOids(maxObjects + 1);
+  if (referencedTrees.length > maxObjects) {
+    throw new RangeError(
+      `refusing to sweep because the rooted object graph exceeds the ${maxObjects}-object limit`,
+    );
+  }
+  const markedTrees = new Set(referencedTrees);
   const markedBlobs = new Set<string>();
   for (const treeOid of markedTrees) {
+    let manifest;
     try {
-      const manifest = await store.readTreeManifest(treeOid);
-      for (const entry of manifest.entries) {
-        if (entry.type === "regular") {
-          markedBlobs.add(entry.blobOid);
-        }
-      }
+      manifest = await store.readTreeManifest(treeOid);
     } catch (error) {
       // Continuing without this manifest could sweep old blobs that remain
       // semantically rooted. Fail before the first filesystem mutation so a
       // repair/backup still has every potentially referenced object.
       throw new GarbageCollectionMarkError(treeOid, error);
+    }
+    for (const blobOid of treeManifestBlobOids(manifest)) {
+      markedBlobs.add(blobOid);
+      if (markedTrees.size + markedBlobs.size > maxObjects) {
+        throw new RangeError(
+          `refusing to sweep because the rooted object graph exceeds the ${maxObjects}-object limit`,
+        );
+      }
     }
   }
 
@@ -274,20 +327,23 @@ export async function collectGarbage(
 
   // Inventory and validate every namespace before the first deletion. A
   // malformed late shard therefore cannot leave an earlier shard half-swept.
+  const budget = { count: 0, maximum: maxObjects };
   const candidates = [
     ...(await inventoryNamespace(
-      storeRoot,
-      "blobs",
+      layout,
+      "blob",
       markedBlobs,
       graceMs,
       now,
+      budget,
     )),
     ...(await inventoryNamespace(
-      storeRoot,
-      "trees",
+      layout,
+      "tree",
       markedTrees,
       graceMs,
       now,
+      budget,
     )),
   ];
 
@@ -333,7 +389,7 @@ export async function collectGarbage(
     await rm(candidate.path);
     if (candidate.isTmp) {
       report.removedTmpFiles += 1;
-    } else if (candidate.kind === "blobs") {
+    } else if (candidate.kind === "blob") {
       report.removedBlobs += 1;
     } else {
       report.removedTrees += 1;

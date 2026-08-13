@@ -15,10 +15,6 @@ export interface NodeKey {
 /** Lowercase SHA-256 hex digest identifying a canonical tree object. */
 export type TreeOid = string;
 
-export interface NodeState {
-  readonly treeOid: TreeOid;
-}
-
 export type Result<T, E> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: E };
@@ -29,11 +25,6 @@ export function success<T>(value: T): Result<T, never> {
 
 export function failure<E>(error: E): Result<never, E> {
   return { ok: false, error };
-}
-
-/** Map/Set token for a node. NUL cannot appear in Pi session or entry ids. */
-export function nodeToken(node: NodeKey): string {
-  return `${node.sessionId}\0${node.entryId}`;
 }
 
 const SHA_256_HEX = /^[0-9a-f]{64}$/u;

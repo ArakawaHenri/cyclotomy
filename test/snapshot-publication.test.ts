@@ -3,6 +3,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   rm,
   symlink,
   writeFile,
@@ -14,9 +15,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   openObjectStore,
-  TREE_MANIFEST_FORMAT,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   IncompleteSnapshotError,
   publishSnapshot,
@@ -140,7 +141,7 @@ describe("snapshot publication", () => {
     expect(treeOid).toMatch(/^[0-9a-f]{64}$/u);
 
     const manifest = await store.readTree(treeOid);
-    expect(manifest.format).toBe(TREE_MANIFEST_FORMAT);
+    expect(manifest.format).toBe(CURRENT_TREE_MANIFEST_FORMAT);
     expect(manifest.scope).toEqual(ALL_MANAGED_SCOPE);
     expect(manifest.entries).toEqual([
       {
@@ -222,7 +223,6 @@ describe("snapshot publication", () => {
       readBlob: (oid) => baseStore.readBlob(oid),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
-      migrateLegacyTree: (oid) => baseStore.migrateLegacyTree(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
     };
 
@@ -233,6 +233,103 @@ describe("snapshot publication", () => {
     const second = await publishSnapshot(store, snapshot);
     expect(second).toBe(first);
     expect(streamedPublications).toBe(2);
+  });
+
+  it("publishes distinct blobs with fixed bounded concurrency before the tree", async () => {
+    const workspace = await tempRoot("cyclotomy-publish-concurrent-");
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        writeFile(join(workspace, `file-${index}.txt`), `unique-${index}`),
+      ),
+    );
+    const snapshot = await scanWorkspace(workspace);
+    const baseStore = await openObjectStore(
+      await tempRoot("cyclotomy-publish-objects-"),
+    );
+    let active = 0;
+    let maxActive = 0;
+    let completed = 0;
+    let treePublications = 0;
+    const store: ObjectStore = {
+      storageRoot: baseStore.storageRoot,
+      beginSnapshotPublication() {
+        const publication = baseStore.beginSnapshotPublication();
+        return {
+          publishBlobFromFile: async (path, oid, byteLength) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            try {
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              const published = await publication.publishBlobFromFile(
+                path,
+                oid,
+                byteLength,
+              );
+              completed += 1;
+              return published;
+            } finally {
+              active -= 1;
+            }
+          },
+          publishTree: (entries, targetScope) => {
+            expect(active).toBe(0);
+            expect(completed).toBe(12);
+            treePublications += 1;
+            return publication.publishTree(entries, targetScope);
+          },
+        };
+      },
+      readBlob: (oid) => baseStore.readBlob(oid),
+      readTree: (oid) => baseStore.readTree(oid),
+      readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
+      verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
+    };
+
+    const treeOid = await publishSnapshot(store, snapshot);
+
+    expect(maxActive).toBe(8);
+    expect(treePublications).toBe(1);
+    expect((await baseStore.readTree(treeOid)).entries).toHaveLength(12);
+  });
+
+  it("reports concurrent publication failures in snapshot order", async () => {
+    const workspace = await tempRoot("cyclotomy-publish-fail-order-");
+    await Promise.all([
+      writeFile(join(workspace, "first.txt"), "first"),
+      writeFile(join(workspace, "second.txt"), "second"),
+    ]);
+    const snapshot = await scanWorkspace(workspace);
+    const baseStore = await openObjectStore(
+      await tempRoot("cyclotomy-publish-fail-objects-"),
+    );
+    let treePublications = 0;
+    const store: ObjectStore = {
+      storageRoot: baseStore.storageRoot,
+      beginSnapshotPublication() {
+        return {
+          publishBlobFromFile: async (path) => {
+            if (path.endsWith("first.txt")) {
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              throw new Error("first input failed");
+            }
+            throw new Error("second input failed");
+          },
+          publishTree: () => {
+            treePublications += 1;
+            throw new Error("tree must not be published");
+          },
+        };
+      },
+      readBlob: (oid) => baseStore.readBlob(oid),
+      readTree: (oid) => baseStore.readTree(oid),
+      readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
+      verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
+    };
+
+    await expect(publishSnapshot(store, snapshot)).rejects.toThrow(
+      "first input failed",
+    );
+    expect(treePublications).toBe(0);
   });
 
   it("rejects a source file changed after its streamed scan", async () => {
@@ -248,6 +345,9 @@ describe("snapshot publication", () => {
     await expect(publishSnapshot(store, snapshot)).rejects.toMatchObject({
       code: "invalid-blob",
     });
+    expect(await readdir(join(store.storageRoot, "objects", "trees"))).toEqual(
+      [],
+    );
   });
 
   it("rejects a forged regular source outside the scanned path", async () => {
@@ -289,7 +389,6 @@ describe("snapshot publication", () => {
       readBlob: (oid) => store.readBlob(oid),
       readTree: (oid) => store.readTree(oid),
       readTreeManifest: (oid) => store.readTreeManifest(oid),
-      migrateLegacyTree: (oid) => store.migrateLegacyTree(oid),
       verifyBlobs: (oids) => store.verifyBlobs(oids),
     };
 

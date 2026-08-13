@@ -3,16 +3,20 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
-  PUBLISHED_TREE_MANIFEST_FORMAT,
-  TREE_MANIFEST_FORMAT,
   DEFAULT_TREE_MANIFEST_LIMITS,
-  canonicalizeTreeManifest,
-  encodeTreeManifest,
-  migrateTreeManifestToCurrent,
-  parseCanonicalTreeManifest,
   type TreeEntry,
-  type TreeManifest,
-} from "../src/infrastructure/tree-manifest.ts";
+} from "../src/infrastructure/tree-formats/manifest-codec.ts";
+import {
+  CURRENT_TREE_MANIFEST_FORMAT,
+  createCurrentTreeManifest,
+  encodeCurrentTreeManifest,
+  type CurrentTreeManifest,
+} from "../src/infrastructure/tree-formats/current.ts";
+import {
+  parseTreeManifest,
+  upgradeTreeManifestToCurrent,
+} from "../src/infrastructure/tree-formats/history.ts";
+import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
 import { validateTreeEntriesAgainstScope } from "../src/infrastructure/tree-scope-validation.ts";
 import {
   DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
@@ -27,9 +31,8 @@ const allManaged = { kind: "all-managed" } as const;
 function manifest(
   entries: readonly TreeEntry[],
   scope: WorkspaceScope,
-): TreeManifest {
-  const canonical = canonicalizeTreeManifest(entries, scope);
-  return { format: TREE_MANIFEST_FORMAT, ...canonical };
+): CurrentTreeManifest {
+  return createCurrentTreeManifest(entries, scope);
 }
 
 describe("versioned tree manifests", () => {
@@ -49,19 +52,21 @@ describe("versioned tree manifests", () => {
   });
 
   it("writes only v2 and requires the final symlink shape", () => {
-    const encoded = encodeTreeManifest(
-      [
-        {
-          path: "link",
-          type: "symlink",
-          target: "target",
-          symlinkKind: "file",
-        },
-      ],
-      allManaged,
+    const encoded = encodeCurrentTreeManifest(
+      createCurrentTreeManifest(
+        [
+          {
+            path: "link",
+            type: "symlink",
+            target: "target",
+            symlinkKind: "file",
+          },
+        ],
+        allManaged,
+      ),
     );
-    expect(TREE_MANIFEST_FORMAT).toBe("cyclotomy-tree-v2");
-    expect(parseCanonicalTreeManifest(encoded)).toEqual({
+    expect(CURRENT_TREE_MANIFEST_FORMAT).toBe("cyclotomy-tree-v2");
+    expect(parseTreeManifest(encoded)).toEqual({
       format: "cyclotomy-tree-v2",
       entries: [
         {
@@ -82,9 +87,7 @@ describe("versioned tree manifests", () => {
       },
     ]) {
       expect(() =>
-        parseCanonicalTreeManifest(
-          Buffer.from(`${JSON.stringify(candidate)}\n`),
-        ),
+        parseTreeManifest(Buffer.from(`${JSON.stringify(candidate)}\n`)),
       ).toThrow();
     }
   });
@@ -92,7 +95,7 @@ describe("versioned tree manifests", () => {
   it("parses the exact published v1 contract before migrating to v2", () => {
     const legacyBytes = Buffer.from(
       `${JSON.stringify({
-        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        format: TREE_MANIFEST_FORMAT_V1,
         entries: [
           {
             path: "link",
@@ -104,10 +107,10 @@ describe("versioned tree manifests", () => {
         scope: allManaged,
       })}\n`,
     );
-    const legacy = parseCanonicalTreeManifest(legacyBytes);
-    expect(legacy.format).toBe(PUBLISHED_TREE_MANIFEST_FORMAT);
-    expect(migrateTreeManifestToCurrent(legacy)).toEqual({
-      format: TREE_MANIFEST_FORMAT,
+    const legacy = parseTreeManifest(legacyBytes);
+    expect(legacy.format).toBe(TREE_MANIFEST_FORMAT_V1);
+    expect(upgradeTreeManifestToCurrent(legacy)).toEqual({
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: legacy.entries,
       scope: legacy.scope,
     });
@@ -122,14 +125,14 @@ describe("versioned tree manifests", () => {
     });
     const legacyBytes = Buffer.from(
       `${JSON.stringify({
-        format: PUBLISHED_TREE_MANIFEST_FORMAT,
+        format: TREE_MANIFEST_FORMAT_V1,
         entries: [entry("Σ/a"), entry("ς/b")],
         scope: allManaged,
       })}\n`,
     );
-    const legacy = parseCanonicalTreeManifest(legacyBytes);
-    expect(legacy.format).toBe(PUBLISHED_TREE_MANIFEST_FORMAT);
-    expect(() => migrateTreeManifestToCurrent(legacy)).toThrow(
+    const legacy = parseTreeManifest(legacyBytes);
+    expect(legacy.format).toBe(TREE_MANIFEST_FORMAT_V1);
+    expect(() => upgradeTreeManifestToCurrent(legacy)).toThrow(
       "cannot be represented",
     );
   });
@@ -138,10 +141,10 @@ describe("versioned tree manifests", () => {
     const overDefault = "a".repeat(
       DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES + 1,
     );
-    const legacy = parseCanonicalTreeManifest(
+    const legacy = parseTreeManifest(
       Buffer.from(
         `${JSON.stringify({
-          format: PUBLISHED_TREE_MANIFEST_FORMAT,
+          format: TREE_MANIFEST_FORMAT_V1,
           entries: [
             {
               path: overDefault,
@@ -155,11 +158,11 @@ describe("versioned tree manifests", () => {
       ),
     );
 
-    expect(() => migrateTreeManifestToCurrent(legacy)).toThrow(
+    expect(() => upgradeTreeManifestToCurrent(legacy)).toThrow(
       "cannot be represented",
     );
     expect(
-      migrateTreeManifestToCurrent(legacy, {
+      upgradeTreeManifestToCurrent(legacy, {
         maxPathBytes: Buffer.byteLength(overDefault),
         maxPathComponents: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
       }).entries,
@@ -176,7 +179,11 @@ describe("versioned tree manifests", () => {
       infoExcludeBase64: "",
       globalExcludeBase64: "",
     } as const;
-    expect(canonicalizeTreeManifest([], scope)).toEqual({ entries: [], scope });
+    expect(createCurrentTreeManifest([], scope)).toEqual({
+      format: CURRENT_TREE_MANIFEST_FORMAT,
+      entries: [],
+      scope,
+    });
     await expect(
       validateTreeEntriesAgainstScope(manifest([], scope)),
     ).resolves.toBeUndefined();
@@ -194,7 +201,7 @@ describe("versioned tree manifests", () => {
       globalExcludeBase64: "",
     } as const;
     expect(
-      canonicalizeTreeManifest(
+      createCurrentTreeManifest(
         [
           {
             path: ".gitignore",
@@ -207,7 +214,7 @@ describe("versioned tree manifests", () => {
       ).entries,
     ).toHaveLength(1);
     expect(() =>
-      canonicalizeTreeManifest(
+      createCurrentTreeManifest(
         [
           {
             path: ".gitignore",
@@ -220,7 +227,7 @@ describe("versioned tree manifests", () => {
       ),
     ).toThrow("does not match");
     expect(() =>
-      canonicalizeTreeManifest(
+      createCurrentTreeManifest(
         [
           {
             path: "nested/.gitignore",
@@ -441,18 +448,14 @@ describe("versioned tree manifests", () => {
       maxPathBytes: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES + 1,
       maxPathComponents: DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS + 1,
     };
-    const raised = canonicalizeTreeManifest(
+    const raised = createCurrentTreeManifest(
       [regular(`${byteBoundary}a`), regular(`${componentBoundary}/a`)],
       allManaged,
       raisedLimits,
     );
     expect(raised.entries).toHaveLength(2);
-    const raisedBytes = encodeTreeManifest(
-      raised.entries,
-      raised.scope,
-      raisedLimits,
-    );
-    expect(parseCanonicalTreeManifest(raisedBytes).entries).toHaveLength(2);
+    const raisedBytes = encodeCurrentTreeManifest(raised, raisedLimits);
+    expect(parseTreeManifest(raisedBytes).entries).toHaveLength(2);
 
     const sourceSuffix = "/.gitignore";
     const sourceBoundary = `${"a".repeat(

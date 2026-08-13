@@ -110,8 +110,6 @@ function comparePathBytes(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
-type WorkspacePathRules = "published-v1" | "portable-v2";
-
 export function assertWorkspacePathLimits(limits: WorkspacePathLimits): void {
   if (
     !Number.isSafeInteger(limits.maxPathBytes) ||
@@ -125,13 +123,13 @@ export function assertWorkspacePathLimits(limits: WorkspacePathLimits): void {
   }
 }
 
-function canonicalWorkspaceRelativePathWithRules(
+/** Validate one normalized repository-relative path. */
+export function canonicalWorkspaceRelativePath(
   value: unknown,
   allowRoot: boolean,
-  rules: WorkspacePathRules,
-  limits: WorkspacePathLimits,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): string {
-  if (rules === "portable-v2") assertWorkspacePathLimits(limits);
+  assertWorkspacePathLimits(limits);
   if (
     typeof value !== "string" ||
     !isExactUtf8String(value) ||
@@ -143,15 +141,12 @@ function canonicalWorkspaceRelativePathWithRules(
   ) {
     return invalidScope("scope contains an unsafe or noncanonical path");
   }
-  if (
-    rules === "portable-v2" &&
-    Buffer.byteLength(value, "utf8") > limits.maxPathBytes
-  ) {
+  if (Buffer.byteLength(value, "utf8") > limits.maxPathBytes) {
     return invalidScope("scope path exceeds the portable byte limit");
   }
   if (value === "" && allowRoot) return value;
   const components = value.split("/");
-  if (rules === "portable-v2" && components.length > limits.maxPathComponents) {
+  if (components.length > limits.maxPathComponents) {
     return invalidScope("scope path exceeds the portable component limit");
   }
   for (const component of components) {
@@ -159,41 +154,12 @@ function canonicalWorkspaceRelativePathWithRules(
       component.length === 0 ||
       component === "." ||
       component === ".." ||
-      (rules === "portable-v2"
-        ? portableWorkspacePathKey(component)
-        : component.toLocaleLowerCase("en-US")) === ".git"
+      portableWorkspacePathKey(component) === ".git"
     ) {
       return invalidScope("scope contains an unsafe or noncanonical path");
     }
   }
   return value;
-}
-
-/** Validate one portable-v2, normalized repository-relative path. */
-export function canonicalWorkspaceRelativePath(
-  value: unknown,
-  allowRoot: boolean,
-  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
-): string {
-  return canonicalWorkspaceRelativePathWithRules(
-    value,
-    allowRoot,
-    "portable-v2",
-    limits,
-  );
-}
-
-/** Frozen path contract shipped by cyclotomy@0.0.1. */
-export function canonicalPublishedV1WorkspaceRelativePath(
-  value: unknown,
-  allowRoot: boolean,
-): string {
-  return canonicalWorkspaceRelativePathWithRules(
-    value,
-    allowRoot,
-    "published-v1",
-    DEFAULT_WORKSPACE_PATH_LIMITS,
-  );
 }
 
 function decodeCanonicalBase64(value: unknown, label: string): Buffer {
@@ -267,42 +233,10 @@ export function workspaceLocalGitignorePath(
   repositoryPath: string,
   limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): string | undefined {
-  return workspaceLocalGitignorePathWithRules(
-    scope,
-    repositoryPath,
-    "portable-v2",
-    limits,
-  );
-}
-
-function workspaceLocalGitignorePathWithRules(
-  scope: GitWorkspaceScope,
-  repositoryPath: string,
-  rules: WorkspacePathRules,
-  limits: WorkspacePathLimits,
-): string | undefined {
-  const path = canonicalWorkspaceRelativePathWithRules(
-    repositoryPath,
-    false,
-    rules,
-    limits,
-  );
+  const path = canonicalWorkspaceRelativePath(repositoryPath, false, limits);
   if (scope.repositoryPrefix === "") return path;
   const prefix = `${scope.repositoryPrefix}/`;
   return path.startsWith(prefix) ? path.slice(prefix.length) : undefined;
-}
-
-/** Frozen local-policy mapping shipped by cyclotomy@0.0.1. */
-export function publishedV1WorkspaceLocalGitignorePath(
-  scope: GitWorkspaceScope,
-  repositoryPath: string,
-): string | undefined {
-  return workspaceLocalGitignorePathWithRules(
-    scope,
-    repositoryPath,
-    "published-v1",
-    DEFAULT_WORKSPACE_PATH_LIMITS,
-  );
 }
 
 /** Canonical key for paths whose Git policy comparison is case-insensitive. */
@@ -315,21 +249,12 @@ export function workspaceScopePathKey(
   return scope.ignoreCase ? path.toLocaleLowerCase("en-US") : path;
 }
 
-/** Frozen Git-scope key shipped by cyclotomy@0.0.1. */
-export function publishedV1WorkspaceScopePathKey(
-  scope: GitWorkspaceScope,
-  workspacePath: string,
-): string {
-  const path = canonicalPublishedV1WorkspaceRelativePath(workspacePath, false);
-  return scope.ignoreCase ? path.toLocaleLowerCase("en-US") : path;
-}
-
-function canonicalizeWorkspaceScopeWithRules(
+/** Validate untrusted scope data and rebuild its canonical byte-sorted form. */
+export function canonicalizeWorkspaceScope(
   value: unknown,
-  rules: WorkspacePathRules,
-  limits: WorkspacePathLimits,
+  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
 ): WorkspaceScope {
-  if (rules === "portable-v2") assertWorkspacePathLimits(limits);
+  assertWorkspacePathLimits(limits);
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return invalidScope("workspace scope must be an object");
   }
@@ -359,10 +284,9 @@ function canonicalizeWorkspaceScopeWithRules(
     return invalidScope("Git workspace scope has too many ignore sources");
   }
 
-  const repositoryPrefix = canonicalWorkspaceRelativePathWithRules(
+  const repositoryPrefix = canonicalWorkspaceRelativePath(
     candidate.repositoryPrefix,
     true,
-    rules,
     limits,
   );
   let totalBytes = 0;
@@ -390,12 +314,7 @@ function canonicalizeWorkspaceScopeWithRules(
     if (!exactKeys(record, ["path", "contentsBase64"])) {
       return invalidScope("Git ignore source has an invalid shape");
     }
-    const path = canonicalWorkspaceRelativePathWithRules(
-      record.path,
-      false,
-      rules,
-      limits,
-    );
+    const path = canonicalWorkspaceRelativePath(record.path, false, limits);
     if (!sourceIsRelevant(path, repositoryPrefix)) {
       return invalidScope("Git ignore source is unrelated to the workspace");
     }
@@ -434,25 +353,6 @@ function canonicalizeWorkspaceScopeWithRules(
   };
 }
 
-/** Validate untrusted scope data and rebuild its canonical byte-sorted form. */
-export function canonicalizeWorkspaceScope(
-  value: unknown,
-  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
-): WorkspaceScope {
-  return canonicalizeWorkspaceScopeWithRules(value, "portable-v2", limits);
-}
-
-/** Frozen scope contract shipped by cyclotomy@0.0.1. */
-export function canonicalizePublishedV1WorkspaceScope(
-  value: unknown,
-): WorkspaceScope {
-  return canonicalizeWorkspaceScopeWithRules(
-    value,
-    "published-v1",
-    DEFAULT_WORKSPACE_PATH_LIMITS,
-  );
-}
-
 /** Decode policy bytes only at the Git process/file boundary. */
 export function workspaceScopeBytes(encoded: string): Buffer {
   return decodeCanonicalBase64(encoded, "workspace policy bytes");
@@ -462,7 +362,7 @@ export function workspaceScopeBytes(encoded: string): Buffer {
 export function workspaceScopesEqual(
   left: WorkspaceScope,
   right: WorkspaceScope,
-  limits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
+  limits: WorkspacePathLimits,
 ): boolean {
   return (
     JSON.stringify(canonicalizeWorkspaceScope(left, limits)) ===

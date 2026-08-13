@@ -5,6 +5,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
@@ -21,7 +22,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   acquireWorkspaceLock,
+  OrderedWorkspaceLockAcquisitionError,
+  OrderedWorkspaceLockReleaseError,
   UnsafeWorkspaceLockPathError,
+  withOrderedWorkspaceLocks,
+  runWithWorkspaceLock,
+  runWithOrderedWorkspaceLocks,
   withWorkspaceLock,
   WorkspaceLockTimeoutError,
 } from "../src/infrastructure/workspace-lock.ts";
@@ -29,6 +35,7 @@ import {
 const roots: string[] = [];
 const execFileAsync = promisify(execFile);
 const children = new Set<LockChild>();
+const CHILD_PROCESS_WATCHDOG_MS = 30_000;
 const childFixture = fileURLToPath(
   new URL("./fixtures/workspace-lock-child.ts", import.meta.url),
 );
@@ -118,7 +125,7 @@ function startLockChild(
 async function waitForMessage(
   child: LockChild,
   type: ChildMessage["type"],
-  timeoutMs = 2_000,
+  timeoutMs = CHILD_PROCESS_WATCHDOG_MS,
 ): Promise<ChildMessage> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -159,18 +166,25 @@ async function waitForMessage(
   }
 }
 
-async function waitForExit(child: LockChild, timeoutMs = 2_000): Promise<void> {
+async function waitForExit(
+  child: LockChild,
+  timeoutMs = CHILD_PROCESS_WATCHDOG_MS,
+): Promise<void> {
   if (child.exited) {
     return;
   }
-  await new Promise<void>((resolveExit, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`timed out waiting for child exit\n${child.stderr}`));
-    }, timeoutMs);
-    child.process.once("exit", () => {
+  await new Promise<void>((resolveExit, rejectExit) => {
+    const onExit = (): void => {
       clearTimeout(timer);
       resolveExit();
-    });
+    };
+    const timer = setTimeout(() => {
+      child.process.off("exit", onExit);
+      rejectExit(
+        new Error(`timed out waiting for child exit\n${child.stderr}`),
+      );
+    }, timeoutMs);
+    child.process.once("exit", onExit);
   });
 }
 
@@ -213,6 +227,41 @@ describe("workspace lock", () => {
       staleMs: 100,
     });
     await second.release();
+  });
+
+  it("serializes opposite multi-workspace lock orders without deadlock", async () => {
+    const firstRoot = await storeRoot();
+    const secondRoot = await storeRoot();
+    let active = 0;
+    let maximumActive = 0;
+    const action = async (): Promise<void> => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+      active -= 1;
+    };
+    const options = { timeoutMs: 1_000, heartbeatMs: 20, staleMs: 100 };
+
+    await Promise.all([
+      withOrderedWorkspaceLocks(
+        [
+          { storeRoot: firstRoot, options },
+          { storeRoot: secondRoot, options },
+        ],
+        "a-to-b",
+        action,
+      ),
+      withOrderedWorkspaceLocks(
+        [
+          { storeRoot: secondRoot, options },
+          { storeRoot: firstRoot, options },
+        ],
+        "b-to-a",
+        action,
+      ),
+    ]);
+
+    expect(maximumActive).toBe(1);
   });
 
   it("excludes operations running in separate Node processes", async () => {
@@ -588,5 +637,273 @@ describe("workspace lock", () => {
       staleMs: 100,
     });
     await lock.release();
+  });
+
+  it("preserves both a single-lock action failure and cleanup failure", async () => {
+    const root = await storeRoot();
+    const actionFailure = new Error("single action failed");
+
+    const failure = await withWorkspaceLock(
+      root,
+      "single-release-test",
+      async () => {
+        const lockPath = join(root, "workspace.lock");
+        const heartbeat = (await readdir(lockPath)).find((name) =>
+          name.startsWith("heartbeat-"),
+        );
+        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+        const heartbeatPath = join(lockPath, heartbeat);
+        await rm(heartbeatPath);
+        await mkdir(heartbeatPath);
+        throw actionFailure;
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      actionFailure,
+      expect.any(Error),
+    ]);
+  });
+
+  it("returns a completed action value even when lock cleanup fails", async () => {
+    const root = await storeRoot();
+    const execution = await runWithWorkspaceLock(
+      root,
+      "settled-release-test",
+      async () => {
+        const lockPath = join(root, "workspace.lock");
+        const heartbeat = (await readdir(lockPath)).find((name) =>
+          name.startsWith("heartbeat-"),
+        );
+        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+        const heartbeatPath = join(lockPath, heartbeat);
+        await rm(heartbeatPath);
+        await mkdir(heartbeatPath);
+        return { effect: "committed" as const };
+      },
+    );
+
+    expect(execution).toMatchObject({
+      kind: "completed",
+      value: { effect: "committed" },
+      cleanup: { kind: "failed" },
+    });
+  });
+
+  it("returns an action failure independently from lock cleanup", async () => {
+    const root = await storeRoot();
+    const actionFailure = new Error("action failed");
+    const execution = await runWithWorkspaceLock(
+      root,
+      "settled-action-test",
+      async () => {
+        throw actionFailure;
+      },
+    );
+
+    expect(execution).toEqual({
+      kind: "action-failed",
+      cause: actionFailure,
+      cleanup: { kind: "released" },
+    });
+  });
+
+  it.each(["a", "z"])(
+    "identifies an ordered acquisition failure at the %s-sorted root",
+    async (lockedName) => {
+      const root = await storeRoot();
+      const firstRoot = join(root, "a");
+      const secondRoot = join(root, "z");
+      await mkdir(firstRoot);
+      await mkdir(secondRoot);
+      const lockedRoot = lockedName === "a" ? firstRoot : secondRoot;
+      const otherRoot = lockedName === "a" ? secondRoot : firstRoot;
+      const blocker = await acquireWorkspaceLock(lockedRoot, "blocker", {
+        heartbeatMs: 20,
+        staleMs: 100,
+      });
+      let actionEntered = false;
+
+      const failure = await withOrderedWorkspaceLocks(
+        [
+          {
+            storeRoot: secondRoot,
+            options: { timeoutMs: 10, heartbeatMs: 20, staleMs: 100 },
+          },
+          {
+            storeRoot: firstRoot,
+            options: { timeoutMs: 10, heartbeatMs: 20, staleMs: 100 },
+          },
+        ],
+        "ordered-test",
+        async () => {
+          actionEntered = true;
+        },
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(OrderedWorkspaceLockAcquisitionError);
+      expect((failure as OrderedWorkspaceLockAcquisitionError).storeRoot).toBe(
+        lockedRoot,
+      );
+      expect(actionEntered).toBe(false);
+
+      // When the blocked root sorts second, this also proves that the first
+      // acquired member was released before the failure escaped.
+      const other = await acquireWorkspaceLock(otherRoot, "probe", {
+        timeoutMs: 40,
+        heartbeatMs: 20,
+        staleMs: 100,
+      });
+      await other.release();
+      await blocker.release();
+    },
+  );
+
+  it("does not relabel an ordered action failure as an acquisition failure", async () => {
+    const root = await storeRoot();
+    const firstRoot = join(root, "a");
+    const secondRoot = join(root, "z");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const actionFailure = new Error("ordered action failed");
+
+    await expect(
+      withOrderedWorkspaceLocks(
+        [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
+        "ordered-test",
+        async () => {
+          throw actionFailure;
+        },
+      ),
+    ).rejects.toBe(actionFailure);
+  });
+
+  it("identifies a release-only failure after the ordered action completed", async () => {
+    const root = await storeRoot();
+    const firstRoot = join(root, "a");
+    const secondRoot = join(root, "z");
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
+
+    const failure = await withOrderedWorkspaceLocks(
+      [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
+      "ordered-release-test",
+      async () => {
+        const lockPath = join(secondRoot, "workspace.lock");
+        const heartbeat = (await readdir(lockPath)).find((name) =>
+          name.startsWith("heartbeat-"),
+        );
+        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+        const heartbeatPath = join(lockPath, heartbeat);
+        await rm(heartbeatPath);
+        await mkdir(heartbeatPath);
+        return "committed";
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(OrderedWorkspaceLockReleaseError);
+    expect((failure as OrderedWorkspaceLockReleaseError).storeRoot).toBe(
+      secondRoot,
+    );
+  });
+
+  it("preserves both an ordered action failure and a cleanup failure", async () => {
+    const root = await storeRoot();
+    const firstRoot = join(root, "a");
+    const secondRoot = join(root, "z");
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
+    const actionFailure = new Error("ordered action failed");
+
+    const failure = await withOrderedWorkspaceLocks(
+      [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
+      "ordered-release-test",
+      async () => {
+        const lockPath = join(secondRoot, "workspace.lock");
+        const heartbeat = (await readdir(lockPath)).find((name) =>
+          name.startsWith("heartbeat-"),
+        );
+        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+        const heartbeatPath = join(lockPath, heartbeat);
+        await rm(heartbeatPath);
+        await mkdir(heartbeatPath);
+        throw actionFailure;
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      actionFailure,
+      expect.any(OrderedWorkspaceLockReleaseError),
+    ]);
+  });
+
+  it("returns an ordered action value with the exact cleanup root", async () => {
+    const root = await storeRoot();
+    const firstRoot = join(root, "a");
+    const secondRoot = join(root, "z");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+
+    const execution = await runWithOrderedWorkspaceLocks(
+      [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
+      "ordered-settled-release-test",
+      async () => {
+        const lockPath = join(secondRoot, "workspace.lock");
+        const heartbeat = (await readdir(lockPath)).find((name) =>
+          name.startsWith("heartbeat-"),
+        );
+        if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+        const heartbeatPath = join(lockPath, heartbeat);
+        await rm(heartbeatPath);
+        await mkdir(heartbeatPath);
+        return { effect: "committed" as const };
+      },
+    );
+
+    expect(execution).toMatchObject({
+      kind: "completed",
+      value: { effect: "committed" },
+      cleanup: {
+        kind: "failed",
+        failures: [{ storeRoot: secondRoot }],
+      },
+    });
+  });
+
+  it("releases an earlier ordered member when later acquisition fails", async () => {
+    const root = await storeRoot();
+    const firstRoot = join(root, "a");
+    const secondRoot = join(root, "z");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const blocker = await acquireWorkspaceLock(secondRoot, "blocker", {
+      heartbeatMs: 20,
+      staleMs: 100,
+    });
+
+    await expect(
+      runWithOrderedWorkspaceLocks(
+        [
+          { storeRoot: firstRoot },
+          {
+            storeRoot: secondRoot,
+            options: { timeoutMs: 10, heartbeatMs: 20, staleMs: 100 },
+          },
+        ],
+        "ordered-settled-acquire-test",
+        async () => "unreachable",
+      ),
+    ).rejects.toMatchObject({
+      name: "OrderedWorkspaceLockAcquisitionError",
+      storeRoot: secondRoot,
+    });
+
+    const probe = await acquireWorkspaceLock(firstRoot, "probe", {
+      timeoutMs: 40,
+      heartbeatMs: 20,
+      staleMs: 100,
+    });
+    await probe.release();
+    await blocker.release();
   });
 });

@@ -1,28 +1,115 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile, mkdir, symlink } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  captureNodeState,
-  commitPreparedNodeState,
+  commitPreparedMissingNodeState as commitPreparedMissingNodeStateWithAuthority,
+  commitPreparedNodeState as commitPreparedNodeStateWithAuthority,
   prepareNodeState,
-  recordObservedNodeState,
+  prepareObservedNodeState,
 } from "../src/application/capture.ts";
-import { MetadataStore } from "../src/infrastructure/metadata.ts";
+import {
+  createCurrentMetadataStore,
+  type CurrentMetadataStore,
+} from "../src/infrastructure/metadata.ts";
 import {
   openObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
-import { commitTestNodeState } from "./metadata-fixture.ts";
+import {
+  checkpointState,
+  commitTestNodeState,
+  registerTestSession,
+} from "./metadata-fixture.ts";
 
 const execFileAsync = promisify(execFile);
 
 let root: string;
 let storeRoot: string;
+
+type TestCaptureDeps = Parameters<
+  typeof commitPreparedNodeStateWithAuthority
+>[0] & { readonly metadata: CurrentMetadataStore };
+
+const singleNodeAuthority = (
+  deps: TestCaptureDeps,
+  node: Parameters<typeof commitPreparedNodeStateWithAuthority>[1],
+) => ({
+  activeAncestryEntryIds: [node.entryId],
+  expectedSlot: deps.metadata.getCheckpointSlot(node.sessionId, node.entryId),
+});
+
+const captureNodeState = async (
+  deps: Parameters<typeof prepareNodeState>[0] & TestCaptureDeps,
+  workspace: string,
+  node: Parameters<typeof commitPreparedNodeStateWithAuthority>[1],
+) => {
+  const prepared = await prepareNodeState(deps, workspace);
+  return prepared.ok
+    ? commitPreparedNodeStateWithAuthority(
+        deps,
+        node,
+        prepared.value,
+        singleNodeAuthority(deps, node),
+      )
+    : prepared;
+};
+
+const recordObservedNodeState = async (
+  deps: Parameters<typeof prepareObservedNodeState>[0] & TestCaptureDeps,
+  node: Parameters<typeof commitPreparedNodeStateWithAuthority>[1],
+  snapshot: Parameters<typeof prepareObservedNodeState>[1],
+) => {
+  const prepared = await prepareObservedNodeState(deps, snapshot);
+  return prepared.ok
+    ? commitPreparedNodeStateWithAuthority(
+        deps,
+        node,
+        prepared.value,
+        singleNodeAuthority(deps, node),
+      )
+    : prepared;
+};
+
+const commitPreparedNodeState = (
+  deps: TestCaptureDeps,
+  node: Parameters<typeof commitPreparedNodeStateWithAuthority>[1],
+  prepared: Parameters<typeof commitPreparedNodeStateWithAuthority>[2],
+  expected?: { readonly treeOid: string | undefined },
+) =>
+  commitPreparedNodeStateWithAuthority(deps, node, prepared, {
+    activeAncestryEntryIds: [node.entryId],
+    expectedSlot:
+      expected === undefined
+        ? deps.metadata.getCheckpointSlot(node.sessionId, node.entryId)
+        : expected.treeOid === undefined
+          ? ({ kind: "open-missing" } as const)
+          : ({
+              kind: "open-checkpoint",
+              treeOid: expected.treeOid,
+            } as const),
+  });
+
+const commitPreparedMissingNodeState = (
+  deps: Parameters<typeof commitPreparedMissingNodeStateWithAuthority>[0],
+  node: Parameters<typeof commitPreparedMissingNodeStateWithAuthority>[1],
+  prepared: Parameters<typeof commitPreparedMissingNodeStateWithAuthority>[2],
+  intent: Parameters<typeof commitPreparedMissingNodeStateWithAuthority>[3],
+) =>
+  commitPreparedMissingNodeStateWithAuthority(deps, node, prepared, intent, {
+    activeAncestryEntryIds: [node.entryId],
+  });
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "cyclotomy-capture-ws-"));
@@ -36,11 +123,34 @@ afterEach(async () => {
 
 async function openDeps() {
   const store = await openObjectStore(storeRoot);
-  const metadata = new MetadataStore(join(storeRoot, "state.db"));
-  return { store, metadata };
+  const metadata = createCurrentMetadataStore(join(storeRoot, "state.db"));
+  const expectedSessionFile = "/test-sessions/s1.jsonl";
+  registerTestSession(metadata, "s1", expectedSessionFile);
+  return {
+    store,
+    metadata,
+    expectedRootPath: await realpath(root),
+    expectedSessionFile,
+    assertWorkspaceAuthority: () => undefined,
+  };
 }
 
 describe("captureNodeState", () => {
+  it("keeps the final workspace authority check synchronous by type", () => {
+    const assertCommitBoundary = (deps: TestCaptureDeps): void => {
+      void deps;
+    };
+    const base = {} as Omit<TestCaptureDeps, "assertWorkspaceAuthority">;
+    const invalid: TestCaptureDeps = {
+      ...base,
+      // @ts-expect-error A Promise cannot authorize a synchronous metadata cutover.
+      assertWorkspaceAuthority: async () => undefined,
+    };
+    void invalid;
+    void assertCommitBoundary;
+    expect(true).toBe(true);
+  });
+
   it("refuses a too-large partial scan without recording a checkpoint", async () => {
     await writeFile(join(root, "large.bin"), "12345");
     const base = await openDeps();
@@ -55,9 +165,8 @@ describe("captureNodeState", () => {
         kind: "scan-incomplete",
         problems: [{ path: "large.bin", kind: "too-large" }],
       });
-      expect(result.error.message).toContain("large.bin");
     }
-    expect(base.metadata.getState("s1", "too-large")).toBeUndefined();
+    expect(checkpointState(base.metadata, "s1", "too-large")).toBeUndefined();
     base.metadata.close();
   });
 
@@ -87,7 +196,7 @@ describe("captureNodeState", () => {
         );
       }
     }
-    expect(deps.metadata.getState("s1", "read-failed")).toBeUndefined();
+    expect(checkpointState(deps.metadata, "s1", "read-failed")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -117,7 +226,7 @@ describe("captureNodeState", () => {
         );
       }
     }
-    expect(deps.metadata.getState("s1", "unsupported")).toBeUndefined();
+    expect(checkpointState(deps.metadata, "s1", "unsupported")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -132,12 +241,46 @@ describe("captureNodeState", () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    const recorded = deps.metadata.getState("s1", "e1");
+    const recorded = checkpointState(deps.metadata, "s1", "e1");
     expect(recorded?.treeOid).toBe(result.value.treeOid);
     const manifest = await deps.store.readTree(result.value.treeOid);
     const paths = manifest.entries.map((entry) => entry.path);
     expect(paths).toContain("a.txt");
     expect(paths).toContain("src/b.ts");
+    deps.metadata.close();
+  });
+
+  it("does not commit through a capture authority bound to another session file", async () => {
+    await writeFile(join(root, "a.txt"), "hello");
+    const deps = await openDeps();
+    const wrongAuthority = {
+      ...deps,
+      expectedSessionFile: "/test-sessions/other.jsonl",
+    };
+    const directNode = { sessionId: "s1", entryId: "direct" };
+
+    const direct = await captureNodeState(wrongAuthority, root, directNode);
+    expect(direct).toMatchObject({
+      ok: false,
+      error: { kind: "metadata-failed" },
+    });
+    expect(checkpointState(deps.metadata, "s1", "direct")).toBeUndefined();
+
+    const prepared = await prepareNodeState(wrongAuthority, root);
+    expect(prepared.ok).toBe(true);
+    if (prepared.ok) {
+      const missing = commitPreparedMissingNodeState(
+        wrongAuthority,
+        { sessionId: "s1", entryId: "missing" },
+        prepared.value,
+        "initialize-fresh",
+      );
+      expect(missing).toMatchObject({
+        ok: false,
+        error: { kind: "metadata-failed" },
+      });
+      expect(checkpointState(deps.metadata, "s1", "missing")).toBeUndefined();
+    }
     deps.metadata.close();
   });
 
@@ -179,7 +322,7 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "candidate")).toBeUndefined();
+    expect(checkpointState(deps.metadata, "s1", "candidate")).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -198,7 +341,9 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "namespace-addition")).toBeUndefined();
+    expect(
+      checkpointState(deps.metadata, "s1", "namespace-addition"),
+    ).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -225,7 +370,9 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "same-oid-path-drift")).toBeUndefined();
+    expect(
+      checkpointState(deps.metadata, "s1", "same-oid-path-drift"),
+    ).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -253,7 +400,9 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "symlink-drift")).toBeUndefined();
+    expect(
+      checkpointState(deps.metadata, "s1", "symlink-drift"),
+    ).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -280,7 +429,9 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "ignore-policy-drift")).toBeUndefined();
+    expect(
+      checkpointState(deps.metadata, "s1", "ignore-policy-drift"),
+    ).toBeUndefined();
     deps.metadata.close();
   });
 
@@ -320,7 +471,6 @@ describe("captureNodeState", () => {
       readBlob: (oid) => baseStore.readBlob(oid),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
-      migrateLegacyTree: (oid) => baseStore.migrateLegacyTree(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
     };
 
@@ -335,9 +485,11 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "workspace-changed" },
     });
-    expect(deps.metadata.getState("s1", "ignore-case-drift")).toBeUndefined();
+    expect(
+      checkpointState(deps.metadata, "s1", "ignore-case-drift"),
+    ).toBeUndefined();
     deps.metadata.close();
-  }, 15_000);
+  });
 
   it("does not let a prepared capture overwrite a changed node slot", async () => {
     await writeFile(join(root, "a.txt"), "v1");
@@ -361,7 +513,53 @@ describe("captureNodeState", () => {
       ok: false,
       error: { kind: "state-changed" },
     });
-    expect(deps.metadata.getState("s1", "e1")?.treeOid).toBe(concurrent);
+    expect(checkpointState(deps.metadata, "s1", "e1")?.treeOid).toBe(
+      concurrent,
+    );
+    deps.metadata.close();
+  });
+
+  it("reconciles a session barrier over the complete ancestry at commit", async () => {
+    await writeFile(join(root, "a.txt"), "captured");
+    const deps = await openDeps();
+    registerTestSession(deps.metadata, "s1", deps.expectedSessionFile, [
+      "root",
+      "leaf",
+    ]);
+    deps.metadata.raiseSessionBarrier({
+      sessionId: "s1",
+      sessionFile: deps.expectedSessionFile,
+    });
+    const prepared = await prepareNodeState(deps, root);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+
+    const committed = commitPreparedNodeStateWithAuthority(
+      deps,
+      { sessionId: "s1", entryId: "leaf" },
+      prepared.value,
+      {
+        activeAncestryEntryIds: ["root", "leaf"],
+        expectedSlot: { kind: "open-missing" },
+      },
+    );
+
+    expect(committed).toMatchObject({
+      ok: false,
+      error: { kind: "write-protected" },
+    });
+    expect(deps.metadata.getCheckpointSlot("s1", "root")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(deps.metadata.getCheckpointSlot("s1", "leaf")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(
+      deps.metadata.hasSessionBarrier({
+        sessionId: "s1",
+        sessionFile: deps.expectedSessionFile,
+      }),
+    ).toBe(false);
     deps.metadata.close();
   });
 

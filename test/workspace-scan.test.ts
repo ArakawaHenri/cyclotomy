@@ -17,10 +17,11 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { TreeEntry } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import {
-  encodeTreeManifest,
-  type TreeEntry,
-} from "../src/infrastructure/tree-manifest.ts";
+  createCurrentTreeManifest,
+  encodeCurrentTreeManifest,
+} from "../src/infrastructure/tree-formats/current.ts";
 import {
   ScanError,
   scanWorkspace,
@@ -503,9 +504,8 @@ describe("workspace scanner", () => {
             symlinkKind: entry.symlinkKind,
           },
     );
-    const exactBytes = encodeTreeManifest(
-      durableEntries,
-      initial.scope,
+    const exactBytes = encodeCurrentTreeManifest(
+      createCurrentTreeManifest(durableEntries, initial.scope),
     ).byteLength;
 
     await expect(

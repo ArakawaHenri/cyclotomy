@@ -16,12 +16,14 @@ import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   DEFAULT_MAX_TREE_ENTRIES,
   DEFAULT_MAX_TREE_MANIFEST_BYTES,
-  TREE_MANIFEST_FORMAT,
-  canonicalizeTreeManifest,
   type FileRecreationMode,
   type SymlinkKind,
   type TreeEntry,
-} from "./tree-manifest.ts";
+} from "./tree-formats/manifest-codec.ts";
+import {
+  CURRENT_TREE_MANIFEST_FORMAT,
+  createCurrentTreeManifest,
+} from "./tree-formats/current.ts";
 import {
   createLiveGitIgnoreOracle,
   createSyntheticGitIgnoreOracle,
@@ -338,7 +340,7 @@ function estimatedManifestBytes(
 ): number {
   return Buffer.byteLength(
     `${JSON.stringify({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: entries.map(treeEntryForManifestEstimate),
       scope,
     })}\n`,
@@ -991,7 +993,7 @@ async function scanWorkspaceWithScope(
     try {
       // Reuse the durable manifest's one static source/blob binding. This also
       // covers the actual on-disk casing of `.gitignore` on ignoreCase hosts.
-      canonicalizeTreeManifest(
+      createCurrentTreeManifest(
         entries.map(treeEntryForManifestEstimate),
         scope,
         { maxEntries, maxManifestBytes, ...pathLimits },

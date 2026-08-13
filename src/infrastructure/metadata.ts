@@ -8,190 +8,51 @@ import {
   type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 
-import { isTreeOid, type NodeState, type TreeOid } from "../domain/model.ts";
+import { isTreeOid, type TreeOid } from "../domain/model.ts";
+import {
+  adoptBlockedMissingSlot,
+  blockCheckpointSlot,
+  captureCheckpointSlot,
+  checkpointSlotIsBlocked,
+  checkpointSlotsEqual,
+  releaseCheckpointSlot,
+  type BlockedCheckpointSlot,
+  type CheckpointSlot,
+} from "../domain/checkpoint-slot.ts";
+import {
+  reduceCheckpointLineage,
+  type ReducedCheckpointLineage,
+} from "../domain/checkpoint-lineage.ts";
+import { MetadataError } from "./metadata-error.ts";
+import {
+  METADATA_WRITER_PROTOCOL_FUNCTION,
+  metadataSchemaVersion,
+  validateUninitializedMetadataDatabase,
+} from "./metadata/schema.ts";
+import { CURRENT_METADATA_VERSION } from "./metadata/current.ts";
+import {
+  initializeMetadataVersionWithinTransaction,
+  migrateMetadataToCurrent,
+} from "./metadata/migration-engine.ts";
+import {
+  findMetadataVersion,
+  type MetadataMigrationDependencies,
+  type MetadataSessionIdentityMatch,
+  type MetadataVersionNode,
+  requireMetadataVersion,
+  validateMetadataVersion,
+} from "./metadata/version.ts";
 
-/** Persistent metadata schema; cyclotomy@0.0.1 shipped version 1. */
-const METADATA_SCHEMA_VERSION = 2;
-const METADATA_WRITER_PROTOCOL_FUNCTION = "cyclotomy_writer_protocol";
+export { MetadataError } from "./metadata-error.ts";
+
 const OPEN_BUSY_RETRY_MS = 5_000;
 const OPEN_BUSY_POLL_MS = 10;
 const OPEN_WAIT_CELL = new Int32Array(new SharedArrayBuffer(4));
 const SIDECAR_VALIDATION_ATTEMPTS = 64;
 const SIDECAR_RETRY_MS = 2;
-
-function normalizeSchemaSql(value: unknown): string {
-  if (typeof value !== "string") return "";
-  return value
-    .replace(/\s+/gu, " ")
-    .replace(/\s*([(),])\s*/gu, "$1")
-    .trim()
-    .toUpperCase();
-}
-
-interface ExpectedSchemaObject {
-  readonly type: "index" | "table" | "trigger";
-  readonly table: string;
-  readonly sql: string;
-}
-
-const NODE_STATE_SCHEMA_SQL = `
-  CREATE TABLE node_state(
-    session_id TEXT NOT NULL,
-    entry_id TEXT NOT NULL,
-    tree_oid TEXT NOT NULL,
-    PRIMARY KEY(session_id, entry_id)
-  ) STRICT, WITHOUT ROWID
-`;
-
-const NODE_WRITE_GUARD_SCHEMA_SQL = `
-  CREATE TABLE node_write_guard(
-    session_id TEXT NOT NULL,
-    entry_id TEXT NOT NULL,
-    PRIMARY KEY(session_id, entry_id)
-  ) STRICT, WITHOUT ROWID
-`;
-
-const SESSION_REGISTRY_V1_SCHEMA_SQL = `
-  CREATE TABLE session_registry(
-    session_id TEXT NOT NULL PRIMARY KEY,
-    session_file TEXT NOT NULL UNIQUE,
-    missing_since INTEGER,
-    missing_observed_at INTEGER
-  ) STRICT, WITHOUT ROWID
-`;
-
-const SESSION_REGISTRY_SCHEMA_SQL = `
-  CREATE TABLE session_registry(
-    session_id TEXT NOT NULL PRIMARY KEY,
-    session_file TEXT NOT NULL UNIQUE,
-    missing_since INTEGER,
-    missing_observed_at INTEGER,
-    pending_node_guard INTEGER NOT NULL DEFAULT 0
-      CHECK(pending_node_guard IN (0, 1))
-  ) STRICT, WITHOUT ROWID
-`;
-
-const SESSION_REGISTRY_MISSING_INDEX_SQL = `
-  CREATE INDEX session_registry_missing
-  ON session_registry(missing_since, missing_observed_at)
-`;
-
-const METADATA_TABLES = [
-  "node_state",
-  "node_write_guard",
-  "session_registry",
-] as const;
-const METADATA_DML_EVENTS = ["DELETE", "INSERT", "UPDATE"] as const;
-
-type MetadataTable = (typeof METADATA_TABLES)[number];
-type MetadataDmlEvent = (typeof METADATA_DML_EVENTS)[number];
-
-function writerFenceTriggerName(
-  table: MetadataTable,
-  event: MetadataDmlEvent,
-): string {
-  return `cyclotomy_writer_fence_${table}_${event.toLowerCase()}`;
-}
-
-function writerFenceTriggerSql(
-  table: MetadataTable,
-  event: MetadataDmlEvent,
-): string {
-  return `
-    CREATE TRIGGER ${writerFenceTriggerName(table, event)}
-    BEFORE ${event} ON ${table}
-    WHEN ${METADATA_WRITER_PROTOCOL_FUNCTION}() IS NOT ${METADATA_SCHEMA_VERSION}
-    BEGIN
-      SELECT RAISE(ABORT, 'Cyclotomy metadata writer protocol mismatch');
-    END
-  `;
-}
-
-const WRITER_FENCE_TRIGGER_SQL = METADATA_TABLES.flatMap((table) =>
-  METADATA_DML_EVENTS.map((event) => writerFenceTriggerSql(table, event)),
-);
-
-/** Exact user-authored schema shipped in the public 0.0.1 tarball. */
-const PUBLISHED_V1_SCHEMA = new Map<string, ExpectedSchemaObject>([
-  [
-    "node_state",
-    {
-      type: "table",
-      table: "node_state",
-      sql: normalizeSchemaSql(NODE_STATE_SCHEMA_SQL),
-    },
-  ],
-  [
-    "session_registry",
-    {
-      type: "table",
-      table: "session_registry",
-      sql: normalizeSchemaSql(SESSION_REGISTRY_V1_SCHEMA_SQL),
-    },
-  ],
-  [
-    "session_registry_missing",
-    {
-      type: "index",
-      table: "session_registry",
-      sql: normalizeSchemaSql(SESSION_REGISTRY_MISSING_INDEX_SQL),
-    },
-  ],
-]);
-
-const CURRENT_DATA_SCHEMA = new Map<string, ExpectedSchemaObject>([
-  [
-    "node_state",
-    {
-      type: "table",
-      table: "node_state",
-      sql: normalizeSchemaSql(NODE_STATE_SCHEMA_SQL),
-    },
-  ],
-  [
-    "node_write_guard",
-    {
-      type: "table",
-      table: "node_write_guard",
-      sql: normalizeSchemaSql(NODE_WRITE_GUARD_SCHEMA_SQL),
-    },
-  ],
-  [
-    "session_registry",
-    {
-      type: "table",
-      table: "session_registry",
-      sql: normalizeSchemaSql(SESSION_REGISTRY_SCHEMA_SQL),
-    },
-  ],
-  [
-    "session_registry_missing",
-    {
-      type: "index",
-      table: "session_registry",
-      sql: normalizeSchemaSql(SESSION_REGISTRY_MISSING_INDEX_SQL),
-    },
-  ],
-]);
-
-const CURRENT_SCHEMA = new Map<string, ExpectedSchemaObject>([
-  ...CURRENT_DATA_SCHEMA,
-  ...METADATA_TABLES.flatMap((table) =>
-    METADATA_DML_EVENTS.map(
-      (event) =>
-        [
-          writerFenceTriggerName(table, event),
-          {
-            type: "trigger",
-            table,
-            sql: normalizeSchemaSql(writerFenceTriggerSql(table, event)),
-          },
-        ] as const,
-    ),
-  ),
-]);
 
 function systemErrorCode(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) return undefined;
@@ -232,85 +93,209 @@ function enableWalWithRetry(db: DatabaseSync): void {
   }
 }
 
-export interface SessionRegistration {
+function inReadTransaction<T>(
+  db: DatabaseSync,
+  operation: (snapshot: DatabaseSync) => T,
+): T {
+  db.exec("BEGIN");
+  try {
+    const result = operation(db);
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Preserve the validation failure.
+    }
+    throw error;
+  }
+}
+
+interface SessionRegistration {
   readonly sessionId: string;
   readonly sessionFile: string;
-  readonly missingSince: number | null;
-  readonly missingObservedAt: number | null;
-  readonly pendingNodeGuard: boolean;
+  readonly captureBarrier: boolean;
+  readonly registrationState: SessionRegistrationState;
 }
 
-export interface PruneMissingSessionOptions {
-  readonly expectedSessionId: string;
-  readonly expectedSessionFile: string;
-  readonly expectedMissingSince: number;
-  readonly expectedMissingObservedAt: number;
-  readonly now?: number;
-  readonly retentionMs: number;
+type SessionRegistrationState = "pending" | "verified";
+
+export interface MetadataSessionIdentity {
+  readonly sessionId: string;
+  readonly sessionFile: string;
 }
 
-export interface SessionMetadataRemovalReport {
-  readonly removedSessions: number;
-  readonly removedNodeStates: number;
-  readonly removedNodeWriteGuards: number;
-  /** Includes node-state, guard, and registry rows. */
-  readonly removedMetadataRows: number;
+export interface ForkCheckpointProjection {
+  readonly sourceSessionId: string;
+  readonly barrier: boolean;
+  /** Total projection over every retained source coordinate requested. */
+  readonly coordinates: readonly {
+    readonly entryId: string;
+    readonly slot: CheckpointSlot;
+  }[];
 }
 
-export type CommitNodeStateResult =
-  "committed" | "state-changed" | "write-protected";
-
-export interface NodeStatePin {
-  /** Effective checkpoint to materialize at the protected node. */
-  readonly treeOid: TreeOid;
-  /** Exact slot observed before protection; undefined means it was absent. */
-  readonly expectedTreeOid: TreeOid | undefined;
-}
-
-export type ProtectNodeWriteResult = "protected" | "state-changed";
-export type MissingNodeStateIntent = "initialize-fresh" | "adopt-protected";
-export type MaterializeMissingNodeStateResult = "committed" | "state-changed";
-type ConsumePendingNodeGuardResult =
-  "protected" | "not-pending" | "session-unregistered";
-export type ClearNodeWriteProtectionResult =
-  "cleared" | "unguarded" | "state-changed";
-
-export interface CopyForkAncestryInput {
-  readonly targetSessionId: string;
+export interface ExportForkProjectionInput {
   readonly parentSessionFile: string;
-  /** The root-to-leaf ancestry Pi actually retained in the fork. */
-  readonly ancestryEntryIds: readonly string[];
+  readonly retainedEntryIds: readonly string[];
 }
 
-export interface CopyForkAncestryReport {
-  /** Undefined means the parent file was never registered in this workspace. */
-  readonly sourceSessionId: string | undefined;
-  readonly copiedStates: number;
+export type CommitCaptureResult = "blocked" | "committed" | "slot-changed";
+export type AdmitResolvedLocationResult = "admitted" | "slot-changed";
+export type ReconcileSessionBarrierResult =
+  "absent" | "reconciled" | "unregistered";
+
+export type ResolvedCheckpoint =
+  | { readonly kind: "missing" }
+  | {
+      readonly kind: "checkpoint";
+      readonly entryId: string;
+      readonly treeOid: TreeOid;
+    };
+
+export interface ResolvedCheckpointLineage {
+  readonly resolution: ResolvedCheckpoint;
+  readonly targetSlot: CheckpointSlot;
 }
 
-interface NodeStateRow {
-  readonly entry_id: unknown;
+export interface CommitCaptureInput {
+  readonly identity: MetadataSessionIdentity;
+  readonly entryId: string;
+  /** Trusted root-to-current ancestry; its final coordinate must be entryId. */
+  readonly activeAncestryEntryIds: readonly string[];
+  readonly treeOid: TreeOid;
+  /** Exact slot observed before asynchronous capture preparation began. */
+  readonly expectedSlot: CheckpointSlot;
+}
+
+export interface ProtectLocationInput {
+  readonly identity: MetadataSessionIdentity;
+  readonly entryId: string;
+  /** Trusted root-to-target ancestry; its final coordinate must be entryId. */
+  readonly activeAncestryEntryIds: readonly string[];
+  readonly expectation:
+    | { readonly kind: "any-current" }
+    | {
+        readonly kind: "exact-resolution";
+        readonly resolution: Exclude<
+          ResolvedCheckpoint,
+          { readonly kind: "missing" }
+        >;
+      };
+}
+
+export interface ProtectLocationResult {
+  /** A stale planned mutation must abort; its protectedSlot still committed. */
+  readonly kind: "protected" | "stale";
+  readonly protectedSlot: BlockedCheckpointSlot;
+}
+
+export interface AdmitResolvedLocationInput {
+  readonly identity: MetadataSessionIdentity;
+  readonly entryId: string;
+  /** Trusted root-to-target ancestry; its final coordinate must be entryId. */
+  readonly activeAncestryEntryIds: readonly string[];
+  readonly expectedResolution: Exclude<
+    ResolvedCheckpoint,
+    { readonly kind: "missing" }
+  >;
+}
+
+export interface AdoptBlockedMissingInput {
+  readonly identity: MetadataSessionIdentity;
+  readonly entryId: string;
+  readonly treeOid: TreeOid;
+}
+
+export interface FinalizeSessionRegistrationReport {
+  readonly kind: "registered" | "existing";
+}
+
+export interface FinalizeSessionProjectionInput {
+  readonly targetSessionId: string;
+  readonly targetSessionFile: string;
+  readonly retainedEntryIds: readonly string[];
+  readonly activeAncestryEntryIds: readonly string[];
+  /** The complete provenance policy committed with a new registration. */
+  readonly seed:
+    | { readonly kind: "fresh" }
+    | { readonly kind: "untrusted-parent" }
+    | {
+        readonly kind: "fork";
+        readonly projection: ForkCheckpointProjection;
+      };
+}
+
+declare const METADATA_IDENTITY_PROOF: unique symbol;
+
+/** Opaque capability returned only after a read-only identity inspection. */
+export interface MetadataIdentityProof {
+  readonly [METADATA_IDENTITY_PROOF]: true;
+}
+
+export type MetadataIdentityInspection =
+  | { readonly kind: "exact"; readonly proof: MetadataIdentityProof }
+  | { readonly kind: "absent" | "conflict" | "unrecognized" }
+  | { readonly kind: "recovery-required"; readonly cause: MetadataError };
+
+interface CheckpointSlotRow {
+  readonly capture_state: unknown;
+  readonly entry_id?: unknown;
   readonly tree_oid: unknown;
 }
+
+const READ_CHECKPOINT_SLOT_SQL = `SELECT tree_oid, capture_state
+  FROM checkpoint_slot WHERE session_id = ? AND entry_id = ?`;
+const DELETE_CHECKPOINT_SLOT_SQL = `DELETE FROM checkpoint_slot
+  WHERE session_id = ? AND entry_id = ?`;
+const UPSERT_CHECKPOINT_SLOT_SQL = `INSERT INTO checkpoint_slot(
+    session_id, entry_id, tree_oid, capture_state
+  ) VALUES (?, ?, ?, ?)
+  ON CONFLICT(session_id, entry_id)
+  DO UPDATE SET tree_oid = excluded.tree_oid,
+                capture_state = excluded.capture_state`;
 
 interface SessionRegistrationRow {
   readonly session_id: unknown;
   readonly session_file: unknown;
-  readonly missing_since: unknown;
-  readonly missing_observed_at: unknown;
-  readonly pending_node_guard: unknown;
+  readonly capture_barrier: unknown;
+  readonly registration_state: unknown;
 }
 
-export class MetadataError extends Error {
-  constructor(message: string, cause?: unknown) {
-    super(message, cause === undefined ? undefined : { cause });
-    this.name = "MetadataError";
-  }
+interface MetadataSidecarSet {
+  readonly journal: boolean;
+  readonly shm: boolean;
+  readonly wal: boolean;
 }
 
-function metadataPathError(path: string, detail: string): MetadataError {
+interface MetadataIdentityProofDetails {
+  readonly canonicalPath: string;
+  readonly observation: Stats;
+  readonly metadataVersion: MetadataVersionNode;
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly sidecars: MetadataSidecarSet;
+}
+
+const metadataIdentityProofDetails = new WeakMap<
+  MetadataIdentityProof,
+  MetadataIdentityProofDetails
+>();
+
+interface MetadataStoreOpenOptions {
+  readonly allowHistorical: boolean;
+  readonly authenticatedProof?: MetadataIdentityProof;
+}
+
+function metadataPathError(
+  path: string,
+  detail: string,
+  cause?: unknown,
+): MetadataError {
   return new MetadataError(
     `unsafe metadata database path ${JSON.stringify(path)}: ${detail}`,
+    cause,
   );
 }
 
@@ -326,6 +311,7 @@ function checkedRegularMetadataPath(path: string): Stats {
     throw metadataPathError(
       path,
       `cannot inspect file (${error instanceof Error ? error.message : String(error)})`,
+      error,
     );
   }
   if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
@@ -354,7 +340,7 @@ function checkedRegularMetadataPath(path: string): Stats {
   }
 }
 
-function optionalMetadataSidecar(path: string): void {
+function optionalMetadataSidecar(path: string): boolean {
   validation: for (
     let attempt = 0;
     attempt < SIDECAR_VALIDATION_ATTEMPTS;
@@ -366,7 +352,7 @@ function optionalMetadataSidecar(path: string): void {
     } catch (error) {
       // SQLite is allowed to delete a WAL/SHM sidecar as the last connection
       // closes. Disappearance at any observation point is a valid absence.
-      if (systemErrorCode(error) === "ENOENT") return;
+      if (systemErrorCode(error) === "ENOENT") return false;
       if (
         isTransientSidecarAccess(error) &&
         attempt + 1 < SIDECAR_VALIDATION_ATTEMPTS
@@ -379,7 +365,7 @@ function optionalMetadataSidecar(path: string): void {
     // A sidecar can be unlinked immediately after a successful lookup. Some
     // kernels expose that legitimate race as a regular-file stat with zero
     // links rather than ENOENT.
-    if (before.nlink === 0) return;
+    if (before.nlink === 0) return false;
     if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) {
       throw metadataPathError(
         path,
@@ -399,7 +385,7 @@ function optionalMetadataSidecar(path: string): void {
       try {
         after = lstatSync(path);
       } catch (error) {
-        if (systemErrorCode(error) === "ENOENT") return;
+        if (systemErrorCode(error) === "ENOENT") return false;
         if (
           isTransientSidecarAccess(error) &&
           attempt + 1 < SIDECAR_VALIDATION_ATTEMPTS
@@ -409,7 +395,7 @@ function optionalMetadataSidecar(path: string): void {
         }
         throw error;
       }
-      if (after.nlink === 0) return;
+      if (after.nlink === 0) return false;
       if (
         opened.isFile() &&
         opened.nlink === 1 &&
@@ -419,7 +405,7 @@ function optionalMetadataSidecar(path: string): void {
         sameFileIdentity(before, opened) &&
         sameFileIdentity(opened, after)
       ) {
-        return;
+        return true;
       }
       if (
         sameFileIdentity(opened, after) &&
@@ -436,7 +422,7 @@ function optionalMetadataSidecar(path: string): void {
       }
       changed = true;
     } catch (error) {
-      if (systemErrorCode(error) === "ENOENT") return;
+      if (systemErrorCode(error) === "ENOENT") return false;
       // A nofollow open reports ELOOP when a regular sidecar is replaced by a
       // symlink between lstat and open. Reobserve it; a stable symlink is
       // rejected by the next iteration without ever being followed.
@@ -462,16 +448,26 @@ function optionalMetadataSidecar(path: string): void {
   );
 }
 
-/**
- * SQLite cannot accept an already O_NOFOLLOW-opened descriptor. This closes
- * the practical pre-created-symlink hole and pairs a pre-open observation with
- * a post-open inode check; the containing control directory remains a trusted
- * same-user boundary against an active replacement race.
- */
-function prepareMetadataPath(path: string): {
-  readonly canonicalPath: string;
-  readonly observation: Stats;
-} {
+function metadataSidecars(path: string): MetadataSidecarSet {
+  return {
+    journal: optionalMetadataSidecar(`${path}-journal`),
+    shm: optionalMetadataSidecar(`${path}-shm`),
+    wal: optionalMetadataSidecar(`${path}-wal`),
+  };
+}
+
+function sameMetadataSidecars(
+  left: MetadataSidecarSet,
+  right: MetadataSidecarSet,
+): boolean {
+  return (
+    left.journal === right.journal &&
+    left.shm === right.shm &&
+    left.wal === right.wal
+  );
+}
+
+function canonicalMetadataPath(path: string): string {
   if (!isAbsolute(path) || path.includes("\0") || resolve(path) !== path) {
     throw metadataPathError(path, "path must be canonical and absolute");
   }
@@ -483,12 +479,49 @@ function prepareMetadataPath(path: string): {
     throw metadataPathError(
       path,
       `parent directory is unavailable (${error instanceof Error ? error.message : String(error)})`,
+      error,
     );
   }
   if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory()) {
     throw metadataPathError(path, "parent must be a real directory");
   }
-  const canonicalParent = realpathSync(parent);
+  try {
+    return join(realpathSync(parent), basename(path));
+  } catch (error) {
+    throw metadataPathError(
+      path,
+      `cannot resolve parent directory (${error instanceof Error ? error.message : String(error)})`,
+      error,
+    );
+  }
+}
+
+function prepareExistingMetadataPath(path: string): {
+  readonly canonicalPath: string;
+  readonly observation: Stats;
+  readonly sidecars: MetadataSidecarSet;
+} {
+  const canonicalPath = canonicalMetadataPath(path);
+  const observation = checkedRegularMetadataPath(path);
+  return {
+    canonicalPath,
+    observation,
+    sidecars: metadataSidecars(canonicalPath),
+  };
+}
+
+/**
+ * SQLite cannot accept an already O_NOFOLLOW-opened descriptor. This closes
+ * the practical pre-created-symlink hole and pairs a pre-open observation with
+ * a post-open inode check; the containing control directory remains a trusted
+ * same-user boundary against an active replacement race.
+ */
+function prepareMetadataPath(path: string): {
+  readonly canonicalPath: string;
+  readonly observation: Stats;
+  readonly sidecars: MetadataSidecarSet;
+} {
+  const canonicalPath = canonicalMetadataPath(path);
 
   let pathExists = false;
   try {
@@ -499,6 +532,7 @@ function prepareMetadataPath(path: string): {
       throw metadataPathError(
         path,
         `cannot inspect database file (${error instanceof Error ? error.message : String(error)})`,
+        error,
       );
     }
   }
@@ -521,6 +555,7 @@ function prepareMetadataPath(path: string): {
         throw metadataPathError(
           path,
           `cannot create private database file (${error instanceof Error ? error.message : String(error)})`,
+          error,
         );
       }
     } finally {
@@ -529,11 +564,10 @@ function prepareMetadataPath(path: string): {
   }
 
   const observation = checkedRegularMetadataPath(path);
-  optionalMetadataSidecar(`${path}-wal`);
-  optionalMetadataSidecar(`${path}-shm`);
   return {
-    canonicalPath: join(canonicalParent, basename(path)),
+    canonicalPath,
     observation,
+    sidecars: metadataSidecars(canonicalPath),
   };
 }
 
@@ -544,136 +578,738 @@ function requireTreeOid(value: unknown, context: string): TreeOid {
   return value;
 }
 
-function requireTimestamp(value: number, context: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new MetadataError(`${context} must be a non-negative integer`);
+function requireNonEmpty(value: unknown, context: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new MetadataError(
+      `${context} must be a non-empty string without NUL bytes`,
+    );
   }
   return value;
 }
 
-function requireNonEmpty(value: string, context: string): string {
-  if (value.length === 0) {
-    throw new MetadataError(`${context} must be non-empty`);
+function checkpointSlotFromRow(
+  row: CheckpointSlotRow | undefined,
+  context: string,
+): CheckpointSlot {
+  if (row === undefined) return { kind: "open-missing" };
+  if (row.capture_state !== "open" && row.capture_state !== "blocked") {
+    throw new MetadataError(`invalid capture state for ${context}`);
   }
-  return value;
+  const treeOid =
+    row.tree_oid === null
+      ? undefined
+      : requireTreeOid(row.tree_oid, `${context} checkpoint`);
+  if (treeOid === undefined) {
+    if (row.capture_state !== "blocked") {
+      throw new MetadataError(`invalid missing checkpoint for ${context}`);
+    }
+    return { kind: "blocked-missing" };
+  }
+  return row.capture_state === "open"
+    ? { kind: "open-checkpoint", treeOid }
+    : { kind: "blocked-checkpoint", treeOid };
+}
+
+function checkpointSlotIn(
+  db: DatabaseSync,
+  sessionId: string,
+  entryId: string,
+): CheckpointSlot {
+  return checkpointSlotReader(db)(sessionId, entryId);
+}
+
+type CheckpointSlotReader = (
+  sessionId: string,
+  entryId: string,
+) => CheckpointSlot;
+
+function checkpointSlotReader(db: DatabaseSync): CheckpointSlotReader {
+  let statement: StatementSync | undefined;
+  return (sessionId, entryId) => {
+    statement ??= db.prepare(READ_CHECKPOINT_SLOT_SQL);
+    const row = statement.get(sessionId, entryId) as
+      CheckpointSlotRow | undefined;
+    return checkpointSlotFromRow(row, `${sessionId}/${entryId}`);
+  };
+}
+
+type CheckpointSlotWriter = (
+  sessionId: string,
+  entryId: string,
+  slot: CheckpointSlot,
+) => void;
+
+function checkpointSlotWriter(db: DatabaseSync): CheckpointSlotWriter {
+  let deleteStatement: StatementSync | undefined;
+  let upsertStatement: StatementSync | undefined;
+  return (sessionId, entryId, slot) => {
+    if (slot.kind === "open-missing") {
+      deleteStatement ??= db.prepare(DELETE_CHECKPOINT_SLOT_SQL);
+      deleteStatement.run(sessionId, entryId);
+      return;
+    }
+    const treeOid =
+      slot.kind === "open-checkpoint" || slot.kind === "blocked-checkpoint"
+        ? slot.treeOid
+        : null;
+    const captureState = checkpointSlotIsBlocked(slot) ? "blocked" : "open";
+    upsertStatement ??= db.prepare(UPSERT_CHECKPOINT_SLOT_SQL);
+    upsertStatement.run(sessionId, entryId, treeOid, captureState);
+  };
+}
+
+/**
+ * Resolve one trusted root-to-target lineage from the same database snapshot
+ * as the mutation that consumes it. A blocked-missing target is authoritative
+ * negative knowledge for that exact location; an earlier blocked-missing slot
+ * does not erase checkpoint inheritance for a descendant.
+ */
+function resolveCheckpointIn(
+  readSlot: CheckpointSlotReader,
+  sessionId: string,
+  ancestryEntryIds: readonly string[],
+): ResolvedCheckpointLineage {
+  if (ancestryEntryIds.length === 0) {
+    throw new MetadataError("checkpoint ancestry must not be empty");
+  }
+  const reduced: ReducedCheckpointLineage<string> = reduceCheckpointLineage(
+    ancestryEntryIds,
+    (entryId) => readSlot(sessionId, entryId),
+  );
+  return {
+    resolution:
+      reduced.resolution.kind === "missing"
+        ? { kind: "missing" }
+        : {
+            kind: "checkpoint",
+            entryId: reduced.resolution.coordinate,
+            treeOid: reduced.resolution.treeOid,
+          },
+    targetSlot: reduced.targetSlot,
+  };
+}
+
+function resolutionsEqual(
+  left: ResolvedCheckpoint,
+  right: ResolvedCheckpoint,
+): boolean {
+  if (left.kind !== right.kind) return false;
+  return (
+    left.kind === "missing" ||
+    (right.kind === "checkpoint" &&
+      left.entryId === right.entryId &&
+      left.treeOid === right.treeOid)
+  );
+}
+
+function writeCheckpointSlotIn(
+  db: DatabaseSync,
+  sessionId: string,
+  entryId: string,
+  slot: CheckpointSlot,
+): void {
+  checkpointSlotWriter(db)(sessionId, entryId, slot);
+}
+
+function sessionHasBarrierIn(db: DatabaseSync, sessionId: string): boolean {
+  return (
+    db
+      .prepare(`SELECT 1 FROM session_capture_barrier WHERE session_id = ?`)
+      .get(sessionId) !== undefined
+  );
+}
+
+/**
+ * Authenticate an existing source database without changing its schema,
+ * journal mode, main database, or WAL. A clean database is opened
+ * through SQLite's immutable URI. An already-live WAL is opened read-only only
+ * when its SHM companion exists; SQLite may update transient SHM read marks.
+ */
+export function inspectMetadataSessionIdentity(
+  path: string,
+  sessionId: string,
+  sessionFile: string,
+): MetadataIdentityInspection {
+  requireNonEmpty(sessionId, "session id");
+  requireNonEmpty(sessionFile, "session file");
+  try {
+    const prepared = prepareExistingMetadataPath(path);
+    if (
+      prepared.sidecars.journal ||
+      prepared.sidecars.wal !== prepared.sidecars.shm
+    ) {
+      return {
+        kind: "recovery-required",
+        cause: metadataPathError(
+          path,
+          "database sidecars require recovery before read-only identity inspection",
+        ),
+      };
+    }
+
+    const location = prepared.sidecars.wal
+      ? prepared.canonicalPath
+      : (() => {
+          const immutable = pathToFileURL(prepared.canonicalPath);
+          immutable.searchParams.set("immutable", "1");
+          return immutable;
+        })();
+    let db: DatabaseSync | undefined;
+    let inspection:
+      | { readonly kind: "absent" | "conflict" | "unrecognized" }
+      | {
+          readonly kind: "exact";
+          readonly metadataVersion: MetadataVersionNode;
+        }
+      | undefined;
+    try {
+      db = new DatabaseSync(location, { readOnly: true });
+      const metadataVersion = findMetadataVersion(
+        CURRENT_METADATA_VERSION,
+        metadataSchemaVersion(db),
+      );
+      if (metadataVersion === undefined) {
+        inspection = { kind: "unrecognized" };
+      } else {
+        try {
+          validateMetadataVersion(db, metadataVersion);
+        } catch (error) {
+          if (!(error instanceof MetadataError)) throw error;
+          inspection = { kind: "unrecognized" };
+        }
+        if (inspection === undefined) {
+          const match = metadataVersion.matchSessionIdentity(
+            db,
+            sessionId,
+            sessionFile,
+          );
+          inspection =
+            match === "exact"
+              ? { kind: "exact", metadataVersion }
+              : { kind: match };
+        }
+      }
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // Preserve the inspection result or primary failure.
+      }
+    }
+
+    const reopened = checkedRegularMetadataPath(prepared.canonicalPath);
+    const sidecars = metadataSidecars(prepared.canonicalPath);
+    if (
+      !sameFileIdentity(prepared.observation, reopened) ||
+      !sameMetadataSidecars(prepared.sidecars, sidecars)
+    ) {
+      throw metadataPathError(
+        path,
+        "database or sidecars changed while identity was inspected",
+      );
+    }
+    if (inspection === undefined) {
+      throw new MetadataError("metadata identity inspection did not complete");
+    }
+    if (inspection.kind !== "exact") return inspection;
+
+    const proof = Object.freeze({}) as MetadataIdentityProof;
+    metadataIdentityProofDetails.set(proof, {
+      canonicalPath: prepared.canonicalPath,
+      observation: reopened,
+      metadataVersion: inspection.metadataVersion,
+      sessionId,
+      sessionFile,
+      sidecars,
+    });
+    return { kind: "exact", proof };
+  } catch (error) {
+    throw error instanceof MetadataError
+      ? error
+      : new MetadataError(`cannot inspect metadata database at ${path}`, error);
+  }
 }
 
 function sessionRegistrationFromRow(
   row: SessionRegistrationRow,
 ): SessionRegistration {
-  const sessionId = requireNonEmpty(String(row.session_id), "session id");
-  const sessionFile = requireNonEmpty(String(row.session_file), "session file");
-  const missingSince =
-    row.missing_since === null
-      ? null
-      : requireTimestamp(Number(row.missing_since), "missing_since");
-  const missingObservedAt =
-    row.missing_observed_at === null
-      ? null
-      : requireTimestamp(
-          Number(row.missing_observed_at),
-          "missing_observed_at",
-        );
-  if (
-    (missingSince === null) !== (missingObservedAt === null) ||
-    (missingSince !== null &&
-      missingObservedAt !== null &&
-      missingObservedAt < missingSince)
-  ) {
-    throw new MetadataError("invalid session registry missing interval");
-  }
-  const pendingNodeGuard = Number(row.pending_node_guard);
-  if (pendingNodeGuard !== 0 && pendingNodeGuard !== 1) {
-    throw new MetadataError("invalid session registry pending node guard");
-  }
+  const sessionId = requireNonEmpty(row.session_id, "session id");
+  const sessionFile = requireNonEmpty(row.session_file, "session file");
+  const captureBarrier = sessionCaptureBarrierFrom(row.capture_barrier);
+  const registrationState = sessionRegistrationStateFrom(
+    row.registration_state,
+  );
   return {
     sessionId,
     sessionFile,
-    missingSince,
-    missingObservedAt,
-    pendingNodeGuard: pendingNodeGuard === 1,
+    captureBarrier,
+    registrationState,
   };
 }
 
-function consumePendingNodeGuardIn(
+function sessionCaptureBarrierFrom(value: unknown): boolean {
+  if (value !== 0 && value !== 1) {
+    throw new MetadataError("invalid session capture barrier");
+  }
+  return value === 1;
+}
+
+function sessionRegistrationStateFrom(
+  value: unknown,
+): SessionRegistrationState {
+  if (value !== "pending" && value !== "verified") {
+    throw new MetadataError("invalid session registration state");
+  }
+  return value;
+}
+
+function requireVerifiedSessionIn(
   db: DatabaseSync,
   sessionId: string,
-  entryIds: readonly string[],
-  expectedSessionFile?: string,
-): ConsumePendingNodeGuardResult {
+  expectedSessionFile: string,
+): void {
   const row = db
     .prepare(
-      `SELECT session_file, pending_node_guard FROM session_registry
+      `SELECT session_file, registration_state FROM session_registry
        WHERE session_id = ?`,
     )
     .get(sessionId) as
     | {
         readonly session_file: unknown;
-        readonly pending_node_guard: unknown;
+        readonly registration_state: unknown;
       }
     | undefined;
+  const registeredFile =
+    row === undefined
+      ? undefined
+      : requireNonEmpty(row.session_file, "session file");
+  const registrationState =
+    row === undefined
+      ? undefined
+      : sessionRegistrationStateFrom(row.registration_state);
   if (
     row === undefined ||
-    (expectedSessionFile !== undefined &&
-      String(row.session_file) !== expectedSessionFile)
+    registrationState !== "verified" ||
+    registeredFile !== requireNonEmpty(expectedSessionFile, "session file")
   ) {
-    return "session-unregistered";
+    throw new MetadataError(
+      `session ${JSON.stringify(sessionId)} is not verified for metadata writes`,
+    );
   }
-  const pending = Number(row.pending_node_guard);
-  if (pending !== 0 && pending !== 1) {
-    throw new MetadataError("invalid session registry pending node guard");
-  }
-  if (pending === 0) return "not-pending";
+}
 
-  const insertGuard = db.prepare(
-    `INSERT OR IGNORE INTO node_write_guard(session_id, entry_id)
-     VALUES (?, ?)`,
-  );
-  for (const entryId of entryIds) insertGuard.run(sessionId, entryId);
+function reconcileSessionBarrierIn(
+  db: DatabaseSync,
+  sessionId: string,
+  entryIds: readonly string[],
+  expectedSessionFile: string,
+): ReconcileSessionBarrierResult {
+  const row = db
+    .prepare(
+      `SELECT registry.session_file, registry.registration_state,
+              EXISTS(
+                SELECT 1 FROM session_capture_barrier AS barrier
+                WHERE barrier.session_id = registry.session_id
+              ) AS capture_barrier
+       FROM session_registry AS registry
+       WHERE session_id = ?`,
+    )
+    .get(sessionId) as
+    | {
+        readonly session_file: unknown;
+        readonly capture_barrier: unknown;
+        readonly registration_state: unknown;
+      }
+    | undefined;
+  const registeredFile =
+    row === undefined
+      ? undefined
+      : requireNonEmpty(row.session_file, "session file");
+  const registrationState =
+    row === undefined
+      ? undefined
+      : sessionRegistrationStateFrom(row.registration_state);
+  if (
+    row === undefined ||
+    registrationState !== "verified" ||
+    registeredFile !== requireNonEmpty(expectedSessionFile, "session file")
+  ) {
+    return "unregistered";
+  }
+  if (!sessionCaptureBarrierFrom(row.capture_barrier)) return "absent";
+
+  const readSlot = checkpointSlotReader(db);
+  const writeSlot = checkpointSlotWriter(db);
+  let effectiveTreeOid: TreeOid | undefined;
+  for (const entryId of entryIds) {
+    const slot = readSlot(sessionId, entryId);
+    if (slot.kind === "open-checkpoint" || slot.kind === "blocked-checkpoint") {
+      effectiveTreeOid = slot.treeOid;
+    }
+    if (slot.kind === "open-checkpoint" || slot.kind === "open-missing") {
+      writeSlot(
+        sessionId,
+        entryId,
+        blockCheckpointSlot(slot, effectiveTreeOid),
+      );
+    }
+    // BlockedMissing deliberately does not erase an effective ancestor.
+  }
   const cleared = db
+    .prepare(`DELETE FROM session_capture_barrier WHERE session_id = ?`)
+    .run(sessionId);
+  if (Number(cleared.changes) !== 1) {
+    throw new MetadataError("session capture barrier changed while reconciled");
+  }
+  return "reconciled";
+}
+
+function uniqueEntrySet(
+  entryIds: readonly string[],
+  context: string,
+): ReadonlySet<string> {
+  if (!Array.isArray(entryIds)) {
+    throw new MetadataError(`${context} must be an array`);
+  }
+  const retained = new Set<string>();
+  for (const rawEntryId of entryIds) {
+    const entryId = requireNonEmpty(rawEntryId, `${context} entry id`);
+    if (retained.has(entryId)) {
+      throw new MetadataError(`${context} must be unique`);
+    }
+    retained.add(entryId);
+  }
+  return retained;
+}
+
+function checkedLocationAncestry(
+  entryIds: readonly string[],
+  entryId: string,
+  context: string,
+): readonly string[] {
+  const ancestry = [...uniqueEntrySet(entryIds, context)];
+  if (ancestry.at(-1) !== entryId) {
+    throw new MetadataError(`${context} must end at the location coordinate`);
+  }
+  return ancestry;
+}
+
+function checkedExpectedResolution(
+  resolution: Exclude<ResolvedCheckpoint, { readonly kind: "missing" }>,
+  ancestry: readonly string[],
+  context: string,
+): Exclude<ResolvedCheckpoint, { readonly kind: "missing" }> {
+  if (
+    typeof resolution !== "object" ||
+    resolution === null ||
+    resolution.kind !== "checkpoint"
+  ) {
+    throw new MetadataError(`${context} must be a checkpoint`);
+  }
+  const entryId = requireNonEmpty(
+    resolution.entryId,
+    `${context} source entry id`,
+  );
+  if (!ancestry.includes(entryId)) {
+    throw new MetadataError(`${context} source must belong to the ancestry`);
+  }
+  return {
+    kind: "checkpoint",
+    entryId,
+    treeOid: requireTreeOid(resolution.treeOid, context),
+  };
+}
+
+function retainedEntrySet(entryIds: readonly string[]): ReadonlySet<string> {
+  return uniqueEntrySet(entryIds, "fork retained entry ids");
+}
+
+function activeAncestry(
+  entryIds: readonly string[],
+  retained: ReadonlySet<string>,
+): readonly string[] {
+  const active = [...uniqueEntrySet(entryIds, "active ancestry entry ids")];
+  if (active.some((entryId) => !retained.has(entryId))) {
+    throw new MetadataError(
+      "active ancestry must be contained in retained entry ids",
+    );
+  }
+  return active;
+}
+
+function checkedProjectedSlot(
+  value: CheckpointSlot,
+  context: string,
+): CheckpointSlot {
+  if (typeof value !== "object" || value === null) {
+    throw new MetadataError(`${context} is invalid`);
+  }
+  switch (value.kind) {
+    case "open-missing":
+    case "blocked-missing":
+      return { kind: value.kind };
+    case "open-checkpoint":
+    case "blocked-checkpoint":
+      return {
+        kind: value.kind,
+        treeOid: requireTreeOid(value.treeOid, context),
+      };
+    default:
+      throw new MetadataError(`${context} is invalid`);
+  }
+}
+
+function checkedForkProjection(
+  projection: ForkCheckpointProjection | undefined,
+  retained: ReadonlySet<string>,
+):
+  | {
+      readonly barrier: boolean;
+      readonly sourceSessionId: string;
+      readonly slots: ReadonlyMap<string, CheckpointSlot>;
+    }
+  | undefined {
+  if (projection === undefined) return undefined;
+  if (
+    typeof projection !== "object" ||
+    projection === null ||
+    typeof projection.barrier !== "boolean" ||
+    !Array.isArray(projection.coordinates)
+  ) {
+    throw new MetadataError("fork checkpoint projection is invalid");
+  }
+  const sourceSessionId = requireNonEmpty(
+    projection.sourceSessionId,
+    "fork source session id",
+  );
+  const slots = new Map<string, CheckpointSlot>();
+  for (const coordinate of projection.coordinates) {
+    if (typeof coordinate !== "object" || coordinate === null) {
+      throw new MetadataError("fork checkpoint coordinate is invalid");
+    }
+    const entryId = requireNonEmpty(
+      coordinate.entryId,
+      "fork checkpoint coordinate entry id",
+    );
+    if (!retained.has(entryId)) {
+      throw new MetadataError(
+        "fork projection contains a coordinate the target did not retain",
+      );
+    }
+    if (slots.has(entryId)) {
+      throw new MetadataError("fork projection contains duplicate coordinates");
+    }
+    slots.set(
+      entryId,
+      checkedProjectedSlot(coordinate.slot, "fork checkpoint coordinate"),
+    );
+  }
+  return { barrier: projection.barrier, sourceSessionId, slots };
+}
+
+interface TrustedSessionCoordinates {
+  readonly stateIds: ReadonlySet<string>;
+  readonly guardedIds: ReadonlySet<string>;
+}
+
+function validateSessionCoordinatesRetainedIn(
+  db: DatabaseSync,
+  registration: SessionRegistration,
+  retained: ReadonlySet<string>,
+  context: "pending" | "verified",
+): TrustedSessionCoordinates {
+  const slotRows = db
+    .prepare(
+      `SELECT entry_id, tree_oid, capture_state FROM checkpoint_slot
+       WHERE session_id = ?`,
+    )
+    .all(registration.sessionId) as unknown as CheckpointSlotRow[];
+  const stateIds = new Set<string>();
+  const guardedIds = new Set<string>();
+  for (const row of slotRows) {
+    const entryId = requireNonEmpty(
+      row.entry_id,
+      `${context} checkpoint slot entry id`,
+    );
+    const slot = checkpointSlotFromRow(
+      row,
+      `${context} checkpoint slot ${entryId}`,
+    );
+    if (!retained.has(entryId)) {
+      throw new MetadataError(
+        `${context} session contains checkpoint metadata outside the trusted session graph`,
+      );
+    }
+    if (slot.kind === "open-checkpoint" || slot.kind === "blocked-checkpoint") {
+      stateIds.add(entryId);
+    }
+    if (slot.kind === "blocked-missing" || slot.kind === "blocked-checkpoint") {
+      guardedIds.add(entryId);
+    }
+  }
+
+  return { stateIds, guardedIds };
+}
+
+function verifyPendingRegistrationIn(
+  db: DatabaseSync,
+  registration: SessionRegistration,
+  retained: ReadonlySet<string>,
+  active: readonly string[],
+): void {
+  const { stateIds, guardedIds } = validateSessionCoordinatesRetainedIn(
+    db,
+    registration,
+    retained,
+    "pending",
+  );
+
+  const writeSlot = checkpointSlotWriter(db);
+  for (const entryId of retained) {
+    if (!stateIds.has(entryId) && !guardedIds.has(entryId)) {
+      writeSlot(registration.sessionId, entryId, {
+        kind: "blocked-missing",
+      });
+    }
+  }
+  const verified = db
     .prepare(
       `UPDATE session_registry
-       SET pending_node_guard = 0
+       SET registration_state = 'verified'
        WHERE session_id = ?
          AND session_file = ?
-         AND pending_node_guard = 1`,
+         AND registration_state = 'pending'`,
     )
-    .run(sessionId, String(row.session_file));
-  if (Number(cleared.changes) !== 1) {
-    throw new MetadataError("pending node guard changed while consumed");
+    .run(registration.sessionId, registration.sessionFile);
+  if (Number(verified.changes) !== 1) {
+    throw new MetadataError(
+      "pending session registration changed while verified",
+    );
   }
-  return "protected";
+  if (registration.captureBarrier && active.length > 0) {
+    const reconciled = reconcileSessionBarrierIn(
+      db,
+      registration.sessionId,
+      active,
+      registration.sessionFile,
+    );
+    if (reconciled !== "reconciled") {
+      throw new MetadataError("pending session barrier changed while verified");
+    }
+  }
 }
 
-/**
- * SQLite control plane for the whole product model: one state and optional
- * write guard per Pi node, plus session identity for fork copying and cleanup.
- */
-export interface MetadataStoreOptions {
-  /**
-   * Leave an exact published-v1 database untouched so object-format migration
-   * can preflight every referenced tree before the one-way schema cutover.
-   */
-  readonly deferPublishedV1Migration?: boolean;
+function exportForkProjectionIn(
+  db: DatabaseSync,
+  parentSessionFile: string,
+  retainedEntryIds: ReadonlySet<string>,
+): ForkCheckpointProjection | undefined {
+  const source = db
+    .prepare(
+      `SELECT registry.session_id, registry.registration_state,
+              EXISTS(
+                SELECT 1 FROM session_capture_barrier AS barrier
+                WHERE barrier.session_id = registry.session_id
+              ) AS capture_barrier
+       FROM session_registry AS registry
+       WHERE registry.session_file = ?`,
+    )
+    .get(parentSessionFile) as
+    | {
+        readonly capture_barrier: unknown;
+        readonly registration_state: unknown;
+        readonly session_id: unknown;
+      }
+    | undefined;
+  const registrationState =
+    source === undefined
+      ? undefined
+      : sessionRegistrationStateFrom(source.registration_state);
+  if (source === undefined || registrationState === "pending") {
+    return undefined;
+  }
+  const sourceSessionId = requireNonEmpty(
+    source.session_id,
+    "fork source session id",
+  );
+  const barrier = sessionCaptureBarrierFrom(source.capture_barrier);
+  const readSlot = checkpointSlotReader(db);
+  return {
+    sourceSessionId,
+    barrier,
+    coordinates: [...retainedEntryIds].map((entryId) => ({
+      entryId,
+      slot: readSlot(sourceSessionId, entryId),
+    })),
+  };
 }
 
-interface CheckedTreeOidMigration {
-  readonly oldTreeOid: TreeOid;
-  readonly newTreeOid: TreeOid;
+/** Operations available only after the database is at the current schema. */
+export interface CurrentMetadataStore {
+  getCheckpointSlot(sessionId: string, entryId: string): CheckpointSlot;
+  resolveLineage(
+    sessionId: string,
+    rootToTargetEntryIds: readonly string[],
+  ): ResolvedCheckpointLineage;
+  commitCapture(input: CommitCaptureInput): CommitCaptureResult;
+  protectLocation(input: ProtectLocationInput): ProtectLocationResult;
+  admitResolvedLocation(
+    input: AdmitResolvedLocationInput,
+  ): AdmitResolvedLocationResult;
+  adoptBlockedMissing(
+    input: AdoptBlockedMissingInput,
+  ): "committed" | "slot-changed";
+  raiseSessionBarrier(identity: MetadataSessionIdentity): boolean;
+  hasSessionBarrier(identity: MetadataSessionIdentity): boolean | undefined;
+  reconcileSessionBarrier(
+    identity: MetadataSessionIdentity,
+    activeAncestryEntryIds: readonly string[],
+  ): ReconcileSessionBarrierResult;
+  matchSessionIdentity(
+    sessionId: string,
+    sessionFile: string,
+  ): MetadataSessionIdentityMatch;
+  exportForkProjection(
+    input: ExportForkProjectionInput,
+  ): ForkCheckpointProjection | undefined;
+  finalizeSessionProjection(
+    input: FinalizeSessionProjectionInput,
+  ): FinalizeSessionRegistrationReport;
+  listReferencedTreeOids(limit?: number): string[];
+  close(): void;
 }
 
-export class MetadataStore {
+class SqliteMetadataConnection implements CurrentMetadataStore {
   readonly #db: DatabaseSync;
   #closed = false;
 
-  constructor(path: string, options: MetadataStoreOptions = {}) {
+  constructor(path: string, options: MetadataStoreOpenOptions) {
+    const authenticatedProof = options.authenticatedProof;
+    const authenticated =
+      authenticatedProof === undefined
+        ? undefined
+        : metadataIdentityProofDetails.get(authenticatedProof);
+    if (authenticatedProof !== undefined && authenticated === undefined) {
+      throw new MetadataError("metadata identity proof is invalid or expired");
+    }
     let db: DatabaseSync | undefined;
     try {
-      const prepared = prepareMetadataPath(path);
+      const prepared =
+        authenticated === undefined
+          ? prepareMetadataPath(path)
+          : prepareExistingMetadataPath(path);
+      if (
+        authenticated !== undefined &&
+        (prepared.canonicalPath !== authenticated.canonicalPath ||
+          !sameFileIdentity(prepared.observation, authenticated.observation) ||
+          !sameMetadataSidecars(prepared.sidecars, authenticated.sidecars))
+      ) {
+        throw metadataPathError(
+          path,
+          "database or sidecars changed after identity was authenticated",
+        );
+      }
       db = new DatabaseSync(prepared.canonicalPath);
-      db.exec("PRAGMA busy_timeout=5000;");
-      enableWalWithRetry(db);
-      db.exec("PRAGMA synchronous=FULL;");
       const opened = checkedRegularMetadataPath(prepared.canonicalPath);
       if (!sameFileIdentity(prepared.observation, opened)) {
         throw metadataPathError(
@@ -681,6 +1317,50 @@ export class MetadataStore {
           "database file changed while SQLite was opening it",
         );
       }
+      db.exec("PRAGMA busy_timeout=5000;");
+      // Authenticate every read that decides whether this connection may
+      // mutate SQLite's journal in one snapshot. A second writer can finish a
+      // legitimate first initialization between transactions, but cannot make
+      // these version and schema reads observe different database states.
+      inReadTransaction(db, (snapshot) => {
+        if (authenticated !== undefined) {
+          try {
+            validateMetadataVersion(snapshot, authenticated.metadataVersion);
+            if (
+              authenticated.metadataVersion.matchSessionIdentity(
+                snapshot,
+                authenticated.sessionId,
+                authenticated.sessionFile,
+              ) !== "exact"
+            ) {
+              throw new MetadataError("metadata session identity changed");
+            }
+          } catch (error) {
+            throw metadataPathError(
+              path,
+              "database identity changed before authenticated write access",
+              error,
+            );
+          }
+        }
+        const observedVersion = metadataSchemaVersion(snapshot);
+        if (observedVersion === 0) {
+          validateUninitializedMetadataDatabase(snapshot);
+          return;
+        }
+        const observed = requireMetadataVersion(
+          CURRENT_METADATA_VERSION,
+          snapshot,
+        );
+        validateMetadataVersion(snapshot, observed);
+        if (observed !== CURRENT_METADATA_VERSION && !options.allowHistorical) {
+          throw new MetadataError(
+            `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
+          );
+        }
+      });
+      enableWalWithRetry(db);
+      db.exec("PRAGMA synchronous=FULL;");
       optionalMetadataSidecar(`${prepared.canonicalPath}-wal`);
       optionalMetadataSidecar(`${prepared.canonicalPath}-shm`);
       // The persistent writer-fence triggers call this connection-private
@@ -689,7 +1369,15 @@ export class MetadataStore {
       db.function(
         METADATA_WRITER_PROTOCOL_FUNCTION,
         { deterministic: true, directOnly: false },
-        () => METADATA_SCHEMA_VERSION,
+        () => {
+          const protocol = CURRENT_METADATA_VERSION.schema.writerProtocol;
+          if (protocol === undefined) {
+            throw new MetadataError(
+              "current metadata schema lacks writer-fence authority",
+            );
+          }
+          return protocol;
+        },
       );
     } catch (error) {
       try {
@@ -704,24 +1392,40 @@ export class MetadataStore {
     this.#db = db;
 
     try {
-      const version = this.#schemaVersion(db);
-      if (version > METADATA_SCHEMA_VERSION) {
-        throw new MetadataError(
-          `metadata schema version ${version} is newer than supported version ${METADATA_SCHEMA_VERSION}`,
-        );
-      }
-      if (version === 1 && options.deferPublishedV1Migration === true) {
-        this.#validateExactSchema(
-          db,
-          1,
-          PUBLISHED_V1_SCHEMA,
-          "published layout",
-        );
-      } else if (version < METADATA_SCHEMA_VERSION) {
-        this.#migrateSchema(db);
-      }
-      if (this.#schemaVersion(db) === METADATA_SCHEMA_VERSION) {
-        this.#validateSchema(db);
+      // EMPTY initializes current directly. A published historical layout is
+      // validated without reinterpretation and may only remain open inside the
+      // async adjacent-version migration protocol.
+      if (metadataSchemaVersion(db) === 0) {
+        this.#transaction((locked) => {
+          if (metadataSchemaVersion(locked) === 0) {
+            initializeMetadataVersionWithinTransaction(
+              locked,
+              CURRENT_METADATA_VERSION,
+            );
+          } else {
+            const observed = requireMetadataVersion(
+              CURRENT_METADATA_VERSION,
+              locked,
+            );
+            validateMetadataVersion(locked, observed);
+            if (
+              observed !== CURRENT_METADATA_VERSION &&
+              !options.allowHistorical
+            ) {
+              throw new MetadataError(
+                `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
+              );
+            }
+          }
+        });
+      } else {
+        const observed = requireMetadataVersion(CURRENT_METADATA_VERSION, db);
+        validateMetadataVersion(db, observed);
+        if (observed !== CURRENT_METADATA_VERSION && !options.allowHistorical) {
+          throw new MetadataError(
+            `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
+          );
+        }
       }
     } catch (error) {
       try {
@@ -735,766 +1439,472 @@ export class MetadataStore {
     }
   }
 
-  isSchemaCurrent(): boolean {
-    return this.#schemaVersion(this.#database()) === METADATA_SCHEMA_VERSION;
-  }
-
-  migrateSchemaToCurrent(): void {
-    const db = this.#database();
-    const version = this.#schemaVersion(db);
-    if (version > METADATA_SCHEMA_VERSION) {
-      throw new MetadataError(
-        `metadata schema version ${version} is newer than supported version ${METADATA_SCHEMA_VERSION}`,
-      );
-    }
-    if (version < METADATA_SCHEMA_VERSION) this.#migrateSchema(db);
-    this.#validateSchema(db);
-  }
-
-  getState(sessionId: string, entryId: string): NodeState | undefined {
-    const row = this.#database()
-      .prepare(
-        `SELECT tree_oid FROM node_state
-         WHERE session_id = ? AND entry_id = ?`,
-      )
-      .get(sessionId, entryId);
-    if (row === undefined) return undefined;
-    return {
-      treeOid: requireTreeOid(row.tree_oid, `${sessionId}/${entryId}`),
-    };
-  }
-
-  isNodeWriteProtected(sessionId: string, entryId: string): boolean {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(entryId, "entry id");
-    return (
-      this.#database()
-        .prepare(
-          `SELECT 1 FROM node_write_guard
-           WHERE session_id = ? AND entry_id = ?`,
-        )
-        .get(sessionId, entryId) !== undefined
+  async migrateToCurrent(
+    dependencies: MetadataMigrationDependencies,
+  ): Promise<void> {
+    await migrateMetadataToCurrent(
+      this.#database(),
+      dependencies,
+      CURRENT_METADATA_VERSION,
     );
+    validateMetadataVersion(this.#database(), CURRENT_METADATA_VERSION);
   }
 
-  /**
-   * Protect one exact node from capture. When the node currently inherits its
-   * checkpoint, `pin` materializes that authenticated tree in the same write
-   * transaction so later ancestor captures cannot move the restore target.
-   */
-  protectNodeWrite(
-    sessionId: string,
-    entryId: string,
-    pin?: NodeStatePin,
-  ): ProtectNodeWriteResult {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(entryId, "entry id");
-    const checkedPin =
-      pin === undefined
-        ? undefined
-        : {
-            treeOid: requireTreeOid(pin.treeOid, "protected node state"),
-            expectedTreeOid:
-              pin.expectedTreeOid === undefined
-                ? undefined
-                : requireTreeOid(
-                    pin.expectedTreeOid,
-                    "expected protected node state",
-                  ),
-          };
-    return this.#transaction((db) => {
-      const guarded =
-        db
-          .prepare(
-            `SELECT 1 FROM node_write_guard
-             WHERE session_id = ? AND entry_id = ?`,
-          )
-          .get(sessionId, entryId) !== undefined;
-      // The first guard owns the meaning of this node. Repeated protection is
-      // intentionally idempotent and must never retarget an existing guard.
-      if (guarded) return "protected";
-
-      if (checkedPin !== undefined) {
-        const existing = db
-          .prepare(
-            `SELECT tree_oid FROM node_state
-             WHERE session_id = ? AND entry_id = ?`,
-          )
-          .get(sessionId, entryId) as
-          { readonly tree_oid: unknown } | undefined;
-        const existingTreeOid =
-          existing === undefined
-            ? undefined
-            : requireTreeOid(existing.tree_oid, `${sessionId}/${entryId}`);
-        if (existingTreeOid === checkedPin.expectedTreeOid) {
-          if (existingTreeOid !== checkedPin.treeOid) {
-            db.prepare(
-              `INSERT INTO node_state(session_id, entry_id, tree_oid)
-               VALUES (?, ?, ?)
-               ON CONFLICT(session_id, entry_id)
-               DO UPDATE SET tree_oid = excluded.tree_oid`,
-            ).run(sessionId, entryId, checkedPin.treeOid);
-          }
-        } else {
-          // A concurrent exact capture wins its pointer, but not the right to
-          // keep writing: install the guard before reporting the stale pin.
-          db.prepare(
-            `INSERT INTO node_write_guard(session_id, entry_id)
-             VALUES (?, ?)`,
-          ).run(sessionId, entryId);
-          return "state-changed";
-        }
-      }
-
-      db.prepare(
-        `INSERT INTO node_write_guard(session_id, entry_id)
-         VALUES (?, ?)`,
-      ).run(sessionId, entryId);
-      return "protected";
-    });
-  }
-
-  /**
-   * Clear protection only while the pinned exact checkpoint still names the
-   * tree that was just matched or restored.
-   */
-  clearNodeWriteProtection(
-    sessionId: string,
-    entryId: string,
-    expectedTreeOid: TreeOid,
-  ): ClearNodeWriteProtectionResult {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(entryId, "entry id");
-    const checkedTreeOid = requireTreeOid(
-      expectedTreeOid,
-      "restored node state",
-    );
-    return this.#transaction((db) => {
-      const guarded =
-        db
-          .prepare(
-            `SELECT 1 FROM node_write_guard
-             WHERE session_id = ? AND entry_id = ?`,
-          )
-          .get(sessionId, entryId) !== undefined;
-      if (!guarded) return "unguarded";
-      const existing = db
-        .prepare(
-          `SELECT tree_oid FROM node_state
-           WHERE session_id = ? AND entry_id = ?`,
-        )
-        .get(sessionId, entryId) as { readonly tree_oid: unknown } | undefined;
-      const existingTreeOid =
-        existing === undefined
-          ? undefined
-          : requireTreeOid(existing.tree_oid, `${sessionId}/${entryId}`);
-      if (existingTreeOid !== checkedTreeOid) return "state-changed";
-      db.prepare(
-        `DELETE FROM node_write_guard
-         WHERE session_id = ? AND entry_id = ?`,
-      ).run(sessionId, entryId);
-      return "cleared";
-    });
-  }
-
-  /** Atomically honor both the caller's slot CAS and durable write protection. */
-  commitNodeState(
-    sessionId: string,
-    entryId: string,
-    treeOid: string,
-    expected?: { readonly treeOid: TreeOid | undefined },
-  ): CommitNodeStateResult {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(entryId, "entry id");
-    const checkedTreeOid = requireTreeOid(treeOid, "node state");
-    return this.#transaction((db) => {
-      if (consumePendingNodeGuardIn(db, sessionId, [entryId]) === "protected") {
-        return "write-protected";
-      }
-      const guarded = db
-        .prepare(
-          `SELECT 1 FROM node_write_guard
-           WHERE session_id = ? AND entry_id = ?`,
-        )
-        .get(sessionId, entryId);
-      if (guarded !== undefined) return "write-protected";
-
-      const existing = db
-        .prepare(
-          `SELECT tree_oid FROM node_state
-           WHERE session_id = ? AND entry_id = ?`,
-        )
-        .get(sessionId, entryId) as { readonly tree_oid: unknown } | undefined;
-      const existingTreeOid =
-        existing === undefined
-          ? undefined
-          : requireTreeOid(existing.tree_oid, `${sessionId}/${entryId}`);
-      if (expected !== undefined && existingTreeOid !== expected.treeOid) {
-        return "state-changed";
-      }
-      if (existingTreeOid !== checkedTreeOid) {
-        db.prepare(
-          `INSERT INTO node_state(session_id, entry_id, tree_oid)
-           VALUES (?, ?, ?)
-           ON CONFLICT(session_id, entry_id)
-           DO UPDATE SET tree_oid = excluded.tree_oid`,
-        ).run(sessionId, entryId, checkedTreeOid);
-      }
-      return "committed";
-    });
-  }
-
-  /** Materialize a missing node only while its caller's intent remains true. */
-  materializeMissingNodeState(
-    sessionId: string,
-    entryId: string,
-    treeOid: string,
-    intent: MissingNodeStateIntent,
-  ): MaterializeMissingNodeStateResult {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(entryId, "entry id");
-    if (intent !== "initialize-fresh" && intent !== "adopt-protected") {
-      throw new MetadataError("missing node state intent is invalid");
-    }
-    const checkedTreeOid = requireTreeOid(treeOid, "missing node state");
-    return this.#transaction((db) => {
-      if (consumePendingNodeGuardIn(db, sessionId, [entryId]) === "protected") {
-        return "state-changed";
-      }
-      const existing = db
-        .prepare(
-          `SELECT 1 FROM node_state
-           WHERE session_id = ? AND entry_id = ?`,
-        )
-        .get(sessionId, entryId);
-      if (existing !== undefined) return "state-changed";
-
-      const guarded =
-        db
-          .prepare(
-            `SELECT 1 FROM node_write_guard
-             WHERE session_id = ? AND entry_id = ?`,
-          )
-          .get(sessionId, entryId) !== undefined;
-      if (
-        (intent === "initialize-fresh" && guarded) ||
-        (intent === "adopt-protected" && !guarded)
-      ) {
-        return "state-changed";
-      }
-      db.prepare(
-        `INSERT INTO node_state(session_id, entry_id, tree_oid)
-         VALUES (?, ?, ?)`,
-      ).run(sessionId, entryId, checkedTreeOid);
-      if (intent === "adopt-protected") {
-        db.prepare(
-          `DELETE FROM node_write_guard
-           WHERE session_id = ? AND entry_id = ?`,
-        ).run(sessionId, entryId);
-      }
-      return "committed";
-    });
-  }
-
-  /** Register the unique persisted file that owns one Pi session id. */
-  touchSession(sessionId: string, sessionFile: string): SessionRegistration {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(sessionFile, "session file");
-    const row = this.#database()
-      .prepare(
-        `INSERT INTO session_registry(
-           session_id, session_file, missing_since, missing_observed_at
-         ) VALUES (?, ?, NULL, NULL)
-         ON CONFLICT(session_id)
-         DO UPDATE SET
-           missing_since = NULL,
-           missing_observed_at = NULL
-         WHERE session_registry.session_file = excluded.session_file
-         RETURNING *`,
-      )
-      .get(sessionId, sessionFile) as unknown as
-      SessionRegistrationRow | undefined;
-    if (row === undefined) {
-      throw new MetadataError(
-        `session id ${JSON.stringify(sessionId)} is already owned by another file`,
-      );
-    }
-    return sessionRegistrationFromRow(row);
-  }
-
-  /** Persist fail-closed intent until this exact session gains a real node. */
-  setPendingNodeGuard(sessionId: string, expectedSessionFile: string): boolean {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(expectedSessionFile, "expected session file");
-    const result = this.#database()
-      .prepare(
-        `UPDATE session_registry
-         SET pending_node_guard = 1
-         WHERE session_id = ? AND session_file = ?`,
-      )
-      .run(sessionId, expectedSessionFile);
-    return Number(result.changes) === 1;
-  }
-
-  pendingNodeGuard(
-    sessionId: string,
-    expectedSessionFile: string,
-  ): boolean | undefined {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(expectedSessionFile, "expected session file");
-    const row = this.#database()
-      .prepare(
-        `SELECT pending_node_guard FROM session_registry
-         WHERE session_id = ? AND session_file = ?`,
-      )
-      .get(sessionId, expectedSessionFile) as
-      { readonly pending_node_guard: unknown } | undefined;
-    if (row === undefined) return undefined;
-    const pending = Number(row.pending_node_guard);
-    if (pending !== 0 && pending !== 1) {
-      throw new MetadataError("invalid session registry pending node guard");
-    }
-    return pending === 1;
-  }
-
-  /** Explicit reload of the still-empty session abandons the pending intent. */
-  clearPendingNodeGuard(
-    sessionId: string,
-    expectedSessionFile: string,
-  ): boolean {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(expectedSessionFile, "expected session file");
-    const result = this.#database()
-      .prepare(
-        `UPDATE session_registry
-         SET pending_node_guard = 0
-         WHERE session_id = ? AND session_file = ?`,
-      )
-      .run(sessionId, expectedSessionFile);
-    return Number(result.changes) === 1;
-  }
-
-  /**
-   * Move a pending session-level guard onto the complete first-observed stable
-   * ancestry. Every guard and the flag change atomically, so multiple host
-   * entries appended before an observable hook cannot leave an earlier arrival
-   * available for fresh materialization.
-   */
-  consumePendingNodeGuard(
-    sessionId: string,
-    expectedSessionFile: string,
-    entryIds: readonly string[],
-  ): ConsumePendingNodeGuardResult {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(expectedSessionFile, "expected session file");
-    if (entryIds.length === 0) {
-      throw new MetadataError("pending node guard ancestry must be non-empty");
-    }
-    const checkedEntryIds = entryIds.map((entryId) =>
+  getCheckpointSlot(sessionId: string, entryId: string): CheckpointSlot {
+    return checkpointSlotIn(
+      this.#database(),
+      requireNonEmpty(sessionId, "session id"),
       requireNonEmpty(entryId, "entry id"),
     );
-    return this.#transaction((db) =>
-      consumePendingNodeGuardIn(
-        db,
-        sessionId,
-        checkedEntryIds,
-        expectedSessionFile,
-      ),
+  }
+
+  /** Resolve one authenticated root-to-target lineage in one read snapshot. */
+  resolveLineage(
+    sessionId: string,
+    rootToTargetEntryIds: readonly string[],
+  ): ResolvedCheckpointLineage {
+    const checkedSessionId = requireNonEmpty(sessionId, "session id");
+    const ancestry = [
+      ...uniqueEntrySet(rootToTargetEntryIds, "checkpoint ancestry"),
+    ];
+    return this.#readTransaction((db) =>
+      resolveCheckpointIn(checkpointSlotReader(db), checkedSessionId, ancestry),
     );
   }
 
-  listRegisteredSessions(): SessionRegistration[] {
-    const rows = this.#database()
-      .prepare("SELECT * FROM session_registry ORDER BY session_id")
-      .all() as unknown as SessionRegistrationRow[];
-    return rows.map(sessionRegistrationFromRow);
-  }
-
-  /**
-   * Give a fork its own immutable-by-value copy of the parent's retained
-   * ancestry, including the negative state of guarded nodes that have no exact
-   * checkpoint. Existing destination slots, guards, and pending intent win,
-   * making retries idempotent and keeping the sessions independent after the
-   * copy. A pending parent transfers its uncertainty instead of supplying
-   * ancestry state.
-   */
-  copyForkAncestry(input: CopyForkAncestryInput): CopyForkAncestryReport {
-    requireNonEmpty(input.targetSessionId, "fork target session id");
-    requireNonEmpty(input.parentSessionFile, "fork parent session file");
-    const wanted = new Set(
-      input.ancestryEntryIds.map((entryId) =>
-        requireNonEmpty(entryId, "fork ancestry entry id"),
-      ),
+  commitCapture(input: CommitCaptureInput): CommitCaptureResult {
+    const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(
+      input.identity.sessionFile,
+      "session file",
     );
-
+    const entryId = requireNonEmpty(input.entryId, "entry id");
+    const ancestry = [
+      ...uniqueEntrySet(
+        input.activeAncestryEntryIds,
+        "capture active ancestry",
+      ),
+    ];
+    if (ancestry.at(-1) !== entryId) {
+      throw new MetadataError(
+        "capture coordinate must end its active ancestry",
+      );
+    }
+    const treeOid = requireTreeOid(input.treeOid, "captured checkpoint");
     return this.#transaction((db) => {
-      const source = db
-        .prepare(
-          `SELECT session_id, pending_node_guard FROM session_registry
-           WHERE session_file = ?`,
-        )
-        .get(input.parentSessionFile) as
-        | {
-            readonly session_id: unknown;
-            readonly pending_node_guard: unknown;
-          }
-        | undefined;
-      if (source === undefined) {
-        return { sourceSessionId: undefined, copiedStates: 0 };
+      requireVerifiedSessionIn(db, sessionId, sessionFile);
+      if (
+        reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile) ===
+        "reconciled"
+      ) {
+        return "blocked";
       }
-      const sourceSessionId = requireNonEmpty(
-        String(source.session_id),
-        "fork source session id",
+      const { targetSlot: current } = resolveCheckpointIn(
+        checkpointSlotReader(db),
+        sessionId,
+        ancestry,
       );
-      if (sourceSessionId === input.targetSessionId) {
-        return { sourceSessionId, copiedStates: 0 };
+      const transition = captureCheckpointSlot(current, treeOid);
+      if (transition.kind === "rejected") return "blocked";
+      if (!checkpointSlotsEqual(current, input.expectedSlot)) {
+        return "slot-changed";
       }
-      const sourcePending = Number(source.pending_node_guard);
-      if (sourcePending !== 0 && sourcePending !== 1) {
-        throw new MetadataError("invalid fork source pending node guard");
-      }
-      const targetPending = db
-        .prepare(
-          `SELECT pending_node_guard FROM session_registry
-           WHERE session_id = ?`,
-        )
-        .get(input.targetSessionId) as
-        { readonly pending_node_guard: unknown } | undefined;
-      if (sourcePending === 1) {
-        // A cold fork has no source before-hook in which to retire ambiguous
-        // no-node bytes. Transfer that durable uncertainty only to an exact,
-        // already-registered destination and never import state underneath it.
-        if (targetPending !== undefined) {
-          db.prepare(
-            `UPDATE session_registry
-             SET pending_node_guard = 1
-             WHERE session_id = ?`,
-          ).run(input.targetSessionId);
-        }
-        return { sourceSessionId, copiedStates: 0 };
-      }
-      if (wanted.size === 0) {
-        return { sourceSessionId, copiedStates: 0 };
-      }
-      if (Number(targetPending?.pending_node_guard ?? 0) === 1) {
-        return { sourceSessionId, copiedStates: 0 };
-      }
-
-      const sourceRows = db
-        .prepare(
-          `SELECT entry_id, tree_oid FROM node_state
-           WHERE session_id = ?`,
-        )
-        .all(sourceSessionId) as unknown as NodeStateRow[];
-      const checked = sourceRows
-        .filter((row) => wanted.has(String(row.entry_id)))
-        .map((row) => ({
-          entryId: requireNonEmpty(
-            String(row.entry_id),
-            "fork source entry id",
-          ),
-          treeOid: requireTreeOid(row.tree_oid, "fork source node state"),
-        }));
-      const sourceGuardRows = db
-        .prepare(
-          `SELECT guard.entry_id
-           FROM node_write_guard AS guard
-           WHERE guard.session_id = ?
-             AND NOT EXISTS (
-               SELECT 1 FROM node_state AS state
-               WHERE state.session_id = guard.session_id
-                 AND state.entry_id = guard.entry_id
-             )`,
-        )
-        .all(sourceSessionId) as unknown as {
-        readonly entry_id: unknown;
-      }[];
-      const guardedMissingEntryIds = sourceGuardRows
-        .filter((row) => wanted.has(String(row.entry_id)))
-        .map((row) =>
-          requireNonEmpty(String(row.entry_id), "fork source guarded entry id"),
-        );
-
-      const insertState = db.prepare(
-        `INSERT OR IGNORE INTO node_state(
-           session_id, entry_id, tree_oid
-         )
-         SELECT ?, ?, ?
-         WHERE NOT EXISTS (
-           SELECT 1 FROM node_write_guard
-           WHERE session_id = ? AND entry_id = ?
-         )`,
-      );
-      let copiedStates = 0;
-      for (const state of checked) {
-        copiedStates += Number(
-          insertState.run(
-            input.targetSessionId,
-            state.entryId,
-            state.treeOid,
-            input.targetSessionId,
-            state.entryId,
-          ).changes,
-        );
-      }
-      const insertGuard = db.prepare(
-        `INSERT OR IGNORE INTO node_write_guard(session_id, entry_id)
-         SELECT ?, ?
-         WHERE NOT EXISTS (
-           SELECT 1 FROM node_state
-           WHERE session_id = ? AND entry_id = ?
-         )`,
-      );
-      for (const entryId of guardedMissingEntryIds) {
-        insertGuard.run(
-          input.targetSessionId,
-          entryId,
-          input.targetSessionId,
-          entryId,
-        );
-      }
-      return { sourceSessionId, copiedStates };
+      writeCheckpointSlotIn(db, sessionId, entryId, transition.slot);
+      return "committed";
     });
   }
 
-  observeSessionPresent(
-    sessionId: string,
-    expectedSessionFile: string,
-  ): boolean {
-    const result = this.#database()
-      .prepare(
-        `UPDATE session_registry
-         SET missing_since = NULL, missing_observed_at = NULL
-         WHERE session_id = ? AND session_file = ?`,
-      )
-      .run(sessionId, expectedSessionFile);
-    return Number(result.changes) === 1;
-  }
-
-  observeSessionMissing(
-    sessionId: string,
-    expectedSessionFile: string,
-    observedAt: number = Date.now(),
-  ): boolean {
-    requireTimestamp(observedAt, "session missing observedAt");
-    const result = this.#database()
-      .prepare(
-        `UPDATE session_registry
-         SET missing_since = COALESCE(missing_since, ?),
-             missing_observed_at = MAX(COALESCE(missing_observed_at, ?), ?)
-         WHERE session_id = ? AND session_file = ?`,
-      )
-      .run(observedAt, observedAt, observedAt, sessionId, expectedSessionFile);
-    return Number(result.changes) === 1;
-  }
-
   /**
-   * Remove one retained missing session only if its complete registry
-   * observation still matches the caller's final filesystem probe.
+   * Protect one exact location against the effective checkpoint resolved in
+   * this SQLite writer transaction. The target always receives a durable pin:
+   * a checkpoint pin when one is inherited, or blocked-missing only when the
+   * transaction itself resolves no checkpoint.
+   *
+   * Planned mutations additionally compare their trusted resolution. A stale
+   * result tells the caller to abort, but is not a protection failure: the
+   * returned slot was committed against the actual resolution in this same
+   * transaction. Uncertain recovery requests unconditional protection.
    */
-  pruneMissingSession(
-    options: PruneMissingSessionOptions,
-  ): SessionMetadataRemovalReport {
-    const expectedSessionId = requireNonEmpty(
-      options.expectedSessionId,
-      "expected session id",
+  protectLocation(input: ProtectLocationInput): ProtectLocationResult {
+    const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(
+      input.identity.sessionFile,
+      "session file",
     );
-    const expectedSessionFile = requireNonEmpty(
-      options.expectedSessionFile,
-      "expected session file",
+    const entryId = requireNonEmpty(input.entryId, "entry id");
+    const ancestry = checkedLocationAncestry(
+      input.activeAncestryEntryIds,
+      entryId,
+      "protection active ancestry",
     );
-    const expectedMissingSince = requireTimestamp(
-      options.expectedMissingSince,
-      "expected missing_since",
-    );
-    const expectedMissingObservedAt = requireTimestamp(
-      options.expectedMissingObservedAt,
-      "expected missing_observed_at",
-    );
-    const now = requireTimestamp(options.now ?? Date.now(), "GC now");
-    const retentionMs = requireTimestamp(
-      options.retentionMs,
-      "session metadata retentionMs",
-    );
-    const cutoff = now - retentionMs;
-
+    const expected =
+      input.expectation.kind === "exact-resolution"
+        ? checkedExpectedResolution(
+            input.expectation.resolution,
+            ancestry,
+            "expected protected resolution",
+          )
+        : undefined;
     return this.#transaction((db) => {
-      const deletedRegistry = db
-        .prepare(
-          `DELETE FROM session_registry
-           WHERE session_id = ?
-             AND session_file = ?
-             AND missing_since = ?
-             AND missing_observed_at = ?
-             AND missing_since <= ?
-             AND missing_observed_at > missing_since`,
-        )
-        .run(
-          expectedSessionId,
-          expectedSessionFile,
-          expectedMissingSince,
-          expectedMissingObservedAt,
-          cutoff,
-        );
-      const removedSessions = Number(deletedRegistry.changes);
-      if (removedSessions === 0) {
-        return {
-          removedSessions: 0,
-          removedNodeStates: 0,
-          removedNodeWriteGuards: 0,
-          removedMetadataRows: 0,
-        };
+      requireVerifiedSessionIn(db, sessionId, sessionFile);
+      const hasBarrier = sessionHasBarrierIn(db, sessionId);
+      const { resolution: actualResolution, targetSlot: current } =
+        resolveCheckpointIn(checkpointSlotReader(db), sessionId, ancestry);
+      const protectedSlot = blockCheckpointSlot(
+        current,
+        actualResolution.kind === "checkpoint"
+          ? actualResolution.treeOid
+          : undefined,
+      );
+      if (!checkpointSlotsEqual(current, protectedSlot)) {
+        writeCheckpointSlotIn(db, sessionId, entryId, protectedSlot);
       }
-      const removedNodeStates = Number(
-        db
-          .prepare("DELETE FROM node_state WHERE session_id = ?")
-          .run(expectedSessionId).changes,
-      );
-      const removedNodeWriteGuards = Number(
-        db
-          .prepare("DELETE FROM node_write_guard WHERE session_id = ?")
-          .run(expectedSessionId).changes,
-      );
       return {
-        removedSessions,
-        removedNodeStates,
-        removedNodeWriteGuards,
-        removedMetadataRows:
-          removedNodeStates + removedNodeWriteGuards + removedSessions,
+        kind:
+          expected !== undefined &&
+          (hasBarrier || !resolutionsEqual(actualResolution, expected))
+            ? "stale"
+            : "protected",
+        protectedSlot,
       };
     });
   }
 
   /**
-   * Perform the published-v1 SQL upgrade and tree-format reference cutover in
-   * one transaction. `expectedTreeOids` is the authenticated root set used to
-   * prepare the replacement objects; any intervening metadata write aborts the
-   * entire cutover before it can commit a mixed state.
+   * Admit a location only while the complete effective resolution is still
+   * authoritative. Inherited open slots need no materialization; an exact
+   * matching pin is reopened by value.
    */
-  migrateSchemaAndReplaceTreeOidReferences(
-    migrations: readonly {
-      readonly oldTreeOid: string;
-      readonly newTreeOid: string;
-    }[],
-    expectedTreeOids: readonly string[],
-  ): number {
-    const checked = this.#checkTreeOidMigrations(migrations);
-    const expected = this.#checkExpectedTreeOids(expectedTreeOids);
-    const expectedSet = new Set(expected);
-    if (checked.some((migration) => !expectedSet.has(migration.oldTreeOid))) {
-      throw new MetadataError(
-        "tree migration source is not an authenticated metadata root",
-      );
-    }
-
+  admitResolvedLocation(
+    input: AdmitResolvedLocationInput,
+  ): AdmitResolvedLocationResult {
+    const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(
+      input.identity.sessionFile,
+      "session file",
+    );
+    const entryId = requireNonEmpty(input.entryId, "entry id");
+    const ancestry = checkedLocationAncestry(
+      input.activeAncestryEntryIds,
+      entryId,
+      "admission active ancestry",
+    );
+    const expected = checkedExpectedResolution(
+      input.expectedResolution,
+      ancestry,
+      "expected admitted resolution",
+    );
     return this.#transaction((db) => {
-      this.#assertReferencedTreeOids(db, expected);
-      this.#migrateSchemaWithinTransaction(db);
-      const replaced = this.#replaceTreeOidReferences(db, checked);
-      const migratedBySource = new Map(
-        checked.map((migration) => [
-          migration.oldTreeOid,
-          migration.newTreeOid,
-        ]),
+      requireVerifiedSessionIn(db, sessionId, sessionFile);
+      if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
+      const { resolution: resolved, targetSlot: current } = resolveCheckpointIn(
+        checkpointSlotReader(db),
+        sessionId,
+        ancestry,
       );
-      const expectedAfter = [
-        ...new Set(
-          expected.map((treeOid) => migratedBySource.get(treeOid) ?? treeOid),
-        ),
-      ].sort();
-      this.#assertReferencedTreeOids(db, expectedAfter);
-      this.#validateSchema(db);
-      return replaced;
+      if (!resolutionsEqual(resolved, expected)) return "slot-changed";
+
+      if (current.kind === "open-missing") return "admitted";
+      if (current.kind === "open-checkpoint") {
+        return current.treeOid === expected.treeOid
+          ? "admitted"
+          : "slot-changed";
+      }
+      if (current.kind === "blocked-checkpoint") {
+        const transition = releaseCheckpointSlot(current, expected.treeOid);
+        if (transition.kind === "rejected") return "slot-changed";
+        writeCheckpointSlotIn(db, sessionId, entryId, transition.slot);
+        return "admitted";
+      }
+      return "slot-changed";
     });
   }
 
-  #checkTreeOidMigrations(
-    migrations: readonly {
-      readonly oldTreeOid: string;
-      readonly newTreeOid: string;
-    }[],
-  ): CheckedTreeOidMigration[] {
-    const checked: CheckedTreeOidMigration[] = [];
-    const oldOids = new Set<string>();
-    for (const migration of migrations) {
-      const oldTreeOid = requireTreeOid(
-        migration.oldTreeOid,
-        "legacy tree migration source",
-      );
-      const newTreeOid = requireTreeOid(
-        migration.newTreeOid,
-        "legacy tree migration target",
-      );
-      if (oldTreeOid === newTreeOid) {
-        throw new MetadataError("tree migration must change the object id");
-      }
-      if (oldOids.has(oldTreeOid)) {
-        throw new MetadataError("tree migration contains a duplicate source");
-      }
-      oldOids.add(oldTreeOid);
-      checked.push({ oldTreeOid, newTreeOid });
-    }
-    if (checked.some((migration) => oldOids.has(migration.newTreeOid))) {
-      throw new MetadataError(
-        "tree migration target must not also be a migration source",
-      );
-    }
-    return checked;
-  }
-
-  #checkExpectedTreeOids(treeOids: readonly string[]): TreeOid[] {
-    const checked = treeOids.map((treeOid) =>
-      requireTreeOid(treeOid, "tree migration expected root"),
+  adoptBlockedMissing(
+    input: AdoptBlockedMissingInput,
+  ): "committed" | "slot-changed" {
+    const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(
+      input.identity.sessionFile,
+      "session file",
     );
-    const unique = new Set(checked);
-    if (unique.size !== checked.length) {
-      throw new MetadataError(
-        "tree migration expected roots contain duplicates",
+    const entryId = requireNonEmpty(input.entryId, "entry id");
+    const treeOid = requireTreeOid(input.treeOid, "adopted checkpoint");
+    return this.#transaction((db) => {
+      requireVerifiedSessionIn(db, sessionId, sessionFile);
+      if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
+      const transition = adoptBlockedMissingSlot(
+        checkpointSlotIn(db, sessionId, entryId),
+        treeOid,
       );
-    }
-    return [...checked].sort();
+      if (transition.kind === "rejected") return "slot-changed";
+      writeCheckpointSlotIn(db, sessionId, entryId, transition.slot);
+      return "committed";
+    });
   }
 
-  #assertReferencedTreeOids(
-    db: DatabaseSync,
-    expectedTreeOids: readonly TreeOid[],
-  ): void {
-    const actual = db
-      .prepare("SELECT DISTINCT tree_oid FROM node_state ORDER BY tree_oid")
-      .all()
-      .map((row) => requireTreeOid(row.tree_oid, "metadata migration root"));
+  raiseSessionBarrier(identity: MetadataSessionIdentity): boolean {
+    const sessionId = requireNonEmpty(identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
+    return this.#transaction((db) => {
+      requireVerifiedSessionIn(db, sessionId, sessionFile);
+      db.prepare(
+        `INSERT OR IGNORE INTO session_capture_barrier(session_id) VALUES (?)`,
+      ).run(sessionId);
+      return true;
+    });
+  }
+
+  hasSessionBarrier(identity: MetadataSessionIdentity): boolean | undefined {
+    const sessionId = requireNonEmpty(identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
+    const row = this.#database()
+      .prepare(
+        `SELECT registry.registration_state,
+                EXISTS(
+                  SELECT 1 FROM session_capture_barrier AS barrier
+                  WHERE barrier.session_id = registry.session_id
+                ) AS capture_barrier
+         FROM session_registry AS registry
+         WHERE registry.session_id = ? AND registry.session_file = ?`,
+      )
+      .get(sessionId, sessionFile) as
+      | {
+          readonly capture_barrier: unknown;
+          readonly registration_state: unknown;
+        }
+      | undefined;
     if (
-      actual.length !== expectedTreeOids.length ||
-      actual.some((treeOid, index) => treeOid !== expectedTreeOids[index])
+      row === undefined ||
+      sessionRegistrationStateFrom(row.registration_state) !== "verified"
     ) {
+      return undefined;
+    }
+    return sessionCaptureBarrierFrom(row.capture_barrier);
+  }
+
+  reconcileSessionBarrier(
+    identity: MetadataSessionIdentity,
+    activeAncestryEntryIds: readonly string[],
+  ): ReconcileSessionBarrierResult {
+    const sessionId = requireNonEmpty(identity.sessionId, "session id");
+    const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
+    const ancestry = [
+      ...uniqueEntrySet(
+        activeAncestryEntryIds,
+        "session barrier active ancestry",
+      ),
+    ];
+    if (ancestry.length === 0) {
       throw new MetadataError(
-        "tree references changed while object-format migration was preparing",
+        "session barrier cannot be reconciled without a stable ancestry",
       );
     }
-  }
-
-  #replaceTreeOidReferences(
-    db: DatabaseSync,
-    migrations: readonly CheckedTreeOidMigration[],
-  ): number {
-    const replace = db.prepare(
-      "UPDATE node_state SET tree_oid = ? WHERE tree_oid = ?",
+    const result = this.#transaction((db) =>
+      reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile),
     );
-    let replaced = 0;
-    for (const migration of migrations) {
-      replaced += Number(
-        replace.run(migration.newTreeOid, migration.oldTreeOid).changes,
-      );
-    }
-    return replaced;
+    return result;
   }
 
-  /** The single-state table is the complete object-GC root set. */
-  listReferencedTreeOids(): string[] {
-    const rows = this.#database()
-      .prepare("SELECT DISTINCT tree_oid FROM node_state ORDER BY tree_oid")
-      .all();
-    return rows.map((row) => requireTreeOid(row.tree_oid, "metadata GC root"));
+  /**
+   * Authenticate Pi's `(id, file)` pair without depending on post-v1 columns.
+   * This is intentionally usable before a published-v1 tree/schema migration.
+   */
+  matchSessionIdentity(
+    sessionId: string,
+    sessionFile: string,
+  ): MetadataSessionIdentityMatch {
+    requireNonEmpty(sessionId, "session id");
+    requireNonEmpty(sessionFile, "session file");
+    return CURRENT_METADATA_VERSION.matchSessionIdentity(
+      this.#database(),
+      sessionId,
+      sessionFile,
+    );
+  }
+
+  /**
+   * Export an authenticated total slot projection. An explicit open-missing
+   * slot proves absence in the verified source; an undefined projection means
+   * the source itself was not authenticated.
+   */
+  exportForkProjection(
+    input: ExportForkProjectionInput,
+  ): ForkCheckpointProjection | undefined {
+    const parentSessionFile = requireNonEmpty(
+      input.parentSessionFile,
+      "fork parent session file",
+    );
+    const retained = retainedEntrySet(input.retainedEntryIds);
+    return this.#readTransaction((db) =>
+      exportForkProjectionIn(db, parentSessionFile, retained),
+    );
+  }
+
+  /** Register a session from a total, authenticated slot projection. */
+  finalizeSessionProjection(
+    input: FinalizeSessionProjectionInput,
+  ): FinalizeSessionRegistrationReport {
+    const targetSessionId = requireNonEmpty(
+      input.targetSessionId,
+      "fork target session id",
+    );
+    const targetSessionFile = requireNonEmpty(
+      input.targetSessionFile,
+      "fork target session file",
+    );
+    const retained = retainedEntrySet(input.retainedEntryIds);
+    const active = activeAncestry(input.activeAncestryEntryIds, retained);
+
+    return this.#transaction((db) => {
+      const matches = db
+        .prepare(
+          `SELECT registry.session_id, registry.session_file,
+                  registry.registration_state,
+                  EXISTS(
+                    SELECT 1 FROM session_capture_barrier AS barrier
+                    WHERE barrier.session_id = registry.session_id
+                  ) AS capture_barrier
+           FROM session_registry AS registry
+           WHERE registry.session_id = ? OR registry.session_file = ?`,
+        )
+        .all(
+          targetSessionId,
+          targetSessionFile,
+        ) as unknown as SessionRegistrationRow[];
+      if (matches.length > 0) {
+        if (matches.length !== 1) {
+          throw new MetadataError(
+            "session identity conflicts with registered metadata",
+          );
+        }
+        const registration = sessionRegistrationFromRow(matches[0]!);
+        if (
+          registration.sessionId !== targetSessionId ||
+          registration.sessionFile !== targetSessionFile
+        ) {
+          throw new MetadataError(
+            "session identity conflicts with registered metadata",
+          );
+        }
+        if (registration.registrationState === "pending") {
+          verifyPendingRegistrationIn(db, registration, retained, active);
+        } else {
+          validateSessionCoordinatesRetainedIn(
+            db,
+            registration,
+            retained,
+            "verified",
+          );
+        }
+        return { kind: "existing" };
+      }
+
+      // Published v1/v2 schemas and write APIs did not enforce registry/slot
+      // coupling. Claim that schema-valid recovery shape conservatively: the
+      // trusted graph must contain every old coordinate, every unclassified
+      // retained coordinate is blocked, and the verified registry row is
+      // committed (or rolled back) as one unit.
+      const orphaned = db
+        .prepare(
+          `SELECT EXISTS(
+             SELECT 1 FROM checkpoint_slot WHERE session_id = ?
+           ) AS has_slot,
+           EXISTS(
+             SELECT 1 FROM session_capture_barrier WHERE session_id = ?
+           ) AS has_barrier`,
+        )
+        .get(targetSessionId, targetSessionId) as {
+        readonly has_barrier: unknown;
+        readonly has_slot: unknown;
+      };
+      const hasOrphanedSlot = Number(orphaned.has_slot);
+      const hasOrphanedBarrier = Number(orphaned.has_barrier);
+      if (
+        (hasOrphanedSlot !== 0 && hasOrphanedSlot !== 1) ||
+        (hasOrphanedBarrier !== 0 && hasOrphanedBarrier !== 1)
+      ) {
+        throw new MetadataError("invalid orphaned session metadata state");
+      }
+      if (hasOrphanedSlot === 1 || hasOrphanedBarrier === 1) {
+        db.prepare(
+          `INSERT INTO session_registry(
+           session_id, session_file, registration_state
+           ) VALUES (?, ?, 'pending')`,
+        ).run(targetSessionId, targetSessionFile);
+        verifyPendingRegistrationIn(
+          db,
+          {
+            sessionId: targetSessionId,
+            sessionFile: targetSessionFile,
+            captureBarrier: hasOrphanedBarrier === 1,
+            registrationState: "pending",
+          },
+          retained,
+          active,
+        );
+        return { kind: "existing" };
+      }
+
+      let projection: ReturnType<typeof checkedForkProjection> | undefined;
+      let openLeaf: string | undefined;
+      let raiseBarrier = false;
+      if (typeof input.seed !== "object" || input.seed === null) {
+        throw new MetadataError("session registration seed is invalid");
+      }
+      switch (input.seed.kind) {
+        case "fresh":
+          openLeaf = active.at(-1);
+          break;
+        case "untrusted-parent":
+          raiseBarrier = true;
+          break;
+        case "fork":
+          projection = checkedForkProjection(input.seed.projection, retained);
+          if (projection === undefined) {
+            throw new MetadataError("fork registration projection is missing");
+          }
+          if (projection.sourceSessionId === targetSessionId) {
+            throw new MetadataError(
+              "fork source and target session ids must differ",
+            );
+          }
+          raiseBarrier = projection.barrier;
+          break;
+        default:
+          throw new MetadataError("session registration seed is invalid");
+      }
+
+      db.prepare(
+        `INSERT INTO session_registry(
+         session_id, session_file, registration_state
+         ) VALUES (?, ?, 'verified')`,
+      ).run(targetSessionId, targetSessionFile);
+
+      const writeSlot = checkpointSlotWriter(db);
+      for (const entryId of retained) {
+        const projected = projection?.slots.get(entryId);
+        const slot =
+          projected ??
+          (entryId === openLeaf
+            ? ({ kind: "open-missing" } as const)
+            : ({ kind: "blocked-missing" } as const));
+        writeSlot(targetSessionId, entryId, slot);
+      }
+      if (raiseBarrier) {
+        db.prepare(
+          `INSERT INTO session_capture_barrier(session_id) VALUES (?)`,
+        ).run(targetSessionId);
+      }
+      return { kind: "registered" };
+    });
+  }
+
+  /** Every checkpoint-bearing slot, open or blocked, is an object-GC root. */
+  listReferencedTreeOids(limit?: number): string[] {
+    return [
+      ...CURRENT_METADATA_VERSION.referencedTreeOids(this.#database(), limit),
+    ];
   }
 
   close(): void {
@@ -1503,226 +1913,20 @@ export class MetadataStore {
     this.#db.close();
   }
 
-  #schemaVersion(db: DatabaseSync): number {
-    const row = db.prepare("PRAGMA user_version").get() as {
-      user_version: number | bigint;
-    };
-    const version = Number(row.user_version);
-    if (!Number.isSafeInteger(version) || version < 0) {
-      throw new MetadataError("metadata schema version is invalid");
-    }
-    return version;
-  }
-
-  #migrateSchema(db: DatabaseSync): void {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      this.#migrateSchemaWithinTransaction(db);
-      db.exec("COMMIT");
-    } catch (error) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Preserve the original failure.
-      }
-      throw error;
-    }
-  }
-
-  #migrateSchemaWithinTransaction(db: DatabaseSync): void {
-    let version = this.#schemaVersion(db);
-    // Another process may have completed the same migration while this
-    // connection waited for the write lock. The version observed before
-    // BEGIN is therefore only a hint; the locked version is authoritative.
-    if (version > METADATA_SCHEMA_VERSION) {
-      throw new MetadataError(
-        `metadata schema version ${version} is newer than supported version ${METADATA_SCHEMA_VERSION}`,
-      );
-    }
-    if (version === 0) {
-      db.exec(`
-        ${NODE_STATE_SCHEMA_SQL};
-        ${NODE_WRITE_GUARD_SCHEMA_SQL};
-        ${SESSION_REGISTRY_SCHEMA_SQL};
-        ${SESSION_REGISTRY_MISSING_INDEX_SQL};
-        ${WRITER_FENCE_TRIGGER_SQL.join(";\n")};
-      `);
-      version = METADATA_SCHEMA_VERSION;
-    } else if (version === 1) {
-      // Version 1 is public. Refuse to reinterpret a claimed v1 database
-      // unless it is exactly the layout shipped in cyclotomy@0.0.1.
-      this.#validateExactSchema(db, 1, PUBLISHED_V1_SCHEMA, "published layout");
-      db.exec(`
-        ${NODE_WRITE_GUARD_SCHEMA_SQL};
-
-        ALTER TABLE session_registry
-        ADD COLUMN pending_node_guard INTEGER NOT NULL DEFAULT 0
-          CHECK(pending_node_guard IN (0, 1));
-
-        ${WRITER_FENCE_TRIGGER_SQL.join(";\n")};
-      `);
-      version = METADATA_SCHEMA_VERSION;
-    }
-    db.exec(`PRAGMA user_version = ${version}`);
-    this.#validateSchema(db);
-  }
-
-  #validateExactSchema(
-    db: DatabaseSync,
-    version: number,
-    expectedSchema: ReadonlyMap<string, ExpectedSchemaObject>,
-    label: string,
-  ): void {
-    if (this.#schemaVersion(db) !== version) {
-      throw new MetadataError("metadata schema migration did not converge");
-    }
-    const actual = db
-      .prepare(
-        `SELECT type, name, tbl_name, sql FROM sqlite_schema
-         WHERE type IN ('trigger', 'view') OR name NOT GLOB 'sqlite_*'
-         ORDER BY type, name`,
-      )
-      .all();
-    if (
-      actual.length !== expectedSchema.size ||
-      actual.some((row) => {
-        const name = String(row.name);
-        const expected = expectedSchema.get(name);
-        return (
-          expected === undefined ||
-          row.type !== expected.type ||
-          String(row.tbl_name) !== expected.table ||
-          normalizeSchemaSql(row.sql) !== expected.sql
-        );
-      })
-    ) {
-      throw new MetadataError(
-        `metadata schema v${version} does not match the ${label}`,
-      );
-    }
-  }
-
-  #validateSchema(db: DatabaseSync): void {
-    this.#validateExactSchema(
-      db,
-      METADATA_SCHEMA_VERSION,
-      CURRENT_SCHEMA,
-      "current layout",
-    );
-    const tables = (
-      db.prepare("PRAGMA table_list").all() as unknown as {
-        readonly name: unknown;
-        readonly type: unknown;
-        readonly wr: unknown;
-        readonly strict: unknown;
-      }[]
-    )
-      .filter(
-        (row) =>
-          row.type === "table" && !String(row.name).startsWith("sqlite_"),
-      )
-      .sort((left, right) =>
-        String(left.name).localeCompare(String(right.name)),
-      );
-    if (
-      tables.length !== 3 ||
-      String(tables[0]?.name) !== "node_state" ||
-      String(tables[1]?.name) !== "node_write_guard" ||
-      String(tables[2]?.name) !== "session_registry" ||
-      tables.some(
-        (table) => Number(table.wr) !== 1 || Number(table.strict) !== 1,
-      )
-    ) {
-      throw new MetadataError(
-        "metadata schema has unexpected tables or table options",
-      );
-    }
-
-    type Column = {
-      readonly name: string;
-      readonly type: string;
-      readonly notnull: number;
-      readonly pk: number;
-    };
-    const validateColumns = (
-      table: "node_state" | "node_write_guard" | "session_registry",
-      expected: readonly Column[],
-    ): void => {
-      const rows = db.prepare(`PRAGMA table_info(${table})`).all();
-      const actual = rows.map((row) => ({
-        name: String(row.name),
-        type: String(row.type),
-        notnull: Number(row.notnull),
-        pk: Number(row.pk),
-      }));
-      if (
-        actual.length !== expected.length ||
-        actual.some((column, index) => {
-          const wanted = expected[index];
-          return (
-            wanted === undefined ||
-            column.name !== wanted.name ||
-            column.type !== wanted.type ||
-            column.notnull !== wanted.notnull ||
-            column.pk !== wanted.pk
-          );
-        })
-      ) {
-        throw new MetadataError(
-          `metadata table ${table} has an unexpected column layout`,
-        );
-      }
-    };
-    validateColumns("node_state", [
-      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-      { name: "entry_id", type: "TEXT", notnull: 1, pk: 2 },
-      { name: "tree_oid", type: "TEXT", notnull: 1, pk: 0 },
-    ]);
-    validateColumns("node_write_guard", [
-      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-      { name: "entry_id", type: "TEXT", notnull: 1, pk: 2 },
-    ]);
-    validateColumns("session_registry", [
-      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-      { name: "session_file", type: "TEXT", notnull: 1, pk: 0 },
-      { name: "missing_since", type: "INTEGER", notnull: 0, pk: 0 },
-      { name: "missing_observed_at", type: "INTEGER", notnull: 0, pk: 0 },
-      { name: "pending_node_guard", type: "INTEGER", notnull: 1, pk: 0 },
-    ]);
-
-    const indexes = db.prepare("PRAGMA index_list(session_registry)").all();
-    const missing = indexes.find(
-      (row) =>
-        row.name === "session_registry_missing" &&
-        Number(row.unique) === 0 &&
-        row.origin === "c" &&
-        Number(row.partial) === 0,
-    );
-    const uniqueSessionFile = indexes.find((row) => {
-      if (Number(row.unique) !== 1 || row.origin !== "u") return false;
-      const columns = db
-        .prepare(`PRAGMA index_info(${String(row.name)})`)
-        .all();
-      return columns.length === 1 && columns[0]?.name === "session_file";
-    });
-    const missingColumns = db
-      .prepare("PRAGMA index_info(session_registry_missing)")
-      .all()
-      .map((row) => String(row.name));
-    if (
-      missing === undefined ||
-      uniqueSessionFile === undefined ||
-      missingColumns.length !== 2 ||
-      missingColumns[0] !== "missing_since" ||
-      missingColumns[1] !== "missing_observed_at"
-    ) {
-      throw new MetadataError("metadata schema has unexpected indexes");
-    }
+  #readTransaction<T>(operation: (db: DatabaseSync) => T): T {
+    return this.#runTransaction("BEGIN", operation);
   }
 
   #transaction<T>(operation: (db: DatabaseSync) => T): T {
+    return this.#runTransaction("BEGIN IMMEDIATE", operation);
+  }
+
+  #runTransaction<T>(
+    begin: "BEGIN" | "BEGIN IMMEDIATE",
+    operation: (db: DatabaseSync) => T,
+  ): T {
     const db = this.#database();
-    db.exec("BEGIN IMMEDIATE");
+    db.exec(begin);
     try {
       const result = operation(db);
       db.exec("COMMIT");
@@ -1741,4 +1945,94 @@ export class MetadataStore {
     if (this.#closed) throw new MetadataError("metadata store is closed");
     return this.#db;
   }
+}
+
+interface HistoricalMetadataCandidate {
+  migrate(
+    dependencies: MetadataMigrationDependencies,
+  ): Promise<CurrentMetadataStore>;
+  close(): void;
+}
+
+function openHistoricalMetadataCandidate(
+  path: string,
+  proof?: MetadataIdentityProof,
+): HistoricalMetadataCandidate {
+  let store: SqliteMetadataConnection | undefined =
+    new SqliteMetadataConnection(path, {
+      allowHistorical: true,
+      ...(proof === undefined ? {} : { authenticatedProof: proof }),
+    });
+  const activeStore = (): SqliteMetadataConnection => {
+    if (store === undefined) {
+      throw new MetadataError("historical metadata candidate is closed");
+    }
+    return store;
+  };
+  return Object.freeze({
+    async migrate(
+      dependencies: MetadataMigrationDependencies,
+    ): Promise<CurrentMetadataStore> {
+      const migrated = activeStore();
+      await migrated.migrateToCurrent(dependencies);
+      store = undefined;
+      return migrated;
+    },
+    close(): void {
+      const active = store;
+      store = undefined;
+      active?.close();
+    },
+  });
+}
+
+async function finishOpeningCurrentMetadataStore(
+  candidate: HistoricalMetadataCandidate,
+  dependencies: MetadataMigrationDependencies,
+): Promise<CurrentMetadataStore> {
+  try {
+    return await candidate.migrate(dependencies);
+  } catch (primary) {
+    try {
+      candidate.close();
+    } catch (cleanup) {
+      throw new AggregateError(
+        [primary, cleanup],
+        "metadata migration and connection cleanup both failed",
+        { cause: primary },
+      );
+    }
+    throw primary;
+  }
+}
+
+/** Create an empty store, or synchronously reopen an exact current store. */
+export function createCurrentMetadataStore(path: string): CurrentMetadataStore {
+  return new SqliteMetadataConnection(path, { allowHistorical: false });
+}
+
+/** Open, initialize or traverse every adjacent edge before exposing the store. */
+export function openCurrentMetadataStore(
+  path: string,
+  dependencies: MetadataMigrationDependencies,
+): Promise<CurrentMetadataStore> {
+  return finishOpeningCurrentMetadataStore(
+    openHistoricalMetadataCandidate(path),
+    dependencies,
+  );
+}
+
+/** Reopen a previously authenticated source and upgrade it before exposure. */
+export function openAuthenticatedCurrentMetadataStore(
+  proof: MetadataIdentityProof,
+  dependencies: MetadataMigrationDependencies,
+): Promise<CurrentMetadataStore> {
+  const details = metadataIdentityProofDetails.get(proof);
+  if (details === undefined) {
+    throw new MetadataError("metadata identity proof is invalid or expired");
+  }
+  return finishOpeningCurrentMetadataStore(
+    openHistoricalMetadataCandidate(details.canonicalPath, proof),
+    dependencies,
+  );
 }

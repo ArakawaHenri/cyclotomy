@@ -18,9 +18,12 @@ import {
   GarbageCollectionMarkError,
   GarbageCollectionNamespaceError,
 } from "../src/infrastructure/object-gc.ts";
-import { MetadataStore } from "../src/infrastructure/metadata.ts";
+import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
-import { commitTestNodeState } from "./metadata-fixture.ts";
+import {
+  commitTestNodeState,
+  registerTestSession,
+} from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
@@ -54,7 +57,7 @@ describe("object garbage collection", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-"));
     roots.push(root);
     const store = await openObjectStore(root);
-    const metadata = new MetadataStore(join(root, "state.db"));
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
     const shard = join(root, "objects", "blobs", "aa");
     await mkdir(shard);
     const first = join(shard, "b".repeat(62));
@@ -65,11 +68,76 @@ describe("object garbage collection", () => {
     await utimes(first, old, old);
     await utimes(second, old, old);
 
-    const report = await collectGarbage(root, store, metadata, 1, Date.now());
+    const report = await collectGarbage(store, metadata, {
+      graceMs: 1,
+      now: Date.now(),
+    });
 
     expect(report.removedBlobs).toBe(2);
     await expect(stat(first)).rejects.toThrow();
     await expect(stat(second)).rejects.toThrow();
+    metadata.close();
+  });
+
+  it("refuses an oversized inventory before deleting any candidate", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-limit-"));
+    roots.push(root);
+    const store = await openObjectStore(root);
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
+    const shard = join(root, "objects", "blobs", "aa");
+    await mkdir(shard);
+    const first = join(shard, "b".repeat(62));
+    const second = join(shard, "c".repeat(62));
+    await writeFile(first, "first orphan");
+    await writeFile(second, "second orphan");
+    const old = new Date(Date.now() - 10_000);
+    await utimes(first, old, old);
+    await utimes(second, old, old);
+
+    await expect(
+      collectGarbage(store, metadata, {
+        graceMs: 1,
+        now: Date.now(),
+        maxObjects: 1,
+      }),
+    ).rejects.toThrow("object inventory exceeds the 1-candidate limit");
+
+    await expect(stat(first)).resolves.toBeDefined();
+    await expect(stat(second)).resolves.toBeDefined();
+    metadata.close();
+  });
+
+  it("classifies a rooted closure budget overflow as a resource limit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-root-limit-"));
+    roots.push(root);
+    const store = await openObjectStore(root);
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
+    const firstBlob = await publishTestBlob(store, Buffer.from("first"));
+    const secondBlob = await publishTestBlob(store, Buffer.from("second"));
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "first.txt",
+          type: "regular",
+          blobOid: firstBlob,
+          recreationMode: 0o644,
+        },
+        {
+          path: "second.txt",
+          type: "regular",
+          blobOid: secondBlob,
+          recreationMode: 0o644,
+        },
+      ],
+      scope,
+    );
+    registerTestSession(metadata, "s", "/sessions/s.jsonl", ["leaf"]);
+    commitTestNodeState(metadata, "s", "leaf", treeOid);
+
+    await expect(
+      collectGarbage(store, metadata, { maxObjects: 2 }),
+    ).rejects.toBeInstanceOf(RangeError);
     metadata.close();
   });
 
@@ -78,7 +146,7 @@ describe("object garbage collection", () => {
     const outside = await mkdtemp(join(tmpdir(), "cyclotomy-gc-outside-"));
     roots.push(root, outside);
     const store = await openObjectStore(root);
-    const metadata = new MetadataStore(join(root, "state.db"));
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
     const sentinel = join(outside, "b".repeat(62));
     await writeFile(sentinel, "outside");
     const old = new Date(Date.now() - 10_000);
@@ -87,7 +155,7 @@ describe("object garbage collection", () => {
     await symlink(outside, join(root, "objects", "blobs", "aa"));
 
     await expect(
-      collectGarbage(root, store, metadata, 1, Date.now()),
+      collectGarbage(store, metadata, { graceMs: 1, now: Date.now() }),
     ).rejects.toBeInstanceOf(GarbageCollectionNamespaceError);
     await expect(stat(sentinel)).resolves.toBeDefined();
     metadata.close();
@@ -97,7 +165,7 @@ describe("object garbage collection", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-"));
     roots.push(root);
     const store = await openObjectStore(root);
-    const metadata = new MetadataStore(join(root, "state.db"));
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
     const blobOid = await publishTestBlob(
       store,
       Buffer.from("still referenced"),
@@ -121,7 +189,7 @@ describe("object garbage collection", () => {
     await writeFile(objectPath(root, "trees", treeOid), "corrupt");
 
     await expect(
-      collectGarbage(root, store, metadata, 1, Date.now()),
+      collectGarbage(store, metadata, { graceMs: 1, now: Date.now() }),
     ).rejects.toBeInstanceOf(GarbageCollectionMarkError);
     await expect(
       stat(objectPath(root, "blobs", blobOid)),
@@ -133,7 +201,7 @@ describe("object garbage collection", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-"));
     roots.push(root);
     const store = await openObjectStore(root);
-    const metadata = new MetadataStore(join(root, "state.db"));
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
     const blobOid = await publishTestBlob(store, Buffer.from("rooted bytes"));
     const treeOid = await publishTestTree(
       store,
@@ -161,7 +229,10 @@ describe("object garbage collection", () => {
     await utimes(rootedPath, old, old);
     await utimes(orphanPath, old, old);
 
-    const report = await collectGarbage(root, store, metadata, 1, Date.now());
+    const report = await collectGarbage(store, metadata, {
+      graceMs: 1,
+      now: Date.now(),
+    });
 
     expect(report.removedBlobs).toBe(1);
     await expect(stat(rootedPath)).resolves.toBeDefined();
@@ -173,7 +244,7 @@ describe("object garbage collection", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-v1-"));
     roots.push(root);
     const store = await openObjectStore(root);
-    const metadata = new MetadataStore(join(root, "state.db"));
+    const metadata = createCurrentMetadataStore(join(root, "state.db"));
     for (const [kind, oid, fixture] of [
       ["blobs", incompatibleV1BlobOid, "incompatible-gitignore.blob"],
       ["trees", incompatibleV1TreeOid, "incompatible-gitignore.tree"],
@@ -198,7 +269,10 @@ describe("object garbage collection", () => {
       utimes(orphanPath, old, old),
     ]);
 
-    const report = await collectGarbage(root, store, metadata, 1, Date.now());
+    const report = await collectGarbage(store, metadata, {
+      graceMs: 1,
+      now: Date.now(),
+    });
 
     expect(report.removedBlobs).toBe(1);
     expect(report.removedTrees).toBe(0);

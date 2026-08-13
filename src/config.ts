@@ -7,7 +7,7 @@ import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   DEFAULT_MAX_TREE_ENTRIES,
   DEFAULT_MAX_TREE_MANIFEST_BYTES,
-} from "./infrastructure/tree-manifest.ts";
+} from "./infrastructure/tree-formats/manifest-codec.ts";
 import {
   ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
   ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
@@ -40,7 +40,6 @@ export interface CyclotomyConfig {
   };
   /** Minimum gap between automatic GC runs; 0 disables automatic GC. */
   readonly autoGcIntervalMs: number;
-  readonly sessionMetadataRetentionMs: number;
   readonly locale: CyclotomyLocale;
 }
 
@@ -69,7 +68,6 @@ interface ConfigOverrides {
   readonly maxPathComponents?: number;
   readonly lockTimeoutMs?: number;
   readonly autoGcIntervalMs?: number;
-  readonly sessionMetadataRetentionMs?: number;
   readonly locale?: CyclotomyLocale;
 }
 
@@ -79,19 +77,6 @@ const MIB = 1024 * 1024;
 const LOCK_HEARTBEAT_MS = 5_000;
 const LOCK_STALE_MS = 30_000;
 const SETTINGS_FILE = "settings.json";
-const ROOT_KEYS = new Set([
-  "storageDir",
-  "maxFileMiB",
-  "maxSnapshotMiB",
-  "maxEntries",
-  "maxManifestMiB",
-  "maxPathBytes",
-  "maxPathComponents",
-  "lockTimeoutMs",
-  "gc",
-  "locale",
-]);
-const GC_KEYS = new Set(["intervalMs", "sessionRetentionMs"]);
 
 function configError(
   settingsPath: string,
@@ -110,21 +95,6 @@ function objectValue(
     return configError(settingsPath, `${label} must be a JSON object`);
   }
   return value as Record<string, unknown>;
-}
-
-function rejectUnknownKeys(
-  value: Record<string, unknown>,
-  allowed: ReadonlySet<string>,
-  settingsPath: string,
-  label: string,
-): void {
-  const unknown = Object.keys(value).find((key) => !allowed.has(key));
-  if (unknown !== undefined) {
-    configError(
-      settingsPath,
-      `${label} contains unknown setting ${JSON.stringify(unknown)}`,
-    );
-  }
 }
 
 function positiveSafeInteger(
@@ -190,7 +160,6 @@ function parseSettings(
   scope: SettingsScope,
 ): ConfigOverrides {
   const root = objectValue(value, settingsPath, "settings");
-  rejectUnknownKeys(root, ROOT_KEYS, settingsPath, "settings");
   if (scope === "workspace" && Object.hasOwn(root, "storageDir")) {
     configError(settingsPath, "storageDir is only allowed in global settings");
   }
@@ -208,7 +177,6 @@ function parseSettings(
     maxPathComponents?: number;
     lockTimeoutMs?: number;
     autoGcIntervalMs?: number;
-    sessionMetadataRetentionMs?: number;
     locale?: CyclotomyLocale;
   } = {};
 
@@ -284,19 +252,11 @@ function parseSettings(
   }
   if (Object.hasOwn(root, "gc")) {
     const gc = objectValue(root.gc, settingsPath, "gc");
-    rejectUnknownKeys(gc, GC_KEYS, settingsPath, "gc");
     if (Object.hasOwn(gc, "intervalMs")) {
       parsed.autoGcIntervalMs = nonNegativeSafeInteger(
         gc.intervalMs,
         settingsPath,
         "gc.intervalMs",
-      );
-    }
-    if (Object.hasOwn(gc, "sessionRetentionMs")) {
-      parsed.sessionMetadataRetentionMs = positiveSafeInteger(
-        gc.sessionRetentionMs,
-        settingsPath,
-        "gc.sessionRetentionMs",
       );
     }
   }
@@ -386,8 +346,6 @@ function applyOverrides(
       staleMs: LOCK_STALE_MS,
     },
     autoGcIntervalMs: overrides.autoGcIntervalMs ?? base.autoGcIntervalMs,
-    sessionMetadataRetentionMs:
-      overrides.sessionMetadataRetentionMs ?? base.sessionMetadataRetentionMs,
     locale: overrides.locale ?? base.locale,
   };
 }
@@ -416,7 +374,6 @@ export function defaultCyclotomyConfig(agentDir: string): CyclotomyConfig {
       staleMs: LOCK_STALE_MS,
     },
     autoGcIntervalMs: 24 * 60 * 60 * 1000,
-    sessionMetadataRetentionMs: 30 * 24 * 60 * 60 * 1000,
     locale: "auto",
   };
 }

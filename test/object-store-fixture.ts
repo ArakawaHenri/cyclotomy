@@ -6,8 +6,8 @@ import { join } from "node:path";
 import type {
   ObjectStore,
   SnapshotPublication,
-  TreeEntry,
 } from "../src/infrastructure/object-store.ts";
+import type { TreeEntry } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
 
 function digest(content: Uint8Array): string {

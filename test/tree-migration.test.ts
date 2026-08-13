@@ -8,15 +8,14 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  LegacyTreeMigrationBlockedError,
-  migrateReferencedTrees,
+  TreeFormatUpgradeBlockedError,
+  prepareTreeOidUpgrades,
 } from "../src/application/tree-migration.ts";
-import { MetadataStore } from "../src/infrastructure/metadata.ts";
+import { openCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
+import { checkpointState } from "./metadata-fixture.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
-import {
-  PUBLISHED_TREE_MANIFEST_FORMAT,
-  TREE_MANIFEST_FORMAT,
-} from "../src/infrastructure/tree-manifest.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
+import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
 
 interface FixtureObject {
   readonly blobBytes: number;
@@ -150,7 +149,7 @@ describe("published tree migration", () => {
     }
   });
 
-  it("freezes the published-v1 scope grammar before applying v2 limits", async () => {
+  it("migrates published-v1 paths against the absolute format contract", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-tree-v1-scope-"));
     roots.push(root);
     const store = await openObjectStore(root);
@@ -163,46 +162,82 @@ describe("published tree migration", () => {
     const legacy = await store.readTree(
       expected.incompatibleScopePrefix.treeOid,
     );
-    expect(legacy.format).toBe(PUBLISHED_TREE_MANIFEST_FORMAT);
+    expect(legacy.format).toBe(TREE_MANIFEST_FORMAT_V1);
     expect(legacy.scope).toMatchObject({
       kind: "git",
       repositoryPrefix: Array(257).fill("a").join("/"),
     });
-    await expect(
-      store.migrateLegacyTree(expected.incompatibleScopePrefix.treeOid),
-    ).resolves.toMatchObject({
-      kind: "legacy-incompatible",
-      treeOid: expected.incompatibleScopePrefix.treeOid,
-    });
-  });
-
-  it("uses configured path limits when migrating a published-v1 tree", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-tree-v1-limit-"));
-    roots.push(root);
-    const store = await openObjectStore(root, { maxPathComponents: 257 });
-    await installFixture(
-      root,
-      "incompatible-scope-prefix",
-      expected.incompatibleScopePrefix,
-    );
-
-    const result = await store.migrateLegacyTree(
+    const result = await store.upgradeTree(
       expected.incompatibleScopePrefix.treeOid,
+      CURRENT_TREE_MANIFEST_FORMAT,
     );
     expect(result).toMatchObject({
-      kind: "migrated",
-      oldTreeOid: expected.incompatibleScopePrefix.treeOid,
+      kind: "upgraded",
+      sourceTreeOid: expected.incompatibleScopePrefix.treeOid,
     });
-    if (result.kind !== "migrated") {
-      throw new Error("expected the raised component limit to allow migration");
+    if (result.kind !== "upgraded") {
+      throw new Error("expected the published v1 path to remain migratable");
     }
     await expect(store.readTree(result.treeOid)).resolves.toMatchObject({
-      format: TREE_MANIFEST_FORMAT,
+      format: CURRENT_TREE_MANIFEST_FORMAT,
       scope: {
         kind: "git",
         repositoryPrefix: Array(257).fill("a").join("/"),
       },
     });
+  });
+
+  it("does not apply current capture limits to durable tree migration", async () => {
+    const baselineRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-tree-v1-baseline-"),
+    );
+    const limitedRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-tree-v1-limit-"),
+    );
+    roots.push(baselineRoot, limitedRoot);
+    const baselineStore = await openObjectStore(baselineRoot);
+    const limitedStore = await openObjectStore(limitedRoot, {
+      maxPathBytes: 1,
+      maxPathComponents: 1,
+    });
+    await Promise.all([
+      installFixture(
+        baselineRoot,
+        "incompatible-scope-prefix",
+        expected.incompatibleScopePrefix,
+      ),
+      installFixture(
+        limitedRoot,
+        "incompatible-scope-prefix",
+        expected.incompatibleScopePrefix,
+      ),
+    ]);
+
+    const [baseline, limited] = await Promise.all([
+      baselineStore.upgradeTree(
+        expected.incompatibleScopePrefix.treeOid,
+        CURRENT_TREE_MANIFEST_FORMAT,
+      ),
+      limitedStore.upgradeTree(
+        expected.incompatibleScopePrefix.treeOid,
+        CURRENT_TREE_MANIFEST_FORMAT,
+      ),
+    ]);
+    expect(baseline).toMatchObject({ kind: "upgraded" });
+    expect(limited).toMatchObject({ kind: "upgraded" });
+    if (baseline.kind !== "upgraded" || limited.kind !== "upgraded") {
+      throw new Error("expected capture limits not to affect tree migration");
+    }
+    expect(limited.treeOid).toBe(baseline.treeOid);
+    await expect(limitedStore.readTree(limited.treeOid)).resolves.toMatchObject(
+      {
+        format: CURRENT_TREE_MANIFEST_FORMAT,
+        scope: {
+          kind: "git",
+          repositoryPrefix: Array(257).fill("a").join("/"),
+        },
+      },
+    );
   });
 
   it("publishes v2 before atomically retargeting every shared v1 root", async () => {
@@ -215,30 +250,21 @@ describe("published tree migration", () => {
       { entryId: "one", treeOid: expected.compatible.treeOid },
       { entryId: "two", treeOid: expected.compatible.treeOid },
     ]);
-    const metadata = new MetadataStore(metadataPath, {
-      deferPublishedV1Migration: true,
+    const metadata = await openCurrentMetadataStore(metadataPath, {
+      prepareTreeOidUpgrades: (treeOids, targetFormat) =>
+        prepareTreeOidUpgrades(store, treeOids, targetFormat),
     });
-
-    const report = await migrateReferencedTrees(store, metadata);
-    expect(report).toMatchObject({
-      inspectedTrees: 1,
-      currentTrees: 0,
-      migratedTrees: 1,
-      incompatibleTrees: [],
-      replacedNodeStates: 2,
-    });
-    expect(metadata.isSchemaCurrent()).toBe(true);
-    expect(metadata.getState("legacy", "one")?.treeOid).toBe(
+    expect(checkpointState(metadata, "legacy", "one")?.treeOid).toBe(
       expected.compatible.migratedTreeOid,
     );
-    expect(metadata.getState("legacy", "two")?.treeOid).toBe(
+    expect(checkpointState(metadata, "legacy", "two")?.treeOid).toBe(
       expected.compatible.migratedTreeOid,
     );
     expect((await store.readTree(expected.compatible.treeOid)).format).toBe(
-      PUBLISHED_TREE_MANIFEST_FORMAT,
+      TREE_MANIFEST_FORMAT_V1,
     );
     const migrated = await store.readTree(expected.compatible.migratedTreeOid!);
-    expect(migrated.format).toBe(TREE_MANIFEST_FORMAT);
+    expect(migrated.format).toBe(CURRENT_TREE_MANIFEST_FORMAT);
     const legacy = await store.readTree(expected.compatible.treeOid);
     expect({ entries: migrated.entries, scope: migrated.scope }).toEqual({
       entries: legacy.entries,
@@ -252,18 +278,10 @@ describe("published tree migration", () => {
       Buffer.from(
         legacyBytes
           .toString("utf8")
-          .replace(PUBLISHED_TREE_MANIFEST_FORMAT, TREE_MANIFEST_FORMAT),
+          .replace(TREE_MANIFEST_FORMAT_V1, CURRENT_TREE_MANIFEST_FORMAT),
       ),
     );
 
-    const second = await migrateReferencedTrees(store, metadata);
-    expect(second).toMatchObject({
-      inspectedTrees: 0,
-      currentTrees: 0,
-      migratedTrees: 0,
-      incompatibleTrees: [],
-      replacedNodeStates: 0,
-    });
     metadata.close();
   });
 
@@ -283,22 +301,15 @@ describe("published tree migration", () => {
         treeOid: expected.incompatibleGitignore.treeOid,
       },
     ]);
-    const metadata = new MetadataStore(metadataPath, {
-      deferPublishedV1Migration: true,
-    });
-
     await expect(
-      migrateReferencedTrees(store, metadata),
-    ).rejects.toBeInstanceOf(LegacyTreeMigrationBlockedError);
-    expect(metadata.isSchemaCurrent()).toBe(false);
-    expect(metadata.getState("legacy", "blocked")?.treeOid).toBe(
-      expected.incompatibleGitignore.treeOid,
-    );
+      openCurrentMetadataStore(metadataPath, {
+        prepareTreeOidUpgrades: (treeOids, targetFormat) =>
+          prepareTreeOidUpgrades(store, treeOids, targetFormat),
+      }),
+    ).rejects.toBeInstanceOf(TreeFormatUpgradeBlockedError);
     expect(
       (await store.readTree(expected.incompatibleGitignore.treeOid)).format,
-    ).toBe(PUBLISHED_TREE_MANIFEST_FORMAT);
-    metadata.close();
-
+    ).toBe(TREE_MANIFEST_FORMAT_V1);
     const check = new DatabaseSync(metadataPath);
     expect(
       Number(
@@ -330,27 +341,17 @@ describe("published tree migration", () => {
         treeOid: expected.incompatibleGitignore.treeOid,
       },
     ]);
-    const metadata = new MetadataStore(metadataPath, {
-      deferPublishedV1Migration: true,
-    });
-
     await expect(
-      migrateReferencedTrees(store, metadata),
-    ).rejects.toBeInstanceOf(LegacyTreeMigrationBlockedError);
-    expect(metadata.isSchemaCurrent()).toBe(false);
-    expect(metadata.getState("legacy", "compatible")?.treeOid).toBe(
-      expected.compatible.treeOid,
-    );
-    expect(metadata.getState("legacy", "blocked")?.treeOid).toBe(
-      expected.incompatibleGitignore.treeOid,
-    );
+      openCurrentMetadataStore(metadataPath, {
+        prepareTreeOidUpgrades: (treeOids, targetFormat) =>
+          prepareTreeOidUpgrades(store, treeOids, targetFormat),
+      }),
+    ).rejects.toBeInstanceOf(TreeFormatUpgradeBlockedError);
     // Publishing is deliberately allowed before the SQL decision: on abort,
     // the v2 object is merely an unreferenced, content-addressed GC candidate.
     await expect(
       store.readTree(expected.compatible.migratedTreeOid!),
-    ).resolves.toMatchObject({ format: TREE_MANIFEST_FORMAT });
-    metadata.close();
-
+    ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
     const check = new DatabaseSync(metadataPath);
     expect(
       Number(

@@ -43,7 +43,6 @@ describe("Cyclotomy configuration", () => {
       globalSettingsPath: settingsPath,
       storageRootPath: join(agentDir, "cyclotomy"),
       autoGcIntervalMs: 24 * 60 * 60 * 1000,
-      sessionMetadataRetentionMs: 30 * 24 * 60 * 60 * 1000,
       locale: "auto",
       scan: {
         maxFileBytes: 50 * 1024 * 1024,
@@ -85,7 +84,6 @@ describe("Cyclotomy configuration", () => {
       lockTimeoutMs: 12_000,
       gc: {
         intervalMs: 0,
-        sessionRetentionMs: 86_400_000,
       },
       locale: "zh-CN",
     });
@@ -103,7 +101,6 @@ describe("Cyclotomy configuration", () => {
     });
     expect(config.lock.timeoutMs).toBe(12_000);
     expect(config.autoGcIntervalMs).toBe(0);
-    expect(config.sessionMetadataRetentionMs).toBe(86_400_000);
     expect(config.locale).toBe("zh-CN");
   });
 
@@ -152,7 +149,7 @@ describe("Cyclotomy configuration", () => {
       maxPathBytes: 80 * 1024,
       maxPathComponents: 384,
       lockTimeoutMs: 7_000,
-      gc: { intervalMs: 90_000, sessionRetentionMs: 200_000 },
+      gc: { intervalMs: 90_000 },
       locale: "en",
     });
     const globalConfig = loadCyclotomyConfig(agentDir);
@@ -176,7 +173,6 @@ describe("Cyclotomy configuration", () => {
     });
     expect(config.lock.timeoutMs).toBe(7_000);
     expect(config.autoGcIntervalMs).toBe(0);
-    expect(config.sessionMetadataRetentionMs).toBe(200_000);
     expect(config.locale).toBe("en");
     expect(config.globalSettingsPath).toBe(globalPath);
     expect(config.storageRootPath).toBe(globalConfig.storageRootPath);
@@ -202,13 +198,42 @@ describe("Cyclotomy configuration", () => {
     ["{", "not valid JSON"],
     ["null", "must be a JSON object"],
     ["[]", "must be a JSON object"],
-    ['{"unknown":true}', "unknown setting"],
-    ['{"gc":{"unknown":true}}', "unknown setting"],
-  ])("rejects malformed or unknown settings: %s", async (contents, message) => {
+  ])("rejects malformed settings: %s", async (contents, message) => {
     const agentDir = await createAgentDir();
     await writeSettings(join(agentDir, "cyclotomy", "settings.json"), contents);
 
     expect(() => loadCyclotomyConfig(agentDir)).toThrow(message);
+  });
+
+  it("ignores unknown root and nested properties", async () => {
+    const agentDir = await createAgentDir();
+    await writeSettings(join(agentDir, "cyclotomy", "settings.json"), {
+      maxFileMiB: 8,
+      futureRootSetting: { enabled: true },
+      gc: {
+        intervalMs: 0,
+        sessionRetentionMs: "no longer interpreted",
+        futureGcSetting: -1,
+      },
+    });
+
+    const config = loadCyclotomyConfig(agentDir);
+    expect(config.scan.maxFileBytes).toBe(8 * 1024 * 1024);
+    expect(config.autoGcIntervalMs).toBe(0);
+  });
+
+  it("ignores unknown properties in workspace settings", async () => {
+    const agentDir = await createAgentDir();
+    const globalConfig = loadCyclotomyConfig(agentDir);
+    const storeRoot = join(globalConfig.storageRootPath, "workspace-hash");
+    await writeSettings(join(storeRoot, "settings.json"), {
+      futureWorkspaceSetting: true,
+      gc: { futureGcSetting: { enabled: true } },
+    });
+
+    expect(loadWorkspaceCyclotomyConfig(globalConfig, storeRoot)).toEqual(
+      globalConfig,
+    );
   });
 
   it.each([
@@ -225,7 +250,6 @@ describe("Cyclotomy configuration", () => {
     [{ maxPathComponents: 4_097 }, "maxPathComponents"],
     [{ lockTimeoutMs: 1.5 }, "lockTimeoutMs"],
     [{ gc: { intervalMs: -1 } }, "gc.intervalMs"],
-    [{ gc: { sessionRetentionMs: 0 } }, "gc.sessionRetentionMs"],
     [{ locale: "fr" }, "locale"],
   ])("rejects an invalid value in %s", async (value, field) => {
     const agentDir = await createAgentDir();
@@ -237,7 +261,7 @@ describe("Cyclotomy configuration", () => {
   it("reports the settings path on configuration errors", async () => {
     const agentDir = await createAgentDir();
     const settingsPath = join(agentDir, "cyclotomy", "settings.json");
-    await writeSettings(settingsPath, { typo: true });
+    await writeSettings(settingsPath, { locale: "fr" });
 
     let error: unknown;
     try {

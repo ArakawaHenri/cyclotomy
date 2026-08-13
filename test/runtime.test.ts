@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import {
+  appendFile,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -13,23 +16,42 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CyclotomyConfigError,
   defaultCyclotomyConfig,
   loadCyclotomyConfig,
 } from "../src/config.ts";
+import {
+  openObjectStore,
+  TreeImportAdmissionError,
+  TreeImportSourceError,
+  type NativeObjectStore,
+} from "../src/infrastructure/object-store.ts";
+import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
+import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
+import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
+import {
+  acquireWorkspaceLock,
+  OrderedWorkspaceLockAcquisitionError,
+} from "../src/infrastructure/workspace-lock.ts";
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
+import { SessionRegistrationService } from "../src/pi/session-registration-service.ts";
+import { projectStableGraph } from "../src/pi/extension-boundary.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import type { SessionView } from "../src/pi/session-view.ts";
 import {
-  PUBLISHED_TREE_MANIFEST_FORMAT,
-  TREE_MANIFEST_FORMAT,
-} from "../src/infrastructure/tree-manifest.ts";
-import { commitTestNodeState } from "./metadata-fixture.ts";
+  checkpointIsBlocked,
+  checkpointState,
+  commitTestNodeState,
+  protectTestLocation,
+  readTestSessionRegistration,
+  registerTestSession,
+} from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
-import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
+import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 
 const roots: string[] = [];
 const TEST_SCOPE = ALL_MANAGED_SCOPE;
@@ -46,6 +68,17 @@ function objectPath(
   oid: string,
 ): string {
   return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
+}
+
+function makeCurrentWorkspaceLockReleaseFail(storeRoot: string): void {
+  const lockPath = join(storeRoot, "workspace.lock");
+  const heartbeat = readdirSync(lockPath).find((name) =>
+    name.startsWith("heartbeat-"),
+  );
+  if (heartbeat === undefined) throw new Error("missing lock heartbeat");
+  const heartbeatPath = join(lockPath, heartbeat);
+  rmSync(heartbeatPath);
+  mkdirSync(heartbeatPath);
 }
 
 async function seedCompatiblePublishedV1Store(
@@ -112,27 +145,298 @@ function view(
   leafId: string,
   parents: Readonly<Record<string, string | null>>,
 ): SessionView {
-  return {
+  const entries = Object.entries(parents).map(([id, parentId]) => ({
+    id,
+    parentId,
+    type: "custom",
+    messageRole: null,
+  }));
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const activeStableAncestryIds: string[] = [];
+  let active: string | null = leafId;
+  while (active !== null) {
+    activeStableAncestryIds.unshift(active);
+    active = parents[active] ?? null;
+  }
+  let snapshot: SessionView;
+  snapshot = {
     cwd,
+    sessionCwd: cwd,
     sessionId: "s",
     sessionFile: null,
-    parentSessionFile: null,
+    parentSession: { kind: "absent" },
     leafId,
-    parentIdOf(entryId) {
-      return Object.hasOwn(parents, entryId) ? parents[entryId] : undefined;
+    stableCoordinates: projectStableGraph(entries).coordinates,
+    stableEntryIds: entries.map((entry) => entry.id),
+    activeStableAncestryIds,
+    stableCoordinateId(entryId = leafId) {
+      return entryId === null || byId.has(entryId) ? entryId : undefined;
     },
-    entryOf(entryId) {
-      return Object.hasOwn(parents, entryId)
-        ? ({ id: entryId } as NonNullable<ReturnType<SessionView["entryOf"]>>)
-        : undefined;
-    },
-    entryTypeOf() {
-      return undefined;
+    stableAncestryIds(entryId = leafId) {
+      if (entryId === null) return [];
+      if (!byId.has(entryId)) return undefined;
+      const reversed: string[] = [];
+      let current: string | null = entryId;
+      while (current !== null) {
+        reversed.push(current);
+        current = parents[current] ?? null;
+      }
+      return reversed.reverse();
     },
     navigationLandingId(entryId) {
       return Object.hasOwn(parents, entryId) ? entryId : undefined;
     },
+    authenticateTreeArrival: () => undefined,
+    hasSameIdentityAs(other) {
+      return (
+        snapshot.sessionId === other.sessionId &&
+        snapshot.sessionFile === other.sessionFile &&
+        snapshot.cwd === other.cwd &&
+        snapshot.sessionCwd === other.sessionCwd
+      );
+    },
+    isSameSnapshotAs(other) {
+      return snapshot === other;
+    },
+    isAppendOnlyExtensionOf(previous) {
+      return snapshot === previous;
+    },
+    isNaturalDescendantOf() {
+      return false;
+    },
   };
+  return snapshot;
+}
+
+function registrationView(options: {
+  readonly cwd: string;
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly parentSessionFile?: string;
+  readonly retainedEntryIds?: readonly string[];
+}): SessionView {
+  const entries = (options.retainedEntryIds ?? []).map((id, index, all) => ({
+    id,
+    parentId: index === 0 ? null : all[index - 1]!,
+    type: "custom",
+    messageRole: null,
+  }));
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  let snapshot: SessionView;
+  snapshot = {
+    cwd: options.cwd,
+    sessionCwd: options.cwd,
+    sessionId: options.sessionId,
+    sessionFile: options.sessionFile,
+    parentSession:
+      options.parentSessionFile === undefined
+        ? { kind: "absent" }
+        : {
+            kind: "candidate",
+            path: options.parentSessionFile,
+          },
+    leafId: entries.at(-1)?.id ?? null,
+    stableCoordinates: projectStableGraph(entries).coordinates,
+    stableEntryIds: entries.map((entry) => entry.id),
+    activeStableAncestryIds: entries.map((entry) => entry.id),
+    stableCoordinateId(entryId = snapshot.leafId) {
+      return entryId === null || byId.has(entryId) ? entryId : undefined;
+    },
+    stableAncestryIds(entryId = snapshot.leafId) {
+      if (entryId === null) return [];
+      const index = entries.findIndex((entry) => entry.id === entryId);
+      return index < 0
+        ? undefined
+        : entries.slice(0, index + 1).map((entry) => entry.id);
+    },
+    navigationLandingId: (entryId) => (byId.has(entryId) ? entryId : undefined),
+    authenticateTreeArrival: () => undefined,
+    hasSameIdentityAs(other) {
+      return (
+        snapshot.sessionId === other.sessionId &&
+        snapshot.sessionFile === other.sessionFile &&
+        snapshot.cwd === other.cwd &&
+        snapshot.sessionCwd === other.sessionCwd
+      );
+    },
+    isSameSnapshotAs(other) {
+      return snapshot === other;
+    },
+    isAppendOnlyExtensionOf(previous) {
+      return snapshot === previous;
+    },
+    isNaturalDescendantOf() {
+      return false;
+    },
+  };
+  return snapshot;
+}
+
+async function createExternalForkFixture(
+  prefix: string,
+  lockTimeoutMs?: number,
+  scope: WorkspaceScope = TEST_SCOPE,
+) {
+  const parent = await mkdtemp(join(tmpdir(), prefix));
+  roots.push(parent);
+  const sourceWorkspace = join(parent, "source");
+  const targetWorkspace = join(parent, "target");
+  const home = join(parent, "home");
+  await Promise.all([
+    mkdir(sourceWorkspace),
+    mkdir(targetWorkspace),
+    mkdir(home),
+  ]);
+  const parentFile = join(home, "parent.jsonl");
+  const childFile = join(home, "child.jsonl");
+  await Promise.all([
+    writeFile(
+      parentFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "parent",
+          cwd: sourceWorkspace,
+        }),
+        JSON.stringify({
+          type: "custom",
+          id: "retained",
+          parentId: null,
+          timestamp: new Date(0).toISOString(),
+          customType: "test",
+        }),
+      ].join("\n") + "\n",
+    ),
+    writeFile(
+      childFile,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "child",
+        cwd: targetWorkspace,
+      })}\n`,
+    ),
+  ]);
+  const loaded = loadCyclotomyConfig(home);
+  const config =
+    lockTimeoutMs === undefined
+      ? loaded
+      : {
+          ...loaded,
+          lock: { ...loaded.lock, timeoutMs: lockTimeoutMs },
+        };
+  const sourceRuntime = new CyclotomyRuntime(config, new CyclotomyI18n("en"));
+  expect(await sourceRuntime.ensureStore(sourceWorkspace)).toBe(true);
+  const blobOid = await publishTestBlob(
+    sourceRuntime.store,
+    Buffer.from("parent state"),
+  );
+  const treeOid = await publishTestTree(
+    sourceRuntime.store,
+    [
+      {
+        path: "state.txt",
+        type: "regular",
+        blobOid,
+        recreationMode: 0o644,
+      },
+    ],
+    scope,
+  );
+  registerTestSession(sourceRuntime.metadata, "parent", parentFile, [
+    "retained",
+  ]);
+  commitTestNodeState(sourceRuntime.metadata, "parent", "retained", treeOid);
+  const sourceStoreRoot = sourceRuntime.storeRoot;
+  sourceRuntime.close();
+
+  return {
+    child: registrationView({
+      cwd: targetWorkspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    }),
+    config,
+    parentFile,
+    sourceStoreRoot,
+    targetWorkspace,
+    treeOid,
+  };
+}
+
+type ExternalForkFixture = Awaited<
+  ReturnType<typeof createExternalForkFixture>
+>;
+
+async function openExternalForkTarget(fixture: ExternalForkFixture) {
+  const runtime = new CyclotomyRuntime(fixture.config, new CyclotomyI18n("en"));
+  const preparation = await runtime.registrations.prepare(fixture.child, {
+    kind: "fork",
+    previousSessionFile: fixture.parentFile,
+  });
+  expect(preparation.kind).toBe("observed");
+  expect(
+    await runtime.ensureRegistrationStore(fixture.targetWorkspace, preparation),
+  ).toBe(true);
+  return { preparation, runtime };
+}
+
+async function expectExternalForkInheritance(
+  fixture: ExternalForkFixture,
+): Promise<void> {
+  const { preparation, runtime } = await openExternalForkTarget(fixture);
+  await expect(
+    runtime.registrations.register(
+      fixture.child,
+      () => fixture.child,
+      preparation,
+    ),
+  ).resolves.toEqual(activeRegistration("inherited"));
+  expect(
+    runtime.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+  ).toEqual({ kind: "open-checkpoint", treeOid: fixture.treeOid });
+  runtime.close();
+}
+
+function activeRegistration<
+  const Kind extends "existing" | "fresh" | "inherited",
+>(
+  kind: Kind,
+): {
+  readonly kind: "active";
+  readonly disposition: { readonly kind: Kind };
+} {
+  return { kind: "active", disposition: { kind } };
+}
+
+function readSessionProjectionResidue(
+  metadataPath: string,
+  sessionId: string,
+): {
+  readonly barriers: number;
+  readonly registrations: number;
+  readonly slots: number;
+} {
+  const db = new DatabaseSync(metadataPath, { readOnly: true });
+  try {
+    return db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM session_registry WHERE session_id = ?) AS registrations,
+           (SELECT COUNT(*) FROM checkpoint_slot WHERE session_id = ?) AS slots,
+           (SELECT COUNT(*) FROM session_capture_barrier WHERE session_id = ?) AS barriers`,
+      )
+      .get(sessionId, sessionId, sessionId) as {
+      readonly barriers: number;
+      readonly registrations: number;
+      readonly slots: number;
+    };
+  } finally {
+    db.close();
+  }
 }
 
 afterEach(async () => {
@@ -142,6 +446,46 @@ afterEach(async () => {
 });
 
 describe("Cyclotomy runtime", () => {
+  it("projects an inactive transparent ancestry in one traversal", async () => {
+    const { workspace, runtime } = await createRuntime();
+    const labelCount = 10_050;
+    const entries = [
+      { id: "root", parentId: null, type: "custom", messageRole: null },
+      ...Array.from({ length: labelCount }, (_, index) => ({
+        id: `label-${index}`,
+        parentId: index === 0 ? "root" : `label-${index - 1}`,
+        type: "label",
+        messageRole: null,
+      })),
+      { id: "current", parentId: "root", type: "custom", messageRole: null },
+    ];
+    const stableGraph = projectStableGraph(entries);
+    let stableAncestryCalls = 0;
+    const base = view(workspace, "current", { root: null, current: "root" });
+    const observed: SessionView = {
+      ...base,
+      stableCoordinates: projectStableGraph(entries).coordinates,
+      stableEntryIds: ["root", "current"],
+      activeStableAncestryIds: ["root", "current"],
+      stableCoordinateId(entryId = "current") {
+        if (entryId === "current") return "current";
+        throw new Error(
+          "inactive coordinates must not be repeatedly collapsed",
+        );
+      },
+      stableAncestryIds(entryId = "current") {
+        stableAncestryCalls += 1;
+        return stableGraph.stableAncestryIds(entryId);
+      },
+    };
+
+    expect(
+      runtime.checkpoints.ancestryEntryIds(observed, `label-${labelCount - 1}`),
+    ).toEqual(["root"]);
+    expect(stableAncestryCalls).toBe(1);
+    runtime.close();
+  });
+
   it("migrates a published-v1 store before exposing the runtime", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-v1-"));
     roots.push(parent);
@@ -155,20 +499,68 @@ describe("Cyclotomy runtime", () => {
     );
 
     expect(await runtime.ensureStore(workspace)).toBe(true);
-    expect(runtime.metadata.isSchemaCurrent()).toBe(true);
-    expect(runtime.metadata.getState("legacy", "checkpoint")?.treeOid).toBe(
-      compatibleV2TreeOid,
-    );
+    expect(
+      checkpointState(runtime.metadata, "legacy", "checkpoint")?.treeOid,
+    ).toBe(compatibleV2TreeOid);
     await expect(
       runtime.store.readTree(compatibleV1TreeOid),
-    ).resolves.toMatchObject({ format: PUBLISHED_TREE_MANIFEST_FORMAT });
+    ).resolves.toMatchObject({ format: TREE_MANIFEST_FORMAT_V1 });
     await expect(
       runtime.store.readTree(compatibleV2TreeOid),
-    ).resolves.toMatchObject({ format: TREE_MANIFEST_FORMAT });
+    ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
     await expect(
       lstat(objectPath(storeRoot, "trees", compatibleV1TreeOid)),
     ).resolves.toBeDefined();
     runtime.close();
+  });
+
+  it("closes migrated metadata when initialization lock cleanup fails", async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-migration-release-"),
+    );
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const home = join(parent, "home");
+    await Promise.all([mkdir(workspace), mkdir(home)]);
+    const storeRoot = await seedCompatiblePublishedV1Store(home, workspace);
+    const probeStore = await openObjectStore(storeRoot);
+    const storePrototype = Object.getPrototypeOf(probeStore) as Pick<
+      NativeObjectStore,
+      "upgradeTree"
+    >;
+    const originalUpgrade = storePrototype.upgradeTree;
+    const upgrade = vi
+      .spyOn(storePrototype, "upgradeTree")
+      .mockImplementation(async function (
+        this: NativeObjectStore,
+        treeOid,
+        targetFormat,
+      ) {
+        const result = await originalUpgrade.call(this, treeOid, targetFormat);
+        makeCurrentWorkspaceLockReleaseFail(storeRoot);
+        return result;
+      });
+    const metadataProbe = createCurrentMetadataStore(
+      join(parent, "metadata-probe.db"),
+    );
+    const metadataPrototype = Object.getPrototypeOf(metadataProbe) as {
+      close(): void;
+    };
+    metadataProbe.close();
+    const close = vi.spyOn(metadataPrototype, "close");
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    try {
+      expect(await runtime.ensureStore(workspace)).toBe(false);
+      expect(runtime.registrations.isReady).toBe(false);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      runtime.close();
+      close.mockRestore();
+      upgrade.mockRestore();
+    }
   });
 
   it("fails closed without opening a store after a registration failure", async () => {
@@ -241,7 +633,7 @@ describe("Cyclotomy runtime", () => {
         maxFileMiB: 8,
         maxPathBytes: 80 * 1024,
         maxPathComponents: 384,
-        gc: { intervalMs: 90_000, sessionRetentionMs: 200_000 },
+        gc: { intervalMs: 90_000 },
       }),
     );
     const globalConfig = loadCyclotomyConfig(home);
@@ -266,11 +658,10 @@ describe("Cyclotomy runtime", () => {
     expect(runtime.config.scan.maxPathBytes).toBe(80 * 1024);
     expect(runtime.config.scan.maxPathComponents).toBe(320);
     expect(runtime.config.autoGcIntervalMs).toBe(0);
-    expect(runtime.config.sessionMetadataRetentionMs).toBe(200_000);
     runtime.close();
   });
 
-  it("keeps one workspace configuration until a new extension runtime is created", async () => {
+  it("reloads workspace configuration in a new runtime after close", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-reload-"));
     roots.push(parent);
     const workspace = join(parent, "workspace");
@@ -290,12 +681,9 @@ describe("Cyclotomy runtime", () => {
     expect(runtime.config.scan.maxFileBytes).toBe(2 * 1024 * 1024);
     runtime.close();
     await writeFile(settingsPath, JSON.stringify({ maxFileMiB: 3 }));
-    expect(await runtime.ensureStore(workspace)).toBe(true);
-    expect(runtime.config.scan.maxFileBytes).toBe(2 * 1024 * 1024);
-    runtime.close();
-
+    expect(await runtime.ensureStore(workspace)).toBe(false);
     const reloaded = new CyclotomyRuntime(
-      loadCyclotomyConfig(home),
+      globalConfig,
       new CyclotomyI18n("en"),
     );
     expect(await reloaded.ensureStore(workspace)).toBe(true);
@@ -303,7 +691,7 @@ describe("Cyclotomy runtime", () => {
     reloaded.close();
   });
 
-  it("keeps an invalid workspace configuration failed closed until reload", async () => {
+  it("keeps an invalid workspace configuration failed closed for its runtime", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-invalid-"));
     roots.push(parent);
     const workspace = join(parent, "workspace");
@@ -326,7 +714,6 @@ describe("Cyclotomy runtime", () => {
     expect(await runtime.ensureStore(workspace)).toBe(false);
     runtime.close();
     expect(await runtime.ensureStore(workspace)).toBe(false);
-
     const reloaded = new CyclotomyRuntime(
       loadCyclotomyConfig(home),
       new CyclotomyI18n("en"),
@@ -352,6 +739,1723 @@ describe("Cyclotomy runtime", () => {
 
     expect(await runtime.ensureStore(workspace)).toBe(false);
     await expect(lstat(external)).rejects.toMatchObject({ code: "ENOENT" });
+    runtime.close();
+  });
+
+  it("rejects a target store inside the authenticated parent workspace before creation", async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-parent-control-"),
+    );
+    roots.push(parent);
+    const sourceWorkspace = join(parent, "source");
+    const targetWorkspace = join(parent, "target");
+    const home = join(parent, "home");
+    const storageRoot = join(sourceWorkspace, ".control");
+    await Promise.all([
+      mkdir(sourceWorkspace),
+      mkdir(targetWorkspace),
+      mkdir(join(home, "cyclotomy"), { recursive: true }),
+    ]);
+    await writeFile(
+      join(home, "cyclotomy", "settings.json"),
+      JSON.stringify({ storageDir: storageRoot }),
+    );
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const targetHash = createHash("sha256")
+      .update(await realpath(targetWorkspace))
+      .digest("hex");
+
+    expect(
+      await runtime.ensureRegistrationStore(targetWorkspace, {
+        kind: "observed",
+        claim: {
+          kind: "candidate",
+          path: join(home, "parent.jsonl"),
+        },
+        parentSessionFile: join(home, "parent.jsonl"),
+        sourceSessionId: "parent",
+        recordedCwd: sourceWorkspace,
+        workspaceNamespace: await realpath(sourceWorkspace),
+        stableCoordinates: [],
+      }),
+    ).toBe(false);
+    await expect(lstat(join(storageRoot, targetHash))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    runtime.close();
+  });
+
+  it("rejects a parent workspace alias rebound onto the target controls", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows symlink creation is privilege-dependent",
+    );
+    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-rebound-"));
+    roots.push(parent);
+    const sourceBefore = join(parent, "source-before");
+    const sourceAfter = join(parent, "source-after");
+    const sourceAlias = join(parent, "source-alias");
+    const targetWorkspace = join(parent, "target");
+    const home = join(parent, "home");
+    await Promise.all([
+      mkdir(sourceBefore),
+      mkdir(sourceAfter),
+      mkdir(targetWorkspace),
+      mkdir(join(home, "cyclotomy"), { recursive: true }),
+    ]);
+    await symlink(sourceBefore, sourceAlias);
+    await writeFile(
+      join(home, "cyclotomy", "settings.json"),
+      JSON.stringify({ storageDir: sourceAfter }),
+    );
+    const parentFile = join(home, "parent.jsonl");
+    const childFile = join(home, "child.jsonl");
+    await Promise.all([
+      writeFile(
+        parentFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "parent",
+          cwd: sourceAlias,
+        })}\n`,
+      ),
+      writeFile(
+        childFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "child",
+          cwd: targetWorkspace,
+        })}\n`,
+      ),
+    ]);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const child = registrationView({
+      cwd: targetWorkspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(
+      await runtime.ensureRegistrationStore(targetWorkspace, preparation),
+    ).toBe(true);
+
+    await rm(sourceAlias);
+    await symlink(sourceAfter, sourceAlias);
+
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).rejects.toThrow(/must not overlap/u);
+    expect(
+      readTestSessionRegistration(join(runtime.storeRoot, "state.db"), "child"),
+    ).toBeUndefined();
+    runtime.close();
+  });
+
+  it("retries when the parent workspace alias becomes unresolvable", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows symlink creation is privilege-dependent",
+    );
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-parent-loop-"),
+    );
+    roots.push(parent);
+    const sourceWorkspace = join(parent, "source");
+    const sourceAlias = join(parent, "source-alias");
+    const targetWorkspace = join(parent, "target");
+    const home = join(parent, "home");
+    await Promise.all([
+      mkdir(sourceWorkspace),
+      mkdir(targetWorkspace),
+      mkdir(home),
+    ]);
+    await symlink(sourceWorkspace, sourceAlias);
+    const parentFile = join(home, "parent.jsonl");
+    const childFile = join(home, "child.jsonl");
+    await Promise.all([
+      writeFile(
+        parentFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "parent",
+          cwd: sourceAlias,
+        })}\n`,
+      ),
+      writeFile(
+        childFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "child",
+          cwd: targetWorkspace,
+        })}\n`,
+      ),
+    ]);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const child = registrationView({
+      cwd: targetWorkspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation.kind).toBe("observed");
+    expect(
+      await runtime.ensureRegistrationStore(targetWorkspace, preparation),
+    ).toBe(true);
+
+    await rm(sourceAlias);
+    await symlink(basename(sourceAlias), sourceAlias);
+
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).rejects.toMatchObject({ code: "ELOOP" });
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        "child",
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+  });
+
+  it("revokes capture authority when a registered workspace path is recreated", async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-workspace-recreated-"),
+    );
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const displaced = join(parent, "displaced");
+    const home = join(parent, "home");
+    await Promise.all([mkdir(workspace), mkdir(home)]);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const parentFile = join(home, "missing-parent.jsonl");
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "child",
+      sessionFile: join(home, "child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(await runtime.ensureRegistrationStore(workspace, preparation)).toBe(
+      true,
+    );
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+
+    await rename(workspace, displaced);
+    await mkdir(workspace);
+
+    await expect(
+      runtime.registrations.workspaceStillBound(workspace),
+    ).resolves.toBe(false);
+    const committed = runtime.commitPreparedCapture(
+      child,
+      { sessionId: "child", entryId: "retained" },
+      {
+        treeOid: "a".repeat(64),
+        snapshot: {} as never,
+      },
+      { kind: "open-missing" },
+    );
+    expect(committed).toMatchObject({
+      ok: false,
+      error: { kind: "metadata-failed" },
+    });
+    expect(
+      checkpointState(runtime.metadata, "child", "retained"),
+    ).toBeUndefined();
+    runtime.close();
+  });
+
+  it("revokes active authority when the workspace store path is recreated", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows does not rename a directory containing an open SQLite database",
+    );
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "store-recreated",
+      sessionFile: join(home, "store-recreated.jsonl"),
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+    const storeRoot = runtime.storeRoot;
+    const displaced = `${storeRoot}.displaced`;
+
+    await rename(storeRoot, displaced);
+    await mkdir(storeRoot);
+
+    await expect(
+      runtime.registrations.workspaceStillBound(workspace),
+    ).resolves.toBe(false);
+    expect(await runtime.ensureStore(workspace)).toBe(false);
+    const committed = runtime.commitPreparedCapture(
+      current,
+      { sessionId: current.sessionId, entryId: "retained" },
+      {
+        treeOid: "a".repeat(64),
+        snapshot: {} as never,
+      },
+      { kind: "open-missing" },
+    );
+    expect(committed).toMatchObject({
+      ok: false,
+      error: { kind: "metadata-failed" },
+    });
+    expect(
+      checkpointState(runtime.metadata, current.sessionId, "retained"),
+    ).toBeUndefined();
+    runtime.close();
+  });
+
+  it("opens only the active leaf of a genuinely fresh session", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "fresh",
+      sessionFile: join(home, "fresh.jsonl"),
+      retainedEntryIds: ["root", "leaf"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    expect(preparation).toEqual({
+      kind: "independent",
+      claim: { kind: "absent" },
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+
+    expect(runtime.metadata.getCheckpointSlot("fresh", "root")).toEqual({
+      kind: "blocked-missing",
+    });
+    expect(runtime.metadata.getCheckpointSlot("fresh", "leaf")).toEqual({
+      kind: "open-missing",
+    });
+    expect(
+      runtime.metadata.hasSessionBarrier({
+        sessionId: "fresh",
+        sessionFile: current.sessionFile!,
+      }),
+    ).toBe(false);
+    runtime.close();
+  });
+
+  it("keeps a committed fresh registration inactive after target lock cleanup fails", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "fresh-release-failure",
+      sessionFile: join(home, "fresh-release-failure.jsonl"),
+      retainedEntryIds: ["leaf"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    const storeRoot = runtime.storeRoot;
+    const originalFinalize = runtime.metadata.finalizeSessionProjection.bind(
+      runtime.metadata,
+    );
+    vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
+      (input) => {
+        const report = originalFinalize(input);
+        makeCurrentWorkspaceLockReleaseFail(storeRoot);
+        return report;
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toMatchObject({
+      kind: "durable-but-inactive",
+      disposition: { kind: "fresh" },
+      cause: expect.any(Error),
+    });
+    expect(runtime.registrations.sessionIsUsable(current)).toBe(false);
+    expect(
+      readTestSessionRegistration(
+        join(storeRoot, "state.db"),
+        current.sessionId,
+      ),
+    ).toBeDefined();
+    runtime.close();
+  });
+
+  it("revokes an earlier authority when re-registration cannot activate", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "reloaded-release-failure",
+      sessionFile: join(home, "reloaded-release-failure.jsonl"),
+      retainedEntryIds: ["leaf"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+    expect(runtime.registrations.sessionIsUsable(current)).toBe(true);
+
+    const originalFinalize = runtime.metadata.finalizeSessionProjection.bind(
+      runtime.metadata,
+    );
+    vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
+      (input) => {
+        const report = originalFinalize(input);
+        makeCurrentWorkspaceLockReleaseFail(runtime.storeRoot);
+        return report;
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toMatchObject({
+      kind: "durable-but-inactive",
+      disposition: { kind: "existing" },
+    });
+    expect(runtime.registrations.sessionIsUsable(current)).toBe(false);
+    runtime.close();
+  });
+
+  it("lets an existing target outrank an indeterminate parent observation", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "temporarily-unreadable-parent.jsonl");
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "existing-child",
+      sessionFile: join(home, "existing-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    registerTestSession(
+      runtime.metadata,
+      child.sessionId,
+      child.sessionFile!,
+      child.stableEntryIds,
+    );
+    const cause = Object.assign(new Error("permission denied"), {
+      code: "EACCES",
+    });
+
+    await expect(
+      runtime.registrations.register(child, () => child, {
+        kind: "indeterminate",
+        claim: child.parentSession,
+        parentSessionFile: parentFile,
+        cause,
+      }),
+    ).resolves.toEqual(activeRegistration("existing"));
+    expect(runtime.registrations.sessionIsUsable(child)).toBe(true);
+    runtime.close();
+  });
+
+  it("does not register an absent target from indeterminate evidence", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "temporarily-unreadable-parent.jsonl");
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "retry-child",
+      sessionFile: join(home, "retry-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    const cause = Object.assign(new Error("permission denied"), {
+      code: "EACCES",
+    });
+
+    await expect(
+      runtime.registrations.register(child, () => child, {
+        kind: "indeterminate",
+        claim: child.parentSession,
+        parentSessionFile: parentFile,
+        cause,
+      }),
+    ).rejects.toBe(cause);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+  });
+
+  it("atomically barriers every coordinate from an untrusted parent", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "missing-parent.jsonl");
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "untrusted-child",
+      sessionFile: join(home, "untrusted-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["root", "leaf"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation.kind).toBe("rejected");
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+
+    expect(
+      runtime.metadata.getCheckpointSlot("untrusted-child", "root"),
+    ).toEqual({ kind: "blocked-missing" });
+    expect(
+      runtime.metadata.getCheckpointSlot("untrusted-child", "leaf"),
+    ).toEqual({ kind: "blocked-missing" });
+    expect(
+      runtime.metadata.hasSessionBarrier({
+        sessionId: "untrusted-child",
+        sessionFile: current.sessionFile!,
+      }),
+    ).toBe(true);
+    runtime.close();
+  });
+
+  it("uses a cold child parent claim only as an authenticated-source locator", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "header-only-parent.jsonl");
+    await writeFile(
+      parentFile,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "header-only-parent",
+        cwd: workspace,
+      })}\n`,
+    );
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "header-only-child",
+      sessionFile: join(home, "header-only-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "independent",
+    });
+
+    expect(preparation).toMatchObject({
+      kind: "observed",
+      parentSessionFile: parentFile,
+      sourceSessionId: "header-only-parent",
+    });
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+    expect(
+      runtime.metadata.getCheckpointSlot(child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+  });
+
+  it("does not treat a fork start with no previous session as fresh", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "source-less-fork",
+      sessionFile: join(home, "source-less-fork.jsonl"),
+      retainedEntryIds: ["retained"],
+    });
+
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+    });
+
+    expect(preparation).toMatchObject({
+      kind: "rejected",
+      rejection: {
+        kind: "invalid-parent-claim",
+        cause: expect.any(Error),
+      },
+    });
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+    expect(
+      runtime.metadata.getCheckpointSlot(child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+  });
+
+  it("inherits only publicly proven parent coordinates and blocks child-only entries", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "projection-parent.jsonl");
+    await writeFile(
+      parentFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "parent",
+          cwd: workspace,
+        }),
+        JSON.stringify({
+          type: "custom",
+          id: "shared",
+          parentId: null,
+          timestamp: new Date(0).toISOString(),
+          customType: "test",
+        }),
+      ].join("\n") + "\n",
+    );
+    registerTestSession(runtime.metadata, "parent", parentFile, ["shared"]);
+    const treeOid = "a".repeat(64);
+    commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "projection-child",
+      sessionFile: join(home, "projection-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["shared", "child-only"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toEqual(activeRegistration("inherited"));
+
+    expect(
+      runtime.metadata.getCheckpointSlot("projection-child", "shared"),
+    ).toEqual({ kind: "open-checkpoint", treeOid });
+    expect(
+      runtime.metadata.getCheckpointSlot("projection-child", "child-only"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+  });
+
+  it("retries a local parent registration that is not yet verified", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "pending-parent.jsonl");
+    await writeFile(
+      parentFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "pending-parent",
+          cwd: workspace,
+        }),
+        JSON.stringify({
+          type: "custom",
+          id: "shared",
+          parentId: null,
+          timestamp: new Date(0).toISOString(),
+          customType: "test",
+        }),
+      ].join("\n") + "\n",
+    );
+    registerTestSession(runtime.metadata, "pending-parent", parentFile, [
+      "shared",
+    ]);
+    const treeOid = "e".repeat(64);
+    commitTestNodeState(runtime.metadata, "pending-parent", "shared", treeOid);
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "pending-child",
+      sessionFile: join(home, "pending-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["shared"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    const projection = vi
+      .spyOn(runtime.metadata, "exportForkProjection")
+      .mockReturnValueOnce(undefined);
+
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).rejects.toThrow(/not yet verified/u);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+
+    projection.mockRestore();
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toEqual(activeRegistration("inherited"));
+    expect(
+      runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
+    ).toEqual({ kind: "open-checkpoint", treeOid });
+    runtime.close();
+  });
+
+  it("quarantines a declared fork when its parent file is unavailable", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "unavailable-parent.jsonl");
+    registerTestSession(runtime.metadata, "unavailable-parent", parentFile, [
+      "shared",
+    ]);
+    const treeOid = "c".repeat(64);
+    commitTestNodeState(
+      runtime.metadata,
+      "unavailable-parent",
+      "shared",
+      treeOid,
+    );
+
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "unavailable-child",
+      sessionFile: join(home, "unavailable-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["shared"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation).toMatchObject({ kind: "rejected" });
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+    expect(
+      runtime.metadata.getCheckpointSlot("unavailable-child", "shared"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+  });
+
+  it("uses the cold public parent graph rather than newer local metadata", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const parentFile = join(home, "cold-parent.jsonl");
+    await writeFile(
+      parentFile,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "cold-parent",
+        cwd: workspace,
+      })}\n`,
+    );
+    registerTestSession(runtime.metadata, "cold-parent", parentFile, [
+      "shared",
+    ]);
+    const treeOid = "d".repeat(64);
+    commitTestNodeState(runtime.metadata, "cold-parent", "shared", treeOid);
+
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "cold-child",
+      sessionFile: join(home, "cold-child.jsonl"),
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["shared"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation).toMatchObject({
+      kind: "observed",
+      stableCoordinates: [],
+    });
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toEqual(activeRegistration("inherited"));
+    expect(
+      runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+  });
+
+  it.each(["semantic type", "stable parent"] as const)(
+    "does not inherit an id whose public %s changed",
+    async (change) => {
+      const { workspace, home, runtime } = await createRuntime();
+      const parentFile = join(home, `forged-${change}.jsonl`);
+      await writeFile(
+        parentFile,
+        [
+          JSON.stringify({
+            type: "session",
+            version: 3,
+            id: "parent",
+            cwd: workspace,
+          }),
+          JSON.stringify({
+            type: "custom",
+            id: "source-root",
+            parentId: null,
+            timestamp: new Date(0).toISOString(),
+            customType: "test",
+          }),
+          JSON.stringify({
+            type: "custom",
+            id: "shared",
+            parentId: "source-root",
+            timestamp: new Date(0).toISOString(),
+            customType: "test",
+          }),
+        ].join("\n") + "\n",
+      );
+      registerTestSession(runtime.metadata, "parent", parentFile, [
+        "source-root",
+        "shared",
+      ]);
+      const treeOid = "b".repeat(64);
+      commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+
+      const base = registrationView({
+        cwd: workspace,
+        sessionId: `forged-${change}`,
+        sessionFile: join(home, `forged-child-${change}.jsonl`),
+        parentSessionFile: parentFile,
+        retainedEntryIds:
+          change === "stable parent"
+            ? ["different-root", "shared"]
+            : ["source-root", "shared"],
+      });
+      const forgedCoordinates = base.stableCoordinates.map((coordinate) =>
+        coordinate.id === "shared" && change === "semantic type"
+          ? { ...coordinate, type: "session_info" }
+          : coordinate,
+      );
+      let child: SessionView;
+      child = {
+        ...base,
+        stableCoordinates: Object.freeze(forgedCoordinates),
+        isSameSnapshotAs: (other) => other === child,
+        isAppendOnlyExtensionOf: (previous) => previous === child,
+      };
+      const preparation = await runtime.registrations.prepare(child, {
+        kind: "fork",
+        previousSessionFile: parentFile,
+      });
+      await expect(
+        runtime.registrations.register(child, () => child, preparation),
+      ).resolves.toEqual(activeRegistration("inherited"));
+      expect(
+        runtime.metadata.getCheckpointSlot(child.sessionId, "shared"),
+      ).toEqual({ kind: "blocked-missing" });
+      runtime.close();
+    },
+  );
+
+  it("keeps a durable guard when an armed tree arrival rewrites its source graph", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const sessionFile = join(home, "guarded-arrival.jsonl");
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "guarded-arrival",
+      sessionFile,
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+
+    const treeOid = "a".repeat(64);
+    commitTestNodeState(
+      runtime.metadata,
+      current.sessionId,
+      "retained",
+      treeOid,
+      sessionFile,
+    );
+    const resolution = {
+      treeOid,
+      foundAt: { sessionId: current.sessionId, entryId: "retained" },
+    };
+    expect(
+      runtime.workspaceMutations.admitLocationIfResolution(current, resolution),
+    ).toBe(true);
+    expect(
+      protectTestLocation(
+        runtime.metadata,
+        { sessionId: current.sessionId, sessionFile },
+        "retained",
+      ).kind,
+    ).toBe("protected");
+
+    const arrival = runtime.admission.beginTreeArrival();
+    const rewritten: SessionView = {
+      ...current,
+      isAppendOnlyExtensionOf: () => false,
+    };
+    expect(
+      runtime.workspaceMutations.admitTreeArrivalIfResolution(
+        arrival,
+        rewritten,
+        resolution,
+      ),
+    ).toMatchObject({ kind: "unsettled", cause: expect.any(Error) });
+    expect(
+      checkpointIsBlocked(runtime.metadata, current.sessionId, "retained"),
+    ).toBe(true);
+    runtime.close();
+  });
+
+  it("fails a stale planned protection while pinning the inherited current checkpoint", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const sessionFile = join(home, "stale-inherited.jsonl");
+    const rootView = registrationView({
+      cwd: workspace,
+      sessionId: "stale-inherited",
+      sessionFile,
+      retainedEntryIds: ["root"],
+    });
+    const preparation = await runtime.registrations.prepare(rootView, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(rootView, () => rootView, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+
+    const before = "a".repeat(64);
+    const after = "b".repeat(64);
+    commitTestNodeState(
+      runtime.metadata,
+      rootView.sessionId,
+      "root",
+      before,
+      sessionFile,
+    );
+    const leafView = registrationView({
+      cwd: workspace,
+      sessionId: rootView.sessionId,
+      sessionFile,
+      retainedEntryIds: ["root", "leaf"],
+    });
+    const staleResolution = {
+      treeOid: before,
+      foundAt: { sessionId: rootView.sessionId, entryId: "root" },
+    };
+    expect(
+      runtime.workspaceMutations.admitLocationIfResolution(
+        leafView,
+        staleResolution,
+      ),
+    ).toBe(true);
+
+    const concurrent = createCurrentMetadataStore(
+      join(runtime.storeRoot, "state.db"),
+    );
+    expect(
+      concurrent.commitCapture({
+        identity: { sessionId: rootView.sessionId, sessionFile },
+        entryId: "root",
+        activeAncestryEntryIds: ["root"],
+        treeOid: after,
+        expectedSlot: { kind: "open-checkpoint", treeOid: before },
+      }),
+    ).toBe("committed");
+    concurrent.close();
+
+    expect(
+      runtime.workspaceMutations.protectNodeIfResolution(
+        leafView,
+        { sessionId: rootView.sessionId, entryId: "leaf" },
+        staleResolution,
+      ),
+    ).toMatchObject({
+      kind: "protected",
+      evidence: { kind: "exact-slot", expectation: "stale" },
+    });
+    expect(
+      runtime.metadata.getCheckpointSlot(rootView.sessionId, "leaf"),
+    ).toEqual({ kind: "blocked-checkpoint", treeOid: after });
+    runtime.close();
+  });
+
+  it("quarantines when an authenticated parent later changes identity", async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-parent-drift-"),
+    );
+    roots.push(parent);
+    const sourceWorkspace = join(parent, "source");
+    const targetWorkspace = join(parent, "target");
+    const home = join(parent, "home");
+    await Promise.all([
+      mkdir(sourceWorkspace),
+      mkdir(targetWorkspace),
+      mkdir(home),
+    ]);
+    const parentFile = join(home, "parent.jsonl");
+    const childFile = join(home, "child.jsonl");
+    await Promise.all([
+      writeFile(
+        parentFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "parent",
+          cwd: sourceWorkspace,
+        })}\n`,
+      ),
+      writeFile(
+        childFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "child",
+          cwd: targetWorkspace,
+        })}\n`,
+      ),
+    ]);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const child = registrationView({
+      cwd: targetWorkspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation.kind).toBe("observed");
+    expect(
+      await runtime.ensureRegistrationStore(targetWorkspace, preparation),
+    ).toBe(true);
+
+    await writeFile(
+      parentFile,
+      `${JSON.stringify({
+        type: "session",
+        id: "replacement",
+        cwd: sourceWorkspace,
+      })}\n`,
+    );
+
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { cause: expect.any(Error) },
+      },
+    });
+    expect(
+      readTestSessionRegistration(join(runtime.storeRoot, "state.db"), "child"),
+    ).toBeDefined();
+    runtime.close();
+  });
+
+  it("revalidates a local parent after the final target currentness check", async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "cyclotomy-runtime-local-final-parent-"),
+    );
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const home = join(parent, "home");
+    await Promise.all([mkdir(workspace), mkdir(home)]);
+    const parentFile = join(home, "parent.jsonl");
+    const childFile = join(home, "child.jsonl");
+    await Promise.all([
+      writeFile(
+        parentFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "parent",
+          cwd: workspace,
+        })}\n`,
+      ),
+      writeFile(
+        childFile,
+        `${JSON.stringify({
+          type: "session",
+          id: "child",
+          cwd: workspace,
+        })}\n`,
+      ),
+    ]);
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const child = registrationView({
+      cwd: workspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(await runtime.ensureRegistrationStore(workspace, preparation)).toBe(
+      true,
+    );
+    registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
+    commitTestNodeState(runtime.metadata, "parent", "retained", "a".repeat(64));
+
+    const originalExport = runtime.metadata.exportForkProjection.bind(
+      runtime.metadata,
+    );
+    let initialSourceProjectionRead = false;
+    vi.spyOn(runtime.metadata, "exportForkProjection").mockImplementation(
+      (input) => {
+        const projection = originalExport(input);
+        if (input.retainedEntryIds.length === 0) {
+          initialSourceProjectionRead = true;
+        }
+        return projection;
+      },
+    );
+    let targetChecksAfterSourceRead = 0;
+    let sourceMutationScheduled = false;
+    const readCurrentView = () => {
+      if (initialSourceProjectionRead) {
+        targetChecksAfterSourceRead += 1;
+        if (targetChecksAfterSourceRead === 2) {
+          sourceMutationScheduled = true;
+          // Run after assertStillCurrent's final synchronous observation but
+          // before its awaiting caller begins source authentication.
+          queueMicrotask(() => {
+            writeFileSync(
+              parentFile,
+              `${JSON.stringify({
+                type: "session",
+                id: "replacement",
+                cwd: workspace,
+              })}\n`,
+            );
+          });
+        }
+      }
+      return child;
+    };
+
+    await expect(
+      runtime.registrations.register(child, readCurrentView, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { cause: expect.any(Error) },
+      },
+    });
+    expect(sourceMutationScheduled).toBe(true);
+    expect(
+      readTestSessionRegistration(join(runtime.storeRoot, "state.db"), "child"),
+    ).toBeDefined();
+    expect(
+      checkpointState(runtime.metadata, "child", "retained"),
+    ).toBeUndefined();
+    runtime.close();
+  });
+
+  it("aborts a preflight source access failure and inherits on retry", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-publication-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const sourceTreePath = objectPath(
+      fixture.sourceStoreRoot,
+      "trees",
+      fixture.treeOid,
+    );
+    const heldTreePath = `${sourceTreePath}.held`;
+    await rename(sourceTreePath, heldTreePath);
+    await mkdir(sourceTreePath);
+
+    try {
+      await expect(
+        runtime.registrations.register(
+          fixture.child,
+          () => fixture.child,
+          preparation,
+        ),
+      ).rejects.toBeInstanceOf(TreeImportSourceError);
+      expect(
+        readSessionProjectionResidue(
+          join(runtime.storeRoot, "state.db"),
+          fixture.child.sessionId,
+        ),
+      ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    } finally {
+      runtime.close();
+      await rm(sourceTreePath, { recursive: true, force: true });
+      await rename(heldTreePath, sourceTreePath);
+    }
+
+    await expectExternalForkInheritance(fixture);
+  });
+
+  it("does not quarantine an operational Pi parent parse failure", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-parent-parse-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    await writeFile(fixture.parentFile, "{\n");
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toBeInstanceOf(Error);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+  });
+
+  it("does not quarantine an operational target policy evaluation failure", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-import-policy-operation-",
+      undefined,
+      gitScope(),
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const previousPath = process.env.PATH;
+    process.env.PATH = join(fixture.targetWorkspace, "missing-bin");
+    try {
+      await expect(
+        runtime.registrations.register(
+          fixture.child,
+          () => fixture.child,
+          preparation,
+        ),
+      ).rejects.toBeInstanceOf(Error);
+      expect(
+        readSessionProjectionResidue(
+          join(runtime.storeRoot, "state.db"),
+          fixture.child.sessionId,
+        ),
+      ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      runtime.close();
+    }
+
+    await expectExternalForkInheritance(fixture);
+  });
+
+  it("aborts an ordered source-lock timeout and inherits on retry", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-lock-",
+      25,
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const sourceLock = await acquireWorkspaceLock(
+      fixture.sourceStoreRoot,
+      "test-hold-fork-source",
+      fixture.config.lock,
+    );
+    try {
+      await expect(
+        runtime.registrations.register(
+          fixture.child,
+          () => fixture.child,
+          preparation,
+        ),
+      ).rejects.toMatchObject({
+        name: OrderedWorkspaceLockAcquisitionError.name,
+        storeRoot: fixture.sourceStoreRoot,
+      });
+      expect(
+        readSessionProjectionResidue(
+          join(runtime.storeRoot, "state.db"),
+          fixture.child.sessionId,
+        ),
+      ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    } finally {
+      await sourceLock.release();
+    }
+    runtime.close();
+
+    await expectExternalForkInheritance(fixture);
+  });
+
+  it("quarantines ancestry when source metadata sidecars require recovery", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-metadata-sidecar-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const metadataPath = join(fixture.sourceStoreRoot, "state.db");
+    const walPath = `${metadataPath}-wal`;
+    const shmPath = `${metadataPath}-shm`;
+    await rm(shmPath, { force: true });
+    await writeFile(walPath, "unrecovered WAL sentinel");
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { kind: "source-metadata-recovery-required" },
+      },
+    });
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 1, registrations: 1, slots: 1 });
+    expect(
+      runtime.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    await rm(walPath, { force: true });
+    runtime.close();
+
+    const reopened = new CyclotomyRuntime(
+      fixture.config,
+      new CyclotomyI18n("en"),
+    );
+    const retried = await reopened.registrations.prepare(fixture.child, {
+      kind: "fork",
+      previousSessionFile: fixture.parentFile,
+    });
+    expect(
+      await reopened.ensureRegistrationStore(fixture.targetWorkspace, retried),
+    ).toBe(true);
+    await expect(
+      reopened.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        retried,
+      ),
+    ).resolves.toEqual(activeRegistration("existing"));
+    expect(
+      reopened.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    reopened.close();
+  });
+
+  it("accepts a semantic-prefix append while external inheritance waits", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-parent-append-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    await appendFile(
+      fixture.parentFile,
+      `${JSON.stringify({
+        type: "custom",
+        id: "appended-after-fork",
+        parentId: "retained",
+        timestamp: new Date(1).toISOString(),
+        customType: "test",
+      })}\n`,
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toEqual(activeRegistration("inherited"));
+    expect(
+      runtime.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+    ).toEqual({ kind: "open-checkpoint", treeOid: fixture.treeOid });
+    runtime.close();
+  });
+
+  it("quarantines an external fork that reuses its source session id", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-id-conflict-",
+    );
+    await writeFile(
+      fixture.child.sessionFile!,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "parent",
+        cwd: fixture.targetWorkspace,
+      })}\n`,
+    );
+    const child = registrationView({
+      cwd: fixture.targetWorkspace,
+      sessionId: "parent",
+      sessionFile: fixture.child.sessionFile!,
+      parentSessionFile: fixture.parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    const runtime = new CyclotomyRuntime(
+      fixture.config,
+      new CyclotomyI18n("en"),
+    );
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: fixture.parentFile,
+    });
+    expect(
+      await runtime.ensureRegistrationStore(
+        fixture.targetWorkspace,
+        preparation,
+      ),
+    ).toBe(true);
+
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { kind: "source-registration-conflict" },
+      },
+    });
+    runtime.close();
+  });
+
+  it("activates a committed import after only the source lock cleanup fails", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-release-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const originalFinalize = runtime.metadata.finalizeSessionProjection.bind(
+      runtime.metadata,
+    );
+    vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
+      (input) => {
+        const report = originalFinalize(input);
+        makeCurrentWorkspaceLockReleaseFail(fixture.sourceStoreRoot);
+        return report;
+      },
+    );
+
+    const registration = await runtime.registrations.register(
+      fixture.child,
+      () => fixture.child,
+      preparation,
+    );
+    expect(registration).toMatchObject({
+      kind: "active",
+      disposition: { kind: "inherited" },
+      advisory: {
+        kind: "source-lock-cleanup-failed",
+        cause: expect.any(Error),
+      },
+    });
+    expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(true);
+    runtime.close();
+  });
+
+  it("reports a committed import inactive after target lock cleanup fails", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-target-release-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const targetStoreRoot = runtime.storeRoot;
+    const originalFinalize = runtime.metadata.finalizeSessionProjection.bind(
+      runtime.metadata,
+    );
+    vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
+      (input) => {
+        const report = originalFinalize(input);
+        makeCurrentWorkspaceLockReleaseFail(targetStoreRoot);
+        return report;
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "durable-but-inactive",
+      disposition: { kind: "inherited" },
+      cause: expect.any(Error),
+    });
+    expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(false);
+    expect(
+      readTestSessionRegistration(
+        join(targetStoreRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toBeDefined();
+    runtime.close();
+  });
+
+  it("does not commit or activate through a same-path target store replacement", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows does not rename a directory containing an open SQLite database",
+    );
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-target-store-replaced-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const targetStoreRoot = runtime.storeRoot;
+    const displaced = `${targetStoreRoot}.displaced`;
+    const importTrees = runtime.store.importTreesFrom.bind(runtime.store);
+    vi.spyOn(runtime.store, "importTreesFrom").mockImplementation(
+      async (...args) => {
+        await importTrees(...args);
+        await rename(targetStoreRoot, displaced);
+        await mkdir(targetStoreRoot);
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toThrow(/target store changed/u);
+    expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(false);
+    runtime.close();
+    expect(
+      readSessionProjectionResidue(
+        join(displaced, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+  });
+
+  it("does not quarantine a same-path source store replacement", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows does not rename a directory containing an open SQLite database",
+    );
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-store-replaced-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const displaced = `${fixture.sourceStoreRoot}.displaced`;
+    const importTrees = runtime.store.importTreesFrom.bind(runtime.store);
+    vi.spyOn(runtime.store, "importTreesFrom").mockImplementation(
+      async (...args) => {
+        await importTrees(...args);
+        await rename(fixture.sourceStoreRoot, displaced);
+        await mkdir(fixture.sourceStoreRoot);
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toThrow(/source store changed/u);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+
+    await rm(fixture.sourceStoreRoot, { recursive: true });
+    await rm(join(displaced, "workspace.lock"), {
+      recursive: true,
+      force: true,
+    });
+    await rename(displaced, fixture.sourceStoreRoot);
+    await expectExternalForkInheritance(fixture);
+  });
+
+  it("rejects a source alias to the target before ordered self-locking", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows symlink creation is privilege-dependent",
+    );
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-store-alias-",
+      25,
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    await rm(fixture.sourceStoreRoot, { recursive: true });
+    await symlink(runtime.storeRoot, fixture.sourceStoreRoot, "dir");
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { kind: "unsafe-source-topology" },
+      },
+    });
+    runtime.close();
+  });
+
+  it("durably quarantines ancestry rejected by target admission", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-import-admission-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const admissionFailure = new TreeImportAdmissionError(
+      new Error("target policy rejected ancestry"),
+    );
+    vi.spyOn(runtime.store, "importTreesFrom").mockRejectedValueOnce(
+      admissionFailure,
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: { kind: "target-import-rejected" },
+      },
+    });
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 1, registrations: 1, slots: 1 });
+    expect(
+      runtime.metadata.getCheckpointSlot(fixture.child.sessionId, "retained"),
+    ).toEqual({ kind: "blocked-missing" });
+    runtime.close();
+
+    const reloaded = await openExternalForkTarget(fixture);
+    await expect(
+      reloaded.runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        reloaded.preparation,
+      ),
+    ).resolves.toEqual(activeRegistration("existing"));
+    expect(
+      reloaded.runtime.metadata.getCheckpointSlot(
+        fixture.child.sessionId,
+        "retained",
+      ),
+    ).toEqual({ kind: "blocked-missing" });
+    reloaded.runtime.close();
+  });
+
+  it("does not trust a local parent registry after its missing file appears with another identity", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-appeared-"));
+    roots.push(parent);
+    const targetWorkspace = join(parent, "target");
+    const externalWorkspace = join(parent, "external");
+    const home = join(parent, "home");
+    await Promise.all([
+      mkdir(targetWorkspace),
+      mkdir(externalWorkspace),
+      mkdir(home),
+    ]);
+    const parentFile = join(home, "parent.jsonl");
+    const childFile = join(home, "child.jsonl");
+    await writeFile(
+      childFile,
+      `${JSON.stringify({
+        type: "session",
+        id: "child",
+        cwd: targetWorkspace,
+      })}\n`,
+    );
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    const child = registrationView({
+      cwd: targetWorkspace,
+      sessionId: "child",
+      sessionFile: childFile,
+      parentSessionFile: parentFile,
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(child, {
+      kind: "fork",
+      previousSessionFile: parentFile,
+    });
+    expect(preparation.kind).toBe("rejected");
+    expect(
+      await runtime.ensureRegistrationStore(targetWorkspace, preparation),
+    ).toBe(true);
+    registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
+    commitTestNodeState(runtime.metadata, "parent", "retained", "a".repeat(64));
+
+    await writeFile(
+      parentFile,
+      `${JSON.stringify({
+        type: "session",
+        id: "different",
+        cwd: externalWorkspace,
+      })}\n`,
+    );
+    await expect(
+      runtime.registrations.register(child, () => child, preparation),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: { kind: "quarantined" },
+    });
+    expect(
+      readTestSessionRegistration(join(runtime.storeRoot, "state.db"), "child"),
+    ).toBeDefined();
+    expect(
+      checkpointState(runtime.metadata, "child", "retained"),
+    ).toBeUndefined();
     runtime.close();
   });
 
@@ -453,6 +2557,18 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
+  it("does not disguise a corrupted automatic-GC schedule as never run", async () => {
+    const { runtime } = await createRuntime();
+    const statePath = join(runtime.storeRoot, "gc-state.json");
+    await writeFile(statePath, "{not-json\n");
+
+    await expect(runtime.maybeRunAutomaticGc()).rejects.toThrow(
+      "automatic GC schedule is unreadable",
+    );
+    expect(await readFile(statePath, "utf8")).toBe("{not-json\n");
+    runtime.close();
+  });
+
   it("does not follow the former predictable GC-state temporary symlink", async (context) => {
     context.skip(
       process.platform === "win32",
@@ -492,13 +2608,62 @@ describe("Cyclotomy runtime", () => {
     commitTestNodeState(runtime.metadata, "s", "e", "a".repeat(64));
     expect(await runtime.ensureStore(second)).toBe(false);
     expect(runtime.storeRoot).toBe(firstRoot);
-    expect(runtime.metadata.getState("s", "e")?.treeOid).toBe("a".repeat(64));
+    expect(checkpointState(runtime.metadata, "s", "e")?.treeOid).toBe(
+      "a".repeat(64),
+    );
 
     runtime.close();
-    expect(await runtime.ensureStore(second)).toBe(true);
-    expect(runtime.storeRoot).not.toBe(firstRoot);
-    expect(runtime.metadata.getState("s", "e")).toBeUndefined();
-    runtime.close();
+    expect(await runtime.ensureStore(second)).toBe(false);
+    const replacement = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    expect(await replacement.ensureStore(second)).toBe(true);
+    expect(replacement.storeRoot).not.toBe(firstRoot);
+    expect(checkpointState(replacement.metadata, "s", "e")).toBeUndefined();
+    replacement.close();
+  });
+
+  it("does not revive a queued cold initialization after terminal close", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-close-"));
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const home = join(parent, "home");
+    await Promise.all([mkdir(workspace), mkdir(home)]);
+
+    let enterQueue!: () => void;
+    const queued = new Promise<void>((resolveQueued) => {
+      enterQueue = resolveQueued;
+    });
+    let releaseQueue!: () => void;
+    const queueGate = new Promise<void>((resolveQueue) => {
+      releaseQueue = resolveQueue;
+    });
+    const registrations = new SessionRegistrationService({
+      globalConfig: loadCyclotomyConfig(home),
+      runExclusively: async (action) => {
+        enterQueue();
+        await queueGate;
+        return action();
+      },
+    });
+
+    const opening = registrations.ensureStore(workspace, {
+      kind: "independent",
+      claim: { kind: "absent" },
+    });
+    await queued;
+    registrations.close();
+    releaseQueue();
+
+    await expect(opening).resolves.toMatchObject({ kind: "failed" });
+    expect(registrations.isReady).toBe(false);
+    await expect(
+      registrations.ensureStore(workspace, {
+        kind: "independent",
+        claim: { kind: "absent" },
+      }),
+    ).resolves.toMatchObject({ kind: "failed" });
   });
 
   it("rejects a cwd symlink retargeted after store selection", async (context) => {
@@ -526,14 +2691,14 @@ describe("Cyclotomy runtime", () => {
     await expect(runtime.scanCurrentWorkspace(link)).rejects.toThrow(
       "workspace root changed",
     );
-    const prepared = await runtime.prepareCaptureResult(
+    const prepared = await runtime.checkpoints.prepareCurrent(
       view(link, "leaf", { leaf: null }),
     );
     expect(prepared).toMatchObject({
       ok: false,
-      error: { kind: "scan-failed" },
+      error: { kind: "workspace-changed", reason: "root" },
     });
-    expect(runtime.metadata.getState("s", "leaf")).toBeUndefined();
+    expect(checkpointState(runtime.metadata, "s", "leaf")).toBeUndefined();
     runtime.close();
   });
 
@@ -592,7 +2757,7 @@ describe("Cyclotomy runtime", () => {
       }),
     ).rejects.toThrow();
     expect(
-      runtime.resolutionStillAuthoritative(
+      runtime.workspaceMutations.resolutionStillAuthoritative(
         currentView,
         { sessionId: "s", entryId: "leaf" },
         {
@@ -601,7 +2766,9 @@ describe("Cyclotomy runtime", () => {
         },
       ),
     ).toBe(true);
-    expect(runtime.metadata.getState("s", "parent")?.treeOid).toBe(parentTree);
+    expect(checkpointState(runtime.metadata, "s", "parent")?.treeOid).toBe(
+      parentTree,
+    );
     runtime.close();
   });
 });

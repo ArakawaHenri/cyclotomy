@@ -1,12 +1,9 @@
-import type {
-  MetadataStore,
-  MissingNodeStateIntent,
-} from "../infrastructure/metadata.ts";
+import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
+import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 import { publishSnapshot } from "../infrastructure/snapshot-publication.ts";
 import {
   scanWorkspace,
-  summarizeScanProblems,
   workspaceSnapshotsEqual,
   type ScanProblem,
   type ScanOptions,
@@ -22,30 +19,44 @@ import {
 
 export interface CaptureDeps {
   readonly store: ObjectStore;
-  readonly metadata: MetadataStore;
   readonly scanOptions?: ScanOptions;
   /** Canonical workspace identity selected before this operation. */
-  readonly expectedRootPath?: string;
+  readonly expectedRootPath: string;
 }
 
-export type CaptureErrorKind =
-  | "scan-failed"
-  | "scan-incomplete"
-  | "publish-failed"
-  | "metadata-failed"
-  | "state-changed"
-  | "write-protected"
-  | "workspace-changed";
+/** Authority required only at the synchronous metadata commit boundary. */
+export interface CaptureCommitDeps extends CaptureDeps {
+  readonly metadata: Pick<
+    CurrentMetadataStore,
+    "adoptBlockedMissing" | "commitCapture"
+  >;
+  /** Persisted file that must own the verified session coordinate. */
+  readonly expectedSessionFile: string;
+  /** Final synchronous process-local workspace identity gate. */
+  readonly assertWorkspaceAuthority: () => undefined;
+}
 
-export type CaptureError =
+export type CaptureFailure =
   | {
       readonly kind: "scan-incomplete";
-      readonly message: string;
+      readonly phase: "capture" | "validation";
       readonly problems: readonly ScanProblem[];
     }
   | {
-      readonly kind: Exclude<CaptureErrorKind, "scan-incomplete">;
-      readonly message: string;
+      readonly kind: "scan-failed";
+      readonly phase: "capture" | "validation";
+      readonly cause: unknown;
+    }
+  | { readonly kind: "publish-failed"; readonly cause: unknown }
+  | { readonly kind: "metadata-failed"; readonly cause: unknown }
+  | {
+      readonly kind: "state-changed";
+      readonly reason: "checkpoint" | "eligibility";
+    }
+  | { readonly kind: "write-protected" }
+  | {
+      readonly kind: "workspace-changed";
+      readonly reason: "root" | "contents";
     };
 
 export interface CaptureSuccess {
@@ -54,16 +65,24 @@ export interface CaptureSuccess {
   readonly snapshot: WorkspaceSnapshot;
 }
 
+/**
+ * The trusted structural coordinate at the final metadata cutover. Metadata
+ * receives the complete root-to-current ancestry so a durable session barrier
+ * can be reconciled in the same transaction as the capture.
+ */
+export interface CaptureCommitAuthority {
+  readonly activeAncestryEntryIds: readonly string[];
+  readonly expectedSlot: CheckpointSlot;
+}
+
+export type MissingNodeStateIntent = "initialize-fresh" | "adopt-protected";
+
 function effectiveScanOptions(deps: CaptureDeps): ScanOptions {
   return {
     ...deps.scanOptions,
     gitIgnoreScratchParent:
       deps.scanOptions?.gitIgnoreScratchParent ?? deps.store.storageRoot,
   };
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -74,22 +93,17 @@ function messageOf(error: unknown): string {
 export async function prepareObservedNodeState(
   deps: CaptureDeps,
   snapshot: WorkspaceSnapshot,
-): Promise<Result<CaptureSuccess, CaptureError>> {
-  if (
-    deps.expectedRootPath !== undefined &&
-    snapshot.rootPath !== deps.expectedRootPath
-  ) {
+): Promise<Result<CaptureSuccess, CaptureFailure>> {
+  if (snapshot.rootPath !== deps.expectedRootPath) {
     return failure({
-      kind: "scan-failed",
-      message: "workspace root changed after the checkpoint store was selected",
+      kind: "workspace-changed",
+      reason: "root",
     });
   }
   if (snapshot.problems.length > 0) {
     return failure({
       kind: "scan-incomplete",
-      message: `workspace scan is incomplete; checkpoint was not published: ${summarizeScanProblems(
-        snapshot.problems,
-      )}`,
+      phase: "capture",
       problems: snapshot.problems,
     });
   }
@@ -100,7 +114,7 @@ export async function prepareObservedNodeState(
   } catch (error) {
     return failure({
       kind: "publish-failed",
-      message: messageOf(error),
+      cause: error,
     });
   }
 
@@ -116,23 +130,21 @@ export async function prepareObservedNodeState(
   } catch (error) {
     return failure({
       kind: "scan-failed",
-      message: `final workspace validation failed: ${messageOf(error)}`,
+      phase: "validation",
+      cause: error,
     });
   }
   if (validated.problems.length > 0) {
     return failure({
       kind: "scan-incomplete",
-      message: `final workspace validation is incomplete; checkpoint was not committed: ${summarizeScanProblems(
-        validated.problems,
-      )}`,
+      phase: "validation",
       problems: validated.problems,
     });
   }
   if (!workspaceSnapshotsEqual(snapshot, validated)) {
     return failure({
       kind: "workspace-changed",
-      message:
-        "workspace changed between capture scan and final validation; checkpoint was not committed",
+      reason: "contents",
     });
   }
 
@@ -145,34 +157,40 @@ export async function prepareObservedNodeState(
  * cannot be overwritten.
  */
 export function commitPreparedNodeState(
-  deps: CaptureDeps,
+  deps: CaptureCommitDeps,
   node: NodeKey,
   prepared: CaptureSuccess,
-  expected?: { readonly treeOid: TreeOid | undefined },
-): Result<CaptureSuccess, CaptureError> {
+  authority: CaptureCommitAuthority,
+): Result<CaptureSuccess, CaptureFailure> {
   try {
-    const committed = deps.metadata.commitNodeState(
-      node.sessionId,
-      node.entryId,
-      prepared.treeOid,
-      expected,
-    );
-    if (committed === "state-changed") {
+    if (deps.assertWorkspaceAuthority() !== undefined) {
+      throw new Error("workspace authority check must complete synchronously");
+    }
+    const committed = deps.metadata.commitCapture({
+      identity: {
+        sessionId: node.sessionId,
+        sessionFile: deps.expectedSessionFile,
+      },
+      entryId: node.entryId,
+      activeAncestryEntryIds: authority.activeAncestryEntryIds,
+      treeOid: prepared.treeOid,
+      expectedSlot: authority.expectedSlot,
+    });
+    if (committed === "slot-changed") {
       return failure({
         kind: "state-changed",
-        message: "node checkpoint changed after capture preparation",
+        reason: "checkpoint",
       });
     }
-    if (committed === "write-protected") {
+    if (committed === "blocked") {
       return failure({
         kind: "write-protected",
-        message: "node checkpoint is write-protected until it is restored",
       });
     }
   } catch (error) {
     return failure({
       kind: "metadata-failed",
-      message: messageOf(error),
+      cause: error,
     });
   }
   return success(prepared);
@@ -180,77 +198,63 @@ export function commitPreparedNodeState(
 
 /** Atomically materialize a node that has no effective historical checkpoint. */
 export function commitPreparedMissingNodeState(
-  deps: CaptureDeps,
+  deps: CaptureCommitDeps,
   node: NodeKey,
   prepared: CaptureSuccess,
   intent: MissingNodeStateIntent,
-): Result<CaptureSuccess, CaptureError> {
+  authority: Pick<CaptureCommitAuthority, "activeAncestryEntryIds">,
+): Result<CaptureSuccess, CaptureFailure> {
   try {
+    if (deps.assertWorkspaceAuthority() !== undefined) {
+      throw new Error("workspace authority check must complete synchronously");
+    }
+    const identity = {
+      sessionId: node.sessionId,
+      sessionFile: deps.expectedSessionFile,
+    };
+    const committed =
+      intent === "adopt-protected"
+        ? deps.metadata.adoptBlockedMissing({
+            identity,
+            entryId: node.entryId,
+            treeOid: prepared.treeOid,
+          })
+        : deps.metadata.commitCapture({
+            identity,
+            entryId: node.entryId,
+            activeAncestryEntryIds: authority.activeAncestryEntryIds,
+            treeOid: prepared.treeOid,
+            expectedSlot: { kind: "open-missing" },
+          });
     if (
-      deps.metadata.materializeMissingNodeState(
-        node.sessionId,
-        node.entryId,
-        prepared.treeOid,
-        intent,
-      ) === "state-changed"
+      committed === "slot-changed" ||
+      (intent === "initialize-fresh" && committed === "blocked")
     ) {
       return failure({
         kind: "state-changed",
-        message:
-          "node checkpoint eligibility changed after capture preparation",
+        reason: "eligibility",
       });
     }
   } catch (error) {
-    return failure({ kind: "metadata-failed", message: messageOf(error) });
+    return failure({ kind: "metadata-failed", cause: error });
   }
   return success(prepared);
-}
-
-/**
- * Publish and record a current-policy observation already made under the
- * lock. A target-scope restore observation is deliberately rejected by final
- * validation rather than silently becoming a capture policy.
- */
-export async function recordObservedNodeState(
-  deps: CaptureDeps,
-  node: NodeKey,
-  snapshot: WorkspaceSnapshot,
-): Promise<Result<CaptureSuccess, CaptureError>> {
-  const prepared = await prepareObservedNodeState(deps, snapshot);
-  return prepared.ok
-    ? commitPreparedNodeState(deps, node, prepared.value)
-    : prepared;
 }
 
 /** Scan and publish a candidate without changing node metadata. */
 export async function prepareNodeState(
   deps: CaptureDeps,
   root: string,
-): Promise<Result<CaptureSuccess, CaptureError>> {
+): Promise<Result<CaptureSuccess, CaptureFailure>> {
   let snapshot;
   try {
     snapshot = await scanWorkspace(root, effectiveScanOptions(deps));
   } catch (error) {
     return failure({
       kind: "scan-failed",
-      message: messageOf(error),
+      phase: "capture",
+      cause: error,
     });
   }
   return prepareObservedNodeState(deps, snapshot);
-}
-
-/**
- * Scan the workspace, publish the snapshot, and record it as the reality
- * observed at `node`. Capture is the only operation that writes node states;
- * restore deliberately leaves the target pointer untouched.
- */
-export async function captureNodeState(
-  deps: CaptureDeps,
-  root: string,
-  node: NodeKey,
-): Promise<Result<CaptureSuccess, CaptureError>> {
-  const prepared = await prepareNodeState(deps, root);
-  return prepared.ok
-    ? commitPreparedNodeState(deps, node, prepared.value)
-    : prepared;
 }

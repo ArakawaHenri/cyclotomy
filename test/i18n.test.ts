@@ -41,6 +41,33 @@ describe("Cyclotomy Pi localization", () => {
     );
   });
 
+  it("explains that skipped ancestry does not disable the child", () => {
+    const en = new CyclotomyI18n("en").t("forkInheritanceSkipped", {
+      message: "source unavailable",
+    });
+    const zh = new CyclotomyI18n("zh-CN").t("forkInheritanceSkipped", {
+      message: "来源不可用",
+    });
+
+    expect(en).toContain("No parent state was imported");
+    expect(en).toContain("retained locations are blocked");
+    expect(zh).toContain("没有导入父会话状态");
+    expect(zh).toContain("阻止保留落点");
+  });
+
+  it("makes a transient fork import failure retryable", () => {
+    const en = new CyclotomyI18n("en").t("forkImportFailed", {
+      message: "source busy",
+    });
+    const zh = new CyclotomyI18n("zh-CN").t("forkImportFailed", {
+      message: "来源忙碌",
+    });
+
+    for (const message of [en, zh]) expect(message).toContain("/reload");
+    expect(en).toContain("retry");
+    expect(zh).toContain("重试");
+  });
+
   it("states post-application uncertainty without leaving placeholders", () => {
     const en = new CyclotomyI18n("en");
     const zh = new CyclotomyI18n("zh-CN");
@@ -81,15 +108,50 @@ describe("Cyclotomy Pi localization", () => {
     for (const message of zh) expect(message).toContain("交互式 TUI");
   });
 
-  it("directs a pending node guard to reload before continuing", () => {
-    const en = new CyclotomyI18n("en").t("sessionPendingNodeGuard");
-    const zh = new CyclotomyI18n("zh-CN").t("sessionPendingNodeGuard");
+  it("explains the durable session capture barrier without treating reload as authority", () => {
+    const en = new CyclotomyI18n("en").t("sessionCaptureBarrier");
+    const zh = new CyclotomyI18n("zh-CN").t("sessionCaptureBarrier");
 
-    for (const message of [en, zh]) {
-      expect(message).toContain("/reload");
-    }
+    expect(en).toContain("session capture barrier");
+    expect(en).toContain("/reload does not grant ownership or clear");
+    expect(en).toContain("next complete concrete ancestry");
     expect(en).toContain("unassigned");
+    expect(zh).toContain("会话捕获屏障");
+    expect(zh).toContain("/reload 不会授予归属或清除");
+    expect(zh).toContain("下一条可认证的完整、具体祖先链");
     expect(zh).toContain("未归属");
+  });
+
+  it("presents every barrier conflict as an atomic projection, not a reload remedy", () => {
+    const english = new CyclotomyI18n("en");
+    const chinese = new CyclotomyI18n("zh-CN");
+    const en = [
+      english.t("restorePostMutationLocationBarrier"),
+      english.t("restorePostMutationTargetBarrier"),
+      english.t("restorePostMutationControlBarrier", { message: "failure" }),
+      english.t("checkpointInitializedConflictBarrier", {
+        message: "conflict",
+      }),
+    ];
+    const zh = [
+      chinese.t("restorePostMutationLocationBarrier"),
+      chinese.t("restorePostMutationTargetBarrier"),
+      chinese.t("restorePostMutationControlBarrier", { message: "失败" }),
+      chinese.t("checkpointInitializedConflictBarrier", { message: "冲突" }),
+    ];
+
+    for (const message of en) {
+      expect(message).toContain("session capture barrier");
+      expect(message).toContain("Reloading does not clear it");
+      expect(message).toContain("next complete concrete ancestry");
+      expect(message).not.toContain("pending checkpoint guard");
+    }
+    for (const message of zh) {
+      expect(message).toContain("会话捕获屏障");
+      expect(message).toContain("重新载入扩展不会清除");
+      expect(message).toContain("下一条可认证的完整、具体祖先链");
+      expect(message).not.toContain("待落实的检查点保护");
+    }
   });
 
   it("makes reload protection actionable without claiming a restore", () => {
@@ -108,10 +170,39 @@ describe("Cyclotomy Pi localization", () => {
     const en = new CyclotomyI18n("en").t("choiceNavigationIntro");
     const zh = new CyclotomyI18n("zh-CN").t("choiceNavigationIntro");
 
-    expect(en).toContain("apply the destination changes");
+    expect(en).toContain("current workspace");
+    expect(en).toContain("protects the destination checkpoint");
+    expect(en).toContain("destination changes");
     expect(en).not.toContain("save this node");
-    expect(zh).toContain("目标状态应用到工作区");
+    expect(zh).toContain("保留当前工作区");
+    expect(zh).toContain("保护目标保存状态");
+    expect(zh).toContain("目标状态");
     expect(zh).not.toContain("保存当前节点");
+  });
+
+  it("explains how to reconcile a Detached arrival", () => {
+    const en = new CyclotomyI18n("en").t("navigationDetached");
+    const zh = new CyclotomyI18n("zh-CN").t("navigationDetached");
+
+    for (const message of [en, zh]) {
+      expect(message).toContain("/drift");
+      expect(message).toContain("/restore");
+    }
+    expect(en).toContain("Detached");
+    expect(en).toContain("remains protected");
+    expect(zh).toContain("Detached");
+    expect(zh).toContain("仍受保护");
+  });
+
+  it("marks both clean and changed protected workspaces as Detached", () => {
+    for (const locale of ["en", "zh-CN"] as const) {
+      const i18n = new CyclotomyI18n(locale);
+      expect(i18n.t("driftCleanProtected")).toContain("Detached");
+      expect(i18n.t("driftCleanProtected")).toContain("/restore");
+      expect(i18n.t("driftTitleDetached", { preview: "preview" })).toContain(
+        "Detached",
+      );
+    }
   });
 
   it("directs a cancelled pre-departure navigation back to tree review", () => {

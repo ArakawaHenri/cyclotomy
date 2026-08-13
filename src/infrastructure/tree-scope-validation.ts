@@ -2,7 +2,8 @@ import {
   createSyntheticGitIgnoreOracle,
   type SyntheticGitIgnoreScratchOptions,
 } from "./git-ignore-oracle.ts";
-import { TreeManifestError, type TreeManifest } from "./tree-manifest.ts";
+import { TreeManifestError } from "./tree-formats/manifest-codec.ts";
+import type { CurrentTreeManifest } from "./tree-formats/current.ts";
 import {
   ABSOLUTE_WORKSPACE_PATH_LIMITS,
   workspaceLocalGitignorePath,
@@ -11,13 +12,21 @@ import {
 
 const VALIDATION_BATCH_SIZE = 2_048;
 
+/** A deterministic mismatch between a tree and its archived ownership policy. */
+export class TreeScopeMismatchError extends TreeManifestError {
+  constructor(message: string) {
+    super("object-integrity", message);
+    this.name = "TreeScopeMismatchError";
+  }
+}
+
 /**
  * Authenticate the mutation boundary between a durable manifest and its
  * archived Git policy. Structural parsing proves that paths are safe; this
  * check additionally proves that every path is owned by the target policy.
  */
 export async function validateTreeEntriesAgainstScope(
-  manifest: TreeManifest,
+  manifest: CurrentTreeManifest,
   scratchOptions: SyntheticGitIgnoreScratchOptions = {},
 ): Promise<void> {
   const scope = manifest.scope;
@@ -93,14 +102,12 @@ export async function validateTreeEntriesAgainstScope(
         const item = batch[index]!;
         const isManaged = managed[index]!;
         if (item.isEntry && !isManaged) {
-          throw new TreeManifestError(
-            "object-integrity",
+          throw new TreeScopeMismatchError(
             `tree entry is excluded by its archived workspace scope: ${item.path}`,
           );
         }
         if (item.isLocalIgnoreSource && isManaged && !item.isEntry) {
-          throw new TreeManifestError(
-            "object-integrity",
+          throw new TreeScopeMismatchError(
             `tree omits a managed archived .gitignore source: ${item.path}`,
           );
         }

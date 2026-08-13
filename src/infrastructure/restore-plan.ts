@@ -1,9 +1,12 @@
 import {
-  TREE_MANIFEST_FORMAT,
   type TreeEntry,
   type TreeManifest,
-} from "./tree-manifest.ts";
-import { workspaceScopesEqual } from "./workspace-scope.ts";
+} from "./tree-formats/manifest-codec.ts";
+import { CURRENT_TREE_MANIFEST_FORMAT } from "./tree-formats/current.ts";
+import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
+  workspaceScopesEqual,
+} from "./workspace-scope.ts";
 import type {
   ExcludedWorkspaceOccupancy,
   ScanProblem,
@@ -116,7 +119,11 @@ export function planWorkspaceRestore(
       detail: `excluded namespace occupancy blocks target path "${targetPath}"`,
     });
   };
-  const scopeMatches = workspaceScopesEqual(current.scope, target.scope);
+  const scopeMatches = workspaceScopesEqual(
+    current.scope,
+    target.scope,
+    ABSOLUTE_WORKSPACE_PATH_LIMITS,
+  );
   if (!scopeMatches) {
     problems.push({
       path: ".",
@@ -224,7 +231,7 @@ export function workspaceSnapshotAsManifest(
   snapshot: WorkspaceState,
 ): WorkspaceComparisonManifest {
   return {
-    format: TREE_MANIFEST_FORMAT,
+    format: CURRENT_TREE_MANIFEST_FORMAT,
     entries: snapshot.entries.map((entry): TreeEntry =>
       entry.kind === "regular"
         ? {

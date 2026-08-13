@@ -10,6 +10,7 @@ import {
   realpath,
   rm,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,15 +87,15 @@ try {
   const archive = join(packDirectory, archives[0]);
 
   // Install only the packed artifact into Pi's managed user-package layout.
-  // Cyclotomy has no runtime dependencies; legacy-peer-deps deliberately keeps
-  // npm from fetching its Pi peer and proves the locked host can supply it.
+  // Cyclotomy has no runtime dependencies; omitting peers keeps npm from
+  // fetching Pi and proves the locked host supplies the public API contract.
   await runNpm(
     [
       "install",
       "--prefix",
       installRoot,
       "--ignore-scripts",
-      "--legacy-peer-deps",
+      "--omit=peer",
       "--no-package-lock",
       "--no-audit",
       "--no-fund",
@@ -111,6 +112,15 @@ try {
   assert.equal(manifest.name, "cyclotomy");
   assert.equal(typeof manifest.version, "string");
   assert.deepEqual(manifest.pi?.extensions, ["./src/index.ts"]);
+  assert.deepEqual(manifest.exports, { ".": "./src/index.ts" });
+  const installedRequire = createRequire(
+    join(installRoot, "package-smoke.cjs"),
+  );
+  assert.throws(
+    () => installedRequire.resolve("cyclotomy/src/pi/runtime.ts"),
+    (error) => error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    "published internals must not be deep-importable",
+  );
 
   // Resolve through Pi's configured-package path, not a direct source import.
   // Offline mode makes a missing or mismatched managed install fail rather

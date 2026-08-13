@@ -1,18 +1,58 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { RestoreOutcome } from "../application/restore.ts";
-import { messageOf, type CyclotomyRuntime } from "./runtime.ts";
-import { readSessionView } from "./session-view.ts";
+import {
+  type ArrivalProtection,
+  unavailableProtection,
+} from "./arrival-protection.ts";
+import {
+  arrivalProtectionFromDisposition,
+  type ArrivalDisposition,
+} from "./arrival-settlement.ts";
 
-export type ArrivalProtection =
-  | { readonly kind: "protected" }
-  | { readonly kind: "pending-node-guard" }
-  | { readonly kind: "unavailable"; readonly message: string };
+type WorkspaceLockScope = "held" | "released";
+export type CleanupSettlement =
+  | { readonly kind: "settled" }
+  | { readonly kind: "failed"; readonly cause: unknown };
+
+export interface ArrivalRecoveryExecution {
+  readonly protection: ArrivalProtection;
+  readonly workspaceLockCleanup: CleanupSettlement;
+}
+
+/** Narrow recovery capability shared by restore and lifecycle settlements. */
+export interface ArrivalRecovery {
+  recoverUncertainLocationInWorkspaceLock(
+    context: ExtensionContext,
+  ): ArrivalProtection;
+  recoverUncertainLocation(
+    context: ExtensionContext,
+  ): Promise<ArrivalRecoveryExecution>;
+}
 
 export interface CheckpointInitializationConflict {
   readonly kind: "initialization-conflict";
-  readonly message: string;
+  readonly cause: unknown;
   readonly arrivalProtection: ArrivalProtection;
+}
+
+/** Preserve a settlement already completed by InitializationProtocol. */
+export function checkpointInitializationDispositionConflict(
+  cause: unknown,
+  arrival: Exclude<ArrivalDisposition, { readonly kind: "admitted" }>,
+): CheckpointInitializationConflict {
+  return {
+    kind: "initialization-conflict",
+    cause,
+    arrivalProtection: arrivalProtectionFromDisposition(arrival),
+  };
+}
+
+export interface RestorePreparationConflict {
+  readonly kind: "preparation-conflict";
+  readonly cause: unknown;
+  readonly arrivalProtection: ArrivalProtection;
+  readonly workspaceLockCleanup: CleanupSettlement;
 }
 
 export type PostMutationConflict =
@@ -21,159 +61,103 @@ export type PostMutationConflict =
       readonly reason: "location-changed" | "target-changed";
       readonly outcome: RestoreOutcome;
       readonly arrivalProtection: ArrivalProtection;
+      readonly workspaceLockCleanup: CleanupSettlement;
     }
   | {
       readonly kind: "post-mutation-conflict";
       readonly reason: "control-failed";
       readonly outcome: RestoreOutcome;
-      readonly message: string;
+      readonly cause: unknown;
       readonly arrivalProtection: ArrivalProtection;
+      readonly workspaceLockCleanup: CleanupSettlement;
     };
 
 /**
- * Protect the currently observable arrival while the caller still owns the
- * workspace lock. An unregistered session or another workspace is not guessed
- * into this runtime's metadata store.
+ * The sole recovery facade for callers already holding the workspace lock.
+ * Authentication, exact-slot blocking, and node-free barrier fallback all
+ * live in the runtime's core recovery policy.
  */
 export async function protectCurrentArrivalInWorkspaceLock(
-  runtime: CyclotomyRuntime,
+  recovery: ArrivalRecovery,
   context: ExtensionContext,
-): Promise<ArrivalProtection> {
-  // An unavailable or tearing location must not inherit the original target's
-  // admission. In particular, a later observable descendant must first be
-  // protected instead of being mistaken for a newly appended capturable node.
-  runtime.quarantineAdmission();
+): Promise<ArrivalRecoveryExecution> {
   try {
-    const observed = readSessionView(context);
-    if (!runtime.sessionIsUsable(observed)) {
-      return {
-        kind: "unavailable",
-        message: "current persisted session identity is unavailable",
-      };
-    }
-    if (!(await runtime.workspaceStillBound(observed.cwd))) {
-      return {
-        kind: "unavailable",
-        message: "current workspace is not bound to this runtime",
-      };
-    }
-
-    // `realpath` yields to the host. Re-read the complete location before the
-    // synchronous metadata write so a stale observation is never reported as
-    // the protected current arrival.
-    const current = readSessionView(context);
-    if (
-      !runtime.sessionIsUsable(current) ||
-      current.sessionId !== observed.sessionId ||
-      current.sessionFile !== observed.sessionFile ||
-      current.cwd !== observed.cwd ||
-      current.leafId !== observed.leafId
-    ) {
-      return {
-        kind: "unavailable",
-        message: "current arrival changed during workspace authentication",
-      };
-    }
-
-    let node;
-    try {
-      node = runtime.captureAnchor(current);
-    } catch (error) {
-      // A stable session/workspace identity is enough to preserve the intent,
-      // even when Pi's current tree is temporarily unresolvable. A later
-      // concrete observation will consume the same durable pending guard.
-      if (runtime.setPendingNodeGuard(current)) {
-        return { kind: "pending-node-guard" };
-      }
-      return {
-        kind: "unavailable",
-        message: `current session did not retain its pending checkpoint guard: ${messageOf(
-          error,
-        )}`,
-      };
-    }
-    if (node === undefined) {
-      // Persist the intent against the authenticated session. Its first
-      // concrete node consumes the flag and installs its exact guard in one
-      // transaction, including after process replacement.
-      if (!runtime.setPendingNodeGuard(current)) {
-        return {
-          kind: "unavailable",
-          message:
-            "current session did not retain its pending checkpoint guard",
-        };
-      }
-      return { kind: "pending-node-guard" };
-    }
-    runtime.protectNode(current, node);
-    return runtime.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
-      ? { kind: "protected" }
-      : {
-          kind: "unavailable",
-          message: "current arrival did not retain write protection",
-        };
-  } catch (error) {
-    return { kind: "unavailable", message: messageOf(error) };
-  }
-}
-
-/**
- * Recover fail-closed after the enclosing workspace operation itself rejects,
- * including a lock-release failure after its action had already completed.
- * Quarantine happens before reacquisition so a waiting retry cannot admit a
- * descendant from stale runtime state.
- */
-export async function protectCurrentArrivalAfterWorkspaceFailure(
-  runtime: CyclotomyRuntime,
-  context: ExtensionContext,
-  operation: string,
-): Promise<ArrivalProtection> {
-  runtime.quarantineAdmission();
-  try {
-    return await runtime.enqueueWorkspace(operation, () =>
-      protectCurrentArrivalInWorkspaceLock(runtime, context),
-    );
-  } catch (error) {
-    runtime.quarantineAdmission();
     return {
-      kind: "unavailable",
-      message: `current arrival protection could not reacquire the workspace lock: ${messageOf(
-        error,
-      )}`,
+      protection: recovery.recoverUncertainLocationInWorkspaceLock(context),
+      workspaceLockCleanup: { kind: "settled" },
+    };
+  } catch (cause) {
+    return {
+      protection: unavailableProtection(
+        "current arrival could not be protected",
+        [cause],
+      ),
+      workspaceLockCleanup: { kind: "settled" },
     };
   }
 }
 
-/** Report a committed first checkpoint without admitting a stale arrival. */
-export async function checkpointInitializationConflict(
-  runtime: CyclotomyRuntime,
+/** Recover after the previous lock scope failed or has already unwound. */
+export async function protectCurrentArrivalAfterWorkspaceFailure(
+  recovery: ArrivalRecovery,
   context: ExtensionContext,
-  error: unknown,
-  reacquireOperation?: string,
-): Promise<CheckpointInitializationConflict> {
+): Promise<ArrivalRecoveryExecution> {
+  try {
+    return await recovery.recoverUncertainLocation(context);
+  } catch (cause) {
+    return {
+      protection: unavailableProtection(
+        "current arrival protection could not reacquire the workspace lock",
+        [cause],
+      ),
+      workspaceLockCleanup: { kind: "settled" },
+    };
+  }
+}
+
+function protectCurrentArrivalForLockScope(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  lockScope: WorkspaceLockScope,
+): Promise<ArrivalRecoveryExecution> {
+  return lockScope === "held"
+    ? protectCurrentArrivalInWorkspaceLock(recovery, context)
+    : protectCurrentArrivalAfterWorkspaceFailure(recovery, context);
+}
+
+/** A loaded arrival could not even authenticate its checkpoint. */
+export async function restorePreparationConflict(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  cause: unknown,
+  lockScope: WorkspaceLockScope,
+): Promise<RestorePreparationConflict> {
+  const recoveryExecution = await protectCurrentArrivalForLockScope(
+    recovery,
+    context,
+    lockScope,
+  );
   return {
-    kind: "initialization-conflict",
-    message: messageOf(error),
-    arrivalProtection:
-      reacquireOperation === undefined
-        ? await protectCurrentArrivalInWorkspaceLock(runtime, context)
-        : await protectCurrentArrivalAfterWorkspaceFailure(
-            runtime,
-            context,
-            reacquireOperation,
-          ),
+    kind: "preparation-conflict",
+    cause,
+    arrivalProtection: recoveryExecution.protection,
+    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
   };
 }
 
 /** Preserve the destructive outcome when a later control-plane step fails. */
 export async function postMutationControlFailure(
-  runtime: CyclotomyRuntime,
+  recovery: ArrivalRecovery,
   context: ExtensionContext,
   error: unknown,
   outcome: RestoreOutcome | undefined,
-  reacquireOperation?: string,
+  lockScope: WorkspaceLockScope,
 ): Promise<PostMutationConflict> {
-  const message = messageOf(error);
+  const recoveryExecution = await protectCurrentArrivalForLockScope(
+    recovery,
+    context,
+    lockScope,
+  );
   return {
     kind: "post-mutation-conflict",
     reason: "control-failed",
@@ -182,16 +166,32 @@ export async function postMutationControlFailure(
       ({
         kind: "failed",
         stage: "apply",
-        message,
+        cause: error,
       } satisfies RestoreOutcome),
-    message,
-    arrivalProtection:
-      reacquireOperation === undefined
-        ? await protectCurrentArrivalInWorkspaceLock(runtime, context)
-        : await protectCurrentArrivalAfterWorkspaceFailure(
-            runtime,
-            context,
-            reacquireOperation,
-          ),
+    cause: error,
+    arrivalProtection: recoveryExecution.protection,
+    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
+  };
+}
+
+/** Preserve the restore result while settling a late location/target race. */
+export async function postMutationStateConflict(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  reason: "location-changed" | "target-changed",
+  outcome: RestoreOutcome,
+  lockScope: WorkspaceLockScope,
+): Promise<PostMutationConflict> {
+  const recoveryExecution = await protectCurrentArrivalForLockScope(
+    recovery,
+    context,
+    lockScope,
+  );
+  return {
+    kind: "post-mutation-conflict",
+    reason,
+    outcome,
+    arrivalProtection: recoveryExecution.protection,
+    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
   };
 }

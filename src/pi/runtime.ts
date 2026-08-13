@@ -1,61 +1,31 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  realpath,
-  rename,
-  unlink,
-} from "node:fs/promises";
-import {
-  basename,
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
+import { open, readFile, rename, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 
-import {
-  commitPreparedMissingNodeState,
-  commitPreparedNodeState,
-  prepareNodeState,
-  type CaptureSuccess,
-  type CaptureDeps,
+import type {
+  CaptureFailure,
+  CaptureSuccess,
+  MissingNodeStateIntent,
 } from "../application/capture.ts";
 import {
-  CyclotomyConfigError,
-  loadWorkspaceCyclotomyConfig,
-  type CyclotomyConfig,
-} from "../config.ts";
+  CheckpointService,
+  type ResolvedReadableTree,
+} from "../application/checkpoint-service.ts";
+import { CyclotomyConfigError, type CyclotomyConfig } from "../config.ts";
 import { collectCyclotomyGarbage } from "../application/gc.ts";
-import { migrateReferencedTrees } from "../application/tree-migration.ts";
-import {
-  ResolutionTraversalError,
-  resolveReadableNodeState,
-  type ResolvedNodeState,
-  walkNodeAncestry,
-} from "../application/resolve.ts";
-import type { RestoreDeps } from "../application/restore.ts";
-import type { NodeKey, TreeOid } from "../domain/model.ts";
-import {
-  MetadataStore,
-  type MissingNodeStateIntent,
-} from "../infrastructure/metadata.ts";
-import {
-  openObjectStore,
-  type ObjectStore,
-} from "../infrastructure/object-store.ts";
-import {
-  migrateTreeManifestToCurrent,
-  type TreeManifest,
-} from "../infrastructure/tree-manifest.ts";
+import type { NodeKey, Result, TreeOid } from "../domain/model.ts";
+import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
+import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
+import type { NativeObjectStore } from "../infrastructure/object-store.ts";
+import type { TreeManifest } from "../infrastructure/tree-formats/manifest-codec.ts";
+import { upgradeTreeManifestToCurrent } from "../infrastructure/tree-formats/history.ts";
 import { validateTreeEntriesAgainstScope } from "../infrastructure/tree-scope-validation.ts";
-import { withWorkspaceLock } from "../infrastructure/workspace-lock.ts";
+import {
+  runWithWorkspaceLock,
+  type WorkspaceLockExecution,
+} from "../infrastructure/workspace-lock.ts";
 import {
   scanWorkspace,
   scanWorkspaceForScope,
@@ -66,36 +36,73 @@ import type { WorkspaceScope } from "../infrastructure/workspace-scope.ts";
 import { CyclotomyI18n } from "./i18n.ts";
 import {
   CheckpointAdmission,
-  type AdmissionDecision,
-  type AdmissionLease,
+  type ArrivalAttempt,
 } from "./checkpoint-admission.ts";
+import type { PendingNavigation } from "./navigation-plan.ts";
+import type { SessionActivation } from "./pi-host-adapter.ts";
 import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 import {
-  TransitionState,
-  type PendingSourceCapture,
-} from "./transition-state.ts";
-
-export interface ResolvedReadableTree {
-  readonly resolution: ResolvedNodeState;
-  readonly manifest: TreeManifest;
-}
+  SessionRegistrationService,
+  type SessionRegistrationPreparation,
+} from "./session-registration-service.ts";
+import { WorkspaceMutationAuthority } from "./workspace-mutation-authority.ts";
 
 const GC_STATE_FILE = "gc-state.json";
 const GC_OBJECT_GRACE_MS = 3_600_000;
+const PRESENTATION_FAILURE_MESSAGE =
+  "Cyclotomy blocked this operation, but could not render its diagnostic message.";
+const PRESENTATION_STATUS_FALLBACK = "Cyclotomy · safety check in progress…";
 
-async function readLastAutomaticGcAt(path: string): Promise<number> {
+function systemErrorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null
+    ? typeof Reflect.get(error, "code") === "string"
+      ? (Reflect.get(error, "code") as string)
+      : undefined
+    : undefined;
+}
+
+type GcScheduleState =
+  | { readonly kind: "absent" }
+  | { readonly kind: "valid"; readonly lastRunAt: number }
+  | { readonly kind: "invalid"; readonly cause: unknown };
+
+async function readAutomaticGcSchedule(path: string): Promise<GcScheduleState> {
+  let contents: string;
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as {
-      lastGcAt?: unknown;
-    };
-    return typeof parsed.lastGcAt === "number" &&
+    contents = await readFile(path, "utf8");
+  } catch (cause) {
+    return systemErrorCode(cause) === "ENOENT"
+      ? { kind: "absent" }
+      : { kind: "invalid", cause };
+  }
+  try {
+    const parsed = JSON.parse(contents) as { lastGcAt?: unknown };
+    if (
+      typeof parsed.lastGcAt === "number" &&
       Number.isFinite(parsed.lastGcAt) &&
       parsed.lastGcAt >= 0
-      ? parsed.lastGcAt
-      : 0;
-  } catch {
-    return 0;
+    ) {
+      return { kind: "valid", lastRunAt: parsed.lastGcAt };
+    }
+    throw new Error("automatic GC schedule has an invalid lastGcAt value");
+  } catch (cause) {
+    return { kind: "invalid", cause };
+  }
+}
+
+async function lastAutomaticGcAt(path: string): Promise<number> {
+  const state = await readAutomaticGcSchedule(path);
+  switch (state.kind) {
+    case "absent":
+      return 0;
+    case "valid":
+      return state.lastRunAt;
+    case "invalid":
+      throw new Error("automatic GC schedule is unreadable", {
+        cause: state.cause,
+      });
   }
 }
 
@@ -128,142 +135,89 @@ async function writeLastAutomaticGcAt(
   }
 }
 
-export function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
     ? `${formatUiPath(basename(error.settingsPath))}: ${formatUiDetail(
         error.detail,
       )} (${formatUiPath(error.settingsPath)})`
-    : formatUiDetail(messageOf(error));
-}
-
-function isWithin(parent: string, candidate: string): boolean {
-  const path = relative(parent, candidate);
-  return (
-    path === "" ||
-    (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`))
-  );
-}
-
-function assertPathsDoNotOverlap(workspace: string, candidate: string): void {
-  if (isWithin(workspace, candidate) || isWithin(candidate, workspace)) {
-    throw new Error(
-      "Cyclotomy control data and workspace paths must not overlap",
-    );
-  }
-}
-
-async function prospectiveRealpath(path: string): Promise<string> {
-  let current = resolve(path);
-  const missing: string[] = [];
-  while (true) {
-    try {
-      return join(await realpath(current), ...missing);
-    } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
-      const parent = dirname(current);
-      if (parent === current) throw cause;
-      missing.unshift(basename(current));
-      current = parent;
-    }
-  }
-}
-
-async function assertControlPathDoesNotOverlap(
-  workspace: string,
-  candidate: string,
-): Promise<void> {
-  const absolute = resolve(candidate);
-  assertPathsDoNotOverlap(workspace, absolute);
-
-  // Check every lexical ancestor after resolving aliases above that entry.
-  // This catches a symlink directory entry inside the workspace even when its
-  // target (and therefore the candidate's final realpath) is outside it.
-  let current = absolute;
-  const target = await prospectiveRealpath(absolute);
-  while (true) {
-    const observed =
-      current === absolute ? target : await prospectiveRealpath(current);
-    if (isWithin(workspace, observed)) {
-      throw new Error(
-        "Cyclotomy control data and workspace paths must not overlap",
-      );
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  assertPathsDoNotOverlap(workspace, target);
+    : formatUiDetail(messageOfUnknown(error));
 }
 
 /** Shared runtime boundary for lifecycle and the command surface. */
 export class CyclotomyRuntime {
   readonly i18n: CyclotomyI18n;
-  readonly transitions = new TransitionState();
   readonly #admission = new CheckpointAdmission();
-
-  readonly #globalConfig: CyclotomyConfig;
-  #config: CyclotomyConfig;
-  #store: ObjectStore | undefined;
-  #metadata: MetadataStore | undefined;
-  #storeRoot: string | undefined;
-  #workspaceRoot: string | undefined;
+  readonly #registrations: SessionRegistrationService;
+  readonly #workspaceMutations: WorkspaceMutationAuthority;
+  #checkpointService: CheckpointService | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   #initFailureNotified = false;
   #captureFailureNotified = false;
   #initFailureDetail: string | undefined;
-  #notificationWorkspace: string | undefined;
-  #configuredWorkspace: string | undefined;
-  #workspaceConfig: CyclotomyConfig | undefined;
-  #bindingFailed = false;
-  #registeredSessionToken: string | undefined;
+  #activation: SessionActivation = {
+    kind: "unavailable",
+    cause: new Error("Pi session registration has not completed"),
+  };
   /** One-entry cache avoids repeating the same Git oracle across preview/apply. */
   #scopeValidatedTreeOid: TreeOid | undefined;
-  /** Configuration failure observed while Pi was loading the extension. */
-  readonly #registrationFailure: unknown;
 
   constructor(
     config: CyclotomyConfig,
     i18n: CyclotomyI18n,
     registrationFailure?: unknown,
   ) {
-    this.#globalConfig = config;
-    this.#config = config;
     this.i18n = i18n;
-    this.#registrationFailure = registrationFailure;
+    this.#registrations = new SessionRegistrationService({
+      globalConfig: config,
+      registrationFailure,
+      runExclusively: (action) => this.enqueue(action),
+    });
+    this.#workspaceMutations = new WorkspaceMutationAuthority({
+      admission: this.#admission,
+      registrations: this.#registrations,
+      checkpoints: () => this.checkpoints,
+      metadata: () => this.metadata,
+      restoreDeps: () => ({
+        store: this.store,
+        scanOptions: this.#scanOptions(),
+        validateManifestScope: (treeOid, manifest) =>
+          this.#validateManifestScope(treeOid, manifest),
+      }),
+      enqueueWorkspaceExecution: (operation, action) =>
+        this.enqueueWorkspaceExecution(operation, action),
+    });
   }
 
   get config(): CyclotomyConfig {
-    return this.#config;
+    return this.#registrations.config;
   }
 
-  get store(): ObjectStore {
-    if (this.#store === undefined) throw new Error("store is not initialized");
-    return this.#store;
+  get store(): NativeObjectStore {
+    if (!this.#registrations.isReady) {
+      throw new Error("store is not initialized");
+    }
+    return this.#registrations.context.store;
   }
 
-  get metadata(): MetadataStore {
-    if (this.#metadata === undefined) {
+  get metadata(): CurrentMetadataStore {
+    if (!this.#registrations.isReady) {
       throw new Error("metadata is not initialized");
     }
-    return this.#metadata;
+    return this.#registrations.context.metadata;
   }
 
   get storeRoot(): string {
-    if (this.#storeRoot === undefined) {
+    if (!this.#registrations.isReady) {
       throw new Error("store is not initialized");
     }
-    return this.#storeRoot;
+    return this.#registrations.context.storeRoot;
   }
 
   get workspaceRoot(): string {
-    if (this.#workspaceRoot === undefined) {
+    if (!this.#registrations.isReady) {
       throw new Error("store is not initialized");
     }
-    return this.#workspaceRoot;
+    return this.#registrations.context.workspaceRoot;
   }
 
   #scanOptions(): ScanOptions {
@@ -273,22 +227,55 @@ export class CyclotomyRuntime {
     };
   }
 
-  checkpointDeps(): CaptureDeps {
-    return {
-      store: this.store,
-      metadata: this.metadata,
-      scanOptions: this.#scanOptions(),
-      expectedRootPath: this.workspaceRoot,
-    };
+  get workspaceMutations(): WorkspaceMutationAuthority {
+    return this.#workspaceMutations;
   }
 
-  restoreDeps(): RestoreDeps {
-    return {
-      store: this.store,
-      scanOptions: this.#scanOptions(),
-      validateManifestScope: (treeOid, manifest) =>
-        this.#validateManifestScope(treeOid, manifest),
-    };
+  get admission(): CheckpointAdmission {
+    return this.#admission;
+  }
+
+  get registrations(): SessionRegistrationService {
+    return this.#registrations;
+  }
+
+  get activation(): SessionActivation {
+    return this.#activation;
+  }
+
+  /** Assert that this Pi observation still names the registered authority. */
+  assertSessionUsable(view: SessionView): void {
+    if (!this.#registrations.sessionIsUsable(view)) {
+      throw new Error("current persisted session identity is unavailable");
+    }
+  }
+
+  markSessionActive(): void {
+    this.#activation = { kind: "active" };
+  }
+
+  markSessionIntentionallyInactive(): void {
+    this.#admission.reset();
+    this.#activation = { kind: "intentionally-inactive" };
+  }
+
+  markSessionUnavailable(cause: unknown): void {
+    this.#admission.reset();
+    this.#activation = { kind: "unavailable", cause };
+  }
+
+  get checkpoints(): CheckpointService {
+    if (this.#checkpointService === undefined) {
+      this.#checkpointService = new CheckpointService({
+        store: this.store,
+        metadata: this.metadata,
+        expectedRootPath: this.workspaceRoot,
+        scanOptions: this.#scanOptions(),
+        validateManifestScope: (treeOid, manifest) =>
+          this.#validateManifestScope(treeOid, manifest),
+      });
+    }
+    return this.#checkpointService;
   }
 
   async #validateManifestScope(
@@ -296,7 +283,7 @@ export class CyclotomyRuntime {
     manifest: TreeManifest,
   ): Promise<void> {
     if (this.#scopeValidatedTreeOid === treeOid) return;
-    const current = migrateTreeManifestToCurrent(manifest, {
+    const current = upgradeTreeManifestToCurrent(manifest, {
       maxPathBytes: this.config.scan.maxPathBytes,
       maxPathComponents: this.config.scan.maxPathComponents,
     });
@@ -326,6 +313,56 @@ export class CyclotomyRuntime {
     }
   }
 
+  /**
+   * Render advisory text behind a total boundary. Pi intentionally continues
+   * after extension-handler exceptions, so presentation must never decide
+   * whether a safety-critical handler reaches its veto or durable settlement.
+   */
+  notifyBestEffort(
+    context: ExtensionContext,
+    render: () => string,
+    level: "info" | "warning" | "error" = "info",
+    fallback: string = PRESENTATION_FAILURE_MESSAGE,
+  ): void {
+    let message = fallback;
+    try {
+      message = render();
+    } catch {
+      // The bounded fallback remains visible even when localization fails.
+    }
+    this.notify(context, message, level);
+  }
+
+  setStatusBestEffort(context: ExtensionContext, render: () => string): void {
+    let message = PRESENTATION_STATUS_FALLBACK;
+    try {
+      message = render();
+    } catch {
+      // Status is advisory; retain a generic non-empty safety status.
+    }
+    this.setStatus(context, message);
+  }
+
+  renderBestEffort(render: () => string, fallback: string): string {
+    try {
+      return render();
+    } catch {
+      return fallback;
+    }
+  }
+
+  presentBestEffort(
+    context: ExtensionContext,
+    present: () => void,
+    fallbackLevel: "warning" | "error" = "error",
+  ): void {
+    try {
+      present();
+    } catch {
+      this.notify(context, PRESENTATION_FAILURE_MESSAGE, fallbackLevel);
+    }
+  }
+
   setStatus(context: ExtensionContext, message: string | undefined): void {
     try {
       if (context.hasUI) context.ui.setStatus("cyclotomy", message);
@@ -346,13 +383,19 @@ export class CyclotomyRuntime {
   ): void {
     if (this.#initFailureNotified && options.force !== true) return;
     this.#initFailureNotified = true;
-    const detail =
-      this.#initFailureDetail === undefined
-        ? ""
-        : ` ${this.i18n.t("captureFailureDetail", {
-            message: this.#initFailureDetail,
-          })}`;
-    this.notify(context, `${this.i18n.t("initFailure")}${detail}`, "error");
+    this.notifyBestEffort(
+      context,
+      () => {
+        const detail =
+          this.#initFailureDetail === undefined
+            ? ""
+            : ` ${this.i18n.t("captureFailureDetail", {
+                message: this.#initFailureDetail,
+              })}`;
+        return `${this.i18n.t("initFailure")}${detail}`;
+      },
+      "error",
+    );
   }
 
   notifyCaptureResult(
@@ -362,15 +405,17 @@ export class CyclotomyRuntime {
   ): void {
     if (!captured && !this.#captureFailureNotified) {
       this.#captureFailureNotified = true;
-      const detail =
-        failureMessage === undefined
-          ? ""
-          : ` ${this.i18n.t("captureFailureDetail", {
-              message: failureMessage,
-            })}`;
-      this.notify(
+      this.notifyBestEffort(
         context,
-        `${this.i18n.t("captureLaterFailed")}${detail}`,
+        () => {
+          const detail =
+            failureMessage === undefined
+              ? ""
+              : ` ${this.i18n.t("captureFailureDetail", {
+                  message: failureMessage,
+                })}`;
+          return `${this.i18n.t("captureLaterFailed")}${detail}`;
+        },
         "warning",
       );
     } else if (captured) {
@@ -379,142 +424,39 @@ export class CyclotomyRuntime {
     }
   }
 
-  #selectNotificationWorkspace(workspace: string): void {
-    if (this.#notificationWorkspace === workspace) return;
-    this.#notificationWorkspace = workspace;
-    this.#initFailureNotified = false;
-    this.#captureFailureNotified = false;
-  }
-
   async ensureStore(cwd: string): Promise<boolean> {
-    let notificationWorkspace = resolve(cwd);
-    if (this.#registrationFailure !== undefined) {
-      // Pi already loaded the extension with an unusable configuration. Fail
-      // closed through the same channel a workspace settings failure uses,
-      // without touching the filesystem for a store that must not be opened.
-      this.#selectNotificationWorkspace(notificationWorkspace);
-      this.#initFailureDetail = initializationDetail(this.#registrationFailure);
-      return false;
-    }
-    try {
-      const canonical = await realpath(cwd);
-      notificationWorkspace = canonical;
-      this.#selectNotificationWorkspace(canonical);
-      const storeBound =
-        this.#store !== undefined ||
-        this.#metadata !== undefined ||
-        this.#storeRoot !== undefined ||
-        this.#workspaceRoot !== undefined;
-      if (storeBound) {
-        // One extension runtime belongs to one canonical workspace. Pi
-        // closes it before session changes; rebinding an open runtime would let
-        // an in-flight plan write through the wrong store.
-        return (
-          this.#store !== undefined &&
-          this.#metadata !== undefined &&
-          this.#storeRoot !== undefined &&
-          this.#workspaceRoot === canonical
-        );
-      }
-      if (this.#configuredWorkspace === canonical && this.#bindingFailed) {
-        return false;
-      }
-      if (this.#configuredWorkspace !== canonical) {
-        this.#configuredWorkspace = canonical;
-        this.#workspaceConfig = undefined;
-        this.#bindingFailed = false;
-        this.#config = this.#globalConfig;
-        this.#initFailureDetail = undefined;
-      }
-      const hash = createHash("sha256").update(canonical).digest("hex");
-      await assertControlPathDoesNotOverlap(
-        canonical,
-        this.#globalConfig.globalSettingsPath,
-      );
-      const requestedRoot = resolve(this.#globalConfig.storageRootPath, hash);
-      await assertControlPathDoesNotOverlap(canonical, requestedRoot);
-      await mkdir(requestedRoot, { recursive: true, mode: 0o700 });
-      const rootEntry = await lstat(requestedRoot);
-      if (!rootEntry.isDirectory() || rootEntry.isSymbolicLink()) {
-        throw new Error(
-          "Cyclotomy workspace store must be a real directory, not a symlink or another file type",
-        );
-      }
-      const root = await realpath(requestedRoot);
-      assertPathsDoNotOverlap(canonical, root);
-      assertPathsDoNotOverlap(
-        canonical,
-        await prospectiveRealpath(join(root, "settings.json")),
-      );
-      const config =
-        this.#workspaceConfig ??
-        loadWorkspaceCyclotomyConfig(this.#globalConfig, root);
-      this.#workspaceConfig = config;
-      const store = await openObjectStore(root, {
-        maxEntries: config.scan.maxEntries,
-        maxManifestBytes: config.scan.maxManifestBytes,
-        maxPathBytes: config.scan.maxPathBytes,
-        maxPathComponents: config.scan.maxPathComponents,
-      });
-      // Serialize the deferred v1 open as well as migration. Two new-version
-      // processes must not race one connection's v1 schema validation against
-      // the other's atomic cutover.
-      const metadata = await withWorkspaceLock(
-        root,
-        "tree-format-migrate",
-        async () => {
-          const candidate = new MetadataStore(join(root, "state.db"), {
-            deferPublishedV1Migration: true,
-          });
-          try {
-            // Tree objects are immutable content-addressed records. Publish v2
-            // replacements first, then retarget SQLite roots in the same SQL
-            // transaction that advances its schema.
-            await migrateReferencedTrees(store, candidate);
-            return candidate;
-          } catch (error) {
-            candidate.close();
-            throw error;
-          }
-        },
-        config.lock,
-      );
-      this.#config = config;
-      this.#storeRoot = root;
-      this.#workspaceRoot = canonical;
-      this.#store = store;
-      this.#metadata = metadata;
-      this.#initFailureNotified = false;
-      this.#initFailureDetail = undefined;
-      this.#captureFailureNotified = false;
-      return true;
-    } catch (error) {
-      this.#selectNotificationWorkspace(notificationWorkspace);
-      this.#initFailureDetail = initializationDetail(error);
-      this.#bindingFailed = true;
-      this.#config = this.#globalConfig;
-      this.#store = undefined;
-      this.#metadata = undefined;
-      this.#storeRoot = undefined;
-      this.#workspaceRoot = undefined;
-      return false;
-    }
+    return this.#ensureStore(cwd, {
+      kind: "independent",
+      claim: { kind: "absent" },
+    });
   }
 
-  /** Read-only binding check for committed after-events; never switches store. */
-  async workspaceStillBound(cwd: string): Promise<boolean> {
-    if (
-      this.#store === undefined ||
-      this.#metadata === undefined ||
-      this.#workspaceRoot === undefined
-    ) {
+  async ensureRegistrationStore(
+    cwd: string,
+    preparation: SessionRegistrationPreparation,
+  ): Promise<boolean> {
+    return this.#ensureStore(cwd, preparation);
+  }
+
+  async #ensureStore(
+    cwd: string,
+    preparation: SessionRegistrationPreparation,
+  ): Promise<boolean> {
+    const result = await this.#registrations.ensureStore(cwd, preparation);
+    return this.#applyStoreBindingResult(result);
+  }
+
+  #applyStoreBindingResult(
+    result: Awaited<ReturnType<SessionRegistrationService["ensureStore"]>>,
+  ): boolean {
+    if (result.kind === "failed") {
+      this.#initFailureDetail = initializationDetail(result.cause);
       return false;
     }
-    try {
-      return (await realpath(cwd)) === this.#workspaceRoot;
-    } catch {
-      return false;
-    }
+    this.#initFailureNotified = false;
+    this.#initFailureDetail = undefined;
+    this.#captureFailureNotified = false;
+    return true;
   }
 
   enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -523,13 +465,15 @@ export class CyclotomyRuntime {
     return result;
   }
 
-  enqueueWorkspace<T>(operation: string, action: () => Promise<T>): Promise<T> {
+  enqueueWorkspaceExecution<T>(
+    operation: string,
+    action: () => Promise<T>,
+  ): Promise<WorkspaceLockExecution<T>> {
     return this.enqueue(() =>
-      withWorkspaceLock(this.storeRoot, operation, action, this.config.lock),
+      runWithWorkspaceLock(this.storeRoot, operation, action, this.config.lock),
     );
   }
 
-  /** Scan only the canonical workspace for which the active store was opened. */
   async scanCurrentWorkspace(cwd: string): Promise<WorkspaceSnapshot> {
     const snapshot = await scanWorkspace(cwd, this.#scanOptions());
     if (snapshot.rootPath !== this.workspaceRoot) {
@@ -558,429 +502,119 @@ export class CyclotomyRuntime {
     return snapshot;
   }
 
-  async maybeRunAutomaticGc(): Promise<void> {
+  async maybeRunAutomaticGc(): Promise<WorkspaceLockExecution<void>> {
     const intervalMs = this.config.autoGcIntervalMs;
-    if (intervalMs <= 0) return;
-    const statePath = join(this.storeRoot, GC_STATE_FILE);
-    if (Date.now() - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
-      return;
+    if (intervalMs <= 0) {
+      return {
+        kind: "completed",
+        value: undefined,
+        cleanup: { kind: "released" },
+      };
     }
-    await this.enqueueWorkspace("auto-gc", async () => {
+    const statePath = join(this.storeRoot, GC_STATE_FILE);
+    if (Date.now() - (await lastAutomaticGcAt(statePath)) < intervalMs) {
+      return {
+        kind: "completed",
+        value: undefined,
+        cleanup: { kind: "released" },
+      };
+    }
+    return this.enqueueWorkspaceExecution("auto-gc", async () => {
       const startedAt = Date.now();
-      if (startedAt - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
+      if (startedAt - (await lastAutomaticGcAt(statePath)) < intervalMs) {
         return;
       }
-      await collectCyclotomyGarbage(this.storeRoot, this.store, this.metadata, {
+      await collectCyclotomyGarbage(this.store, this.metadata, {
         objectGraceMs: GC_OBJECT_GRACE_MS,
-        retentionMs: this.config.sessionMetadataRetentionMs,
       });
       await writeLastAutomaticGcAt(statePath, startedAt);
     });
-  }
-
-  /**
-   * Pi rewrites label-entry ids when forking. Labels carry no conversation or
-   * workspace state, so captures anchor at their nearest stable parent. A
-   * label chain rooted at null is Pi's valid root editor point and has no node.
-   */
-  captureAnchor(
-    view: SessionView,
-    leafId: string | null = view.leafId,
-  ): NodeKey | undefined {
-    if (leafId === null) return undefined;
-    let entryId = leafId;
-    const visited = new Set<string>();
-    while (true) {
-      if (visited.has(entryId)) {
-        throw new ResolutionTraversalError("cycle");
-      }
-      visited.add(entryId);
-      const type = view.entryTypeOf(entryId);
-      if (type === undefined) {
-        throw new ResolutionTraversalError("unknown-node", entryId);
-      }
-      if (type !== "label") {
-        return { sessionId: view.sessionId, entryId };
-      }
-      const parentId = view.parentIdOf(entryId);
-      if (parentId === undefined) {
-        throw new ResolutionTraversalError("unknown-node", entryId);
-      }
-      if (parentId === null) return undefined;
-      entryId = parentId;
-    }
-  }
-
-  beginAdmission(view: SessionView): void {
-    this.#admission.begin(view, this.captureAnchor(view));
-  }
-
-  /** Fail closed until one concrete live location is authenticated again. */
-  quarantineAdmission(): void {
-    this.#admission.reset();
-  }
-
-  setPendingNodeGuard(view: SessionView): boolean {
-    if (
-      view.sessionFile === null ||
-      !this.metadata.setPendingNodeGuard(view.sessionId, view.sessionFile)
-    ) {
-      return false;
-    }
-    return true;
-  }
-
-  pendingNodeGuard(view: SessionView): boolean | undefined {
-    return view.sessionFile === null
-      ? undefined
-      : this.metadata.pendingNodeGuard(view.sessionId, view.sessionFile);
-  }
-
-  clearPendingNodeGuard(view: SessionView): boolean {
-    return (
-      view.sessionFile !== null &&
-      this.metadata.clearPendingNodeGuard(view.sessionId, view.sessionFile)
-    );
-  }
-
-  consumePendingNodeGuard(
-    view: SessionView,
-    node: NodeKey,
-  ): "protected" | "not-pending" | "session-unregistered" {
-    if (view.sessionFile === null) return "session-unregistered";
-    const current = this.captureAnchor(view);
-    if (
-      current === undefined ||
-      current.sessionId !== node.sessionId ||
-      current.entryId !== node.entryId
-    ) {
-      return "not-pending";
-    }
-    const consumed = this.metadata.consumePendingNodeGuard(
-      view.sessionId,
-      view.sessionFile,
-      this.ancestryIds(view, node.entryId),
-    );
-    if (consumed === "protected") this.#admission.protect(view, node);
-    if (consumed === "session-unregistered") this.#admission.reset();
-    return consumed;
-  }
-
-  /** Carry a planned raw-leaf rewrite that remains on the same stable anchor. */
-  carryAdmission(view: SessionView, node: NodeKey | undefined): boolean {
-    return this.#admission.carry(view, node);
-  }
-
-  /**
-   * Admit the live stable location after a match, verified restore, or first
-   * materialization. A durable guard is cleared only against the exact tree
-   * that was just authenticated.
-   */
-  admitLocation(view: SessionView, treeOid?: TreeOid): boolean {
-    const node = this.captureAnchor(view);
-    if (node !== undefined && treeOid !== undefined) {
-      const cleared = this.metadata.clearNodeWriteProtection(
-        node.sessionId,
-        node.entryId,
-        treeOid,
-      );
-      if (cleared === "state-changed") return false;
-    } else if (
-      node !== undefined &&
-      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
-    ) {
-      return false;
-    }
-    this.#admission.admit(view, node);
-    return true;
-  }
-
-  protectLocation(view: SessionView, resolution?: ResolvedNodeState): boolean {
-    const node = this.captureAnchor(view);
-    if (node === undefined) {
-      this.#admission.protect(view, node);
-      return true;
-    }
-    return this.protectNode(view, node, resolution);
-  }
-
-  /** Returns false only when the guard was installed against a stale pin. */
-  protectNode(
-    view: SessionView,
-    node: NodeKey,
-    resolution?: ResolvedNodeState,
-  ): boolean {
-    const pending = this.consumePendingNodeGuard(view, node);
-    if (pending === "session-unregistered" && this.sessionIsUsable(view)) {
-      return false;
-    }
-    if (resolution === undefined) {
-      try {
-        resolution = this.#resolveMetadataIn(view, node);
-      } catch {
-        // Malformed ancestry still needs an exact fail-closed guard. There is
-        // no trustworthy effective tree to pin in this branch.
-      }
-    }
-    const protectedResult = this.metadata.protectNodeWrite(
-      node.sessionId,
-      node.entryId,
-      resolution === undefined
-        ? undefined
-        : {
-            treeOid: resolution.treeOid,
-            expectedTreeOid:
-              resolution.foundAt.sessionId === node.sessionId &&
-              resolution.foundAt.entryId === node.entryId
-                ? resolution.treeOid
-                : undefined,
-          },
-    );
-    this.#admission.protect(view, node);
-    return protectedResult === "protected";
-  }
-
-  captureAdmission(
-    view: SessionView,
-    node: NodeKey | undefined,
-  ): AdmissionDecision {
-    if (node !== undefined) {
-      const pending = this.consumePendingNodeGuard(view, node);
-      if (pending === "protected") return { kind: "protected" };
-      if (pending === "session-unregistered") return { kind: "blocked" };
-    }
-    const previousEntryId = this.#admission.entryIdIn(view);
-    const isNaturalDescendant =
-      !this.transitions.hasNavigation() &&
-      node !== undefined &&
-      previousEntryId !== undefined &&
-      previousEntryId !== node.entryId &&
-      (previousEntryId === null ||
-        this.ancestryIds(view, node.entryId).includes(previousEntryId));
-    const writeProtected =
-      node !== undefined &&
-      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId);
-    const decision = this.#admission.decideCapture({
-      view,
-      node,
-      isNaturalDescendant,
-      writeProtected,
-    });
-    if (decision.kind === "blocked" && node !== undefined) {
-      // An unrelated or unclassified Pi arrival must survive reload/restart.
-      this.protectNode(view, node);
-    }
-    return decision;
-  }
-
-  captureLeaseIsCurrent(
-    lease: AdmissionLease,
-    view: SessionView,
-    node: NodeKey,
-  ): boolean {
-    return (
-      this.#admission.leaseIsCurrent(lease, view, node) &&
-      !this.metadata.isNodeWriteProtected(node.sessionId, node.entryId)
-    );
-  }
-
-  beginSessionRegistration(): void {
-    this.#registeredSessionToken = undefined;
-    this.#admission.reset();
-  }
-
-  completeSessionRegistration(view: SessionView): void {
-    this.#registeredSessionToken = this.#sessionToken(view);
-  }
-
-  sessionIsUsable(view: SessionView): boolean {
-    return (
-      view.sessionFile !== null &&
-      this.#registeredSessionToken === this.#sessionToken(view)
-    );
-  }
-
-  #sessionToken(view: SessionView): string {
-    return `${view.sessionId}\0${view.sessionFile ?? ""}`;
-  }
-
-  parentOfIn(view: SessionView) {
-    return (node: NodeKey): NodeKey | undefined => {
-      if (node.sessionId !== view.sessionId) {
-        throw new ResolutionTraversalError("unknown-node", node.entryId);
-      }
-      if (view.entryOf(node.entryId) === undefined) {
-        throw new ResolutionTraversalError("unknown-node", node.entryId);
-      }
-      const parentId = view.parentIdOf(node.entryId);
-      if (parentId === undefined) {
-        throw new ResolutionTraversalError("unknown-node", node.entryId);
-      }
-      if (typeof parentId !== "string") return undefined;
-      if (view.entryOf(parentId) === undefined) {
-        throw new ResolutionTraversalError("unknown-node", parentId);
-      }
-      return { sessionId: view.sessionId, entryId: parentId };
-    };
-  }
-
-  ancestryIds(view: SessionView, leafId: string | null): string[] {
-    if (leafId === null) return [];
-    return [
-      ...walkNodeAncestry(
-        { sessionId: view.sessionId, entryId: leafId },
-        this.parentOfIn(view),
-      ),
-    ]
-      .map(({ entryId }) => entryId)
-      .reverse();
   }
 
   async resolveReadableTreeIn(
     view: SessionView,
     node: NodeKey,
   ): Promise<ResolvedReadableTree | undefined> {
-    const pending = this.consumePendingNodeGuard(view, node);
-    if (pending === "session-unregistered" && this.sessionIsUsable(view)) {
-      throw new Error("current session registration changed before resolution");
-    }
-    // A guard without an exact state records that this exact node had no
-    // effective checkpoint when protected. Later ancestor captures must not
-    // retroactively give that node a different restore target; descendants
-    // remain independent and may inherit normally.
-    if (
-      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId) &&
-      this.metadata.getState(node.sessionId, node.entryId) === undefined
-    ) {
+    if (this.#workspaceMutations.sessionHasBarrier(view) === true) {
       return undefined;
     }
-    let manifest: TreeManifest | undefined;
-    const resolution = await resolveReadableNodeState(
-      node,
-      this.parentOfIn(view),
-      (candidate) =>
-        this.metadata.getState(candidate.sessionId, candidate.entryId),
-      async (state) => {
-        // Return the authenticated manifest from the same closure read that
-        // selected the authoritative slot. Callers can plan from these bytes
-        // without reading the whole tree a second time in the same phase.
-        const candidate = await this.store.readTree(state.treeOid);
-        await this.#validateManifestScope(state.treeOid, candidate);
-        manifest = candidate;
-      },
-    );
-    if (resolution === undefined) return undefined;
-    if (manifest === undefined) {
-      throw new Error(
-        "readable tree resolution did not authenticate a manifest",
-      );
-    }
-    return { resolution, manifest };
-  }
-
-  #resolveMetadataIn(
-    view: SessionView,
-    node: NodeKey,
-  ): ResolvedNodeState | undefined {
-    if (
-      this.metadata.isNodeWriteProtected(node.sessionId, node.entryId) &&
-      this.metadata.getState(node.sessionId, node.entryId) === undefined
-    ) {
-      return undefined;
-    }
-    for (const current of walkNodeAncestry(node, this.parentOfIn(view))) {
-      const state = this.metadata.getState(current.sessionId, current.entryId);
-      if (state !== undefined) {
-        return { treeOid: state.treeOid, foundAt: current };
-      }
-    }
-    return undefined;
-  }
-
-  resolutionStillAuthoritative(
-    view: SessionView,
-    node: NodeKey,
-    expected: ResolvedNodeState | undefined,
-  ): boolean {
-    // The caller already authenticated the expected closure in its prior
-    // phase. This check binds only the nearest metadata slot; the next genuine
-    // trust boundary performs its own full closure read.
-    const current = this.#resolveMetadataIn(view, node);
-    if (current === undefined || expected === undefined) {
-      return current === expected;
-    }
-    return (
-      current.treeOid === expected.treeOid &&
-      current.foundAt.sessionId === expected.foundAt.sessionId &&
-      current.foundAt.entryId === expected.foundAt.entryId
-    );
-  }
-
-  prepareCaptureResult(view: SessionView): ReturnType<typeof prepareNodeState> {
-    return prepareNodeState(this.checkpointDeps(), view.cwd);
+    return this.checkpoints.resolveReadableTree(view, node);
   }
 
   commitPreparedCapture(
-    capture: PendingSourceCapture,
-  ): ReturnType<typeof commitPreparedNodeState> {
-    return commitPreparedNodeState(
-      this.checkpointDeps(),
-      capture.source,
-      capture.prepared,
-      { treeOid: capture.expectedTreeOid },
-    );
-  }
-
-  commitPreparedMissingCapture(
+    view: SessionView,
     node: NodeKey,
     prepared: CaptureSuccess,
-    intent: MissingNodeStateIntent,
-  ): ReturnType<typeof commitPreparedMissingNodeState> {
-    return commitPreparedMissingNodeState(
-      this.checkpointDeps(),
-      node,
-      prepared,
-      intent,
-    );
-  }
-
-  /** Best-effort registry hygiene after an authoritative turn checkpoint. */
-  touchCapturedSession(view: SessionView): void {
-    if (view.sessionFile === null) return;
-    try {
-      this.metadata.touchSession(view.sessionId, view.sessionFile);
-    } catch {
-      // The node state is already durable; registry data is hygiene only.
+    expectedSlot: CheckpointSlot,
+  ): Result<CaptureSuccess, CaptureFailure> {
+    const authority = this.#registrations.registeredAuthority;
+    if (authority === undefined) {
+      throw new Error("Pi session registration authority is unavailable");
     }
-  }
-
-  importForkAncestry(view: SessionView): void {
-    if (view.parentSessionFile === null) return;
-    this.metadata.copyForkAncestry({
-      targetSessionId: view.sessionId,
-      parentSessionFile: view.parentSessionFile,
-      ancestryEntryIds:
-        view.leafId === null ? [] : this.ancestryIds(view, view.leafId),
+    return this.checkpoints.commitPrepared(view, node, prepared, expectedSlot, {
+      expectedSessionFile: authority.sessionFile,
+      assertWorkspaceAuthority: () => {
+        this.#registrations.assertActiveWorkspaceAuthority(authority);
+        return undefined;
+      },
     });
   }
 
-  close(): void {
-    try {
-      this.#metadata?.close();
-    } catch {
-      // Shutdown must not throw.
+  commitMissingCapture(
+    view: SessionView,
+    node: NodeKey,
+    prepared: CaptureSuccess,
+    intent: MissingNodeStateIntent,
+  ): Result<CaptureSuccess, CaptureFailure> {
+    const authority = this.#registrations.registeredAuthority;
+    if (authority === undefined) {
+      throw new Error("Pi session registration authority is unavailable");
     }
-    this.#metadata = undefined;
-    this.#store = undefined;
-    this.#storeRoot = undefined;
-    this.#workspaceRoot = undefined;
-    this.#config = this.#globalConfig;
-    this.transitions.reset();
+    return this.checkpoints.commitMissing(view, node, prepared, intent, {
+      expectedSessionFile: authority.sessionFile,
+      assertWorkspaceAuthority: () => {
+        this.#registrations.assertActiveWorkspaceAuthority(authority);
+        return undefined;
+      },
+    });
+  }
+
+  commitTreeArrivalCapture(
+    arrival: ArrivalAttempt<PendingNavigation | undefined>,
+    view: SessionView,
+    node: NodeKey,
+    prepared: CaptureSuccess,
+    expectedSlot: CheckpointSlot,
+  ): Result<CaptureSuccess, CaptureFailure> {
+    if (!this.#workspaceMutations.treeArrivalCanProceed(arrival, view, node)) {
+      throw new Error("tree arrival authority changed before capture commit");
+    }
+    const authority = this.#registrations.registeredAuthority;
+    if (authority === undefined) {
+      throw new Error("Pi session registration authority is unavailable");
+    }
+    return this.checkpoints.commitPreparedTreeArrival(
+      view,
+      node,
+      prepared,
+      expectedSlot,
+      {
+        expectedSessionFile: authority.sessionFile,
+        assertWorkspaceAuthority: () => {
+          this.#registrations.assertActiveWorkspaceAuthority(authority);
+          return undefined;
+        },
+      },
+    );
+  }
+
+  close(): void {
+    this.#activation = { kind: "closed" };
+    this.#registrations.close();
+    this.#checkpointService = undefined;
     this.#admission.reset();
-    this.#notificationWorkspace = undefined;
     this.#initFailureNotified = false;
     this.#captureFailureNotified = false;
-    this.#registeredSessionToken = undefined;
     this.#scopeValidatedTreeOid = undefined;
   }
 }

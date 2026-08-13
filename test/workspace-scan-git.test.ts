@@ -20,6 +20,7 @@ import {
   type WorkspaceSnapshot,
 } from "../src/infrastructure/workspace-scan.ts";
 import {
+  ABSOLUTE_WORKSPACE_PATH_LIMITS,
   canonicalizeWorkspaceScope,
   workspaceScopesEqual,
   type WorkspaceScope,
@@ -275,7 +276,13 @@ describe("workspace scanner Git policy integration", () => {
     const current = await scanWorkspaceForScope(root, target.scope);
 
     expect(pathsOf(current)).toEqual([".gitignore", "other.txt"]);
-    expect(workspaceScopesEqual(current.scope, target.scope)).toBe(true);
+    expect(
+      workspaceScopesEqual(
+        current.scope,
+        target.scope,
+        ABSOLUTE_WORKSPACE_PATH_LIMITS,
+      ),
+    ).toBe(true);
     const source = current.entries.find(({ path }) => path === ".gitignore");
     expect(source).toMatchObject({
       kind: "regular",

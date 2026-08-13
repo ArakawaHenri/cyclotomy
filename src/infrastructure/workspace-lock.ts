@@ -97,6 +97,32 @@ export class UnsafeWorkspaceLockPathError extends Error {
   }
 }
 
+/** Failure to acquire one member of an ordered workspace-lock set. */
+export class OrderedWorkspaceLockAcquisitionError extends Error {
+  readonly storeRoot: string;
+
+  constructor(storeRoot: string, cause: unknown) {
+    super(`cannot acquire the ordered workspace lock at ${storeRoot}`, {
+      cause,
+    });
+    this.name = "OrderedWorkspaceLockAcquisitionError";
+    this.storeRoot = storeRoot;
+  }
+}
+
+/** Failure to release one member of an ordered workspace-lock set. */
+export class OrderedWorkspaceLockReleaseError extends Error {
+  readonly storeRoot: string;
+
+  constructor(storeRoot: string, cause: unknown) {
+    super(`cannot release the ordered workspace lock at ${storeRoot}`, {
+      cause,
+    });
+    this.name = "OrderedWorkspaceLockReleaseError";
+    this.storeRoot = storeRoot;
+  }
+}
+
 class WorkspaceLockFormationChangedError extends Error {
   constructor() {
     super("workspace lock directory changed during owner publication");
@@ -866,16 +892,206 @@ export async function acquireWorkspaceLock(
   };
 }
 
+export type WorkspaceLockCleanup =
+  | { readonly kind: "released" }
+  | { readonly kind: "failed"; readonly cause: unknown };
+
+/**
+ * Preserve the action effect independently from lock cleanup. Acquisition still
+ * throws because the action provably did not run; after acquisition every fact
+ * is returned without reconstructing it from an AggregateError.
+ */
+export type WorkspaceLockExecution<T> =
+  | {
+      readonly kind: "completed";
+      readonly value: T;
+      readonly cleanup: WorkspaceLockCleanup;
+    }
+  | {
+      readonly kind: "action-failed";
+      readonly cause: unknown;
+      readonly cleanup: WorkspaceLockCleanup;
+    };
+
+export async function runWithWorkspaceLock<T>(
+  storeRoot: string,
+  operation: string,
+  action: () => Promise<T>,
+  options?: WorkspaceLockOptions,
+): Promise<WorkspaceLockExecution<T>> {
+  const lock = await acquireWorkspaceLock(storeRoot, operation, options);
+  let actionResult:
+    | { readonly kind: "completed"; readonly value: T }
+    | { readonly kind: "action-failed"; readonly cause: unknown };
+  try {
+    actionResult = { kind: "completed", value: await action() };
+  } catch (cause) {
+    actionResult = { kind: "action-failed", cause };
+  }
+  let cleanup: WorkspaceLockCleanup = { kind: "released" };
+  try {
+    await lock.release();
+  } catch (cause) {
+    cleanup = { kind: "failed", cause };
+  }
+  return { ...actionResult, cleanup };
+}
+
 export async function withWorkspaceLock<T>(
   storeRoot: string,
   operation: string,
   action: () => Promise<T>,
   options?: WorkspaceLockOptions,
 ): Promise<T> {
-  const lock = await acquireWorkspaceLock(storeRoot, operation, options);
-  try {
-    return await action();
-  } finally {
-    await lock.release();
+  const execution = await runWithWorkspaceLock(
+    storeRoot,
+    operation,
+    action,
+    options,
+  );
+  if (execution.kind === "completed") {
+    if (execution.cleanup.kind === "released") return execution.value;
+    throw execution.cleanup.cause;
   }
+  if (execution.cleanup.kind === "released") throw execution.cause;
+  throw new AggregateError(
+    [execution.cause, execution.cleanup.cause],
+    "workspace-lock operation and cleanup both failed",
+    { cause: execution.cause },
+  );
+}
+
+export interface OrderedWorkspaceLockTarget {
+  readonly storeRoot: string;
+  readonly options?: WorkspaceLockOptions;
+}
+
+export type OrderedWorkspaceLockCleanup =
+  | { readonly kind: "released" }
+  | {
+      readonly kind: "failed";
+      readonly failures: readonly OrderedWorkspaceLockReleaseError[];
+    };
+
+export type OrderedWorkspaceLockExecution<T> =
+  | {
+      readonly kind: "completed";
+      readonly value: T;
+      readonly cleanup: OrderedWorkspaceLockCleanup;
+    }
+  | {
+      readonly kind: "action-failed";
+      readonly cause: unknown;
+      readonly cleanup: OrderedWorkspaceLockCleanup;
+    };
+
+function orderedTargets(
+  targets: readonly OrderedWorkspaceLockTarget[],
+): readonly OrderedWorkspaceLockTarget[] {
+  const unique = new Map<string, OrderedWorkspaceLockTarget>();
+  for (const target of targets) {
+    const storeRoot = resolve(target.storeRoot);
+    if (!unique.has(storeRoot)) unique.set(storeRoot, { ...target, storeRoot });
+  }
+  return [...unique.values()].sort((left, right) =>
+    Buffer.from(left.storeRoot).compare(Buffer.from(right.storeRoot)),
+  );
+}
+
+async function releaseOrderedLocks(
+  acquired: readonly {
+    readonly target: OrderedWorkspaceLockTarget;
+    readonly lock: WorkspaceLock;
+  }[],
+): Promise<OrderedWorkspaceLockCleanup> {
+  const failures: OrderedWorkspaceLockReleaseError[] = [];
+  for (let index = acquired.length - 1; index >= 0; index -= 1) {
+    const member = acquired[index]!;
+    try {
+      await member.lock.release();
+    } catch (cause) {
+      failures.push(
+        new OrderedWorkspaceLockReleaseError(member.target.storeRoot, cause),
+      );
+    }
+  }
+  return failures.length === 0
+    ? { kind: "released" }
+    : { kind: "failed", failures };
+}
+
+/** Acquire canonically and preserve the action result independently per cleanup root. */
+export async function runWithOrderedWorkspaceLocks<T>(
+  targets: readonly OrderedWorkspaceLockTarget[],
+  operation: string,
+  action: () => Promise<T>,
+): Promise<OrderedWorkspaceLockExecution<T>> {
+  const acquired: Array<{
+    readonly target: OrderedWorkspaceLockTarget;
+    readonly lock: WorkspaceLock;
+  }> = [];
+  for (const target of orderedTargets(targets)) {
+    try {
+      acquired.push({
+        target,
+        lock: await acquireWorkspaceLock(
+          target.storeRoot,
+          operation,
+          target.options,
+        ),
+      });
+    } catch (cause) {
+      const acquisition = new OrderedWorkspaceLockAcquisitionError(
+        target.storeRoot,
+        cause,
+      );
+      const cleanup = await releaseOrderedLocks(acquired);
+      if (cleanup.kind === "released") throw acquisition;
+      throw new AggregateError(
+        [acquisition, ...cleanup.failures],
+        "ordered workspace-lock acquisition and cleanup both failed",
+        { cause: acquisition },
+      );
+    }
+  }
+
+  let actionResult:
+    | { readonly kind: "completed"; readonly value: T }
+    | { readonly kind: "action-failed"; readonly cause: unknown };
+  try {
+    actionResult = { kind: "completed", value: await action() };
+  } catch (cause) {
+    actionResult = { kind: "action-failed", cause };
+  }
+  return { ...actionResult, cleanup: await releaseOrderedLocks(acquired) };
+}
+
+/** Acquire multiple workspace locks in one canonical order to avoid AB/BA deadlocks. */
+export async function withOrderedWorkspaceLocks<T>(
+  targets: readonly OrderedWorkspaceLockTarget[],
+  operation: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const execution = await runWithOrderedWorkspaceLocks(
+    targets,
+    operation,
+    action,
+  );
+  if (execution.kind === "completed") {
+    if (execution.cleanup.kind === "released") return execution.value;
+    if (execution.cleanup.failures.length === 1) {
+      throw execution.cleanup.failures[0];
+    }
+    throw new AggregateError(
+      execution.cleanup.failures,
+      "ordered workspace-lock cleanup failed",
+      { cause: execution.cleanup.failures[0] },
+    );
+  }
+  if (execution.cleanup.kind === "released") throw execution.cause;
+  throw new AggregateError(
+    [execution.cause, ...execution.cleanup.failures],
+    "ordered workspace-lock operation and cleanup both failed",
+    { cause: execution.cause },
+  );
 }

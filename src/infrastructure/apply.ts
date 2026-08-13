@@ -20,7 +20,7 @@ import {
   type FileRecreationMode,
   type TreeEntry,
   type TreeManifest,
-} from "./tree-manifest.ts";
+} from "./tree-formats/manifest-codec.ts";
 import {
   prepareWorkspaceRestorePlan,
   type WorkspacePathAlias,
@@ -84,6 +84,43 @@ const UNOBSERVED_PATH_DETAIL =
 const BLOCKED_ANCESTOR_DETAIL =
   "refusing to mutate below an unsafe or unavailable target directory";
 
+/**
+ * A restore may spend an arbitrary amount of time in asynchronous preflight.
+ * Entering this gate is the single synchronous cutover from observation to
+ * mutation. Every possible first workspace mutation enters it immediately
+ * before issuing its syscall; subsequent entries are no-ops. A rejected
+ * cutover stays rejected so per-path error collection can never let a later
+ * path mutate without authority. A no-op apply never enters; a potentially
+ * mutating syscall does even when the kernel ultimately rejects that syscall.
+ */
+class WorkspaceMutationGate {
+  #state: "pending" | "entered" | "rejected" = "pending";
+  #rejection: unknown;
+  readonly #beforeFirstMutation: () => void;
+
+  constructor(beforeFirstMutation: () => void) {
+    this.#beforeFirstMutation = beforeFirstMutation;
+  }
+
+  enter(): void {
+    if (this.#state === "entered") return;
+    if (this.#state === "rejected") throw this.#rejection;
+
+    try {
+      this.#beforeFirstMutation();
+      this.#state = "entered";
+    } catch (error) {
+      this.#state = "rejected";
+      this.#rejection = error;
+      throw error;
+    }
+  }
+
+  throwIfRejected(): void {
+    if (this.#state === "rejected") throw this.#rejection;
+  }
+}
+
 function errorCode(error: unknown): string | undefined {
   try {
     if (typeof error !== "object" || error === null) {
@@ -135,14 +172,17 @@ async function writeRegularAtomically(
   content: Uint8Array,
   recreationMode: FileRecreationMode,
   beforeCommit: () => Promise<void>,
+  mutationGate: WorkspaceMutationGate,
 ): Promise<void> {
   const temporary = join(
     dirname(absolute),
     `.cyclotomy-${process.pid}-${randomUUID()}.tmp`,
   );
   let handle: FileHandle | undefined;
+  let temporaryCreated = false;
   try {
     await beforeCommit();
+    mutationGate.enter();
     handle = await open(
       temporary,
       constants.O_CREAT |
@@ -151,6 +191,7 @@ async function writeRegularAtomically(
         (constants.O_NOFOLLOW ?? 0),
       0o600,
     );
+    temporaryCreated = true;
     await handle.writeFile(content);
     if (process.platform !== "win32" && recreationMode !== null) {
       await handle.chmod(recreationMode);
@@ -168,11 +209,13 @@ async function writeRegularAtomically(
         // Preserve the original write failure.
       }
     }
-    try {
-      await unlink(temporary);
-    } catch (cleanupError) {
-      if (errorCode(cleanupError) !== "ENOENT") {
-        // Orphan temporary files are inert; preserve the original failure.
+    if (temporaryCreated) {
+      try {
+        await unlink(temporary);
+      } catch (cleanupError) {
+        if (errorCode(cleanupError) !== "ENOENT") {
+          // Orphan temporary files are inert; preserve the original failure.
+        }
       }
     }
     throw error;
@@ -272,6 +315,7 @@ async function rewriteRegularInPlace(
   content: Uint8Array,
   observed: Extract<WorkspaceEntry, { readonly kind: "regular" }>,
   validateAncestors: () => Promise<void>,
+  mutationGate: WorkspaceMutationGate,
 ): Promise<void> {
   await validateAncestors();
   const handle = await openWorkspaceRegularCandidate(
@@ -319,6 +363,7 @@ async function rewriteRegularInPlace(
     }
     await assertPathBindsOpenedRegular(absolute, opened);
 
+    mutationGate.enter();
     await handle.truncate(0);
     await writeAll(handle, content);
     await handle.truncate(content.byteLength);
@@ -359,11 +404,13 @@ async function writeSymlinkAtomically(
   target: string,
   symlinkKind: SymlinkTargetEntry["symlinkKind"],
   beforeCommit: () => Promise<void>,
+  mutationGate: WorkspaceMutationGate,
 ): Promise<void> {
   const temporary = join(
     dirname(absolute),
     `.cyclotomy-${process.pid}-${randomUUID()}.tmp`,
   );
+  let temporaryCreated = false;
   try {
     await beforeCommit();
     if (process.platform === "win32") {
@@ -372,18 +419,23 @@ async function writeSymlinkAtomically(
           "cannot safely recreate a Windows symlink without a recorded target type",
         );
       }
+      mutationGate.enter();
       await symlink(
         target,
         temporary,
         symlinkKind === "directory" ? "dir" : "file",
       );
     } else {
+      mutationGate.enter();
       await symlink(target, temporary);
     }
+    temporaryCreated = true;
     await beforeCommit();
     await rename(temporary, absolute);
   } catch (error) {
-    await unlink(temporary).catch(() => {});
+    if (temporaryCreated) {
+      await unlink(temporary).catch(() => {});
+    }
     throw error;
   }
 }
@@ -499,6 +551,7 @@ class CommittedDirectoryRecaseError extends Error {
 async function recasePreparedDirectory(
   workspaceRoot: string,
   alias: WorkspacePathAlias,
+  mutationGate: WorkspaceMutationGate,
 ): Promise<boolean> {
   const source = join(workspaceRoot, alias.from);
   const target = join(workspaceRoot, alias.to);
@@ -510,6 +563,7 @@ async function recasePreparedDirectory(
     return false;
   }
 
+  mutationGate.enter();
   await rename(source, target);
   try {
     const targetMetadata = await lstat(target);
@@ -995,7 +1049,9 @@ export async function applyTreeToWorkspace(
   target: TreeManifest,
   readBlob: (oid: string) => Promise<Uint8Array>,
   current: WorkspaceSnapshot,
+  beforeFirstMutation: () => void,
 ): Promise<ApplyReport> {
+  const mutationGate = new WorkspaceMutationGate(beforeFirstMutation);
   if (current.problems.length > 0) {
     throw new ApplyError(
       `refusing to apply from an incomplete current workspace scan: ${summarizeScanProblems(
@@ -1295,6 +1351,7 @@ export async function applyTreeToWorkspace(
       const changed = await recasePreparedDirectory(
         workspaceRoot,
         effectiveAlias,
+        mutationGate,
       );
       copyDirectoryObservations(effectiveFrom, alias.to);
       if (changed) {
@@ -1351,6 +1408,7 @@ export async function applyTreeToWorkspace(
     }
     try {
       await assertCurrentPath(currentEntry);
+      mutationGate.enter();
       await unlink(join(workspaceRoot, relativePath));
       markDirty(relativePath);
       if (targetKeptDirectories.has(relativePath)) {
@@ -1397,6 +1455,7 @@ export async function applyTreeToWorkspace(
       if (observation !== undefined) {
         await assertObservedDirectory(workspaceRoot, observation);
       }
+      mutationGate.enter();
       await rmdir(join(workspaceRoot, relativePath));
       // The pruned directory itself can no longer be fsynced; its removal
       // is covered by the parent fsync.
@@ -1486,6 +1545,7 @@ export async function applyTreeToWorkspace(
           workspaceRoot,
           directoryObservations.get(relativePath)!,
         );
+        mutationGate.enter();
         await rmdir(join(workspaceRoot, relativePath));
         directoryObservations.delete(relativePath);
         dirtiedDirectories.delete(relativePath);
@@ -1578,6 +1638,7 @@ export async function applyTreeToWorkspace(
         if (observed !== undefined) {
           await assertCurrentPath(observed);
         }
+        mutationGate.enter();
         await unlink(absolute);
         markDirty(relativePath);
         replacedManagedEntry = currentByPath.has(relativePath);
@@ -1597,6 +1658,7 @@ export async function applyTreeToWorkspace(
       // an ancestor swapped for a symlink cannot redirect directory creation
       // outside the scanned workspace.
       await assertCreatedPathStillAbsent(relativePath);
+      mutationGate.enter();
       await mkdir(absolute);
       // mkdir has already changed the parent entry even if the identity
       // check below fails, so record that durability obligation immediately.
@@ -1716,12 +1778,17 @@ export async function applyTreeToWorkspace(
     try {
       const absolute = join(workspaceRoot, entry.path);
       if (existingRegular !== undefined) {
-        await rewriteRegularInPlace(absolute, content, existingRegular, () =>
-          assertObservedAncestors(
-            workspaceRoot,
-            entry.path,
-            directoryObservations,
-          ),
+        await rewriteRegularInPlace(
+          absolute,
+          content,
+          existingRegular,
+          () =>
+            assertObservedAncestors(
+              workspaceRoot,
+              entry.path,
+              directoryObservations,
+            ),
+          mutationGate,
         );
       } else {
         const validateDestination = createdPath
@@ -1733,6 +1800,7 @@ export async function applyTreeToWorkspace(
           content,
           targetRecreationMode(entry),
           validateDestination,
+          mutationGate,
         );
       }
       // In-place content writes fsync the inode itself and do not mutate a
@@ -1791,6 +1859,7 @@ export async function applyTreeToWorkspace(
         createdPath
           ? () => assertCreatedPathStillAbsent(entry.path)
           : () => assertCurrentPath(currentByPath.get(entry.path)!),
+        mutationGate,
       );
       markDirty(entry.path);
       if (createdPath) {
@@ -1844,5 +1913,6 @@ export async function applyTreeToWorkspace(
   updated.sort(comparePaths);
   deleted.sort(comparePaths);
   renamed.sort((left, right) => comparePaths(left.to, right.to));
+  mutationGate.throwIfRejected();
   return { created, updated, deleted, renamed, unchangedCount, problems };
 }
