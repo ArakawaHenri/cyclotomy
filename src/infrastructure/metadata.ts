@@ -27,6 +27,11 @@ import {
   type ReducedCheckpointLineage,
 } from "../domain/checkpoint-lineage.ts";
 import { MetadataError } from "./metadata-error.ts";
+import { systemErrorCode } from "./system-error.ts";
+import {
+  assertWorkspaceWriteAuthority,
+  type WorkspaceWriteAuthority,
+} from "./workspace-lock.ts";
 import {
   METADATA_WRITER_PROTOCOL_FUNCTION,
   metadataSchemaVersion,
@@ -53,12 +58,6 @@ const OPEN_BUSY_POLL_MS = 10;
 const OPEN_WAIT_CELL = new Int32Array(new SharedArrayBuffer(4));
 const SIDECAR_VALIDATION_ATTEMPTS = 64;
 const SIDECAR_RETRY_MS = 2;
-
-function systemErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
-}
 
 function isTransientSidecarAccess(error: unknown): boolean {
   const code = systemErrorCode(error);
@@ -236,6 +235,11 @@ export interface MetadataIdentityProof {
 
 export type MetadataIdentityInspection =
   | { readonly kind: "exact"; readonly proof: MetadataIdentityProof }
+  | {
+      readonly kind: "newer";
+      readonly observedVersion: number;
+      readonly supportedVersion: number;
+    }
   | { readonly kind: "absent" | "conflict" | "unrecognized" }
   | { readonly kind: "recovery-required"; readonly cause: MetadataError };
 
@@ -284,8 +288,9 @@ const metadataIdentityProofDetails = new WeakMap<
 >();
 
 interface MetadataStoreOpenOptions {
-  readonly allowHistorical: boolean;
+  readonly migrationCandidate: boolean;
   readonly authenticatedProof?: MetadataIdentityProof;
+  readonly writeAuthority: WorkspaceWriteAuthority;
 }
 
 function metadataPathError(
@@ -782,35 +787,49 @@ export function inspectMetadataSessionIdentity(
     let inspection:
       | { readonly kind: "absent" | "conflict" | "unrecognized" }
       | {
+          readonly kind: "newer";
+          readonly observedVersion: number;
+          readonly supportedVersion: number;
+        }
+      | {
           readonly kind: "exact";
           readonly metadataVersion: MetadataVersionNode;
         }
       | undefined;
     try {
       db = new DatabaseSync(location, { readOnly: true });
-      const metadataVersion = findMetadataVersion(
-        CURRENT_METADATA_VERSION,
-        metadataSchemaVersion(db),
-      );
-      if (metadataVersion === undefined) {
-        inspection = { kind: "unrecognized" };
+      const observedVersion = metadataSchemaVersion(db);
+      if (observedVersion > CURRENT_METADATA_VERSION.version) {
+        inspection = {
+          kind: "newer",
+          observedVersion,
+          supportedVersion: CURRENT_METADATA_VERSION.version,
+        };
       } else {
-        try {
-          validateMetadataVersion(db, metadataVersion);
-        } catch (error) {
-          if (!(error instanceof MetadataError)) throw error;
+        const metadataVersion = findMetadataVersion(
+          CURRENT_METADATA_VERSION,
+          observedVersion,
+        );
+        if (metadataVersion === undefined) {
           inspection = { kind: "unrecognized" };
-        }
-        if (inspection === undefined) {
-          const match = metadataVersion.matchSessionIdentity(
-            db,
-            sessionId,
-            sessionFile,
-          );
-          inspection =
-            match === "exact"
-              ? { kind: "exact", metadataVersion }
-              : { kind: match };
+        } else {
+          try {
+            validateMetadataVersion(db, metadataVersion);
+          } catch (error) {
+            if (!(error instanceof MetadataError)) throw error;
+            inspection = { kind: "unrecognized" };
+          }
+          if (inspection === undefined) {
+            const match = metadataVersion.matchSessionIdentity(
+              db,
+              sessionId,
+              sessionFile,
+            );
+            inspection =
+              match === "exact"
+                ? { kind: "exact", metadataVersion }
+                : { kind: match };
+          }
         }
       }
     } finally {
@@ -1275,17 +1294,29 @@ export interface CurrentMetadataStore {
     sessionId: string,
     rootToTargetEntryIds: readonly string[],
   ): ResolvedCheckpointLineage;
-  commitCapture(input: CommitCaptureInput): CommitCaptureResult;
-  protectLocation(input: ProtectLocationInput): ProtectLocationResult;
+  commitCapture(
+    authority: WorkspaceWriteAuthority,
+    input: CommitCaptureInput,
+  ): CommitCaptureResult;
+  protectLocation(
+    authority: WorkspaceWriteAuthority,
+    input: ProtectLocationInput,
+  ): ProtectLocationResult;
   admitResolvedLocation(
+    authority: WorkspaceWriteAuthority,
     input: AdmitResolvedLocationInput,
   ): AdmitResolvedLocationResult;
   adoptBlockedMissing(
+    authority: WorkspaceWriteAuthority,
     input: AdoptBlockedMissingInput,
   ): "committed" | "slot-changed";
-  raiseSessionBarrier(identity: MetadataSessionIdentity): boolean;
+  raiseSessionBarrier(
+    authority: WorkspaceWriteAuthority,
+    identity: MetadataSessionIdentity,
+  ): boolean;
   hasSessionBarrier(identity: MetadataSessionIdentity): boolean | undefined;
   reconcileSessionBarrier(
+    authority: WorkspaceWriteAuthority,
     identity: MetadataSessionIdentity,
     activeAncestryEntryIds: readonly string[],
   ): ReconcileSessionBarrierResult;
@@ -1297,7 +1328,12 @@ export interface CurrentMetadataStore {
     input: ExportForkProjectionInput,
   ): ForkCheckpointProjection | undefined;
   finalizeSessionProjection(
+    authority: WorkspaceWriteAuthority,
     input: FinalizeSessionProjectionInput,
+    sourceAuthority?: {
+      readonly authority: WorkspaceWriteAuthority;
+      readonly storeRoot: string;
+    },
   ): FinalizeSessionRegistrationReport;
   listReferencedTreeOids(limit?: number): string[];
   close(): void;
@@ -1305,9 +1341,15 @@ export interface CurrentMetadataStore {
 
 class SqliteMetadataConnection implements CurrentMetadataStore {
   readonly #db: DatabaseSync;
+  readonly #canonicalPath: string;
+  #phase: "historical" | "current" = "historical";
   #closed = false;
 
   constructor(path: string, options: MetadataStoreOpenOptions) {
+    // Construction is synchronous through path preparation, SQLite open, and
+    // WAL configuration. Fence before the first possible persistent mutation;
+    // mutating transactions retain their own adjacent fence below.
+    assertWorkspaceWriteAuthority(options.writeAuthority, dirname(path));
     const authenticatedProof = options.authenticatedProof;
     const authenticated =
       authenticatedProof === undefined
@@ -1322,6 +1364,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         authenticated === undefined
           ? prepareMetadataPath(path)
           : prepareExistingMetadataPath(path);
+      this.#canonicalPath = prepared.canonicalPath;
       if (
         authenticated !== undefined &&
         (prepared.canonicalPath !== authenticated.canonicalPath ||
@@ -1377,7 +1420,10 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
           snapshot,
         );
         validateMetadataVersion(snapshot, observed);
-        if (observed !== CURRENT_METADATA_VERSION && !options.allowHistorical) {
+        if (
+          observed !== CURRENT_METADATA_VERSION &&
+          !options.migrationCandidate
+        ) {
           throw new MetadataError(
             `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
           );
@@ -1419,13 +1465,19 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       // EMPTY initializes current directly. A published historical layout is
       // validated without reinterpretation and may only remain open inside the
       // async adjacent-version migration protocol.
+      let phase: "historical" | "current";
       if (metadataSchemaVersion(db) === 0) {
-        this.#transaction((locked) => {
+        phase = this.#runRawTransaction("BEGIN IMMEDIATE", (locked) => {
           if (metadataSchemaVersion(locked) === 0) {
+            assertWorkspaceWriteAuthority(
+              options.writeAuthority,
+              dirname(this.#canonicalPath),
+            );
             initializeMetadataVersionWithinTransaction(
               locked,
               CURRENT_METADATA_VERSION,
             );
+            return "current";
           } else {
             const observed = requireMetadataVersion(
               CURRENT_METADATA_VERSION,
@@ -1434,23 +1486,38 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
             validateMetadataVersion(locked, observed);
             if (
               observed !== CURRENT_METADATA_VERSION &&
-              !options.allowHistorical
+              !options.migrationCandidate
             ) {
               throw new MetadataError(
                 `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
               );
             }
+            return observed === CURRENT_METADATA_VERSION
+              ? "current"
+              : "historical";
           }
         });
       } else {
-        const observed = requireMetadataVersion(CURRENT_METADATA_VERSION, db);
-        validateMetadataVersion(db, observed);
-        if (observed !== CURRENT_METADATA_VERSION && !options.allowHistorical) {
-          throw new MetadataError(
-            `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
+        phase = inReadTransaction(db, (snapshot) => {
+          const observed = requireMetadataVersion(
+            CURRENT_METADATA_VERSION,
+            snapshot,
           );
-        }
+          validateMetadataVersion(snapshot, observed);
+          if (
+            observed !== CURRENT_METADATA_VERSION &&
+            !options.migrationCandidate
+          ) {
+            throw new MetadataError(
+              `metadata schema version ${observed.version} requires openCurrentMetadataStore()`,
+            );
+          }
+          return observed === CURRENT_METADATA_VERSION
+            ? "current"
+            : "historical";
+        });
       }
+      this.#phase = phase;
     } catch (error) {
       try {
         db.close();
@@ -1465,20 +1532,27 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
 
   async migrateToCurrent(
     dependencies: MetadataMigrationDependencies,
+    authority: WorkspaceWriteAuthority,
   ): Promise<void> {
+    const db = this.#rawDatabase();
     await migrateMetadataToCurrent(
-      this.#database(),
+      db,
       dependencies,
+      authority,
+      dirname(this.#canonicalPath),
       CURRENT_METADATA_VERSION,
     );
-    validateMetadataVersion(this.#database(), CURRENT_METADATA_VERSION);
+    inReadTransaction(db, (snapshot) => {
+      validateMetadataVersion(snapshot, CURRENT_METADATA_VERSION);
+    });
+    this.#phase = "current";
   }
 
   getCheckpointSlot(sessionId: string, entryId: string): CheckpointSlot {
-    return checkpointSlotIn(
-      this.#database(),
-      requireNonEmpty(sessionId, "session id"),
-      requireNonEmpty(entryId, "entry id"),
+    const checkedSessionId = requireNonEmpty(sessionId, "session id");
+    const checkedEntryId = requireNonEmpty(entryId, "entry id");
+    return this.#readTransaction((db) =>
+      checkpointSlotIn(db, checkedSessionId, checkedEntryId),
     );
   }
 
@@ -1496,7 +1570,10 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     );
   }
 
-  commitCapture(input: CommitCaptureInput): CommitCaptureResult {
+  commitCapture(
+    authority: WorkspaceWriteAuthority,
+    input: CommitCaptureInput,
+  ): CommitCaptureResult {
     const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
     const sessionFile = requireNonEmpty(
       input.identity.sessionFile,
@@ -1515,7 +1592,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       );
     }
     const treeOid = requireTreeOid(input.treeOid, "captured checkpoint");
-    return this.#transaction((db) => {
+    return this.#writeTransaction(authority, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (
         reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile) ===
@@ -1549,7 +1626,10 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
    * returned slot was committed against the actual resolution in this same
    * transaction. Uncertain recovery requests unconditional protection.
    */
-  protectLocation(input: ProtectLocationInput): ProtectLocationResult {
+  protectLocation(
+    authority: WorkspaceWriteAuthority,
+    input: ProtectLocationInput,
+  ): ProtectLocationResult {
     const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
     const sessionFile = requireNonEmpty(
       input.identity.sessionFile,
@@ -1569,7 +1649,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
             "expected protected resolution",
           )
         : undefined;
-    return this.#transaction((db) => {
+    return this.#writeTransaction(authority, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       const hasBarrier = sessionHasBarrierIn(db, sessionId);
       const { resolution: actualResolution, targetSlot: current } =
@@ -1600,6 +1680,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
    * matching pin is reopened by value.
    */
   admitResolvedLocation(
+    authority: WorkspaceWriteAuthority,
     input: AdmitResolvedLocationInput,
   ): AdmitResolvedLocationResult {
     const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
@@ -1618,7 +1699,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       ancestry,
       "expected admitted resolution",
     );
-    return this.#transaction((db) => {
+    return this.#writeTransaction(authority, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
       const { resolution: resolved, targetSlot: current } = resolveCheckpointIn(
@@ -1645,6 +1726,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
   }
 
   adoptBlockedMissing(
+    authority: WorkspaceWriteAuthority,
     input: AdoptBlockedMissingInput,
   ): "committed" | "slot-changed" {
     const sessionId = requireNonEmpty(input.identity.sessionId, "session id");
@@ -1654,7 +1736,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     );
     const entryId = requireNonEmpty(input.entryId, "entry id");
     const treeOid = requireTreeOid(input.treeOid, "adopted checkpoint");
-    return this.#transaction((db) => {
+    return this.#writeTransaction(authority, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
       const transition = adoptBlockedMissingSlot(
@@ -1667,10 +1749,13 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     });
   }
 
-  raiseSessionBarrier(identity: MetadataSessionIdentity): boolean {
+  raiseSessionBarrier(
+    authority: WorkspaceWriteAuthority,
+    identity: MetadataSessionIdentity,
+  ): boolean {
     const sessionId = requireNonEmpty(identity.sessionId, "session id");
     const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
-    return this.#transaction((db) => {
+    return this.#writeTransaction(authority, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       db.prepare(
         `INSERT OR IGNORE INTO session_capture_barrier(session_id) VALUES (?)`,
@@ -1682,32 +1767,35 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
   hasSessionBarrier(identity: MetadataSessionIdentity): boolean | undefined {
     const sessionId = requireNonEmpty(identity.sessionId, "session id");
     const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
-    const row = this.#database()
-      .prepare(
-        `SELECT registry.registration_state,
+    return this.#readTransaction((db) => {
+      const row = db
+        .prepare(
+          `SELECT registry.registration_state,
                 EXISTS(
                   SELECT 1 FROM session_capture_barrier AS barrier
                   WHERE barrier.session_id = registry.session_id
                 ) AS capture_barrier
          FROM session_registry AS registry
          WHERE registry.session_id = ? AND registry.session_file = ?`,
-      )
-      .get(sessionId, sessionFile) as
-      | {
-          readonly capture_barrier: unknown;
-          readonly registration_state: unknown;
-        }
-      | undefined;
-    if (
-      row === undefined ||
-      sessionRegistrationStateFrom(row.registration_state) !== "verified"
-    ) {
-      return undefined;
-    }
-    return sessionCaptureBarrierFrom(row.capture_barrier);
+        )
+        .get(sessionId, sessionFile) as
+        | {
+            readonly capture_barrier: unknown;
+            readonly registration_state: unknown;
+          }
+        | undefined;
+      if (
+        row === undefined ||
+        sessionRegistrationStateFrom(row.registration_state) !== "verified"
+      ) {
+        return undefined;
+      }
+      return sessionCaptureBarrierFrom(row.capture_barrier);
+    });
   }
 
   reconcileSessionBarrier(
+    authority: WorkspaceWriteAuthority,
     identity: MetadataSessionIdentity,
     activeAncestryEntryIds: readonly string[],
   ): ReconcileSessionBarrierResult {
@@ -1724,26 +1812,28 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         "session barrier cannot be reconciled without a stable ancestry",
       );
     }
-    const result = this.#transaction((db) =>
+    const result = this.#writeTransaction(authority, (db) =>
       reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile),
     );
     return result;
   }
 
   /**
-   * Authenticate Pi's `(id, file)` pair without depending on post-v1 columns.
-   * This is intentionally usable before a published-v1 tree/schema migration.
+   * Authenticate Pi's `(id, file)` pair in the promoted current snapshot.
+   * Read-only historical inspection dispatches through its exact version node.
    */
   matchSessionIdentity(
     sessionId: string,
     sessionFile: string,
   ): MetadataSessionIdentityMatch {
-    requireNonEmpty(sessionId, "session id");
-    requireNonEmpty(sessionFile, "session file");
-    return CURRENT_METADATA_VERSION.matchSessionIdentity(
-      this.#database(),
-      sessionId,
-      sessionFile,
+    const checkedSessionId = requireNonEmpty(sessionId, "session id");
+    const checkedSessionFile = requireNonEmpty(sessionFile, "session file");
+    return this.#readTransaction((db) =>
+      CURRENT_METADATA_VERSION.matchSessionIdentity(
+        db,
+        checkedSessionId,
+        checkedSessionFile,
+      ),
     );
   }
 
@@ -1767,7 +1857,12 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
 
   /** Register a session from a total, authenticated slot projection. */
   finalizeSessionProjection(
+    authority: WorkspaceWriteAuthority,
     input: FinalizeSessionProjectionInput,
+    sourceAuthority?: {
+      readonly authority: WorkspaceWriteAuthority;
+      readonly storeRoot: string;
+    },
   ): FinalizeSessionRegistrationReport {
     const targetSessionId = requireNonEmpty(
       input.targetSessionId,
@@ -1780,7 +1875,27 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     const retained = retainedEntrySet(input.retainedEntryIds);
     const active = activeAncestry(input.activeAncestryEntryIds, retained);
 
-    return this.#transaction((db) => {
+    const forkSeed =
+      typeof input.seed === "object" &&
+      input.seed !== null &&
+      input.seed.kind === "fork";
+    if (forkSeed && sourceAuthority === undefined) {
+      throw new MetadataError(
+        "fork session projection requires source workspace write authority",
+      );
+    }
+    if (!forkSeed && sourceAuthority !== undefined) {
+      throw new MetadataError(
+        "source workspace write authority is only valid for a fork projection",
+      );
+    }
+    return this.#writeTransaction(authority, (db) => {
+      if (sourceAuthority !== undefined) {
+        assertWorkspaceWriteAuthority(
+          sourceAuthority.authority,
+          sourceAuthority.storeRoot,
+        );
+      }
       const matches = db
         .prepare(
           `SELECT registry.session_id, registry.session_file,
@@ -1926,14 +2041,18 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
 
   /** Every checkpoint-bearing slot, open or blocked, is an object-GC root. */
   listReferencedTreeOids(limit?: number): string[] {
-    return [
-      ...CURRENT_METADATA_VERSION.referencedTreeOids(this.#database(), limit),
-    ];
+    return this.#readTransaction((db) => [
+      ...CURRENT_METADATA_VERSION.referencedTreeOids(db, limit),
+    ]);
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    // SQLite may checkpoint already-committed WAL pages while the final
+    // connection closes. That representation-only maintenance is serialized
+    // by SQLite's own cross-process locks; it does not publish new Cyclotomy
+    // metadata and therefore does not consume workspace write authority.
     this.#db.close();
   }
 
@@ -1941,15 +2060,41 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     return this.#runTransaction("BEGIN", operation);
   }
 
-  #transaction<T>(operation: (db: DatabaseSync) => T): T {
-    return this.#runTransaction("BEGIN IMMEDIATE", operation);
+  #writeTransaction<T>(
+    authority: WorkspaceWriteAuthority,
+    operation: (db: DatabaseSync) => T,
+  ): T {
+    return this.#runTransaction("BEGIN IMMEDIATE", (db) => {
+      assertWorkspaceWriteAuthority(authority, dirname(this.#canonicalPath));
+      return operation(db);
+    });
   }
 
   #runTransaction<T>(
     begin: "BEGIN" | "BEGIN IMMEDIATE",
     operation: (db: DatabaseSync) => T,
   ): T {
-    const db = this.#database();
+    return this.#runRawTransaction(begin, (db) => {
+      if (this.#phase !== "current") {
+        throw new MetadataError(
+          "historical metadata connection cannot provide current operations",
+        );
+      }
+      const observed = metadataSchemaVersion(db);
+      if (observed !== CURRENT_METADATA_VERSION.version) {
+        throw new MetadataError(
+          `metadata schema version changed from ${CURRENT_METADATA_VERSION.version} to ${observed} while this current store remained open`,
+        );
+      }
+      return operation(db);
+    });
+  }
+
+  #runRawTransaction<T>(
+    begin: "BEGIN" | "BEGIN IMMEDIATE",
+    operation: (db: DatabaseSync) => T,
+  ): T {
+    const db = this.#rawDatabase();
     db.exec(begin);
     try {
       const result = operation(db);
@@ -1965,31 +2110,33 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     }
   }
 
-  #database(): DatabaseSync {
+  #rawDatabase(): DatabaseSync {
     if (this.#closed) throw new MetadataError("metadata store is closed");
     return this.#db;
   }
 }
 
-interface HistoricalMetadataCandidate {
+interface MetadataMigrationCandidate {
   migrate(
     dependencies: MetadataMigrationDependencies,
   ): Promise<CurrentMetadataStore>;
   close(): void;
 }
 
-function openHistoricalMetadataCandidate(
+function openMetadataMigrationCandidate(
   path: string,
+  authority: WorkspaceWriteAuthority,
   proof?: MetadataIdentityProof,
-): HistoricalMetadataCandidate {
+): MetadataMigrationCandidate {
   let store: SqliteMetadataConnection | undefined =
     new SqliteMetadataConnection(path, {
-      allowHistorical: true,
+      migrationCandidate: true,
+      writeAuthority: authority,
       ...(proof === undefined ? {} : { authenticatedProof: proof }),
     });
   const activeStore = (): SqliteMetadataConnection => {
     if (store === undefined) {
-      throw new MetadataError("historical metadata candidate is closed");
+      throw new MetadataError("metadata migration candidate is closed");
     }
     return store;
   };
@@ -1998,7 +2145,7 @@ function openHistoricalMetadataCandidate(
       dependencies: MetadataMigrationDependencies,
     ): Promise<CurrentMetadataStore> {
       const migrated = activeStore();
-      await migrated.migrateToCurrent(dependencies);
+      await migrated.migrateToCurrent(dependencies, authority);
       store = undefined;
       return migrated;
     },
@@ -2011,7 +2158,7 @@ function openHistoricalMetadataCandidate(
 }
 
 async function finishOpeningCurrentMetadataStore(
-  candidate: HistoricalMetadataCandidate,
+  candidate: MetadataMigrationCandidate,
   dependencies: MetadataMigrationDependencies,
 ): Promise<CurrentMetadataStore> {
   try {
@@ -2031,17 +2178,24 @@ async function finishOpeningCurrentMetadataStore(
 }
 
 /** Create an empty store, or synchronously reopen an exact current store. */
-export function createCurrentMetadataStore(path: string): CurrentMetadataStore {
-  return new SqliteMetadataConnection(path, { allowHistorical: false });
+export function createCurrentMetadataStore(
+  path: string,
+  authority: WorkspaceWriteAuthority,
+): CurrentMetadataStore {
+  return new SqliteMetadataConnection(path, {
+    migrationCandidate: false,
+    writeAuthority: authority,
+  });
 }
 
 /** Open, initialize or traverse every adjacent edge before exposing the store. */
 export function openCurrentMetadataStore(
   path: string,
   dependencies: MetadataMigrationDependencies,
+  authority: WorkspaceWriteAuthority,
 ): Promise<CurrentMetadataStore> {
   return finishOpeningCurrentMetadataStore(
-    openHistoricalMetadataCandidate(path),
+    openMetadataMigrationCandidate(path, authority),
     dependencies,
   );
 }
@@ -2050,13 +2204,14 @@ export function openCurrentMetadataStore(
 export function openAuthenticatedCurrentMetadataStore(
   proof: MetadataIdentityProof,
   dependencies: MetadataMigrationDependencies,
+  authority: WorkspaceWriteAuthority,
 ): Promise<CurrentMetadataStore> {
   const details = metadataIdentityProofDetails.get(proof);
   if (details === undefined) {
     throw new MetadataError("metadata identity proof is invalid or expired");
   }
   return finishOpeningCurrentMetadataStore(
-    openHistoricalMetadataCandidate(details.canonicalPath, proof),
+    openMetadataMigrationCandidate(details.canonicalPath, authority, proof),
     dependencies,
   );
 }

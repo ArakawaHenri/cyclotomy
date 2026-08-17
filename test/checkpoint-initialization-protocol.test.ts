@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ResolvedNodeState } from "../src/application/resolve.ts";
 import type { NodeKey } from "../src/domain/model.ts";
-import type { ArrivalProtection } from "../src/pi/arrival-protection.ts";
+import type { NonAdmittedArrivalDisposition } from "../src/pi/arrival-settlement.ts";
 import {
   settleCheckpointInitialization,
   type CheckpointInitializationProtocolDeps,
@@ -32,8 +32,14 @@ function deps(
   current: SessionView,
   protectCommittedArrival: (
     cause: unknown,
-  ) => ArrivalProtection | Promise<ArrivalProtection> = vi.fn(() => ({
-    kind: "session-barrier" as const,
+  ) =>
+    | NonAdmittedArrivalDisposition
+    | Promise<NonAdmittedArrivalDisposition> = vi.fn(() => ({
+    kind: "protected" as const,
+    evidence: {
+      kind: "session-barrier" as const,
+      admission: { kind: "settled" as const },
+    },
   })),
 ): CheckpointInitializationProtocolDeps {
   return {
@@ -48,7 +54,11 @@ describe("checkpoint initialization settlement", () => {
   it("admits an unchanged committed coordinate", async () => {
     const expected = view("expected");
     const protectCommittedArrival = vi.fn(() => ({
-      kind: "session-barrier" as const,
+      kind: "protected" as const,
+      evidence: {
+        kind: "session-barrier" as const,
+        admission: { kind: "settled" as const },
+      },
     }));
     const admit = vi.fn(() => ({ kind: "admitted" as const }));
 
@@ -89,14 +99,18 @@ describe("checkpoint initialization settlement", () => {
   it("durably protects a committed checkpoint when location changed", async () => {
     const expected = view("expected");
     const protectCommittedArrival = vi.fn(() => ({
-      kind: "exact-slot" as const,
-      slot: {
-        kind: "blocked-checkpoint" as const,
-        treeOid: resolution.treeOid,
-      },
-      admission: {
-        kind: "failed" as const,
-        cause: new Error("ephemeral rebuild failed"),
+      kind: "protected" as const,
+      evidence: {
+        kind: "exact-slot" as const,
+        slot: {
+          kind: "blocked-checkpoint" as const,
+          treeOid: resolution.treeOid,
+        },
+        expectation: "matched" as const,
+        admission: {
+          kind: "failed" as const,
+          cause: new Error("ephemeral rebuild failed"),
+        },
       },
     }));
     const admit = vi.fn(() => ({ kind: "admitted" as const }));

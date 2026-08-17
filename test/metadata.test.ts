@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,27 +21,68 @@ import {
   createCurrentMetadataStore,
   inspectMetadataSessionIdentity,
   MetadataError,
-  openAuthenticatedCurrentMetadataStore,
-  openCurrentMetadataStore,
+  openAuthenticatedCurrentMetadataStore as openAuthenticatedCurrentMetadataStoreWithLease,
+  openCurrentMetadataStore as openCurrentMetadataStoreWithLease,
   type CurrentMetadataStore,
 } from "../src/infrastructure/metadata.ts";
 import { CURRENT_METADATA_VERSION } from "../src/infrastructure/metadata/current.ts";
 import { initializeMetadataVersionWithinTransaction } from "../src/infrastructure/metadata/migration-engine.ts";
+import { TREE_MANIFEST_FORMAT_V2 } from "../src/infrastructure/tree-formats/v2.ts";
 import {
+  bindTestMetadataWriteAuthority,
   checkpointIsBlocked,
   checkpointState,
   commitTestNodeState,
+  createTestCurrentMetadataStore,
+  finalizeTestSessionProjection,
   protectTestLocation,
   readTestSessionRegistration,
   readTestSessionRegistrations,
   registerTestSession,
+  testMetadataWriteAuthority,
 } from "./metadata-fixture.ts";
+import {
+  holdTestWorkspaceWriteAuthority,
+  releaseTestWorkspaceWriteAuthorities,
+} from "./workspace-write-authority-fixture.ts";
 
 const roots: string[] = [];
 const CHILD_PROCESS_WATCHDOG_MS = 30_000;
 const metadataOpenFixture = fileURLToPath(
   new URL("./fixtures/metadata-open-child.ts", import.meta.url),
 );
+
+async function openCurrentMetadataStore(
+  path: string,
+  dependencies: Parameters<typeof openCurrentMetadataStoreWithLease>[1],
+): ReturnType<typeof openCurrentMetadataStoreWithLease> {
+  const storeRoot = dirname(path);
+  const authority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  const store = await openCurrentMetadataStoreWithLease(
+    path,
+    dependencies,
+    authority,
+  );
+  bindTestMetadataWriteAuthority(store, authority, storeRoot);
+  return store;
+}
+
+async function openAuthenticatedWithLease(
+  storeRoot: string,
+  proof: Parameters<typeof openAuthenticatedCurrentMetadataStoreWithLease>[0],
+  dependencies: Parameters<
+    typeof openAuthenticatedCurrentMetadataStoreWithLease
+  >[1],
+): ReturnType<typeof openAuthenticatedCurrentMetadataStoreWithLease> {
+  const authority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  const store = await openAuthenticatedCurrentMetadataStoreWithLease(
+    proof,
+    dependencies,
+    authority,
+  );
+  bindTestMetadataWriteAuthority(store, authority, storeRoot);
+  return store;
+}
 
 interface MetadataChildMessage {
   readonly type: "ready" | "opening" | "opened" | "error";
@@ -150,28 +191,31 @@ function startMetadataChild(
   };
 }
 
-async function waitForGatePause(
-  child: MetadataChild,
-  pausedPath: string,
+async function waitForAnyGatePause(
+  children: readonly MetadataChild[],
+  pausedPaths: readonly string[],
 ): Promise<void> {
   const deadline = Date.now() + CHILD_PROCESS_WATCHDOG_MS;
   while (true) {
-    try {
-      await stat(pausedPath);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    for (const pausedPath of pausedPaths) {
+      try {
+        await stat(pausedPath);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
-    if (child.process.exitCode !== null || child.process.signalCode !== null) {
-      throw new Error(
-        `metadata child exited before reaching the schema gate\n${child.stderr()}`,
-      );
+    if (
+      children.every(
+        ({ process }) =>
+          process.exitCode !== null || process.signalCode !== null,
+      )
+    ) {
+      throw new Error("all metadata children exited before the schema gate");
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error(
-        `timed out waiting for metadata child schema gate\n${child.stderr()}`,
-      );
+      throw new Error("timed out waiting for one metadata schema gate");
     }
     await new Promise<void>((resolveWait) =>
       setTimeout(resolveWait, Math.min(10, remaining)),
@@ -208,7 +252,10 @@ async function createStore(): Promise<{
   const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-"));
   roots.push(root);
   const path = join(root, "state.db");
-  return { root, path, store: createCurrentMetadataStore(path) };
+  const authority = await holdTestWorkspaceWriteAuthority(root);
+  const store = createCurrentMetadataStore(path, authority);
+  bindTestMetadataWriteAuthority(store, authority, root);
+  return { root, path, store };
 }
 
 function openCurrentWithTreeUpgrades(
@@ -306,7 +353,9 @@ async function snapshotDirectory(root: string): Promise<{
   readonly names: readonly string[];
   readonly contents: Readonly<Record<string, string>>;
 }> {
-  const names = (await readdir(root)).sort();
+  const names = (await readdir(root))
+    .filter((name) => name !== "workspace.lock")
+    .sort();
   const contents = Object.fromEntries(
     await Promise.all(
       names.map(async (name) => [
@@ -319,13 +368,14 @@ async function snapshotDirectory(root: string): Promise<{
 }
 
 afterEach(async () => {
+  await releaseTestWorkspaceWriteAuthorities();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 
 describe("checkpoint slot metadata", () => {
-  it("creates fresh stores directly at the current v3 schema", async () => {
+  it("creates fresh stores directly at the current v4 schema", async () => {
     const { path, store } = await createStore();
     store.close();
     const db = new DatabaseSync(path);
@@ -347,7 +397,7 @@ describe("checkpoint slot metadata", () => {
         (db.prepare("PRAGMA user_version").get() as { user_version: number })
           .user_version,
       ),
-    ).toBe(3);
+    ).toBe(CURRENT_METADATA_VERSION.version);
     expect(
       db
         .prepare("PRAGMA table_info(session_registry)")
@@ -414,7 +464,7 @@ describe("checkpoint slot metadata", () => {
         (db.prepare("PRAGMA user_version").get() as { user_version: number })
           .user_version,
       ),
-    ).toBe(3);
+    ).toBe(CURRENT_METADATA_VERSION.version);
     expect(
       db
         .prepare("PRAGMA table_info(session_registry)")
@@ -446,7 +496,7 @@ describe("checkpoint slot metadata", () => {
     db.close();
   });
 
-  it("migrates the published v2 schema through its adjacent v2-to-v3 step", async () => {
+  it("migrates published v2 through every adjacent step to current", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-v2-"));
     roots.push(root);
     const path = join(root, "state.db");
@@ -465,9 +515,9 @@ describe("checkpoint slot metadata", () => {
       )
       .run("legacy", "known", "a".repeat(64));
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /schema version 2 requires openCurrentMetadataStore/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/schema version 2 requires openCurrentMetadataStore/u);
     const current = await openCurrentWithTreeUpgrades(path);
     expect(readTestSessionRegistration(path, "legacy")).toEqual({
       sessionId: "legacy",
@@ -555,7 +605,7 @@ describe("checkpoint slot metadata", () => {
 
     const current = await openCurrentWithTreeUpgrades(path);
     expect(
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "s",
         targetSessionFile: "/sessions/s.jsonl",
         retainedEntryIds: ["open", "blocked", "missing", "unclassified"],
@@ -585,7 +635,7 @@ describe("checkpoint slot metadata", () => {
     });
 
     expect(
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "s",
         targetSessionFile: "/sessions/s.jsonl",
         retainedEntryIds: ["open", "blocked", "missing", "unclassified"],
@@ -612,7 +662,7 @@ describe("checkpoint slot metadata", () => {
 
     const current = await openCurrentWithTreeUpgrades(path);
     expect(
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "s",
         targetSessionFile: "/sessions/s.jsonl",
         retainedEntryIds: ["known", "unclassified"],
@@ -647,7 +697,7 @@ describe("checkpoint slot metadata", () => {
 
     const current = await openCurrentWithTreeUpgrades(path);
     expect(() =>
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "s",
         targetSessionFile: "/sessions/s.jsonl",
         retainedEntryIds: ["trusted"],
@@ -674,9 +724,9 @@ describe("checkpoint slot metadata", () => {
     forged.exec("DROP TRIGGER cyclotomy_writer_fence_node_state_update");
     forged.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /v2 does not match the published v2 layout/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/v2 does not match the published v2 layout/u);
     const check = new DatabaseSync(path);
     expect(
       Number(
@@ -725,7 +775,7 @@ describe("checkpoint slot metadata", () => {
 
     const current = await openCurrentWithTreeUpgrades(path);
     expect(
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "child",
         targetSessionFile: "/sessions/child.jsonl",
         retainedEntryIds: ["known", "guarded", "parent-only"],
@@ -774,7 +824,7 @@ describe("checkpoint slot metadata", () => {
 
     const current = await openCurrentWithTreeUpgrades(path);
     expect(() =>
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "child",
         targetSessionFile: "/sessions/child.jsonl",
         retainedEntryIds: ["trusted"],
@@ -815,7 +865,7 @@ describe("checkpoint slot metadata", () => {
     legacy.close();
 
     const current = await openCurrentWithTreeUpgrades(path);
-    current.finalizeSessionProjection({
+    finalizeTestSessionProjection(current, {
       targetSessionId: "child",
       targetSessionFile: "/sessions/child.jsonl",
       retainedEntryIds: [],
@@ -830,6 +880,7 @@ describe("checkpoint slot metadata", () => {
     ).toBe(true);
     expect(
       current.reconcileSessionBarrier(
+        testMetadataWriteAuthority(current),
         { sessionId: "child", sessionFile: "/sessions/child.jsonl" },
         ["first"],
       ),
@@ -850,7 +901,7 @@ describe("checkpoint slot metadata", () => {
       ).kind,
     ).toBe("protected");
     expect(
-      store.raiseSessionBarrier({
+      store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
         sessionId: "s",
         sessionFile: "/sessions/s.jsonl",
       }),
@@ -858,6 +909,7 @@ describe("checkpoint slot metadata", () => {
 
     expect(
       store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
         { sessionId: "s", sessionFile: "/sessions/s.jsonl" },
         ["root", "gap", "leaf"],
       ),
@@ -913,7 +965,7 @@ describe("checkpoint slot metadata", () => {
     commitTestNodeState(store, "s", "root", rootTree);
 
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["root", "leaf"],
@@ -945,9 +997,17 @@ describe("checkpoint slot metadata", () => {
     registerTestSession(store, "s", sessionFile, ["root"]);
     commitTestNodeState(store, "s", "root", before);
 
-    const concurrent = createCurrentMetadataStore(path);
+    const concurrent = createCurrentMetadataStore(
+      path,
+      testMetadataWriteAuthority(store),
+    );
+    bindTestMetadataWriteAuthority(
+      concurrent,
+      testMetadataWriteAuthority(store),
+      dirname(path),
+    );
     expect(
-      concurrent.commitCapture({
+      concurrent.commitCapture(testMetadataWriteAuthority(concurrent), {
         identity: { sessionId: "s", sessionFile },
         entryId: "root",
         activeAncestryEntryIds: ["root"],
@@ -958,7 +1018,7 @@ describe("checkpoint slot metadata", () => {
     concurrent.close();
 
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["root", "leaf"],
@@ -992,12 +1052,15 @@ describe("checkpoint slot metadata", () => {
     const treeOid = "a".repeat(64);
     registerTestSession(store, "s", sessionFile, ["root"]);
     commitTestNodeState(store, "s", "root", treeOid);
-    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
-      true,
-    );
+    expect(
+      store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
+        sessionId: "s",
+        sessionFile,
+      }),
+    ).toBe(true);
 
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["root", "leaf"],
@@ -1034,7 +1097,7 @@ describe("checkpoint slot metadata", () => {
     ).toBe("protected");
 
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["leaf"],
@@ -1049,7 +1112,7 @@ describe("checkpoint slot metadata", () => {
       }).kind,
     ).toBe("protected");
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["leaf"],
@@ -1078,7 +1141,7 @@ describe("checkpoint slot metadata", () => {
     commitTestNodeState(store, "s", "root", rootTree);
 
     expect(
-      store.admitResolvedLocation({
+      store.admitResolvedLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["root", "leaf"],
@@ -1093,7 +1156,7 @@ describe("checkpoint slot metadata", () => {
       kind: "open-missing",
     });
     expect(
-      store.commitCapture({
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "root",
         activeAncestryEntryIds: ["root"],
@@ -1102,7 +1165,7 @@ describe("checkpoint slot metadata", () => {
       }),
     ).toBe("committed");
     expect(
-      store.admitResolvedLocation({
+      store.admitResolvedLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["root", "leaf"],
@@ -1125,7 +1188,7 @@ describe("checkpoint slot metadata", () => {
     registerTestSession(store, "s", sessionFile, ["leaf"]);
 
     expect(
-      store.protectLocation({
+      store.protectLocation(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["leaf"],
@@ -1133,7 +1196,7 @@ describe("checkpoint slot metadata", () => {
       }),
     ).toMatchObject({ protectedSlot: { kind: "blocked-missing" } });
     expect(
-      store.commitCapture({
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "leaf",
         activeAncestryEntryIds: ["leaf"],
@@ -1152,7 +1215,10 @@ describe("checkpoint slot metadata", () => {
     commitTestNodeState(store, "s", "leaf", treeOid);
     protectTestLocation(store, { sessionId: "s", sessionFile }, "leaf");
 
-    store.raiseSessionBarrier({ sessionId: "s", sessionFile });
+    store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
+      sessionId: "s",
+      sessionFile,
+    });
     const input = {
       identity: { sessionId: "s", sessionFile },
       entryId: "leaf",
@@ -1163,14 +1229,22 @@ describe("checkpoint slot metadata", () => {
         treeOid,
       },
     };
-    expect(store.admitResolvedLocation(input)).toBe("slot-changed");
+    expect(
+      store.admitResolvedLocation(testMetadataWriteAuthority(store), input),
+    ).toBe("slot-changed");
     expect(store.getCheckpointSlot("s", "leaf").kind).toBe(
       "blocked-checkpoint",
     );
     expect(
-      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, ["leaf"]),
+      store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
+        { sessionId: "s", sessionFile },
+        ["leaf"],
+      ),
     ).toBe("reconciled");
-    expect(store.admitResolvedLocation(input)).toBe("admitted");
+    expect(
+      store.admitResolvedLocation(testMetadataWriteAuthority(store), input),
+    ).toBe("admitted");
     expect(store.getCheckpointSlot("s", "leaf")).toEqual({
       kind: "open-checkpoint",
       treeOid,
@@ -1202,7 +1276,7 @@ describe("checkpoint slot metadata", () => {
         "missing",
       ).kind,
     ).toBe("protected");
-    store.raiseSessionBarrier({
+    store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
       sessionId: "source",
       sessionFile: "/sessions/source.jsonl",
     });
@@ -1227,7 +1301,7 @@ describe("checkpoint slot metadata", () => {
       ],
     });
 
-    store.finalizeSessionProjection({
+    finalizeTestSessionProjection(store, {
       targetSessionId: "child",
       targetSessionFile: "/sessions/child.jsonl",
       seed: { kind: "fork", projection: projection! },
@@ -1291,7 +1365,7 @@ describe("checkpoint slot metadata", () => {
     const { store } = await createStore();
 
     expect(
-      store.finalizeSessionProjection({
+      finalizeTestSessionProjection(store, {
         targetSessionId: "child",
         targetSessionFile: "/sessions/child.jsonl",
         seed: { kind: "untrusted-parent" },
@@ -1316,7 +1390,7 @@ describe("checkpoint slot metadata", () => {
 
   it("keeps an untrusted empty parent barrier until a concrete ancestry exists", async () => {
     const { store } = await createStore();
-    store.finalizeSessionProjection({
+    finalizeTestSessionProjection(store, {
       targetSessionId: "child",
       targetSessionFile: "/sessions/child.jsonl",
       seed: { kind: "untrusted-parent" },
@@ -1332,6 +1406,7 @@ describe("checkpoint slot metadata", () => {
     ).toBe(true);
     expect(() =>
       store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
         { sessionId: "child", sessionFile: "/sessions/child.jsonl" },
         [],
       ),
@@ -1366,7 +1441,7 @@ describe("checkpoint slot metadata", () => {
         retainedEntryIds: [],
       }),
     ).toBeUndefined();
-    current.finalizeSessionProjection({
+    finalizeTestSessionProjection(current, {
       targetSessionId: "source",
       targetSessionFile: "/sessions/source.jsonl",
       retainedEntryIds: [],
@@ -1389,7 +1464,7 @@ describe("checkpoint slot metadata", () => {
   it("rejects non-string identifiers before SQLite can coerce coordinates", async () => {
     const { path, store } = await createStore();
     expect(() =>
-      store.finalizeSessionProjection({
+      finalizeTestSessionProjection(store, {
         targetSessionId: 1 as unknown as string,
         targetSessionFile: "/sessions/numeric.jsonl",
         retainedEntryIds: [],
@@ -1399,7 +1474,7 @@ describe("checkpoint slot metadata", () => {
     ).toThrow(/non-empty string/u);
     registerTestSession(store, "1.0", "/sessions/string.jsonl");
     expect(() =>
-      store.commitCapture({
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: {
           sessionId: 1 as unknown as string,
           sessionFile: "/sessions/string.jsonl",
@@ -1432,9 +1507,9 @@ describe("checkpoint slot metadata", () => {
       // @ts-expect-error The factory accepts no hidden compatibility options.
       createCurrentMetadataStore(path, {});
     }
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /schema version 1 requires openCurrentMetadataStore/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/schema version 1 requires openCurrentMetadataStore/u);
 
     const untouched = new DatabaseSync(path);
     expect(
@@ -1483,8 +1558,15 @@ describe("checkpoint slot metadata", () => {
     );
     const metadata = await openCurrentWithTreeUpgrades(
       path,
-      async (treeOids) =>
-        new Map(treeOids.map((treeOid) => [treeOid, upgraded.get(treeOid)!])),
+      async (treeOids, targetFormat) =>
+        new Map(
+          treeOids.map((treeOid) => [
+            treeOid,
+            targetFormat === TREE_MANIFEST_FORMAT_V2
+              ? upgraded.get(treeOid)!
+              : treeOid,
+          ]),
+        ),
     );
     for (const [index, mapping] of mappings.entries()) {
       expect(checkpointState(metadata, "legacy", `first-${index}`)).toEqual({
@@ -1517,7 +1599,12 @@ describe("checkpoint slot metadata", () => {
     let preparation = 0;
     const metadata = await openCurrentWithTreeUpgrades(
       path,
-      async (authenticatedRoots) => {
+      async (authenticatedRoots, targetFormat) => {
+        if (targetFormat !== TREE_MANIFEST_FORMAT_V2) {
+          return new Map(
+            authenticatedRoots.map((treeOid) => [treeOid, treeOid]),
+          );
+        }
         preparation += 1;
         if (preparation === 2) {
           expect(authenticatedRoots).toEqual([originalTreeOid, lateTreeOid]);
@@ -1556,7 +1643,7 @@ describe("checkpoint slot metadata", () => {
           }
         ).user_version,
       ),
-    ).toBe(3);
+    ).toBe(CURRENT_METADATA_VERSION.version);
     check.close();
   });
 
@@ -1593,7 +1680,7 @@ describe("checkpoint slot metadata", () => {
       ),
     ).toThrow(/not verified/u);
     expect(
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "legacy",
         targetSessionFile: "/sessions/legacy.jsonl",
         retainedEntryIds: ["entry"],
@@ -1728,7 +1815,7 @@ describe("checkpoint slot metadata", () => {
       const opened = waitForChildMessage(child.process, "opened", child.stderr);
 
       const current = await openCurrentWithTreeUpgrades(path);
-      current.finalizeSessionProjection({
+      finalizeTestSessionProjection(current, {
         targetSessionId: "legacy-process",
         targetSessionFile: "/sessions/legacy-process.jsonl",
         retainedEntryIds: ["entry"],
@@ -1797,14 +1884,9 @@ describe("checkpoint slot metadata", () => {
         );
         for (const child of children) child.process.send?.("start");
         await Promise.all(opening);
-        // Each child has opened the old schema and is paused immediately
-        // before either fresh initialization or the explicit v1 cutover takes
-        // the write lock. Releasing them exercises the locked version recheck.
-        await Promise.all(
-          children.map((child, index) =>
-            waitForGatePause(child, pausedPaths[index]!),
-          ),
-        );
+        // The exclusive workspace lease admits one opener to SQLite's schema
+        // gate; the remaining openers wait outside the mutation boundary.
+        await waitForAnyGatePause(children, pausedPaths);
         const opened = children.map((child) =>
           waitForChildMessage(child.process, "opened", child.stderr),
         );
@@ -1823,9 +1905,9 @@ describe("checkpoint slot metadata", () => {
               }
             ).user_version,
           ),
-        ).toBe(3);
+        ).toBe(CURRENT_METADATA_VERSION.version);
         check.close();
-        const store = createCurrentMetadataStore(path);
+        const store = await createTestCurrentMetadataStore(path, dirname(path));
         for (const result of results) {
           expect(
             checkpointState(
@@ -1857,7 +1939,7 @@ describe("checkpoint slot metadata", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-churn-"));
     roots.push(root);
     const path = join(root, "state.db");
-    const initial = createCurrentMetadataStore(path);
+    const initial = await createTestCurrentMetadataStore(path, dirname(path));
     initial.close();
 
     const iterations = 20;
@@ -1877,7 +1959,7 @@ describe("checkpoint slot metadata", () => {
       await Promise.all(opened);
       await Promise.all(children.map((child) => waitForChildExit(child)));
 
-      const store = createCurrentMetadataStore(path);
+      const store = await createTestCurrentMetadataStore(path, dirname(path));
       expect(
         checkpointState(store, "concurrent-open", "unused"),
       ).toBeUndefined();
@@ -1904,9 +1986,9 @@ describe("checkpoint slot metadata", () => {
       .run("source", "/sessions/source.jsonl");
     legacy.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /schema version 1 requires openCurrentMetadataStore/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/schema version 1 requires openCurrentMetadataStore/u);
     const store = await openCurrentWithTreeUpgrades(path);
     expect(store.matchSessionIdentity("missing", "/missing.jsonl")).toBe(
       "absent",
@@ -1938,7 +2020,8 @@ describe("checkpoint slot metadata", () => {
     expect(await snapshotDirectory(root)).toEqual(before);
     if (inspection.kind !== "exact") throw new Error("expected exact proof");
 
-    const authenticated = await openAuthenticatedCurrentMetadataStore(
+    const authenticated = await openAuthenticatedWithLease(
+      root,
       inspection.proof,
       {
         prepareTreeOidUpgrades: async (roots) =>
@@ -2043,13 +2126,10 @@ describe("checkpoint slot metadata", () => {
     expect(await snapshotDirectory(root)).toEqual(before);
 
     if (exact.kind !== "exact") throw new Error("expected exact proof");
-    const authenticated = await openAuthenticatedCurrentMetadataStore(
-      exact.proof,
-      {
-        prepareTreeOidUpgrades: async (roots) =>
-          new Map(roots.map((treeOid) => [treeOid, treeOid])),
-      },
-    );
+    const authenticated = await openAuthenticatedWithLease(root, exact.proof, {
+      prepareTreeOidUpgrades: async (roots) =>
+        new Map(roots.map((treeOid) => [treeOid, treeOid])),
+    });
     expect(
       authenticated.matchSessionIdentity("source", "/sessions/source.jsonl"),
     ).toBe("exact");
@@ -2080,7 +2160,8 @@ describe("checkpoint slot metadata", () => {
     expect(await snapshotDirectory(root)).toEqual(before);
     if (inspection.kind !== "exact") throw new Error("expected exact proof");
 
-    const authenticated = await openAuthenticatedCurrentMetadataStore(
+    const authenticated = await openAuthenticatedWithLease(
+      root,
       inspection.proof,
       {
         prepareTreeOidUpgrades: async (roots) =>
@@ -2093,7 +2174,6 @@ describe("checkpoint slot metadata", () => {
   it.each([
     { version: 0, label: "unversioned" },
     { version: 1, label: "forged-v1" },
-    { version: CURRENT_METADATA_VERSION.version + 1, label: "newer" },
   ])(
     "leaves an unrelated $label SQLite database byte-for-byte untouched",
     async ({ version }) => {
@@ -2140,6 +2220,32 @@ describe("checkpoint slot metadata", () => {
       expect((await readdir(root)).sort()).toEqual(["state.db"]);
     },
   );
+
+  it("classifies a newer schema without validating or changing its layout", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "cyclotomy-metadata-probe-newer-"),
+    );
+    roots.push(root);
+    const path = join(root, "state.db");
+    const newerVersion = CURRENT_METADATA_VERSION.version + 1;
+    const unrelated = new DatabaseSync(path);
+    unrelated.exec(`
+      CREATE TABLE unrelated(value TEXT);
+      INSERT INTO unrelated(value) VALUES ('keep me');
+      PRAGMA user_version = ${newerVersion};
+    `);
+    unrelated.close();
+    const before = await snapshotDirectory(root);
+
+    expect(
+      inspectMetadataSessionIdentity(path, "source", "/sessions/source.jsonl"),
+    ).toEqual({
+      kind: "newer",
+      observedVersion: newerVersion,
+      supportedVersion: CURRENT_METADATA_VERSION.version,
+    });
+    expect(await snapshotDirectory(root)).toEqual(before);
+  });
 
   it("reads a live WAL without changing its durable database bytes", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-probe-wal-"));
@@ -2198,7 +2304,7 @@ describe("checkpoint slot metadata", () => {
 
     await expect(
       Promise.resolve().then(() =>
-        openAuthenticatedCurrentMetadataStore(inspection.proof, {
+        openAuthenticatedWithLease(root, inspection.proof, {
           prepareTreeOidUpgrades: async (roots) =>
             new Map(roots.map((treeOid) => [treeOid, treeOid])),
         }),
@@ -2240,7 +2346,7 @@ describe("checkpoint slot metadata", () => {
 
     await expect(
       Promise.resolve().then(() =>
-        openAuthenticatedCurrentMetadataStore(inspection.proof, {
+        openAuthenticatedWithLease(root, inspection.proof, {
           prepareTreeOidUpgrades: async (roots) =>
             new Map(roots.map((treeOid) => [treeOid, treeOid])),
         }),
@@ -2252,7 +2358,7 @@ describe("checkpoint slot metadata", () => {
   it("never registers a fork under its parent's session id", async () => {
     const { path, store } = await createStore();
     expect(() =>
-      store.finalizeSessionProjection({
+      finalizeTestSessionProjection(store, {
         targetSessionId: "same",
         targetSessionFile: "/sessions/child.jsonl",
         retainedEntryIds: [],
@@ -2285,7 +2391,7 @@ describe("checkpoint slot metadata", () => {
     const { path, store } = await createStore();
     registerTestSession(store, "same", "/sessions/original.jsonl");
     expect(() =>
-      store.finalizeSessionProjection({
+      finalizeTestSessionProjection(store, {
         targetSessionId: "same",
         targetSessionFile: "/sessions/duplicate.jsonl",
         retainedEntryIds: [],
@@ -2309,17 +2415,29 @@ describe("checkpoint slot metadata", () => {
     expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
       false,
     );
-    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
-      true,
-    );
+    expect(
+      store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
+        sessionId: "s",
+        sessionFile,
+      }),
+    ).toBe(true);
     expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(true);
 
-    const second = createCurrentMetadataStore(path);
+    const second = createCurrentMetadataStore(
+      path,
+      testMetadataWriteAuthority(store),
+    );
+    bindTestMetadataWriteAuthority(
+      second,
+      testMetadataWriteAuthority(store),
+      dirname(path),
+    );
     expect(
-      second.reconcileSessionBarrier({ sessionId: "s", sessionFile }, [
-        "first-child",
-        "second-child",
-      ]),
+      second.reconcileSessionBarrier(
+        testMetadataWriteAuthority(second),
+        { sessionId: "s", sessionFile },
+        ["first-child", "second-child"],
+      ),
     ).toBe("reconciled");
     expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
       false,
@@ -2327,7 +2445,7 @@ describe("checkpoint slot metadata", () => {
     expect(checkpointIsBlocked(store, "s", "first-child")).toBe(true);
     expect(checkpointIsBlocked(store, "s", "second-child")).toBe(true);
     expect(
-      store.commitCapture({
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "first-child",
         activeAncestryEntryIds: ["first-child"],
@@ -2336,19 +2454,24 @@ describe("checkpoint slot metadata", () => {
       }),
     ).toBe("blocked");
     expect(
-      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, [
-        "later-child",
-      ]),
+      store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
+        { sessionId: "s", sessionFile },
+        ["later-child"],
+      ),
     ).toBe("absent");
     expect(checkpointIsBlocked(store, "s", "later-child")).toBe(false);
 
     // Commit CAS operations provide the same transaction boundary if another
     // SQLite connection sets the flag after an earlier runtime observation.
-    expect(second.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
-      true,
-    );
     expect(
-      store.commitCapture({
+      second.raiseSessionBarrier(testMetadataWriteAuthority(second), {
+        sessionId: "s",
+        sessionFile,
+      }),
+    ).toBe(true);
+    expect(
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "capture-race",
         activeAncestryEntryIds: ["capture-race"],
@@ -2358,11 +2481,14 @@ describe("checkpoint slot metadata", () => {
     ).toBe("blocked");
     expect(checkpointState(store, "s", "capture-race")).toBeUndefined();
     expect(checkpointIsBlocked(store, "s", "capture-race")).toBe(true);
-    expect(second.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
-      true,
-    );
     expect(
-      store.commitCapture({
+      second.raiseSessionBarrier(testMetadataWriteAuthority(second), {
+        sessionId: "s",
+        sessionFile,
+      }),
+    ).toBe(true);
+    expect(
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity: { sessionId: "s", sessionFile },
         entryId: "materialize-race",
         activeAncestryEntryIds: ["materialize-race"],
@@ -2391,22 +2517,30 @@ describe("checkpoint slot metadata", () => {
       }),
     ).toBeUndefined();
     expect(() =>
-      store.raiseSessionBarrier({
+      store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
         sessionId: "s",
         sessionFile: "/sessions/other.jsonl",
       }),
     ).toThrow(/not verified/u);
     expect(
       store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
         { sessionId: "s", sessionFile: "/sessions/other.jsonl" },
         ["child"],
       ),
     ).toBe("unregistered");
-    expect(store.raiseSessionBarrier({ sessionId: "s", sessionFile })).toBe(
-      true,
-    );
     expect(
-      store.reconcileSessionBarrier({ sessionId: "s", sessionFile }, ["child"]),
+      store.raiseSessionBarrier(testMetadataWriteAuthority(store), {
+        sessionId: "s",
+        sessionFile,
+      }),
+    ).toBe(true);
+    expect(
+      store.reconcileSessionBarrier(
+        testMetadataWriteAuthority(store),
+        { sessionId: "s", sessionFile },
+        ["child"],
+      ),
     ).toBe("reconciled");
     expect(store.hasSessionBarrier({ sessionId: "s", sessionFile })).toBe(
       false,
@@ -2433,9 +2567,9 @@ describe("checkpoint slot metadata", () => {
     const outside = join(root, "outside.db");
     await symlink(outside, path);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /single-link regular file/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/single-link regular file/u);
     await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -2463,9 +2597,9 @@ describe("checkpoint slot metadata", () => {
     const path = join(root, "state.db");
     await link(outside, path);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /single-link regular file/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/single-link regular file/u);
   });
 
   it.each(["wal", "shm"])(
@@ -2476,9 +2610,9 @@ describe("checkpoint slot metadata", () => {
       const outside = join(root, `outside-${sidecar}`);
       await symlink(outside, `${path}-${sidecar}`);
 
-      expect(() => createCurrentMetadataStore(path)).toThrow(
-        /single-link regular file/u,
-      );
+      expect(() =>
+        createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
+      ).toThrow(/single-link regular file/u);
       await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
@@ -2491,9 +2625,9 @@ describe("checkpoint slot metadata", () => {
     seeded.close();
     await link(outside, `${path}-wal`);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /single-link regular file/u,
-    );
+    expect(() =>
+      createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
+    ).toThrow(/single-link regular file/u);
   });
 
   it("refuses a stable non-file metadata sidecar", async () => {
@@ -2501,9 +2635,9 @@ describe("checkpoint slot metadata", () => {
     store.close();
     await mkdir(`${path}-shm`);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /single-link regular file/u,
-    );
+    expect(() =>
+      createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
+    ).toThrow(/single-link regular file/u);
   });
 
   it("rejects a claimed current version whose physical schema is incomplete", async () => {
@@ -2511,12 +2645,12 @@ describe("checkpoint slot metadata", () => {
     roots.push(root);
     const path = join(root, "state.db");
     const db = new DatabaseSync(path);
-    db.exec("PRAGMA user_version = 3");
+    db.exec(`PRAGMA user_version = ${CURRENT_METADATA_VERSION.version}`);
     db.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the metadata v3 layout/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/does not match the metadata v4 layout/u);
   });
 
   it("authenticates string literals in the current schema exactly", async () => {
@@ -2540,9 +2674,9 @@ describe("checkpoint slot metadata", () => {
     forged.close();
     expect(Number(changed.changes)).toBe(1);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the metadata v3 layout/u,
-    );
+    expect(() =>
+      createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
+    ).toThrow(/does not match the metadata v4 layout/u);
   });
 
   it("does not normalize whitespace inside schema string literals", async () => {
@@ -2566,9 +2700,9 @@ describe("checkpoint slot metadata", () => {
     forged.close();
     expect(Number(changed.changes)).toBe(9);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the metadata v3 layout/u,
-    );
+    expect(() =>
+      createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
+    ).toThrow(/does not match the metadata v4 layout/u);
   });
 
   it("rejects a non-public claimed v1 before making migration changes", async () => {
@@ -2579,9 +2713,9 @@ describe("checkpoint slot metadata", () => {
     forged.exec("ALTER TABLE node_state ADD COLUMN forged TEXT");
     forged.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the published v1 layout/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/does not match the published v1 layout/u);
 
     const check = new DatabaseSync(path);
     expect(
@@ -2640,9 +2774,9 @@ describe("checkpoint slot metadata", () => {
     `);
     forged.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the published v1 layout/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/does not match the published v1 layout/u);
     const check = new DatabaseSync(path);
     expect(
       Number(
@@ -2682,7 +2816,9 @@ describe("checkpoint slot metadata", () => {
     forged.close();
     const before = await snapshotDirectory(root);
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(
       /unversioned metadata database contains unexpected schema objects/u,
     );
     expect(await snapshotDirectory(root)).toEqual(before);
@@ -2737,15 +2873,15 @@ describe("checkpoint slot metadata", () => {
       const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-object-"));
       roots.push(root);
       const path = join(root, "state.db");
-      const initial = createCurrentMetadataStore(path);
+      const initial = await createTestCurrentMetadataStore(path, dirname(path));
       initial.close();
       const db = new DatabaseSync(path);
       db.exec(sql);
       db.close();
 
-      expect(() => createCurrentMetadataStore(path)).toThrow(
-        /does not match the metadata v3 layout/u,
-      );
+      await expect(
+        createTestCurrentMetadataStore(path, dirname(path)),
+      ).rejects.toThrow(/does not match the metadata v4 layout/u);
     },
   );
 
@@ -2774,18 +2910,18 @@ describe("checkpoint slot metadata", () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-fence-"));
     roots.push(root);
     const path = join(root, "state.db");
-    const initial = createCurrentMetadataStore(path);
+    const initial = await createTestCurrentMetadataStore(path, dirname(path));
     initial.close();
     const db = new DatabaseSync(path);
     db.exec(sql);
     db.close();
 
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /does not match the metadata v3 layout/u,
-    );
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/does not match the metadata v4 layout/u);
   });
 
-  it("refuses a newer schema without mutating it", async () => {
+  it("refuses a newer schema before preparing migrations or mutating it", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-newer-"));
     roots.push(root);
     const path = join(root, "state.db");
@@ -2793,19 +2929,23 @@ describe("checkpoint slot metadata", () => {
     const newerVersion = CURRENT_METADATA_VERSION.version + 1;
     db.exec(`PRAGMA user_version = ${newerVersion}`);
     db.close();
-    expect(() => createCurrentMetadataStore(path)).toThrow(
-      /newer than supported/u,
-    );
-    const check = new DatabaseSync(path);
-    expect(
-      Number(
-        (
-          check.prepare("PRAGMA user_version").get() as {
-            user_version: number;
-          }
-        ).user_version,
+    const before = await snapshotDirectory(root);
+    let preparationCalls = 0;
+
+    await expect(
+      createTestCurrentMetadataStore(path, dirname(path)),
+    ).rejects.toThrow(/newer than supported/u);
+    await expect(
+      Promise.resolve().then(() =>
+        openCurrentMetadataStore(path, {
+          prepareTreeOidUpgrades: async () => {
+            preparationCalls += 1;
+            return new Map();
+          },
+        }),
       ),
-    ).toBe(newerVersion);
-    check.close();
+    ).rejects.toThrow(/newer than supported/u);
+    expect(preparationCalls).toBe(0);
+    expect(await snapshotDirectory(root)).toEqual(before);
   });
 });

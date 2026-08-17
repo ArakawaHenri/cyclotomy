@@ -5,6 +5,7 @@ import type {
   ApplyReport,
 } from "../infrastructure/apply.ts";
 import type { WorkspaceRestorePlan } from "../infrastructure/restore-plan.ts";
+import type { GitReplayRisk } from "../infrastructure/git-replay-risk.ts";
 import type {
   ScanProblem,
   ScanProblemKind,
@@ -22,175 +23,168 @@ type MessageVariables = Readonly<Record<string, string | number>>;
 
 const EN = {
   cyclotomyCommandDescription: "Show, stop, or resume Cyclotomy",
-  cyclotomyStopCompletion: "Stop Cyclotomy for this Pi runtime",
-  cyclotomyResumeCompletion: "Retry Cyclotomy without reloading Pi",
+  cyclotomyStopCompletion: "Stop Cyclotomy",
+  cyclotomyResumeCompletion: "Resume Cyclotomy",
   cyclotomyRunning: "Cyclotomy is running.",
-  cyclotomyInactive:
-    "Cyclotomy is not active for this Pi session. Pi remains available.",
+  cyclotomyInactive: "Cyclotomy is unavailable in this session.",
   cyclotomyStopped:
-    "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+    "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
   cyclotomyStoppedWithError:
-    "Cyclotomy is stopped for this Pi runtime ({{message}}). Pi remains available; fix the problem, then run /cyclotomy resume.",
-  cyclotomyStopSucceeded:
-    "Cyclotomy stopped for this Pi runtime. Pi remains available.",
+    "Cyclotomy stopped because of an error ({{message}}). Fix the problem, then run /cyclotomy resume.",
+  cyclotomyStopSucceeded: "Cyclotomy stopped.",
   cyclotomyResumeSucceeded: "Cyclotomy resumed.",
   cyclotomyResumeFailed:
-    "Cyclotomy could not resume ({{message}}). Pi remains available; fix the problem, then retry /cyclotomy resume.",
+    "Cyclotomy could not resume ({{message}}). Fix the problem, then try again.",
   driftCommandDescription: "Show what /restore would change",
   restoreCommandDescription: "Restore the current node's checkpoint",
   checkingWorkspace: "Cyclotomy · checking workspace…",
   restoringWorkspace: "Cyclotomy · restoring workspace…",
   initFailure:
-    "Cyclotomy initialization failed. Capture and restore are unavailable; files were not changed. Pi remains available; fix the reported configuration or storage problem, then run /cyclotomy resume.",
+    "Cyclotomy could not start. Fix the reported problem, then run /cyclotomy resume.",
   captureLaterFailed:
-    "Cyclotomy could not complete this checkpoint. The intended checkpoint pointer was not changed.",
+    "Cyclotomy could not save this checkpoint. The previous checkpoint was kept.",
   arrivalProtectionUnavailable:
-    "Cyclotomy could not durably protect the current arrival ({{message}}). Keep the current files unchanged and inspect /drift before continuing.",
+    "Cyclotomy could not secure the current files ({{message}}). Run /drift before continuing.",
   arrivalAdmissionUnavailable:
-    "Cyclotomy durably protected the current arrival, but could not rebuild its in-memory admission ({{message}}). Checkpointing remains blocked here; inspect /drift before continuing.",
+    "Automatic checkpoints are paused at the current node ({{message}}). Run /drift before continuing.",
   automaticGcFailed:
-    "Cyclotomy automatic cleanup failed ({{message}}). Checkpointing succeeded and will continue; cleanup will retry later.",
+    "Automatic storage cleanup failed ({{message}}). Cyclotomy will try again later.",
   captureFailureDetail: "Details: {{message}}",
-  captureScanIncomplete:
-    "Workspace scan is incomplete; checkpoint was not published: {{message}}",
+  captureScanIncomplete: "Checkpoint not saved: {{message}}",
   captureValidationIncomplete:
-    "Final workspace validation is incomplete; checkpoint was not committed: {{message}}",
-  captureValidationFailed: "Final workspace validation failed: {{message}}",
-  captureCheckpointChanged:
-    "The node checkpoint changed after capture preparation.",
+    "Checkpoint not saved because the workspace could not be verified: {{message}}",
+  captureValidationFailed: "Checkpoint not saved: {{message}}",
+  captureCheckpointChanged: "The checkpoint changed while it was being saved.",
   captureEligibilityChanged:
-    "The node checkpoint eligibility changed after capture preparation.",
-  captureWriteProtected:
-    "The node checkpoint is write-protected until it is restored.",
+    "The node changed before the checkpoint could be saved.",
+  captureWriteProtected: "Automatic checkpoints are paused at this node.",
   captureRootChanged:
-    "The workspace root changed after the checkpoint store was selected.",
+    "The workspace location changed while the checkpoint was being saved.",
   captureContentsChanged:
-    "The workspace changed between capture scan and final validation; checkpoint was not committed.",
+    "The workspace changed while the checkpoint was being saved.",
   sourceCaptureFailed:
     "Cyclotomy could not checkpoint the current workspace, so the operation was cancelled.",
   inputCaptureFailed:
     "Cyclotomy did not submit the prompt because the current workspace could not be checkpointed. Fix the reported problem and submit again.",
-  bashWhileBusy:
-    "Cyclotomy refused user bash while the agent or another session transition is active.",
+  bashWhileBusy: "Wait for the current operation to finish, then try again.",
   transitionInProgress:
-    "Cyclotomy refused this operation because another session transition is still in progress.",
+    "Another session change is still in progress. Try again when it finishes.",
   sessionRegistrationFailed:
-    "Cyclotomy disabled checkpoints for this session because its persisted identity could not be registered safely ({{message}}).",
+    "Cyclotomy could not enable checkpoints for this session ({{message}}).",
   sessionIdentityUnavailable:
-    "Cyclotomy cannot verify this session's persisted identity, so it will not checkpoint or restore the workspace.",
+    "Cyclotomy cannot use this session. Checkpoints and restore are unavailable.",
   memorySessionUnsupported:
-    "Cyclotomy requires a persisted Pi session. Checkpoints are disabled for --no-session/in-memory sessions.",
+    "Cyclotomy requires a saved session. It is unavailable with --no-session or in-memory sessions.",
   sessionWorkspaceMismatch:
-    "Pi opened this session outside the workspace recorded in its session file. Cyclotomy is paused here and did not bind or modify either workspace; create a Pi-native fork in this directory to carry the session forward safely.",
+    "This session was opened in a different workspace. Create a Pi fork in this directory to continue with Cyclotomy.",
   forkImportFailed:
-    "Cyclotomy could not finish the fork ancestry registration safely ({{message}}). Workspace files were not changed; run /cyclotomy resume to retry.",
+    "Cyclotomy could not import the parent checkpoints ({{message}}). Run /cyclotomy resume to try again.",
   forkInheritanceSkipped:
-    "Cyclotomy could not authenticate or admit the parent checkpoints ({{message}}). No parent state was imported; retained locations are blocked until a later, explicitly reviewed location can establish its own checkpoint.",
-  navigationPrepareFailed:
-    "Cyclotomy could not prepare navigation safely ({{message}}), so it was cancelled.",
+    "Parent checkpoints were not imported ({{message}}). New work can still be checkpointed, but existing nodes need /restore before they can be checkpointed again.",
+  navigationPrepareFailed: "Navigation cancelled: {{message}}",
   navigationScanIncomplete:
-    "Cyclotomy cancelled navigation because the workspace scan is incomplete: {{message}}",
+    "Navigation cancelled because the workspace could not be read completely: {{message}}",
   navigationNeedsUi:
-    "The destination workspace differs, but no interactive choice is available. Navigation was cancelled and files were not changed: {{preview}}",
+    "The destination has different files and needs confirmation. Navigation was cancelled: {{preview}}",
   navigationAttentionStatus:
-    "Cyclotomy · navigation needs review · check the source checkpoint and current files",
+    "Cyclotomy · review the current files before continuing",
   navigationPlanMismatch:
-    "Cyclotomy observed an unplanned or different tree arrival. It did not run the automatic restore or assign current files to that node; inspect them before running /restore.",
+    "Navigation ended at a different node than expected. Current files were kept; run /drift before using /restore.",
   navigationChangedAfterPreview:
-    "The workspace changed after the preview. The conversation moved, so Cyclotomy left those later changes unassigned and did not restore files. The source kept its verified pre-navigation checkpoint; review the current files before running /restore.",
+    "The workspace changed after the preview. Navigation completed without restoring files; run /drift before using /restore.",
   navigationChangedBeforeDeparture:
-    "Cyclotomy cancelled navigation because the workspace or source/destination checkpoint changed after the preview. Review the current source files, then retry /tree.",
+    "The workspace or checkpoint changed after the preview. Navigation was cancelled; review the files and try /tree again.",
   navigationDetached:
-    "Navigated in Detached state with the current files. The destination checkpoint remains protected; use /drift to inspect the difference, then /restore to reconcile and exit Detached state.",
+    "Navigation completed with the current files in Detached state. New work can be checkpointed on the new branch; run /drift, then /restore to reconcile this node.",
   navigationDetachFailed:
-    "Navigation kept the current files, but Cyclotomy could not authenticate the planned Detached arrival ({{message}}). The current arrival was protected where possible; inspect /drift before continuing.",
+    "Navigation kept the current files, but Cyclotomy could not finish entering Detached state ({{message}}). Run /drift before continuing.",
   sessionRestoreNeedsUi:
-    "The loaded session differs from the workspace, but no interactive confirmation is available. Current files were kept in Detached state without replacing this node's checkpoint; use /drift to inspect the difference, then run /restore in an interactive TUI to reconcile it.",
+    "The loaded session has different files and needs confirmation. Current files were kept; run /drift, then use /restore in the interactive TUI.",
   sessionRestoreDeferredRpc:
-    "The loaded session differs from the workspace. Current files were kept in Detached state without replacing this node's checkpoint; invoke /restore explicitly to reconcile them.",
+    "The loaded session has different files. Current files were kept in Detached state; use /restore to apply the checkpoint.",
   sessionRestoreCancelled:
-    "Continuing in Detached state with the current files without replacing this node's checkpoint.",
+    "Continuing with the current files in Detached state. New work will be checkpointed on a new branch.",
   sessionMissingProtected:
-    "This node has no checkpoint that Cyclotomy can safely restore. Current files remain unassigned to it; use /restore to record them as this node's first checkpoint.",
+    "This node has no checkpoint. Run /restore to save the current workspace as its first checkpoint.",
   sessionCaptureBarrier:
-    "Cyclotomy retained a session capture barrier because no complete, stable current ancestry could be authenticated. Current files remain unassigned. Running /reload does not grant ownership or clear the barrier; Cyclotomy will project it atomically onto the next complete concrete ancestry it can authenticate.",
+    "The current state will not be checkpointed automatically because the session history could not be confirmed. Run /drift before continuing; use /restore after review.",
   reloadProtected:
-    "Cyclotomy could not prove that the reloaded workspace matches this checkpoint. Current files were kept and checkpoint capture remains protected; run /drift to inspect them, then /restore to reconcile.",
-  waitIdleRestore: "Cyclotomy: wait until the agent is idle before restoring.",
-  locationUnknown: "Cyclotomy: the current location cannot be identified.",
-  restoreMissing: "Cyclotomy: there is no checkpoint here to restore.",
-  restorePrepareFailed: "Cyclotomy could not prepare restore ({{message}}).",
+    "The reloaded workspace does not match this checkpoint. Current files were kept, and this node will not be checkpointed automatically; run /drift, then /restore.",
+  waitIdleRestore: "Wait for the current operation to finish before restoring.",
+  locationUnknown: "Cyclotomy cannot identify the current node.",
+  restoreMissing: "There is no checkpoint to restore at this node.",
+  restorePrepareFailed: "Restore could not start ({{message}}).",
   restorePreparationProtected:
-    "Cyclotomy could not read the loaded checkpoint ({{message}}). Current files were not changed, and the current arrival is protected from automatic capture.",
+    "The checkpoint could not be read ({{message}}). Current files were kept and will not be saved automatically at this node.",
   restorePreparationBarrier:
-    "Cyclotomy could not read the loaded checkpoint ({{message}}). Current files remain unassigned, and a session capture barrier prevents automatic assignment.",
+    "The checkpoint could not be read ({{message}}). Current files were kept and will not be saved automatically at this node.",
   restorePreparationUnavailable:
-    "Cyclotomy could not read the loaded checkpoint ({{message}}), and it could not protect the current arrival ({{protection}}). Current files were not changed; inspect /drift before continuing.",
+    "The checkpoint could not be read ({{message}}), and Cyclotomy could not secure the current files ({{protection}}). Run /drift before continuing.",
   restoreScanIncomplete:
-    "Cyclotomy refused restore because the workspace scan is incomplete: {{message}}",
+    "Restore could not start because the workspace could not be read completely: {{message}}",
   restoreNeedsUi:
-    "Restore needs an interactive choice. Current files were kept; use /drift to inspect the difference, then run /restore in an interactive TUI.",
+    "Restore needs confirmation. Current files were kept; run /drift, then use /restore in the interactive TUI.",
   commandPreviewStale:
-    "Cyclotomy: the workspace changed after the preview. Nothing was applied; run /restore again.",
+    "The workspace changed after the preview. Nothing was changed; run /restore again.",
   commandTargetChanged:
-    "Cyclotomy: the checkpoint target changed after the preview. Nothing was applied; run /restore again.",
+    "The checkpoint changed after the preview. Nothing was changed; run /restore again.",
   commandLocationChanged:
-    "Cyclotomy: the active session, node, or workspace changed after the preview. Nothing was applied.",
+    "The session, node, or workspace changed. The operation was cancelled.",
   restorePostMutationLocationProtected:
-    "Cyclotomy entered the file-application phase before the active session, node, or workspace changed. Files may have changed. Cyclotomy write-protected the current arrival; run /drift before continuing.",
+    "The session, node, or workspace changed during restore. Some files may have changed and will not be saved automatically at this node. Run /drift before continuing.",
   restorePostMutationLocationUnavailable:
-    "Cyclotomy entered the file-application phase before the active session, node, or workspace changed. Files may have changed, and Cyclotomy could not authenticate and protect the current arrival ({{message}}). Inspect /drift before continuing.",
+    "The session, node, or workspace changed during restore. Some files may have changed, and Cyclotomy could not secure the current files ({{message}}). Run /drift before continuing.",
   restorePostMutationTargetProtected:
-    "Cyclotomy entered the file-application phase before the checkpoint target changed. Files may have changed. Cyclotomy kept the current arrival write-protected; run /drift before continuing.",
+    "The checkpoint changed during restore. Some files may have changed and will not be saved automatically at this node. Run /drift before continuing.",
   restorePostMutationTargetUnavailable:
-    "Cyclotomy entered the file-application phase before the checkpoint target changed. Files may have changed, and Cyclotomy could not confirm write protection for the current arrival ({{message}}). Inspect /drift before continuing.",
+    "The checkpoint changed during restore. Some files may have changed, and Cyclotomy could not secure the current files ({{message}}). Run /drift before continuing.",
   restorePostMutationControlProtected:
-    "Cyclotomy entered the file-application phase, but a post-restore safety check failed ({{message}}). Files may have changed. Cyclotomy write-protected the current arrival; run /drift before continuing.",
+    "Restore stopped before Cyclotomy could verify the result ({{message}}). Some files may have changed and will not be saved automatically at this node. Run /drift before continuing.",
   restorePostMutationControlUnavailable:
-    "Cyclotomy entered the file-application phase, but a post-restore safety check failed ({{message}}). Files may have changed, and Cyclotomy could not authenticate and protect the current arrival ({{protection}}). Inspect /drift before continuing.",
+    "Restore stopped before Cyclotomy could verify the result ({{message}}). Some files may have changed, and Cyclotomy could not secure them ({{protection}}). Run /drift before continuing.",
   restorePostMutationLocationBarrier:
-    "Cyclotomy entered the file-application phase before the active session, node, or workspace changed. Files may have changed. No complete, stable current ancestry could be authenticated, so current files remain unassigned and a session capture barrier prevents automatic assignment. Reloading does not clear it; Cyclotomy will project it atomically onto the next complete concrete ancestry it can authenticate.",
+    "The session, node, or workspace changed during restore. Some files may have changed and are not attached to a checkpoint. This state will not be saved automatically; run /drift before continuing.",
   restorePostMutationTargetBarrier:
-    "Cyclotomy entered the file-application phase before the checkpoint target changed. Files may have changed. No complete, stable current ancestry could be authenticated, so current files remain unassigned and a session capture barrier prevents automatic assignment. Reloading does not clear it; Cyclotomy will project it atomically onto the next complete concrete ancestry it can authenticate.",
+    "The checkpoint changed during restore. Some files may have changed and are not attached to a checkpoint. This state will not be saved automatically; run /drift before continuing.",
   restorePostMutationControlBarrier:
-    "Cyclotomy entered the file-application phase, but a post-restore safety check failed ({{message}}). Files may have changed. No complete, stable current ancestry could be authenticated, so current files remain unassigned and a session capture barrier prevents automatic assignment. Reloading does not clear it; Cyclotomy will project it atomically onto the next complete concrete ancestry it can authenticate.",
+    "Restore stopped before Cyclotomy could verify the result ({{message}}). Some files may have changed and are not attached to a checkpoint. This state will not be saved automatically; run /drift before continuing.",
   checkpointInitializedConflictProtected:
-    "Cyclotomy recorded the workspace as the intended node's first checkpoint, but could not safely admit the now-current location ({{message}}). The current arrival is write-protected; run /drift before continuing.",
+    "The first checkpoint was saved, but the current node changed before Cyclotomy finished ({{message}}). This state will not be saved automatically; run /drift before continuing.",
   checkpointInitializedConflictUnavailable:
-    "Cyclotomy recorded the workspace as the intended node's first checkpoint, but could not safely admit or protect the now-current location ({{message}}). Inspect /drift before continuing.",
+    "The first checkpoint was saved, but the current node changed before Cyclotomy finished ({{message}}). Run /drift before continuing.",
   checkpointInitializedConflictBarrier:
-    "Cyclotomy recorded the workspace as the intended node's first checkpoint, but no complete, stable current ancestry could be authenticated afterward ({{message}}). Current files remain unassigned and a session capture barrier prevents automatic assignment. Reloading does not clear it; Cyclotomy will project it atomically onto the next complete concrete ancestry it can authenticate.",
+    "The first checkpoint was saved, but the current session history could not be confirmed afterward ({{message}}). This state will not be saved automatically; run /drift before continuing.",
   restoreInitialized:
-    "Current workspace recorded as this node's first checkpoint; checkpoint capture resumed.",
+    "Saved the current workspace as this node's first checkpoint.",
   restoreAlreadyMatches: "Workspace already matches this checkpoint.",
   restoreSuccessOne: "Workspace restored · {{count}} path changed.",
   restoreSuccessMany: "Workspace restored · {{count}} paths changed.",
   checkpointUnreadable:
-    "Restore did not start because the checkpoint could not be read ({{message}}). Current files were not changed.",
+    "Restore did not start because the checkpoint could not be read ({{message}}). No files were changed.",
   restoreApplyIncomplete:
     "Restore could not apply every workspace change:\n{{problems}}\n{{applied}}\nRun /drift to inspect the result, then /restore to retry.",
   restoreVerifyFailed:
     "Files changed, but Cyclotomy could not verify the final workspace.\n{{applied}}\nRun /drift before continuing.",
-  restoreAppliedNone: "No path mutation completed before the stop.",
-  restoreAppliedPaths: "Completed before the stop:\n{{mutations}}",
+  restoreAppliedNone: "No files were changed before restore stopped.",
+  restoreAppliedPaths: "Changed before restore stopped:\n{{mutations}}",
   restoreNotStarted:
-    "Restore did not start ({{message}}). Current files were not changed.",
+    "Restore did not start ({{message}}). No files were changed.",
   restoreExecutionFailed:
-    "Restore entered the file-application phase and stopped ({{message}}). Files may have changed; run /drift before continuing.",
-  restoreStagingCleanupFailed:
-    "Cyclotomy could not remove private restore staging ({{message}}). Check temporary storage before continuing.",
+    "Restore stopped ({{message}}). Some files may have changed; run /drift before continuing.",
+  restorePreparationCleanupFailed:
+    "Cyclotomy could not clean up restore files ({{message}}). Try again before continuing.",
   workspaceLockCleanupFailed:
-    "Cyclotomy could not finish workspace-lock cleanup ({{message}}). Check the checkpoint store before continuing.",
+    "Cyclotomy could not finish using its storage ({{message}}). Close other Cyclotomy sessions using this workspace, then try again.",
   restoreFailed:
-    "Restore failed ({{message}}). The original checkpoint remains the restore target.",
+    "Restore failed ({{message}}). Run /drift to review the current files.",
   driftMissing: "No checkpoint is available for this node yet.",
   driftMissingProtected:
-    "This protected node has no historical checkpoint. Run /restore to record the current workspace as its first checkpoint.",
+    "This node has no checkpoint. Run /restore to save the current workspace as its first checkpoint.",
   driftClean: "No drift · workspace matches this node's checkpoint.",
   driftCleanInherited:
     "No drift · workspace matches the checkpoint inherited from the nearest ancestor.",
   driftCleanProtected:
-    "Detached · no drift; workspace matches this checkpoint, but capture remains protected. Run /restore to exit Detached state and resume checkpointing.",
+    "Detached · no drift. Run /restore to attach the workspace to this node.",
   driftTitle: "Workspace drift\n{{preview}}",
   driftTitleDetached: "Workspace drift · Detached\n{{preview}}",
   driftTitleInherited:
@@ -203,11 +197,16 @@ const EN = {
   previewDelete: "-{{count}} delete",
   previewOmitted: "… {{count}} more",
   previewProblemOne:
-    "Preview incomplete · {{count}} scan problem; /restore is blocked",
+    "Preview incomplete · {{count}} workspace issue; /restore is unavailable",
   previewProblemMany:
-    "Preview incomplete · {{count}} scan problems; /restore is blocked",
+    "Preview incomplete · {{count}} workspace issues; /restore is unavailable",
   previewScopeNotice:
     "Note: ignore rules will also be restored; paths excluded by this checkpoint stay untouched.",
+  gitReplayRiskLegacy:
+    "Warning: this checkpoint was saved with an unknown Git version. {{current}} may interpret its ignore rules differently; review the full plan before confirming.",
+  gitReplayRiskVersionMismatch:
+    "Warning: this checkpoint was saved with {{captured}}, but restore is using {{current}}. Ignore rules may behave differently; review the full plan before confirming.",
+  gitReplayVersionUnknown: "an unknown Git version",
   scanProblemTooLarge: "too large",
   scanProblemReadFailed: "cannot read",
   scanProblemUnsupported: "unsupported entry",
@@ -227,12 +226,12 @@ const EN = {
   choiceManualRestore: "Restore checkpoint",
   choiceLoadedTitle: "Loaded session differs from workspace",
   choiceLoadedIntro:
-    "Choose which workspace to continue with. Restoring discards the differences below.",
+    "Choose which files to continue with. Restoring discards the differences below.",
   choiceLoadedSafe: "Use current files in Detached state",
   choiceLoadedRestore: "Restore loaded checkpoint",
   choiceNavigationTitle: "Destination workspace differs",
   choiceNavigationIntro:
-    "Detached navigation keeps the current workspace unassigned and protects the destination checkpoint; restoring applies the destination changes below.",
+    "Keep the current files in Detached state, or apply the destination checkpoint shown below.",
   choiceNavigationSafe: "Stay at current node",
   choiceNavigationDetach: "Navigate in Detached state — keep current workspace",
   choiceNavigationRestore: "Navigate and restore",
@@ -246,166 +245,152 @@ export type MessageKey = keyof typeof EN;
 
 const ZH_CN: Record<MessageKey, string> = {
   cyclotomyCommandDescription: "查看、停止或恢复 Cyclotomy",
-  cyclotomyStopCompletion: "在当前 Pi 运行期间停止 Cyclotomy",
-  cyclotomyResumeCompletion: "仅重试 Cyclotomy，不重新载入 Pi",
+  cyclotomyStopCompletion: "停止 Cyclotomy",
+  cyclotomyResumeCompletion: "恢复 Cyclotomy",
   cyclotomyRunning: "Cyclotomy 正在运行。",
-  cyclotomyInactive: "Cyclotomy 未在当前 Pi 会话中启用；Pi 仍可正常使用。",
-  cyclotomyStopped:
-    "Cyclotomy 已在当前 Pi 运行期间停止。可执行 /cyclotomy resume 尝试重新启动。",
+  cyclotomyInactive: "当前会话无法使用 Cyclotomy。",
+  cyclotomyStopped: "Cyclotomy 已停止。执行 /cyclotomy resume 可重新启动。",
   cyclotomyStoppedWithError:
-    "Cyclotomy 已在当前 Pi 运行期间停止（{{message}}）。Pi 仍可正常使用；请修复问题后执行 /cyclotomy resume。",
-  cyclotomyStopSucceeded:
-    "Cyclotomy 已在当前 Pi 运行期间停止；Pi 仍可正常使用。",
-  cyclotomyResumeSucceeded: "Cyclotomy 已恢复运行。",
-  cyclotomyResumeFailed:
-    "Cyclotomy 无法恢复运行（{{message}}）。Pi 仍可正常使用；请修复问题后重试 /cyclotomy resume。",
+    "Cyclotomy 因错误停止（{{message}}）。修复问题后执行 /cyclotomy resume。",
+  cyclotomyStopSucceeded: "Cyclotomy 已停止。",
+  cyclotomyResumeSucceeded: "Cyclotomy 已恢复。",
+  cyclotomyResumeFailed: "Cyclotomy 无法恢复（{{message}}）。修复问题后重试。",
   driftCommandDescription: "显示 /restore 将执行的文件变化",
-  restoreCommandDescription: "恢复当前节点的保存状态",
+  restoreCommandDescription: "恢复当前节点的检查点",
   checkingWorkspace: "Cyclotomy · 正在检查工作区…",
   restoringWorkspace: "Cyclotomy · 正在恢复工作区…",
   initFailure:
-    "Cyclotomy 初始化失败。捕获与恢复不可用，文件没有被改动；Pi 仍可正常使用。请修复报告的配置或存储问题，然后执行 /cyclotomy resume。",
-  captureLaterFailed:
-    "Cyclotomy 未能完成这次保存；本次保存所指向的状态指针没有改变。",
+    "Cyclotomy 无法启动。请修复报告的问题，然后执行 /cyclotomy resume。",
+  captureLaterFailed: "Cyclotomy 无法保存此检查点，已保留原检查点。",
   arrivalProtectionUnavailable:
-    "Cyclotomy 无法持久保护当前抵达位置（{{message}}）。请先保持当前文件不变，并检查 /drift 后再继续。",
+    "Cyclotomy 无法保护当前文件（{{message}}）。继续前请先运行 /drift。",
   arrivalAdmissionUnavailable:
-    "Cyclotomy 已持久保护当前抵达位置，但无法重建其内存准入状态（{{message}}）。此处的保存仍保持阻止；请先检查 /drift 后再继续。",
-  automaticGcFailed:
-    "Cyclotomy 自动清理失败（{{message}}）。保存状态已经成功建立且会继续工作；稍后将重试清理。",
+    "当前节点的自动检查点已暂停（{{message}}）。继续前请先运行 /drift。",
+  automaticGcFailed: "自动清理存储失败（{{message}}）。Cyclotomy 稍后会重试。",
   captureFailureDetail: "详情：{{message}}",
-  captureScanIncomplete: "工作区扫描不完整，未发布检查点：{{message}}",
-  captureValidationIncomplete:
-    "最终工作区验证不完整，未提交检查点：{{message}}",
-  captureValidationFailed: "最终工作区验证失败：{{message}}",
-  captureCheckpointChanged: "节点检查点在捕获准备后发生了变化。",
-  captureEligibilityChanged: "节点的检查点资格在捕获准备后发生了变化。",
-  captureWriteProtected: "节点检查点在恢复完成前受写保护。",
-  captureRootChanged: "选择检查点存储后，工作区根目录发生了变化。",
-  captureContentsChanged:
-    "工作区在捕获扫描与最终验证之间发生了变化，未提交检查点。",
+  captureScanIncomplete: "检查点未保存：{{message}}",
+  captureValidationIncomplete: "无法确认工作区状态，检查点未保存：{{message}}",
+  captureValidationFailed: "检查点未保存：{{message}}",
+  captureCheckpointChanged: "保存期间，检查点发生了变化。",
+  captureEligibilityChanged: "保存检查点前，当前节点发生了变化。",
+  captureWriteProtected: "当前节点的自动检查点已暂停。",
+  captureRootChanged: "保存检查点期间，工作区位置发生了变化。",
+  captureContentsChanged: "保存检查点期间，工作区发生了变化。",
   sourceCaptureFailed: "Cyclotomy 无法保存当前工作区，因此已取消本次操作。",
   inputCaptureFailed:
     "Cyclotomy 因无法保存当前工作区而没有提交这条提示。请修复上述问题后重新提交。",
-  bashWhileBusy: "Pi 正在工作或切换会话，Cyclotomy 没有执行这条终端命令。",
-  transitionInProgress: "另一项会话切换尚未完成，Cyclotomy 没有执行本次操作。",
+  bashWhileBusy: "请等待当前操作完成后重试。",
+  transitionInProgress: "另一项会话切换尚未完成，请稍后重试。",
   sessionRegistrationFailed:
-    "Cyclotomy 无法安全登记此会话（{{message}}），因此不会为它保存或恢复工作区。",
-  sessionIdentityUnavailable:
-    "Cyclotomy 无法确认此会话的持久化身份，因此不会为它保存或恢复工作区。",
+    "Cyclotomy 无法为此会话启用检查点（{{message}}）。",
+  sessionIdentityUnavailable: "Cyclotomy 无法使用此会话，检查点与恢复不可用。",
   memorySessionUnsupported:
-    "Cyclotomy 需要持久化的 Pi 会话；--no-session 和内存会话不会建立保存状态。",
+    "Cyclotomy 需要已保存的会话；--no-session 和内存会话不受支持。",
   sessionWorkspaceMismatch:
-    "Pi 在会话文件所记录工作区之外打开了此会话。Cyclotomy 已在此暂停，且没有绑定或修改任一工作区；请在当前目录创建 Pi 原生 fork，以安全延续此会话。",
+    "此会话在另一个工作区中打开。请在当前目录创建 Pi fork，再继续使用 Cyclotomy。",
   forkImportFailed:
-    "Cyclotomy 无法安全完成分支来源登记（{{message}}）；工作区文件未改变，请执行 /cyclotomy resume 重试。",
+    "Cyclotomy 无法导入父会话的检查点（{{message}}）。请执行 /cyclotomy resume 重试。",
   forkInheritanceSkipped:
-    "Cyclotomy 无法认证父会话的保存状态，或其未通过目标策略准入（{{message}}）；因此没有导入父会话状态，且已阻止保留落点自动接收当前工作区，直到后续明确检查的新落点建立自己的保存状态。",
-  navigationPrepareFailed:
-    "Cyclotomy 无法安全准备跳转（{{message}}），已取消。",
-  navigationScanIncomplete:
-    "Cyclotomy 因工作区扫描不完整而取消跳转：{{message}}",
-  navigationNeedsUi:
-    "目标节点的工作区不同，但当前没有可用的交互选择。跳转已取消，文件没有改动：{{preview}}",
-  navigationAttentionStatus:
-    "Cyclotomy · 本次跳转需要检查 · 请确认源节点保存状态与当前文件",
+    "未导入父会话的检查点（{{message}}）。新工作仍会保存检查点；已有节点需要先执行 /restore，才能再次保存检查点。",
+  navigationPrepareFailed: "跳转已取消：{{message}}",
+  navigationScanIncomplete: "无法完整读取工作区，跳转已取消：{{message}}",
+  navigationNeedsUi: "目标节点的文件不同，需要确认后才能跳转：{{preview}}",
+  navigationAttentionStatus: "Cyclotomy · 继续前请检查当前文件",
   navigationPlanMismatch:
-    "Cyclotomy 检测到与预期不同的跳转结果，因此既没有自动恢复，也没有把当前文件归给该节点；请检查后再执行 /restore。",
+    "跳转到达了预期之外的节点。已保留当前文件；执行 /restore 前请先运行 /drift。",
   navigationChangedAfterPreview:
-    "预览后工作区又发生了变化。对话位置已经移动，因此 Cyclotomy 没有给这些后续变化指定节点，也没有恢复文件；源节点保留跳转前已验证的保存状态。请先检查当前文件，再执行 /restore。",
+    "预览后工作区发生了变化。跳转已完成，但没有恢复文件；执行 /restore 前请先运行 /drift。",
   navigationChangedBeforeDeparture:
-    "预览后工作区、源节点或目标保存状态发生了变化，Cyclotomy 已取消跳转。请检查当前源节点文件，然后重试 /tree。",
+    "预览后工作区或检查点发生了变化。跳转已取消；请检查文件后重试 /tree。",
   navigationDetached:
-    "已在 Detached 状态下跳转并保留当前文件。目标节点的保存状态仍受保护；可用 /drift 查看差异，再用 /restore 完成对齐并退出 Detached 状态。",
+    "跳转已完成，并在 Detached 状态下保留当前文件。新工作仍会在新分支上保存检查点；请先运行 /drift，再用 /restore 处理当前节点。",
   navigationDetachFailed:
-    "跳转已保留当前文件，但 Cyclotomy 无法认证计划中的 Detached 落点（{{message}}）。Cyclotomy 已尽可能保护实际落点；请先用 /drift 检查再继续。",
+    "跳转已保留当前文件，但无法完成 Detached 状态切换（{{message}}）。继续前请先运行 /drift。",
   sessionRestoreNeedsUi:
-    "载入的会话与工作区不同，但当前无法交互确认。当前文件已在 Detached 状态下保留，且不会替换此节点原有的保存状态；请先用 /drift 检查差异，再在交互式 TUI 中执行 /restore 进行协调。",
+    "载入的会话与当前文件不同，需要确认。请先运行 /drift，再在交互式 TUI 中执行 /restore。",
   sessionRestoreDeferredRpc:
-    "载入的会话与工作区不同。当前文件已在 Detached 状态下保留，且不会替换此节点原有的保存状态；请显式执行 /restore 进行协调。",
+    "载入的会话与当前文件不同。已在 Detached 状态下保留当前文件；执行 /restore 可应用检查点。",
   sessionRestoreCancelled:
-    "以 Detached 状态继续使用当前文件，但不替换此节点原有的保存状态。",
+    "继续使用当前文件，并进入 Detached 状态。新工作会在新分支上保存检查点。",
   sessionMissingProtected:
-    "这个节点没有 Cyclotomy 可以安全恢复的保存状态；当前文件仍未归属于该节点。执行 /restore 可将当前工作区记录为它的首个保存状态。",
+    "当前节点没有检查点。执行 /restore 可将当前工作区保存为首个检查点。",
   sessionCaptureBarrier:
-    "由于无法认证完整、稳定的当前祖先链，Cyclotomy 保留了会话捕获屏障；当前文件仍未归属。执行 /reload 不会授予归属或清除该屏障；Cyclotomy 会将其原子地投影到下一条可认证的完整、具体祖先链上。",
+    "Cyclotomy 无法确认当前会话历史，因此不会自动保存当前状态。继续前请先运行 /drift，检查后再使用 /restore。",
   reloadProtected:
-    "Cyclotomy 无法确认重新载入的工作区与此保存状态一致；当前文件已保留，检查点捕获仍受保护。请先执行 /drift 检查，再执行 /restore 进行协调。",
-  waitIdleRestore: "Cyclotomy：请等 Pi 空闲后再执行 /restore。",
-  locationUnknown: "Cyclotomy：当前位置不可识别。",
-  restoreMissing: "Cyclotomy：当前位置没有保存状态，无法恢复。",
-  restorePrepareFailed: "Cyclotomy 无法准备恢复（{{message}}）。",
+    "重新载入的工作区与此检查点不同。已保留当前文件，且当前节点不会自动保存检查点；请运行 /drift，再执行 /restore。",
+  waitIdleRestore: "请等待当前操作完成后再恢复。",
+  locationUnknown: "Cyclotomy 无法识别当前节点。",
+  restoreMissing: "当前节点没有可恢复的检查点。",
+  restorePrepareFailed: "恢复无法开始（{{message}}）。",
   restorePreparationProtected:
-    "Cyclotomy 无法读取已载入的保存状态（{{message}}）。当前文件没有改动，且当前抵达位置已受保护，不会被自动捕获覆盖。",
+    "无法读取检查点（{{message}}）。已保留当前文件，且不会在此节点自动保存。",
   restorePreparationBarrier:
-    "Cyclotomy 无法读取已载入的保存状态（{{message}}）。当前文件仍未归属，且会话捕获屏障会阻止自动归属。",
+    "无法读取检查点（{{message}}）。已保留当前文件，且不会在此节点自动保存。",
   restorePreparationUnavailable:
-    "Cyclotomy 无法读取已载入的保存状态（{{message}}），也无法保护当前抵达位置（{{protection}}）。当前文件没有改动；请先检查 /drift 再继续。",
-  restoreScanIncomplete: "Cyclotomy 因工作区扫描不完整而拒绝恢复：{{message}}",
+    "无法读取检查点（{{message}}），也无法保护当前文件（{{protection}}）。继续前请先运行 /drift。",
+  restoreScanIncomplete: "无法完整读取工作区，恢复未开始：{{message}}",
   restoreNeedsUi:
-    "恢复需要交互式选择；当前文件已保留。请先用 /drift 检查差异，再在交互式 TUI 中执行 /restore。",
+    "恢复需要确认。已保留当前文件；请先运行 /drift，再在交互式 TUI 中执行 /restore。",
   commandPreviewStale:
-    "Cyclotomy：预览后工作区发生了变化；没有应用任何内容，请重新执行 /restore。",
+    "预览后工作区发生了变化。文件没有改动；请重新执行 /restore。",
   commandTargetChanged:
-    "Cyclotomy：预览后目标保存状态发生了变化；没有应用任何内容，请重新执行 /restore。",
-  commandLocationChanged:
-    "Cyclotomy：预览后当前会话、节点或工作区发生了变化；没有应用任何内容。",
+    "预览后检查点发生了变化。文件没有改动；请重新执行 /restore。",
+  commandLocationChanged: "会话、节点或工作区发生了变化，操作已取消。",
   restorePostMutationLocationProtected:
-    "Cyclotomy 进入文件应用阶段后，当前会话、节点或工作区发生了变化；文件可能已发生改动。Cyclotomy 已保护当前抵达位置，防止后续捕获覆盖其保存状态；请先运行 /drift 再继续。",
+    "恢复期间，会话、节点或工作区发生了变化。部分文件可能已改动，且不会在此节点自动保存；继续前请先运行 /drift。",
   restorePostMutationLocationUnavailable:
-    "Cyclotomy 进入文件应用阶段后，当前会话、节点或工作区发生了变化；文件可能已发生改动，且 Cyclotomy 无法认证并保护当前抵达位置（{{message}}）。请先运行 /drift 检查再继续。",
+    "恢复期间，会话、节点或工作区发生了变化。部分文件可能已改动，且 Cyclotomy 无法保护当前文件（{{message}}）；继续前请先运行 /drift。",
   restorePostMutationTargetProtected:
-    "Cyclotomy 进入文件应用阶段后，目标保存状态发生了变化；文件可能已发生改动。Cyclotomy 已让当前抵达位置保持受保护；请先运行 /drift 再继续。",
+    "恢复期间，检查点发生了变化。部分文件可能已改动，且不会在此节点自动保存；继续前请先运行 /drift。",
   restorePostMutationTargetUnavailable:
-    "Cyclotomy 进入文件应用阶段后，目标保存状态发生了变化；文件可能已发生改动，且 Cyclotomy 无法确认当前抵达位置仍受保护（{{message}}）。请先运行 /drift 检查再继续。",
+    "恢复期间，检查点发生了变化。部分文件可能已改动，且 Cyclotomy 无法保护当前文件（{{message}}）；继续前请先运行 /drift。",
   restorePostMutationControlProtected:
-    "Cyclotomy 已进入文件应用阶段，但恢复后的安全检查失败（{{message}}）；文件可能已发生改动。Cyclotomy 已保护当前抵达位置，防止后续捕获覆盖其保存状态；请先运行 /drift 再继续。",
+    "恢复结果无法确认（{{message}}）。部分文件可能已改动，且不会在此节点自动保存；继续前请先运行 /drift。",
   restorePostMutationControlUnavailable:
-    "Cyclotomy 已进入文件应用阶段，但恢复后的安全检查失败（{{message}}）；文件可能已发生改动，且 Cyclotomy 无法认证并保护当前抵达位置（{{protection}}）。请先运行 /drift 检查再继续。",
+    "恢复结果无法确认（{{message}}）。部分文件可能已改动，且 Cyclotomy 无法保护当前文件（{{protection}}）；继续前请先运行 /drift。",
   restorePostMutationLocationBarrier:
-    "Cyclotomy 进入文件应用阶段后，当前会话、节点或工作区发生了变化；文件可能已发生改动。由于无法认证完整、稳定的当前祖先链，当前文件仍未归属，且会话捕获屏障会阻止自动归属。重新载入扩展不会清除该屏障；Cyclotomy 会将其原子地投影到下一条可认证的完整、具体祖先链上。",
+    "恢复期间，会话、节点或工作区发生了变化。部分文件可能已改动，且尚未归入检查点。此状态不会自动保存；继续前请先运行 /drift。",
   restorePostMutationTargetBarrier:
-    "Cyclotomy 进入文件应用阶段后，目标保存状态发生了变化；文件可能已发生改动。由于无法认证完整、稳定的当前祖先链，当前文件仍未归属，且会话捕获屏障会阻止自动归属。重新载入扩展不会清除该屏障；Cyclotomy 会将其原子地投影到下一条可认证的完整、具体祖先链上。",
+    "恢复期间，检查点发生了变化。部分文件可能已改动，且尚未归入检查点。此状态不会自动保存；继续前请先运行 /drift。",
   restorePostMutationControlBarrier:
-    "Cyclotomy 已进入文件应用阶段，但恢复后的安全检查失败（{{message}}）；文件可能已发生改动。由于无法认证完整、稳定的当前祖先链，当前文件仍未归属，且会话捕获屏障会阻止自动归属。重新载入扩展不会清除该屏障；Cyclotomy 会将其原子地投影到下一条可认证的完整、具体祖先链上。",
+    "恢复结果无法确认（{{message}}）。部分文件可能已改动，且尚未归入检查点。此状态不会自动保存；继续前请先运行 /drift。",
   checkpointInitializedConflictProtected:
-    "Cyclotomy 已把工作区记录为预期节点的首个保存状态，但无法安全接纳当前所在位置（{{message}}）。当前抵达位置已受写入保护；请先运行 /drift 再继续。",
+    "首个检查点已保存，但当前节点随后发生了变化（{{message}}）。此状态不会自动保存；继续前请先运行 /drift。",
   checkpointInitializedConflictUnavailable:
-    "Cyclotomy 已把工作区记录为预期节点的首个保存状态，但无法安全接纳或保护当前所在位置（{{message}}）。请先运行 /drift 检查再继续。",
+    "首个检查点已保存，但当前节点随后发生了变化（{{message}}）。继续前请先运行 /drift。",
   checkpointInitializedConflictBarrier:
-    "Cyclotomy 已把工作区记录为预期节点的首个保存状态，但随后无法认证完整、稳定的当前祖先链（{{message}}）。当前文件仍未归属，且会话捕获屏障会阻止自动归属。重新载入扩展不会清除该屏障；Cyclotomy 会将其原子地投影到下一条可认证的完整、具体祖先链上。",
-  restoreInitialized:
-    "已将当前工作区记录为此节点的首个保存状态，并恢复后续检查点捕获。",
-  restoreAlreadyMatches: "工作区已经与此保存状态一致。",
+    "首个检查点已保存，但随后无法确认当前会话历史（{{message}}）。此状态不会自动保存；继续前请先运行 /drift。",
+  restoreInitialized: "已将当前工作区保存为此节点的首个检查点。",
+  restoreAlreadyMatches: "工作区已与此检查点一致。",
   restoreSuccessOne: "工作区已恢复 · 改动 {{count}} 个路径。",
   restoreSuccessMany: "工作区已恢复 · 改动 {{count}} 个路径。",
   checkpointUnreadable:
-    "无法读取保存状态，恢复尚未开始（{{message}}）；当前文件没有改动。",
+    "无法读取检查点，恢复未开始（{{message}}）。文件没有改动。",
   restoreApplyIncomplete:
     "恢复未能应用全部工作区变更：\n{{problems}}\n{{applied}}\n请运行 /drift 检查结果，再运行 /restore 重试。",
   restoreVerifyFailed:
     "文件已经改动，但 Cyclotomy 无法确认最终工作区状态。\n{{applied}}\n请先运行 /drift 再继续。",
-  restoreAppliedNone: "停止前没有完成任何路径变更。",
-  restoreAppliedPaths: "停止前已完成：\n{{mutations}}",
-  restoreNotStarted: "恢复尚未开始（{{message}}）；当前文件没有改动。",
+  restoreAppliedNone: "恢复停止前没有改动文件。",
+  restoreAppliedPaths: "恢复停止前已改动：\n{{mutations}}",
+  restoreNotStarted: "恢复未开始（{{message}}）。文件没有改动。",
   restoreExecutionFailed:
-    "恢复已进入文件应用阶段并停止（{{message}}）；文件可能已发生改动，请先运行 /drift 再继续。",
-  restoreStagingCleanupFailed:
-    "Cyclotomy 无法移除恢复时使用的私有暂存数据（{{message}}）；继续前请检查临时存储。",
+    "恢复已停止（{{message}}）。部分文件可能已改动；继续前请先运行 /drift。",
+  restorePreparationCleanupFailed:
+    "Cyclotomy 无法清理恢复文件（{{message}}）。请重试后再继续。",
   workspaceLockCleanupFailed:
-    "Cyclotomy 无法完成工作区锁清理（{{message}}）；继续前请检查保存状态存储目录。",
-  restoreFailed: "恢复失败（{{message}}）；原保存状态仍是下次恢复的目标。",
-  driftMissing: "当前节点还没有可用的保存状态。",
+    "Cyclotomy 无法结束本次存储操作（{{message}}）。请关闭其他正在使用此工作区的 Cyclotomy 会话后重试。",
+  restoreFailed: "恢复失败（{{message}}）。请运行 /drift 检查当前文件。",
+  driftMissing: "当前节点还没有检查点。",
   driftMissingProtected:
-    "这个受保护节点没有历史保存状态。执行 /restore 可将当前工作区记录为它的首个保存状态。",
-  driftClean: "没有漂移 · 工作区与当前节点的保存状态一致。",
-  driftCleanInherited: "没有漂移 · 工作区与最近祖先节点继承的保存状态一致。",
+    "当前节点没有检查点。执行 /restore 可将当前工作区保存为首个检查点。",
+  driftClean: "没有差异 · 工作区与当前节点的检查点一致。",
+  driftCleanInherited: "没有差异 · 工作区与最近祖先节点的检查点一致。",
   driftCleanProtected:
-    "Detached · 没有漂移；工作区与保存状态一致，但捕获仍受保护。执行 /restore 可退出 Detached 状态并恢复检查点捕获。",
-  driftTitle: "工作区漂移\n{{preview}}",
+    "Detached · 没有差异。执行 /restore 可将工作区归入当前节点。",
+  driftTitle: "工作区差异\n{{preview}}",
   driftTitleDetached:
-    "工作区漂移 · Detached（当前工作区尚未归属此节点）\n{{preview}}",
-  driftTitleInherited: "工作区漂移 · 使用最近祖先节点的保存状态\n{{preview}}",
+    "工作区差异 · Detached（当前工作区尚未归属此节点）\n{{preview}}",
+  driftTitleInherited: "工作区差异 · 使用最近祖先节点的检查点\n{{preview}}",
   previewPathOne: "{{count}} 个路径",
   previewPathMany: "{{count}} 个路径",
   previewCreate: "+{{count}} 创建",
@@ -413,10 +398,14 @@ const ZH_CN: Record<MessageKey, string> = {
   previewRename: ">{{count}} 重命名",
   previewDelete: "-{{count}} 删除",
   previewOmitted: "… 还有 {{count}} 项",
-  previewProblemOne: "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
-  previewProblemMany: "预览不完整 · {{count}} 个扫描问题；/restore 已阻止",
-  previewScopeNotice:
-    "提示：忽略规则也会恢复；此保存状态排除的路径不会被改动。",
+  previewProblemOne: "预览不完整 · {{count}} 个工作区问题；/restore 不可用",
+  previewProblemMany: "预览不完整 · {{count}} 个工作区问题；/restore 不可用",
+  previewScopeNotice: "提示：忽略规则也会恢复；此检查点排除的路径不会被改动。",
+  gitReplayRiskLegacy:
+    "警告：保存此检查点时使用的 Git 版本未知。{{current}} 对忽略规则的解释可能不同；确认前请检查完整计划。",
+  gitReplayRiskVersionMismatch:
+    "警告：此检查点由 {{captured}} 保存，但恢复将使用 {{current}}。忽略规则的行为可能不同；确认前请检查完整计划。",
+  gitReplayVersionUnknown: "未知 Git 版本",
   scanProblemTooLarge: "文件过大",
   scanProblemReadFailed: "无法读取",
   scanProblemUnsupported: "不支持的条目",
@@ -429,17 +418,17 @@ const ZH_CN: Record<MessageKey, string> = {
   applyProblemDeleteFailed: "删除失败",
   applyProblemMkdirFailed: "创建目录失败",
   applyProblemReadFailed: "读取失败",
-  choiceManualTitle: "恢复当前节点的保存状态？",
+  choiceManualTitle: "恢复当前节点的检查点？",
   choiceManualIntro: "恢复会丢弃下列当前差异，Cyclotomy 无法撤销此次操作。",
   choiceManualSafe: "取消（不改动文件）",
-  choiceManualRestore: "恢复保存状态",
+  choiceManualRestore: "恢复检查点",
   choiceLoadedTitle: "载入的会话与工作区不同",
-  choiceLoadedIntro: "请选择继续使用哪份工作区；恢复会丢弃下列当前差异。",
+  choiceLoadedIntro: "请选择继续使用哪组文件；恢复会丢弃下列当前差异。",
   choiceLoadedSafe: "以 Detached 状态使用当前文件",
   choiceLoadedRestore: "恢复会话状态",
   choiceNavigationTitle: "目标节点的工作区不同",
   choiceNavigationIntro:
-    "Detached 跳转会保留当前工作区，使其暂不归属目标节点，并保护目标保存状态；恢复则会应用下列目标状态。",
+    "保留当前文件并进入 Detached 状态，或应用下列目标检查点。",
   choiceNavigationSafe: "停留在当前节点",
   choiceNavigationDetach: "以 Detached 状态跳转（保留当前工作区）",
   choiceNavigationRestore: "跳转并恢复",
@@ -549,6 +538,26 @@ export class CyclotomyI18n {
         this.#scanProblemLabel(problem.kind),
       scopeNotice: this.t("previewScopeNotice"),
     });
+  }
+
+  formatGitReplayRisk(risk: GitReplayRisk): string | undefined {
+    const version = (value: string | null): string =>
+      value === null
+        ? this.t("gitReplayVersionUnknown")
+        : formatUiDetail(value);
+    switch (risk.kind) {
+      case "none":
+        return undefined;
+      case "legacy-unattested":
+        return this.t("gitReplayRiskLegacy", {
+          current: version(risk.currentGitVersion),
+        });
+      case "version-mismatch":
+        return this.t("gitReplayRiskVersionMismatch", {
+          captured: version(risk.capturedGitVersion),
+          current: version(risk.currentGitVersion),
+        });
+    }
   }
 
   formatScanProblems(problems: readonly ScanProblem[]): string {

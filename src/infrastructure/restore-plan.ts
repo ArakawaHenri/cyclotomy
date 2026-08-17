@@ -1,17 +1,19 @@
+import { type TreeEntry } from "./tree-formats/manifest-codec.ts";
 import {
-  type TreeEntry,
-  type TreeManifest,
-} from "./tree-formats/manifest-codec.ts";
-import { CURRENT_TREE_MANIFEST_FORMAT } from "./tree-formats/current.ts";
+  CURRENT_TREE_MANIFEST_FORMAT,
+  type CurrentTreeManifest,
+} from "./tree-formats/current.ts";
 import {
   ABSOLUTE_WORKSPACE_PATH_LIMITS,
   workspaceScopesEqual,
 } from "./workspace-scope.ts";
-import type {
-  ExcludedWorkspaceOccupancy,
-  ScanProblem,
-  WorkspaceState,
+import {
+  workspaceEntryAsTreeEntry,
+  type ExcludedWorkspaceOccupancy,
+  type ScanProblem,
+  type WorkspaceState,
 } from "./workspace-scan.ts";
+import { addWorkspacePathAncestors } from "./workspace-path-relations.ts";
 
 export interface RestoreScopeBlocker {
   readonly path: string;
@@ -44,7 +46,7 @@ export interface WorkspaceRestorePlan {
 }
 
 /** In-memory comparison target; never encoded as a durable tree object. */
-export interface WorkspaceComparisonManifest extends TreeManifest {
+export interface WorkspaceComparisonManifest extends CurrentTreeManifest {
   readonly excludedOccupancies: readonly ExcludedWorkspaceOccupancy[];
 }
 
@@ -70,17 +72,8 @@ function nonDirectoryTargetAtOrAbove(
   return nonDirectoryTargetAncestor(path, targetByPath);
 }
 
-function ancestorDirectories(path: string, into: Set<string>): void {
-  let separator = path.lastIndexOf("/");
-  while (separator !== -1) {
-    const ancestor = path.slice(0, separator);
-    into.add(ancestor);
-    separator = ancestor.lastIndexOf("/");
-  }
-}
-
 function comparisonOccupancies(
-  target: TreeManifest,
+  target: CurrentTreeManifest,
 ): readonly ExcludedWorkspaceOccupancy[] | undefined {
   return "excludedOccupancies" in target
     ? (target as WorkspaceComparisonManifest).excludedOccupancies
@@ -93,7 +86,7 @@ function comparisonOccupancies(
  */
 export function planWorkspaceRestore(
   current: WorkspaceState,
-  target: TreeManifest,
+  target: CurrentTreeManifest,
 ): WorkspaceRestorePlan {
   const targetByPath = new Map<string, TreeEntry>(
     target.entries.map((entry) => [entry.path, entry]),
@@ -154,7 +147,7 @@ export function planWorkspaceRestore(
 
   const targetImplicitDirectories = new Set<string>();
   for (const entry of target.entries) {
-    ancestorDirectories(entry.path, targetImplicitDirectories);
+    addWorkspacePathAncestors(entry.path, targetImplicitDirectories);
   }
   for (const occupancy of current.excludedOccupancies) {
     const targetPath =
@@ -232,21 +225,7 @@ export function workspaceSnapshotAsManifest(
 ): WorkspaceComparisonManifest {
   return {
     format: CURRENT_TREE_MANIFEST_FORMAT,
-    entries: snapshot.entries.map((entry): TreeEntry =>
-      entry.kind === "regular"
-        ? {
-            path: entry.path,
-            type: "regular",
-            blobOid: entry.sha256,
-            recreationMode: entry.recreationMode,
-          }
-        : {
-            path: entry.path,
-            type: "symlink",
-            target: entry.target,
-            symlinkKind: entry.symlinkKind,
-          },
-    ),
+    entries: snapshot.entries.map(workspaceEntryAsTreeEntry),
     excludedOccupancies: snapshot.excludedOccupancies.map(({ path, kind }) => ({
       path,
       kind,

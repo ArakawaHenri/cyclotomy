@@ -11,11 +11,13 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
+import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
 import {
   ABSOLUTE_MAX_TREE_ENTRIES,
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   DEFAULT_MAX_TREE_ENTRIES,
   DEFAULT_MAX_TREE_MANIFEST_BYTES,
+  encodeTreeManifestDocument,
   type FileRecreationMode,
   type SymlinkKind,
   type TreeEntry,
@@ -120,6 +122,8 @@ export interface WorkspaceState {
 export interface WorkspaceSnapshot extends WorkspaceState {
   readonly entries: readonly WorkspaceEntry[];
   readonly excludedOccupancies: readonly ExcludedWorkspaceObservation[];
+  /** Git executable that classified this scan, or null for all-managed scope. */
+  readonly gitOracleVersion: string | null;
   /** Canonical root frozen by the scan. */
   readonly rootPath: string;
   /** Ephemeral real-directory identities used to bind a later apply. */
@@ -199,7 +203,28 @@ function comparePathBytes(left: string, right: string): number {
 }
 
 function errorDetail(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const primary = primaryFailure(cause);
+  return primary instanceof Error ? primary.message : String(primary);
+}
+
+async function withScanCleanup<T>(
+  action: () => Promise<T>,
+  cleanup: () => Promise<void>,
+  message: string,
+): Promise<T> {
+  try {
+    return await withRetainedCleanup(action, cleanup, message);
+  } catch (error) {
+    const primary = primaryFailure(error);
+    if (primary instanceof ScanError) {
+      if (primary === error) throw primary;
+      throw new ScanError(primary.message, { cause: error });
+    }
+    throw new ScanError(
+      primary instanceof Error ? primary.message : String(primary),
+      { cause: error },
+    );
+  }
 }
 
 function unsupportedType(stat: Stats): string {
@@ -301,6 +326,7 @@ export function workspaceSnapshotsEqual(
 ): boolean {
   return (
     left.rootPath === right.rootPath &&
+    left.gitOracleVersion === right.gitOracleVersion &&
     workspaceScopesEqual(
       left.scope,
       right.scope,
@@ -318,7 +344,10 @@ export function workspaceSnapshotsEqual(
   );
 }
 
-function treeEntryForManifestEstimate(entry: WorkspaceEntry): TreeEntry {
+/** Project a physical scan observation into the current tree's semantics. */
+export function workspaceEntryAsTreeEntry(
+  entry: WorkspaceStateEntry,
+): TreeEntry {
   return entry.kind === "regular"
     ? {
         path: entry.path,
@@ -332,20 +361,6 @@ function treeEntryForManifestEstimate(entry: WorkspaceEntry): TreeEntry {
         target: entry.target,
         symlinkKind: entry.symlinkKind,
       };
-}
-
-function estimatedManifestBytes(
-  entries: readonly WorkspaceEntry[],
-  scope: WorkspaceScope,
-): number {
-  return Buffer.byteLength(
-    `${JSON.stringify({
-      format: CURRENT_TREE_MANIFEST_FORMAT,
-      entries: entries.map(treeEntryForManifestEstimate),
-      scope,
-    })}\n`,
-    "utf8",
-  );
 }
 
 function sameFileObservation(before: Stats, after: Stats): boolean {
@@ -701,7 +716,7 @@ async function scanWorkspaceWithScope(
     const managed = await classify(
       candidates.map(({ relativePath, stat }) => ({
         path: relativePath,
-        isDirectory: stat.isDirectory(),
+        kind: stat.isDirectory() ? "directory" : "non-directory",
       })),
     );
     for (let index = 0; index < candidates.length; index += 1) {
@@ -832,47 +847,63 @@ async function scanWorkspaceWithScope(
           absolutePath,
           fsConstants.O_RDONLY,
         );
-        try {
-          const before = await handle.stat();
-          if (!before.isFile() || !sameFileObservation(stat, before)) {
-            throw new Error("entry changed before it could be read safely");
-          }
-          if (before.size > maxFileBytes) {
-            problems.push({
-              path: relativePath,
-              kind: "too-large",
-              detail: `${before.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
-            });
-            continue;
-          }
+        const scanned = await withRetainedCleanup(
+          async (): Promise<
+            | { readonly kind: "too-large"; readonly detail: string }
+            | {
+                readonly kind: "entry";
+                readonly entry: Extract<WorkspaceEntry, { kind: "regular" }>;
+              }
+          > => {
+            const before = await handle.stat();
+            if (!before.isFile() || !sameFileObservation(stat, before)) {
+              throw new Error("entry changed before it could be read safely");
+            }
+            if (before.size > maxFileBytes) {
+              return {
+                kind: "too-large",
+                detail: `${before.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
+              };
+            }
 
-          const hashed = await hashFileHandle(handle, maxFileBytes);
-          if (hashed.tooLarge) {
-            problems.push({
-              path: relativePath,
-              kind: "too-large",
-              detail: `more than ${maxFileBytes} bytes were read before the file limit was detected`,
-            });
-            continue;
-          }
-          const after = await handle.stat();
-          if (!sameFileObservation(before, after)) {
-            throw new Error("entry changed while it was being scanned");
-          }
-          canonicalOwners.set(canonical, relativePath);
-          entries.push({
+            const hashed = await hashFileHandle(handle, maxFileBytes);
+            if (hashed.tooLarge) {
+              return {
+                kind: "too-large",
+                detail: `more than ${maxFileBytes} bytes were read before the file limit was detected`,
+              };
+            }
+            const after = await handle.stat();
+            if (!sameFileObservation(before, after)) {
+              throw new Error("entry changed while it was being scanned");
+            }
+            return {
+              kind: "entry",
+              entry: {
+                path: relativePath,
+                kind: "regular",
+                recreationMode:
+                  process.platform === "win32" ? null : after.mode & 0o7777,
+                byteLength: hashed.byteLength,
+                sha256: hashed.sha256,
+                sourcePath: absolutePath,
+              },
+            };
+          },
+          () => handle.close(),
+          `workspace entry ${relativePath} scan and cleanup both failed`,
+        );
+        if (scanned.kind === "too-large") {
+          problems.push({
             path: relativePath,
-            kind: "regular",
-            recreationMode:
-              process.platform === "win32" ? null : after.mode & 0o7777,
-            byteLength: hashed.byteLength,
-            sha256: hashed.sha256,
-            sourcePath: absolutePath,
+            kind: "too-large",
+            detail: scanned.detail,
           });
-          addBytes(hashed.byteLength);
-        } finally {
-          await handle.close();
+          continue;
         }
+        canonicalOwners.set(canonical, relativePath);
+        entries.push(scanned.entry);
+        addBytes(scanned.entry.byteLength);
       } catch (cause) {
         if (cause instanceof ScanError) throw cause;
         problems.push({
@@ -887,11 +918,11 @@ async function scanWorkspaceWithScope(
 
   // The canonical root has no parent directory entry to charge its one slot.
   addInventory();
-  try {
-    await walk(workspaceRoot, "", rootStat);
-  } finally {
-    await oracle.close();
-  }
+  await withScanCleanup(
+    () => walk(workspaceRoot, "", rootStat),
+    () => oracle.close(),
+    "workspace scan and Git oracle cleanup both failed",
+  );
 
   entries.sort((left, right) => comparePathBytes(left.path, right.path));
   excludedOccupancies.sort((left, right) =>
@@ -959,6 +990,12 @@ async function scanWorkspaceWithScope(
         );
       }
       scope = finalScope;
+      if (scope.kind !== "git") {
+        throw new ScanError(
+          "Git scope disappeared while finalizing the workspace scan",
+        );
+      }
+      const finalGitScope = scope;
 
       // The live Git process classified current paths. Replay every observed
       // decision through the archived policy before publishing that policy as
@@ -967,49 +1004,71 @@ async function scanWorkspaceWithScope(
         scope,
         syntheticScratch,
       );
-      try {
-        for (let offset = 0; offset < liveDecisions.length; offset += 2_048) {
-          const expected = liveDecisions.slice(offset, offset + 2_048);
-          const actual = await replay.managed(expected);
+      await withScanCleanup(
+        async () => {
           if (
-            actual.length !== expected.length ||
-            actual.some(
-              (managed, index) => managed !== expected[index]!.managed,
-            )
+            finalGitScope.evaluator === null ||
+            replay.gitVersion !== finalGitScope.evaluator.version
           ) {
             throw new ScanError(
-              "archived Git policy does not reproduce the live workspace boundary",
+              "archived Git policy was replayed by a different Git version",
             );
           }
-        }
-      } finally {
-        await replay.close();
-      }
+          for (let offset = 0; offset < liveDecisions.length; offset += 2_048) {
+            const expected = liveDecisions.slice(offset, offset + 2_048);
+            const actual = await replay.managed(expected);
+            if (
+              actual.length !== expected.length ||
+              actual.some(
+                (managed, index) => managed !== expected[index]!.managed,
+              )
+            ) {
+              throw new ScanError(
+                "archived Git policy does not reproduce the live workspace boundary",
+              );
+            }
+          }
+        },
+        () => replay.close(),
+        "archived Git policy replay and cleanup both failed",
+      );
     } else {
       scope = rediscovered.scope;
     }
   }
-  if (discovery?.scope.kind === "git") {
+  const treeEntries = entries.map(workspaceEntryAsTreeEntry);
+  if (targetScope === undefined) {
     try {
-      // Reuse the durable manifest's one static source/blob binding. This also
-      // covers the actual on-disk casing of `.gitignore` on ignoreCase hosts.
-      createCurrentTreeManifest(
-        entries.map(treeEntryForManifestEstimate),
+      // Live capture must satisfy the complete durable admission contract for
+      // both Git and all-managed scopes.
+      createCurrentTreeManifest(treeEntries, scope, {
+        maxEntries,
+        maxManifestBytes,
+        ...pathLimits,
+      });
+    } catch (cause) {
+      throw new ScanError(
+        "workspace entries do not satisfy the current tree manifest contract",
+        { cause },
+      );
+    }
+  } else {
+    try {
+      // A restore comparison deliberately combines an archived policy with
+      // current policy-file bytes.  It is not a publishable manifest, but its
+      // semantic projection is still charged by the exact same byte codec.
+      encodeTreeManifestDocument(
+        CURRENT_TREE_MANIFEST_FORMAT,
+        treeEntries,
         scope,
         { maxEntries, maxManifestBytes, ...pathLimits },
       );
     } catch (cause) {
       throw new ScanError(
-        "workspace entries do not match the captured Git ignore sources",
+        "workspace comparison exceeds the current tree manifest contract",
         { cause },
       );
     }
-  }
-  const manifestBytes = estimatedManifestBytes(entries, scope);
-  if (manifestBytes > maxManifestBytes) {
-    throw new ScanError(
-      `tree manifest estimate is ${manifestBytes} bytes, exceeding the ${maxManifestBytes}-byte limit`,
-    );
   }
   return {
     entries,
@@ -1017,6 +1076,7 @@ async function scanWorkspaceWithScope(
     problems,
     rootPath: workspaceRoot,
     directoryObservations,
+    gitOracleVersion: oracle.gitVersion,
     scope,
   };
 }

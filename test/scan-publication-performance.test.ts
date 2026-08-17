@@ -5,6 +5,7 @@ import { performance } from "node:perf_hooks";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { chunkFastCdcV1 } from "../src/infrastructure/content-store/fastcdc.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
 import { publishSnapshot } from "../src/infrastructure/snapshot-publication.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
@@ -12,6 +13,7 @@ import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 const LARGE_FILE_BYTES = 12 * 1024 * 1024;
 const MANY_FILE_COUNT = 1_000;
 const UNIQUE_FILE_COUNT = 100;
+const FASTCDC_BENCHMARK_BYTES = 32 * 1024 * 1024;
 // This prevents a wedged filesystem operation from hanging the suite. Timing
 // observations below are indicators only and are never pass/fail thresholds.
 const INDICATOR_TEST_TIMEOUT_MS = 30_000;
@@ -165,6 +167,34 @@ describe("scan and publication performance indicators", () => {
         scanMs,
         firstPublishMs,
         repeatedPublishMs,
+      });
+    },
+    INDICATOR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reports fixed-profile FastCDC throughput",
+    () => {
+      const input = Buffer.allocUnsafe(FASTCDC_BENCHMARK_BYTES);
+      let state = 0x1234_5678;
+      for (let index = 0; index < input.byteLength; index += 1) {
+        state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+        input[index] = state >>> 24;
+      }
+
+      // Warm the optimizing compiler before measuring the fixed profile.
+      chunkFastCdcV1(input);
+      const started = performance.now();
+      const chunks = chunkFastCdcV1(input);
+      const elapsedMs = performance.now() - started;
+      const throughputMiBPerSecond =
+        FASTCDC_BENCHMARK_BYTES / (1024 * 1024) / (elapsedMs / 1_000);
+
+      expect(chunks.length).toBeGreaterThan(0);
+      reportIndicator("fastcdc-v1", {
+        bytes: FASTCDC_BENCHMARK_BYTES,
+        elapsedMs,
+        throughputMiBPerSecond,
       });
     },
     INDICATOR_TEST_TIMEOUT_MS,

@@ -13,39 +13,45 @@ import {
 import type { ResolvedNodeState } from "../application/resolve.ts";
 import type { NodeKey } from "../domain/model.ts";
 import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 import type { ArrivalAttempt } from "./checkpoint-admission.ts";
-import type { ArrivalDisposition } from "./arrival-settlement.ts";
-import { dispositionFromArrivalProtection } from "./arrival-settlement.ts";
 import {
-  mergeCleanupSettlements,
-  protectCurrentArrivalAfterWorkspaceFailure,
+  unsettledArrival,
+  type ArrivalDisposition,
+} from "./arrival-settlement.ts";
+import {
   protectCurrentArrivalInWorkspaceLock,
   postMutationControlFailure,
+  postMutationControlFailureExecution,
   postMutationStateConflict,
   type ArrivalRecovery,
-  type CleanupSettlement,
-  type PostMutationConflict,
+  type PostMutationConflictExecution,
 } from "./post-mutation.ts";
-import { readSessionView, type SessionView } from "./session-view.ts";
+import {
+  isExactUsableSessionView,
+  readSessionView,
+  type SessionView,
+} from "./session-view.ts";
+import type { LockedArrivalOutcome } from "./workspace-receipt.ts";
+
+const SETTLED_PREPARATION_CLEANUP = { kind: "settled" } as const;
 
 /** A restore outcome together with the exact first-write fact that produced it. */
 export interface RestoreProtocolOutcome {
   readonly kind: "outcome";
   readonly outcome: RestoreOutcome;
   readonly cutover: RestoreExecution["cutover"];
-  readonly stagingCleanup: RestoreExecution["stagingCleanup"];
-  readonly workspaceLockCleanup: CleanupSettlement;
+  readonly preparationCleanup: RestoreExecution["preparationCleanup"];
 }
 
-export type WorkspaceMutationProtocolResult =
+export type WorkspaceMutationProtocolExecution =
   | { readonly kind: "target-changed" }
   | RestoreProtocolOutcome
-  | PostMutationConflict;
+  | PostMutationConflictExecution;
 
-export interface TreeRestoreProtocolResult {
-  readonly execution: WorkspaceMutationProtocolResult;
-  readonly arrival: ArrivalDisposition;
-}
+export type WorkspaceMutationProtocolActionResult =
+  | Exclude<WorkspaceMutationProtocolExecution, PostMutationConflictExecution>
+  | LockedArrivalOutcome<WorkspaceMutationProtocolExecution>;
 
 export interface LocationRestoreRequest {
   readonly expected: SessionView;
@@ -78,19 +84,20 @@ interface RestoreSettlement {
     view: SessionView,
     resolution: ResolvedNodeState,
   ) => boolean | ArrivalDisposition;
-  readonly noOpConflict: "target-changed";
 }
 
 /** The protocol deliberately cannot reach Runtime's UI, queue, or lifecycle. */
 export interface WorkspaceMutationProtocolAuthority extends ArrivalRecovery {
   restoreDependencies(): RestoreDeps;
   prepareLocationMutation(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
     expected: SessionView,
     node: NodeKey,
     resolution: ResolvedNodeState,
   ): WorkspaceMutationLease<ResolvedNodeState> | undefined;
   prepareTreeArrivalMutation(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
     attempt: ArrivalAttempt,
     expected: SessionView,
@@ -104,15 +111,18 @@ export interface WorkspaceMutationProtocolAuthority extends ArrivalRecovery {
     expected: ResolvedNodeState,
   ): boolean;
   admitLocationIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     resolution: ResolvedNodeState,
   ): boolean;
   admitTreeArrivalIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
     resolution: ResolvedNodeState,
   ): ArrivalDisposition;
   protectCurrentTreeArrival(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
   ): ArrivalDisposition;
@@ -140,61 +150,83 @@ export class WorkspaceMutationProtocol {
     this.#readView = readView;
   }
 
-  restoreLocation(
+  async restoreLocation(
     request: LocationRestoreRequest,
-  ): Promise<WorkspaceMutationProtocolResult> {
+    writeAuthority: WorkspaceWriteAuthority,
+  ): Promise<WorkspaceMutationProtocolActionResult> {
     const { expected, node, resolution } = request;
-    return this.#restore(request.current, expected.cwd, resolution, {
-      prepareLease: () =>
-        this.#authority.prepareLocationMutation(
-          this.#context,
-          expected,
-          node,
-          resolution,
-        ),
-      reauthenticate: (pinned) => {
-        let current: SessionView | undefined;
-        try {
-          current = this.#readExactView(expected);
-        } catch {
-          return { kind: "location-changed" };
-        }
-        if (current === undefined) return { kind: "location-changed" };
-        const anchor = this.#authority.captureAnchor(current);
-        if (
-          anchor?.sessionId !== node.sessionId ||
-          anchor.entryId !== node.entryId
-        ) {
-          return { kind: "location-changed" };
-        }
-        return this.#authority.resolutionStillAuthoritative(
-          current,
-          node,
-          pinned,
-        )
-          ? { kind: "matches", view: current }
-          : { kind: "target-changed" };
+    const result = await this.#restore(
+      request.current,
+      expected.cwd,
+      resolution,
+      writeAuthority,
+      {
+        prepareLease: () =>
+          this.#authority.prepareLocationMutation(
+            writeAuthority,
+            this.#context,
+            expected,
+            node,
+            resolution,
+          ),
+        reauthenticate: (pinned) => {
+          let current: SessionView | undefined;
+          try {
+            current = this.#readExactView(expected);
+          } catch {
+            return { kind: "location-changed" };
+          }
+          if (current === undefined) return { kind: "location-changed" };
+          const anchor = this.#authority.captureAnchor(current);
+          if (
+            anchor?.sessionId !== node.sessionId ||
+            anchor.entryId !== node.entryId
+          ) {
+            return { kind: "location-changed" };
+          }
+          return this.#authority.resolutionStillAuthoritative(
+            current,
+            node,
+            pinned,
+          )
+            ? { kind: "matches", view: current }
+            : { kind: "target-changed" };
+        },
+        admitAuthorized: (view, pinned) =>
+          this.#authority.admitLocationIfResolution(
+            writeAuthority,
+            view,
+            pinned,
+          ),
+        admitNoOp: (view, target) =>
+          this.#authority.admitLocationIfResolution(
+            writeAuthority,
+            view,
+            target,
+          ),
       },
-      admitAuthorized: (view, pinned) =>
-        this.#authority.admitLocationIfResolution(view, pinned),
-      admitNoOp: (view, target) =>
-        this.#authority.admitLocationIfResolution(view, target),
-      noOpConflict: "target-changed",
-    });
+    );
+    if ("execution" in result) return result;
+    return result.kind === "outcome" && result.outcome.kind === "restored"
+      ? { execution: result, arrival: { kind: "admitted" } }
+      : result;
   }
 
   async restoreTreeArrival(
     request: TreeArrivalRestoreRequest,
-  ): Promise<TreeRestoreProtocolResult> {
+    writeAuthority: WorkspaceWriteAuthority,
+  ): Promise<LockedArrivalOutcome<WorkspaceMutationProtocolExecution>> {
     const { arrival, expected, node, resolution } = request;
     let settledArrival: ArrivalDisposition | undefined;
-    const execution = await this.#restore(
+    const result = await this.#restore(
       request.current,
       expected.cwd,
       resolution,
+      writeAuthority,
       {
         prepareLease: () =>
           this.#authority.prepareTreeArrivalMutation(
+            writeAuthority,
             this.#context,
             arrival,
             expected,
@@ -228,6 +260,7 @@ export class WorkspaceMutationProtocol {
         // ordinary capture authority only after the restored target is reproved.
         admitAuthorized: (view, pinned) => {
           const admitted = this.#authority.admitLocationIfResolution(
+            writeAuthority,
             view,
             pinned,
           );
@@ -237,6 +270,7 @@ export class WorkspaceMutationProtocol {
         // A no-op never consumed that token, so it must be settled as an arrival.
         admitNoOp: (view, target) => {
           const disposition = this.#authority.admitTreeArrivalIfResolution(
+            writeAuthority,
             arrival,
             view,
             target,
@@ -244,16 +278,15 @@ export class WorkspaceMutationProtocol {
           settledArrival = disposition;
           return disposition;
         },
-        noOpConflict: "target-changed",
       },
     );
-    if (settledArrival !== undefined) {
-      return { execution, arrival: settledArrival };
+    if ("execution" in result) {
+      return result;
     }
-    if (execution.kind === "post-mutation-conflict") {
+    if (settledArrival !== undefined) {
       return {
-        execution,
-        arrival: dispositionFromArrivalProtection(execution.arrivalProtection),
+        execution: result,
+        arrival: settledArrival,
       };
     }
     let current: SessionView | undefined;
@@ -262,115 +295,59 @@ export class WorkspaceMutationProtocol {
     } catch {
       // The general recovery below does not rely on the arrival token.
     }
+    let tokenProtectionFailure: unknown;
     if (current !== undefined) {
       const protectedArrival = this.#authority.protectCurrentTreeArrival(
+        writeAuthority,
         arrival,
         current,
       );
       if (protectedArrival.kind !== "unsettled") {
-        return { execution, arrival: protectedArrival };
+        return {
+          execution: result,
+          arrival: protectedArrival,
+        };
       }
+      tokenProtectionFailure = protectedArrival.cause;
     }
     const recovery = await protectCurrentArrivalInWorkspaceLock(
       this.#authority,
+      writeAuthority,
       this.#context,
     );
     return {
-      execution,
-      arrival: dispositionFromArrivalProtection(recovery.protection),
+      execution: result,
+      arrival:
+        tokenProtectionFailure !== undefined && recovery.kind === "unsettled"
+          ? unsettledArrival("arrival protection attempts both failed", [
+              tokenProtectionFailure,
+              recovery.cause,
+            ])
+          : recovery,
     };
   }
 
-  /**
-   * Reconcile an explicit execution receipt with the independent workspace-lock
-   * cleanup result. Preserve settled facts and recover only when an authorized
-   * cutover means workspace mutation may have occurred.
-   */
-  recoverAfterWorkspaceFailure(
+  recoveryExecutionAfterCleanupFailure(
+    execution: WorkspaceMutationProtocolExecution,
     cause: unknown,
-    result: WorkspaceMutationProtocolResult | undefined,
-    workspaceLockCleanup: CleanupSettlement,
-  ): Promise<WorkspaceMutationProtocolResult | undefined> {
-    if (result?.kind === "post-mutation-conflict") {
-      return this.#preserveSettledConflict(result, cause, workspaceLockCleanup);
-    }
-    if (result?.kind !== "outcome" || result.cutover.kind !== "authorized") {
-      return Promise.resolve(
-        result?.kind === "outcome"
-          ? {
-              ...result,
-              workspaceLockCleanup: mergeCleanupSettlements(
-                result.workspaceLockCleanup,
-                workspaceLockCleanup,
-              ),
-            }
-          : undefined,
-      );
-    }
-    return postMutationControlFailure(
-      this.#authority,
-      this.#context,
-      cause,
-      result.outcome,
-      "released",
-    ).then((conflict) => ({
-      ...conflict,
-      workspaceLockCleanup: mergeCleanupSettlements(
-        conflict.workspaceLockCleanup,
-        workspaceLockCleanup,
-      ),
-    }));
-  }
-
-  async #preserveSettledConflict(
-    conflict: PostMutationConflict,
-    secondaryFailure: unknown,
-    workspaceLockCleanup: CleanupSettlement,
-  ): Promise<PostMutationConflict> {
-    if (conflict.arrivalProtection.kind !== "unavailable") {
-      return {
-        ...conflict,
-        workspaceLockCleanup: mergeCleanupSettlements(
-          conflict.workspaceLockCleanup,
-          workspaceLockCleanup,
-        ),
-      };
-    }
-    const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
-      this.#authority,
-      this.#context,
-    );
-    return {
-      ...conflict,
-      workspaceLockCleanup: mergeCleanupSettlements(
-        conflict.workspaceLockCleanup,
-        workspaceLockCleanup,
-        recovery.workspaceLockCleanup,
-      ),
-      arrivalProtection:
-        recovery.protection.kind === "unavailable"
-          ? {
-              kind: "unavailable",
-              cause: new AggregateError(
-                [
-                  conflict.arrivalProtection.cause,
-                  secondaryFailure,
-                  recovery.protection.cause,
-                ],
-                "arrival settlement and workspace cleanup both failed",
-                { cause: conflict.arrivalProtection.cause },
-              ),
-            }
-          : recovery.protection,
-    };
+  ): WorkspaceMutationProtocolExecution | undefined {
+    return execution.kind === "outcome" &&
+      execution.cutover.kind === "authorized"
+      ? postMutationControlFailureExecution(
+          cause,
+          execution.outcome,
+          execution.preparationCleanup,
+        )
+      : undefined;
   }
 
   async #restore(
     current: WorkspaceSnapshot,
     root: string,
     resolution: ResolvedNodeState,
+    writeAuthority: WorkspaceWriteAuthority,
     settlement: RestoreSettlement,
-  ): Promise<WorkspaceMutationProtocolResult> {
+  ): Promise<WorkspaceMutationProtocolActionResult> {
     const mutationLease = settlement.prepareLease();
     if (mutationLease === undefined) return { kind: "target-changed" };
 
@@ -386,8 +363,7 @@ export class WorkspaceMutationProtocol {
         kind: "outcome",
         outcome: execution.outcome,
         cutover: execution.cutover,
-        stagingCleanup: execution.stagingCleanup,
-        workspaceLockCleanup: { kind: "settled" },
+        preparationCleanup: execution.preparationCleanup,
       };
       // A rejected cutover is a settled proof that no workspace write crossed
       // the mutation gate. The authority callback may have durably pinned a
@@ -405,7 +381,8 @@ export class WorkspaceMutationProtocol {
           this.#context,
           authenticated.kind,
           execution.outcome,
-          "held",
+          execution.preparationCleanup,
+          { kind: "held", writeAuthority },
         );
       }
 
@@ -419,10 +396,11 @@ export class WorkspaceMutationProtocol {
           this.#authority,
           this.#context,
           execution.cutover.kind === "not-requested"
-            ? settlement.noOpConflict
+            ? "target-changed"
             : authenticated.kind,
           execution.outcome,
-          "held",
+          execution.preparationCleanup,
+          { kind: "held", writeAuthority },
         );
       }
       const admission =
@@ -435,14 +413,15 @@ export class WorkspaceMutationProtocol {
           : admission.kind === "admitted";
       if (!admitted) {
         if (execution.cutover.kind === "not-requested") {
-          return { kind: settlement.noOpConflict };
+          return { kind: "target-changed" };
         }
         return postMutationStateConflict(
           this.#authority,
           this.#context,
           "target-changed",
           execution.outcome,
-          "held",
+          execution.preparationCleanup,
+          { kind: "held", writeAuthority },
         );
       }
       return result;
@@ -461,15 +440,17 @@ export class WorkspaceMutationProtocol {
         this.#context,
         cause,
         execution?.outcome,
-        "held",
+        execution?.preparationCleanup ?? SETTLED_PREPARATION_CLEANUP,
+        { kind: "held", writeAuthority },
       );
     }
   }
 
   #readExactView(expected: SessionView): SessionView | undefined {
     const current = this.#readView();
-    return this.#authority.sessionIsUsable(current) &&
-      current.isSameSnapshotAs(expected)
+    return isExactUsableSessionView(current, expected, (candidate) =>
+      this.#authority.sessionIsUsable(candidate),
+    )
       ? current
       : undefined;
   }

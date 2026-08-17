@@ -1,68 +1,21 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { RestoreOutcome } from "../application/restore.ts";
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
 import type {
   CheckpointInitializationConflict,
-  CleanupSettlement,
   PostMutationConflict,
   RestorePreparationConflict,
 } from "./post-mutation.ts";
-import type { ArrivalProtection } from "./arrival-protection.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import { assertNever } from "./assert-never.ts";
 import { formatUiDetail } from "./restore-presentation.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { RestoreProtocolOutcome } from "./workspace-mutation-protocol.ts";
+import type { WorkspaceReceipt } from "./workspace-receipt.ts";
 
-/** Critical presenter for a protocol that could not establish durable safety. */
-export function notifyArrivalProtectionFailure(
-  runtime: CyclotomyRuntime,
-  context: ExtensionContext,
-  protection: ArrivalProtection,
-): void {
-  switch (protection.kind) {
-    case "unavailable":
-      runtime.notifyBestEffort(
-        context,
-        () =>
-          runtime.i18n.t("arrivalProtectionUnavailable", {
-            message: formatUiDetail(messageOf(protection.cause)),
-          }),
-        "error",
-      );
-      return;
-    case "exact-slot": {
-      switch (protection.admission.kind) {
-        case "settled":
-          return;
-        case "failed": {
-          const cause = protection.admission.cause;
-          runtime.notifyBestEffort(
-            context,
-            () =>
-              runtime.i18n.t("arrivalAdmissionUnavailable", {
-                message: formatUiDetail(messageOf(cause)),
-              }),
-            "error",
-          );
-          return;
-        }
-        default:
-          return assertNever(
-            protection.admission,
-            "unhandled arrival admission settlement",
-          );
-      }
-    }
-    case "session-barrier":
-      return;
-    default:
-      return assertNever(protection, "unhandled arrival protection");
-  }
-}
-
-/** Critical presenter for the safety fact carried beside a protocol result. */
+/** Critical notification presenter for the safety fact beside a protocol result. */
 export function notifyArrivalDispositionFailure(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
@@ -194,9 +147,10 @@ export function notifyRestoreOutcome(
 export function notifyRestoreProtocolOutcome(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  execution: RestoreProtocolOutcome,
+  receipt: WorkspaceReceipt<RestoreProtocolOutcome>,
   options: { readonly announceSuccess?: boolean } = {},
 ): void {
+  const execution = receipt.execution;
   if (execution.cutover.kind !== "rejected") {
     notifyRestoreOutcome(runtime, context, execution.outcome, options);
   } else {
@@ -211,47 +165,46 @@ export function notifyRestoreProtocolOutcome(
       );
     });
   }
-  notifyRestoreCleanupFailures(runtime, context, execution);
+  notifyRestorePreparationCleanupFailure(
+    runtime,
+    context,
+    execution.preparationCleanup,
+  );
+  notifyWorkspaceLockCleanupFailure(
+    runtime,
+    context,
+    receipt.workspaceLockCleanup,
+  );
 }
 
-function notifyRestoreCleanupFailures(
+function notifyRestorePreparationCleanupFailure(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  execution: Pick<
-    RestoreProtocolOutcome,
-    "stagingCleanup" | "workspaceLockCleanup"
-  >,
+  cleanup: CleanupSettlement,
 ): void {
-  if (execution.stagingCleanup.kind === "failed") {
-    const cause = execution.stagingCleanup.cause;
+  if (cleanup.kind === "failed") {
+    const cause = cleanup.cause;
     runtime.notifyBestEffort(
       context,
       () =>
-        runtime.i18n.t("restoreStagingCleanupFailed", {
+        runtime.i18n.t("restorePreparationCleanupFailed", {
           message: formatUiDetail(messageOf(cause)),
         }),
       "error",
     );
   }
-  notifyWorkspaceLockCleanupFailure(
-    runtime,
-    context,
-    execution.workspaceLockCleanup,
-  );
 }
 
 /** Present file-application results without disguising a late location race. */
 export function notifyPostMutationConflict(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  conflict: PostMutationConflict,
+  receipt: PostMutationConflict,
 ): void {
-  if (conflict.arrivalProtection.kind === "exact-slot") {
-    notifyArrivalProtectionFailure(
-      runtime,
-      context,
-      conflict.arrivalProtection,
-    );
+  const conflict = receipt.execution;
+  const arrival = receipt.arrival;
+  if (arrival.kind === "protected") {
+    notifyArrivalDispositionFailure(runtime, context, arrival);
   }
   if (conflict.outcome.kind !== "restored") {
     notifyRestoreOutcome(runtime, context, conflict.outcome);
@@ -262,8 +215,10 @@ export function notifyPostMutationConflict(
         ? `${runtime.i18n.formatRestoreSuccess(conflict.outcome.report)} `
         : "";
 
-    const unavailable = conflict.arrivalProtection.kind === "unavailable";
-    const barrier = conflict.arrivalProtection.kind === "session-barrier";
+    const unavailable = arrival.kind === "unsettled";
+    const barrier =
+      arrival.kind === "protected" &&
+      arrival.evidence.kind === "session-barrier";
     let key:
       | "restorePostMutationLocationProtected"
       | "restorePostMutationLocationUnavailable"
@@ -300,15 +255,13 @@ export function notifyPostMutationConflict(
         variables = unavailable
           ? {
               message: controlMessage,
-              protection: formatUiDetail(
-                messageOf(conflict.arrivalProtection.cause),
-              ),
+              protection: formatUiDetail(messageOf(arrival.cause)),
             }
           : { message: controlMessage };
         break;
     }
     if (unavailable && conflict.reason !== "control-failed") {
-      variables = { message: messageOf(conflict.arrivalProtection.cause) };
+      variables = { message: messageOf(arrival.cause) };
     }
     runtime.notify(
       context,
@@ -316,15 +269,20 @@ export function notifyPostMutationConflict(
       unavailable ? "error" : "warning",
     );
   });
+  notifyRestorePreparationCleanupFailure(
+    runtime,
+    context,
+    conflict.preparationCleanup,
+  );
   const cleanupIsControlFailure =
     conflict.reason === "control-failed" &&
-    conflict.workspaceLockCleanup.kind === "failed" &&
-    conflict.workspaceLockCleanup.cause === conflict.cause;
+    receipt.workspaceLockCleanup.kind === "failed" &&
+    receipt.workspaceLockCleanup.cause === conflict.cause;
   if (!cleanupIsControlFailure) {
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,
-      conflict.workspaceLockCleanup,
+      receipt.workspaceLockCleanup,
     );
   }
 }
@@ -333,23 +291,22 @@ export function notifyPostMutationConflict(
 export function notifyCheckpointInitializationConflict(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  conflict: CheckpointInitializationConflict,
+  receipt: CheckpointInitializationConflict,
 ): void {
-  if (conflict.arrivalProtection.kind === "exact-slot") {
-    notifyArrivalProtectionFailure(
-      runtime,
-      context,
-      conflict.arrivalProtection,
-    );
+  const conflict = receipt.execution;
+  const arrival = receipt.arrival;
+  if (arrival.kind === "protected") {
+    notifyArrivalDispositionFailure(runtime, context, arrival);
   }
   runtime.presentBestEffort(context, () => {
-    const unavailable = conflict.arrivalProtection.kind === "unavailable";
-    const barrier = conflict.arrivalProtection.kind === "session-barrier";
-    const detail = unavailable
-      ? `${messageOf(conflict.cause)}; ${messageOf(
-          conflict.arrivalProtection.cause,
-        )}`
-      : messageOf(conflict.cause);
+    const unavailable = arrival.kind === "unsettled";
+    const barrier =
+      arrival.kind === "protected" &&
+      arrival.evidence.kind === "session-barrier";
+    const detail =
+      unavailable && arrival.cause !== conflict.cause
+        ? `${messageOf(conflict.cause)}; ${messageOf(arrival.cause)}`
+        : messageOf(conflict.cause);
     runtime.notify(
       context,
       runtime.i18n.t(
@@ -363,60 +320,67 @@ export function notifyCheckpointInitializationConflict(
       unavailable ? "error" : "warning",
     );
   });
+  const cleanupIsInitializationFailure =
+    receipt.workspaceLockCleanup.kind === "failed" &&
+    receipt.workspaceLockCleanup.cause === conflict.cause;
+  if (!cleanupIsInitializationFailure) {
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      receipt.workspaceLockCleanup,
+    );
+  }
 }
 
 /** Present both the primary loaded-checkpoint failure and recovery result. */
 export function notifyRestorePreparationConflict(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  conflict: RestorePreparationConflict,
+  receipt: RestorePreparationConflict,
 ): void {
-  if (conflict.arrivalProtection.kind === "exact-slot") {
-    notifyArrivalProtectionFailure(
-      runtime,
-      context,
-      conflict.arrivalProtection,
-    );
+  const conflict = receipt.execution;
+  const arrival = receipt.arrival;
+  if (arrival.kind === "protected") {
+    notifyArrivalDispositionFailure(runtime, context, arrival);
   }
-  runtime.presentBestEffort(context, () => {
-    const primary = messageOf(conflict.cause);
-    switch (conflict.arrivalProtection.kind) {
-      case "exact-slot":
-        runtime.notify(
-          context,
-          runtime.i18n.t("restorePreparationProtected", { message: primary }),
-          "warning",
-        );
-        return;
-      case "session-barrier":
+  const cleanupIsPreparationFailure =
+    receipt.workspaceLockCleanup.kind === "failed" &&
+    receipt.workspaceLockCleanup.cause === conflict.cause;
+  if (cleanupIsPreparationFailure && arrival.kind === "unsettled") {
+    notifyArrivalDispositionFailure(runtime, context, arrival);
+  }
+  if (!cleanupIsPreparationFailure) {
+    runtime.presentBestEffort(context, () => {
+      const primary = messageOf(conflict.cause);
+      if (arrival.kind === "protected") {
+        if (arrival.evidence.kind === "exact-slot") {
+          runtime.notify(
+            context,
+            runtime.i18n.t("restorePreparationProtected", { message: primary }),
+            "warning",
+          );
+          return;
+        }
         runtime.notify(
           context,
           runtime.i18n.t("restorePreparationBarrier", { message: primary }),
           "warning",
         );
         return;
-      case "unavailable":
-        runtime.notify(
-          context,
-          runtime.i18n.t("restorePreparationUnavailable", {
-            message: primary,
-            protection: formatUiDetail(
-              messageOf(conflict.arrivalProtection.cause),
-            ),
-          }),
-          "error",
-        );
-        return;
-      default:
-        assertNever(
-          conflict.arrivalProtection,
-          "unhandled restore preparation protection",
-        );
-    }
-  });
+      }
+      runtime.notify(
+        context,
+        runtime.i18n.t("restorePreparationUnavailable", {
+          message: primary,
+          protection: formatUiDetail(messageOf(arrival.cause)),
+        }),
+        "error",
+      );
+    });
+  }
   notifyWorkspaceLockCleanupFailure(
     runtime,
     context,
-    conflict.workspaceLockCleanup,
+    receipt.workspaceLockCleanup,
   );
 }

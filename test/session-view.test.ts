@@ -15,11 +15,33 @@ import {
   type PublicSessionEntry,
 } from "../src/pi/extension-boundary.ts";
 import {
+  isExactUsableSessionView,
   persistedSessionIdentityOf,
   readPersistedSessionIdentity,
   readSessionView,
   SessionViewTracker,
+  type SessionView,
 } from "../src/pi/session-view.ts";
+
+describe("exact usable session views", () => {
+  it("checks usability before comparing the complete snapshot", () => {
+    let comparisons = 0;
+    const current = {
+      isSameSnapshotAs() {
+        comparisons += 1;
+        return true;
+      },
+    } as unknown as SessionView;
+    const expected = {} as SessionView;
+
+    expect(isExactUsableSessionView(current, expected, () => false)).toBe(
+      false,
+    );
+    expect(comparisons).toBe(0);
+    expect(isExactUsableSessionView(current, expected, () => true)).toBe(true);
+    expect(comparisons).toBe(1);
+  });
+});
 
 function context(manager: SessionManager): ExtensionContext {
   return {

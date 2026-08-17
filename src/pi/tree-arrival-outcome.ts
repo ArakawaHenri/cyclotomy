@@ -1,18 +1,20 @@
-import type { ScanProblem } from "../infrastructure/workspace-scan.ts";
 import type { CaptureFailure } from "../application/capture.ts";
+import type { ScanProblem } from "../infrastructure/workspace-scan.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import type {
-  CheckpointInitializationConflict,
-  CleanupSettlement,
-  PostMutationConflict,
+  CheckpointInitializationConflictExecution,
+  PostMutationConflictExecution,
 } from "./post-mutation.ts";
-import { arrivalProtectionFromDisposition } from "./arrival-settlement.ts";
 import type { RestoreProtocolOutcome } from "./workspace-mutation-protocol.ts";
+import type {
+  ArrivalReceipt,
+  LockedArrivalOutcome,
+} from "./workspace-receipt.ts";
 
-/** Complete result of one authenticated tree-arrival execution. */
+/** Complete factual execution at one authenticated tree arrival. */
 export type TreeArrivalExecution =
-  | CheckpointInitializationConflict
-  | PostMutationConflict
+  | CheckpointInitializationConflictExecution
+  | PostMutationConflictExecution
   | {
       readonly kind:
         | "location-changed"
@@ -34,54 +36,14 @@ export type TreeArrivalExecution =
   | { readonly kind: "failed"; readonly cause: unknown }
   | RestoreProtocolOutcome;
 
-/**
- * A tree boundary is not complete until its arrival authority is settled.
- * Presentation remains a separate interpretation of `execution`.
- */
-export interface TreeArrivalResult {
-  readonly execution: TreeArrivalExecution;
-  readonly arrival: ArrivalDisposition;
-  readonly workspaceLockCleanup: CleanupSettlement;
-}
+export type TreeArrivalResult = ArrivalReceipt<TreeArrivalExecution>;
+export type LockedTreeArrivalOutcome =
+  LockedArrivalOutcome<TreeArrivalExecution>;
 
-/**
- * Build the one public tree-arrival fact. A retried durable settlement replaces
- * stale recovery evidence embedded in a conflict, so presenters cannot report
- * two incompatible protection outcomes for the same arrival.
- */
-export function treeArrivalResult(
+/** Construct a tree-arrival outcome while its action lock is still held. */
+export function lockedTreeArrivalOutcome(
   execution: TreeArrivalExecution,
   arrival: ArrivalDisposition,
-  workspaceLockCleanup: CleanupSettlement,
-): TreeArrivalResult {
-  let settledExecution = execution;
-  if (
-    arrival.kind !== "admitted" &&
-    (execution.kind === "initialization-conflict" ||
-      execution.kind === "post-mutation-conflict")
-  ) {
-    settledExecution = {
-      ...execution,
-      arrivalProtection: arrivalProtectionFromDisposition(arrival),
-    };
-  }
-  let settledWorkspaceLockCleanup = workspaceLockCleanup;
-  if (
-    settledExecution.kind === "post-mutation-conflict" ||
-    settledExecution.kind === "outcome"
-  ) {
-    // MutationProtocol already folds the outer action-lock receipt together
-    // with any recovery-lock receipt. Keep that canonical value instead of
-    // replacing it with the less complete outer receipt.
-    settledWorkspaceLockCleanup = settledExecution.workspaceLockCleanup;
-    settledExecution = {
-      ...settledExecution,
-      workspaceLockCleanup: settledWorkspaceLockCleanup,
-    };
-  }
-  return {
-    execution: settledExecution,
-    arrival,
-    workspaceLockCleanup: settledWorkspaceLockCleanup,
-  };
+): LockedTreeArrivalOutcome {
+  return { execution, arrival };
 }

@@ -1,20 +1,20 @@
 import {
-  applyTreeToWorkspace,
+  applyTreeToWorkspaceFromStream,
   type ApplyReport,
 } from "../infrastructure/apply.ts";
 import {
   BlobStagingCleanupError,
   BlobStagingError,
+  stageBlobStreams,
   stageBlobs,
   type StagedBlobs,
 } from "../infrastructure/blob-staging.ts";
-import type { ObjectStore } from "../infrastructure/object-store.ts";
-import type { CurrentTreeManifest } from "../infrastructure/tree-formats/current.ts";
-import { upgradeTreeManifestToCurrent } from "../infrastructure/tree-formats/history.ts";
 import {
-  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
-  DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
-} from "../infrastructure/workspace-scope.ts";
+  openObjectStoreReadScope,
+  type ObjectStore,
+  type ObjectStoreReadScope,
+} from "../infrastructure/object-store.ts";
+import type { CurrentTreeManifest } from "../infrastructure/tree-formats/current.ts";
 import {
   planWorkspaceRestore,
   restorePlanHasChanges,
@@ -26,6 +26,15 @@ import {
   type WorkspaceSnapshot,
 } from "../infrastructure/workspace-scan.ts";
 import type { TreeOid } from "../domain/model.ts";
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
+import {
+  aggregateFailures,
+  retainFailureCause,
+} from "../infrastructure/failure-settlement.ts";
+import {
+  sameGitOracleVersion,
+  type GitReplayAttestation,
+} from "../infrastructure/git-replay-risk.ts";
 import {
   consumeWorkspaceMutationLease,
   workspaceMutationLeaseState,
@@ -39,9 +48,8 @@ export interface RestoreDeps {
   readonly scanOptions?: ScanOptions;
   /** Runtime-scoped validation may reuse a prior attestation for this tree. */
   readonly validateManifestScope: (
-    treeOid: TreeOid,
     manifest: CurrentTreeManifest,
-  ) => Promise<void>;
+  ) => Promise<GitReplayAttestation>;
   /** Test/embedding seam; production uses the native private staging protocol. */
   readonly stageBlobs?: typeof stageBlobs;
 }
@@ -101,13 +109,10 @@ export type RestoreOutcome =
       readonly cause: unknown;
     };
 
-export type CleanupSettlement =
-  | { readonly kind: "settled" }
-  | { readonly kind: "failed"; readonly cause: unknown };
-
 interface RestoreAttempt {
   readonly outcome: RestoreOutcome;
-  readonly stagingCleanup: CleanupSettlement;
+  /** Cleanup for every resource owned by pre-mutation restore preparation. */
+  readonly preparationCleanup: CleanupSettlement;
 }
 
 export type RestoreExecution = RestoreAttempt &
@@ -130,9 +135,29 @@ const CLEANUP_SETTLED = { kind: "settled" } as const;
 
 function restoreAttempt(
   outcome: RestoreOutcome,
-  stagingCleanup: CleanupSettlement = CLEANUP_SETTLED,
+  preparationCleanup: CleanupSettlement = CLEANUP_SETTLED,
 ): RestoreAttempt {
-  return { outcome, stagingCleanup };
+  return { outcome, preparationCleanup };
+}
+
+function retainPreparationCleanup(
+  attempt: RestoreAttempt,
+  cleanup: unknown,
+): RestoreAttempt {
+  const existing = attempt.preparationCleanup;
+  return {
+    ...attempt,
+    preparationCleanup: {
+      kind: "failed",
+      cause:
+        existing.kind === "settled"
+          ? cleanup
+          : aggregateFailures(
+              [existing.cause, cleanup],
+              "multiple restore preparation cleanup attempts failed",
+            ),
+    },
+  };
 }
 
 async function disposeStaging(staged: StagedBlobs): Promise<CleanupSettlement> {
@@ -149,29 +174,21 @@ async function disposeStaging(staged: StagedBlobs): Promise<CleanupSettlement> {
  * writes node metadata. The node's one state is therefore also the durable
  * retry target after an unreadable, partial, or unverifiable attempt.
  */
-async function restoreWorkspaceOutcome(
+async function restoreWorkspaceOutcomeWithReads(
   deps: RestoreDeps,
+  reads: ObjectStoreReadScope,
   root: string,
   resolution: ResolvedNodeState,
   options: RestoreOptions,
 ): Promise<RestoreAttempt> {
   let manifest;
+  let scopeValidation: GitReplayAttestation;
   try {
     // Authenticate the manifest first. The plan below identifies blobs whose
     // bytes must be staged; the rest of the closure is authenticated exactly
     // once before apply may consume its mutation lease.
-    manifest = upgradeTreeManifestToCurrent(
-      await deps.store.readTreeManifest(resolution.treeOid),
-      {
-        maxPathBytes:
-          deps.scanOptions?.maxPathBytes ??
-          DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
-        maxPathComponents:
-          deps.scanOptions?.maxPathComponents ??
-          DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
-      },
-    );
-    await deps.validateManifestScope(resolution.treeOid, manifest);
+    manifest = await reads.readTreeManifest(resolution.treeOid);
+    scopeValidation = await deps.validateManifestScope(manifest);
   } catch (error) {
     return restoreAttempt({
       kind: "checkpoint-unreadable",
@@ -181,6 +198,17 @@ async function restoreWorkspaceOutcome(
   }
 
   const current = options.current;
+  if (
+    !sameGitOracleVersion(scopeValidation.gitVersion, current.gitOracleVersion)
+  ) {
+    return restoreAttempt({
+      kind: "failed",
+      stage: "current-scan",
+      cause: new Error(
+        "Git evaluator changed after the workspace restore observation",
+      ),
+    });
+  }
   if (current.problems.length > 0) {
     return restoreAttempt({
       kind: "scan-incomplete",
@@ -209,25 +237,35 @@ async function restoreWorkspaceOutcome(
 
   let staged;
   try {
-    staged = await (deps.stageBlobs ?? stageBlobs)(
-      restorePlan.requiredBlobOids,
-      (oid) => deps.store.readBlob(oid),
-      {
-        workspaceRoot: operationRoot,
-        forbiddenRoots: [deps.store.storageRoot],
-      },
-    );
+    staged =
+      deps.stageBlobs === undefined
+        ? await stageBlobStreams(
+            restorePlan.requiredBlobOids,
+            (oid, sink) => reads.streamBlob(oid, sink),
+            {
+              workspaceRoot: operationRoot,
+              forbiddenRoots: [deps.store.storageRoot],
+            },
+          )
+        : await deps.stageBlobs(
+            restorePlan.requiredBlobOids,
+            (oid) => reads.readBlob(oid),
+            {
+              workspaceRoot: operationRoot,
+              forbiddenRoots: [deps.store.storageRoot],
+            },
+          );
   } catch (error) {
     const primary =
       error instanceof BlobStagingCleanupError ? error.primary : error;
-    const stagingCleanup: CleanupSettlement =
+    const preparationCleanup: CleanupSettlement =
       error instanceof BlobStagingCleanupError
         ? { kind: "failed", cause: error.cleanup }
         : CLEANUP_SETTLED;
     if (primary instanceof BlobStagingError) {
       return restoreAttempt(
         { kind: "failed", stage: "staging", cause: primary },
-        stagingCleanup,
+        preparationCleanup,
       );
     }
     return restoreAttempt(
@@ -236,7 +274,7 @@ async function restoreWorkspaceOutcome(
         treeOid: resolution.treeOid,
         cause: primary,
       },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
 
@@ -254,39 +292,57 @@ async function restoreWorkspaceOutcome(
         nonRequired.push(entry.blobOid);
       }
     }
-    await deps.store.verifyBlobs(nonRequired);
+    await reads.verifyBlobs(nonRequired);
   } catch (error) {
-    const stagingCleanup = await disposeStaging(staged);
+    const preparationCleanup = await disposeStaging(staged);
     return restoreAttempt(
       {
         kind: "checkpoint-unreadable",
         treeOid: resolution.treeOid,
         cause: error,
       },
-      stagingCleanup,
+      preparationCleanup,
+    );
+  }
+
+  // No object-store reads remain beyond this point. Release authenticated
+  // pack handles before workspace mutation; the outer owner records that the
+  // close was attempted so a rejection is not awaited and reported twice.
+  try {
+    await reads.close();
+  } catch (error) {
+    return restoreAttempt(
+      {
+        kind: "failed",
+        stage: "staging",
+        cause: error,
+      },
+      await disposeStaging(staged),
     );
   }
 
   let report: ApplyReport;
   try {
-    report = await applyTreeToWorkspace(
+    report = await applyTreeToWorkspaceFromStream(
       root,
       manifest,
-      (oid) => staged.readBlob(oid),
+      staged.streamBlob ??
+        (async (oid, sink) => {
+          const content = await staged.readBlob(oid);
+          await sink(content);
+          return { decodedLength: content.byteLength };
+        }),
       current,
-      () => {
-        consumeWorkspaceMutationLease(options.mutationLease);
-        return undefined;
-      },
+      () => consumeWorkspaceMutationLease(options.mutationLease),
     );
   } catch (error) {
-    const stagingCleanup = await disposeStaging(staged);
+    const preparationCleanup = await disposeStaging(staged);
     return restoreAttempt(
       { kind: "failed", stage: "apply", cause: error },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
-  const stagingCleanup = await disposeStaging(staged);
+  const preparationCleanup = await disposeStaging(staged);
 
   let actual: WorkspaceSnapshot;
   try {
@@ -298,7 +354,7 @@ async function restoreWorkspaceOutcome(
   } catch (error) {
     return restoreAttempt(
       { kind: "failed", stage: "verification", cause: error },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
   if (actual.problems.length > 0) {
@@ -310,7 +366,7 @@ async function restoreWorkspaceOutcome(
         report,
         problems: actual.problems,
       },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
 
@@ -318,7 +374,7 @@ async function restoreWorkspaceOutcome(
   if (report.problems.length > 0) {
     return restoreAttempt(
       { kind: "apply-incomplete", treeOid: resolution.treeOid, report },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
   if (verification.problems.length > 0 || restorePlanHasChanges(verification)) {
@@ -329,13 +385,71 @@ async function restoreWorkspaceOutcome(
         treeOid: resolution.treeOid,
         report,
       },
-      stagingCleanup,
+      preparationCleanup,
     );
   }
   return restoreAttempt(
     { kind: "restored", treeOid: resolution.treeOid, report },
-    stagingCleanup,
+    preparationCleanup,
   );
+}
+
+async function restoreWorkspaceOutcome(
+  deps: RestoreDeps,
+  root: string,
+  resolution: ResolvedNodeState,
+  options: RestoreOptions,
+): Promise<RestoreAttempt> {
+  const ownedReads = openObjectStoreReadScope(deps.store);
+  let closeAttempted = false;
+  const reads = Object.freeze({
+    ...ownedReads,
+    close: (): Promise<void> => {
+      closeAttempted = true;
+      return ownedReads.close();
+    },
+  });
+  let result:
+    | { readonly kind: "completed"; readonly attempt: RestoreAttempt }
+    | { readonly kind: "failed"; readonly cause: unknown };
+  try {
+    result = {
+      kind: "completed",
+      attempt: await restoreWorkspaceOutcomeWithReads(
+        deps,
+        reads,
+        root,
+        resolution,
+        options,
+      ),
+    };
+  } catch (cause) {
+    result = { kind: "failed", cause };
+  }
+
+  let readCleanup: CleanupSettlement = CLEANUP_SETTLED;
+  if (!closeAttempted) {
+    try {
+      await ownedReads.close();
+    } catch (cause) {
+      readCleanup = { kind: "failed", cause };
+    }
+  }
+
+  if (result.kind === "failed") {
+    if (readCleanup.kind === "failed") {
+      throw retainFailureCause(
+        result.cause,
+        readCleanup.cause,
+        "workspace restore and object-read cleanup both failed",
+      );
+    }
+    throw result.cause;
+  }
+  if (readCleanup.kind === "failed") {
+    return retainPreparationCleanup(result.attempt, readCleanup.cause);
+  }
+  return result.attempt;
 }
 
 /**

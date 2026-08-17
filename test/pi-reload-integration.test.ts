@@ -11,12 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-  createCurrentMetadataStore,
-  type CurrentMetadataStore,
-} from "../src/infrastructure/metadata.ts";
+import type { CurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
-import { checkpointIsBlocked, checkpointState } from "./metadata-fixture.ts";
+import {
+  checkpointIsBlocked,
+  checkpointState,
+  createTestCurrentMetadataStore,
+} from "./metadata-fixture.ts";
 import { FakePi, type FakeForkPlan } from "./fake-pi.ts";
 
 let workspace: string;
@@ -51,8 +52,8 @@ afterEach(async () => {
   await rm(home, { recursive: true, force: true });
 });
 
-function metadata(): CurrentMetadataStore {
-  return createCurrentMetadataStore(join(storeRoot, "state.db"));
+function metadata(): Promise<CurrentMetadataStore> {
+  return createTestCurrentMetadataStore(join(storeRoot, "state.db"), storeRoot);
 }
 
 async function twoStateSession(pi: FakePi) {
@@ -92,7 +93,7 @@ describe("Pi runtime replacement", () => {
 
     await pi.endTurn();
     const failedLeaf = pi.manager.getLeafId()!;
-    let db = metadata();
+    let db = await metadata();
     expect(
       checkpointState(db, pi.manager.sessionId, failedLeaf),
     ).toBeUndefined();
@@ -101,13 +102,13 @@ describe("Pi runtime replacement", () => {
     await pi.reloadExtension();
     expect(pi.factoryLoads).toBe(2);
     expect(await readFile(join(workspace, "large.bin"))).toEqual(contents);
-    db = metadata();
+    db = await metadata();
     expect(
       checkpointState(db, pi.manager.sessionId, failedLeaf),
     ).toBeUndefined();
     db.close();
     await pi.endTurn();
-    db = metadata();
+    db = await metadata();
     expect(
       checkpointState(db, pi.manager.sessionId, pi.manager.getLeafId()!),
     ).toBeDefined();
@@ -132,7 +133,7 @@ describe("Pi runtime replacement", () => {
       ),
     ).toBe(true);
     // The disabled runtime must not have created the hashed store at all.
-    expect(() => metadata()).toThrow();
+    await expect(metadata()).rejects.toThrow();
 
     await writeFile(
       settingsPath,
@@ -144,7 +145,7 @@ describe("Pi runtime replacement", () => {
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
 
     await pi.endTurn();
-    const db = metadata();
+    const db = await metadata();
     expect(
       checkpointState(db, pi.manager.sessionId, disabledLeaf),
     ).toBeUndefined();
@@ -160,7 +161,7 @@ describe("Pi runtime replacement", () => {
     await writeFile(join(workspace, "a.txt"), "saved");
     await pi.endTurn();
     const leaf = pi.manager.getLeafId()!;
-    let db = metadata();
+    let db = await metadata();
     const savedState = checkpointState(db, pi.manager.sessionId, leaf)!;
     db.close();
     const persistedSession = pi.manager;
@@ -169,14 +170,14 @@ describe("Pi runtime replacement", () => {
     pi.hasUI = false;
 
     expect(await pi.resumeTo(persistedSession)).toBe("done");
-    db = metadata();
+    db = await metadata();
     expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
     expect(checkpointState(db, pi.manager.sessionId, leaf)).toEqual(savedState);
     db.close();
 
     await pi.reloadExtension();
     await pi.endTurn(0);
-    db = metadata();
+    db = await metadata();
     expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
     expect(checkpointState(db, pi.manager.sessionId, leaf)).toEqual(savedState);
     db.close();
@@ -194,7 +195,7 @@ describe("Pi runtime replacement", () => {
     await restarted.startSession("startup");
     await restarted.endTurn(0);
 
-    db = metadata();
+    db = await metadata();
     expect(checkpointIsBlocked(db, restarted.manager.sessionId, leaf)).toBe(
       true,
     );
@@ -214,7 +215,7 @@ describe("Pi runtime replacement", () => {
     await writeFile(join(workspace, "a.txt"), "saved");
     await pi.endTurn();
     const protectedLeaf = pi.manager.getLeafId()!;
-    let db = metadata();
+    let db = await metadata();
     const savedState = checkpointState(
       db,
       pi.manager.sessionId,
@@ -231,7 +232,7 @@ describe("Pi runtime replacement", () => {
     );
     await pi.reloadExtension();
 
-    db = metadata();
+    db = await metadata();
     expect(checkpointState(db, pi.manager.sessionId, protectedLeaf)).toEqual(
       savedState,
     );
@@ -242,7 +243,7 @@ describe("Pi runtime replacement", () => {
 
     await pi.endTurn();
     const descendant = pi.manager.getLeafId()!;
-    db = metadata();
+    db = await metadata();
     expect(checkpointState(db, pi.manager.sessionId, protectedLeaf)).toEqual(
       savedState,
     );
@@ -264,7 +265,7 @@ describe("Pi runtime replacement", () => {
     expect(pi.factoryLoads).toBe(2);
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
 
-    const db = metadata();
+    const db = await metadata();
     expect(checkpointState(db, sourceSession, second)).toBeDefined();
     expect(checkpointState(db, pi.manager.sessionId, first)).toBeDefined();
     expect(checkpointState(db, pi.manager.sessionId, second)).toBeUndefined();
@@ -281,7 +282,7 @@ describe("Pi runtime replacement", () => {
 
     await pi.landUnmanaged(ancestor.id);
     const sourceSessionId = pi.manager.sessionId;
-    let db = metadata();
+    let db = await metadata();
     expect(checkpointState(db, sourceSessionId, ancestor.id)).toBeUndefined();
     expect(checkpointIsBlocked(db, sourceSessionId, ancestor.id)).toBe(true);
     expect(checkpointState(db, sourceSessionId, descendant.id)).toBeDefined();
@@ -292,7 +293,7 @@ describe("Pi runtime replacement", () => {
     const forkSessionId = pi.manager.sessionId;
     expect(forkSessionId).not.toBe(sourceSessionId);
 
-    db = metadata();
+    db = await metadata();
     expect(checkpointState(db, forkSessionId, ancestor.id)).toBeUndefined();
     expect(checkpointIsBlocked(db, forkSessionId, ancestor.id)).toBe(true);
     db.close();
@@ -301,7 +302,7 @@ describe("Pi runtime replacement", () => {
     );
 
     await pi.endTurn(0);
-    db = metadata();
+    db = await metadata();
     expect(checkpointState(db, forkSessionId, ancestor.id)).toBeUndefined();
     expect(checkpointIsBlocked(db, forkSessionId, ancestor.id)).toBe(true);
     db.close();
@@ -386,7 +387,7 @@ describe("Pi runtime replacement", () => {
     // Cyclotomy source registration still supply the inheritance authority.
     await restarted.startSession("startup");
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-    const db = metadata();
+    const db = await metadata();
     expect(
       checkpointState(db, restarted.manager.sessionId, first),
     ).toBeDefined();
@@ -416,7 +417,7 @@ describe("Pi runtime replacement", () => {
     await restarted.startSession("fork", plan.previousSessionFile);
 
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-    const db = metadata();
+    const db = await metadata();
     expect(
       checkpointState(db, restarted.manager.sessionId, first),
     ).toBeUndefined();
@@ -429,7 +430,7 @@ describe("Pi runtime replacement", () => {
   it("fork copies diverge independently after materialization", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
     const { first, sourceSession } = await twoStateSession(pi);
-    const sourceBefore = metadata();
+    const sourceBefore = await metadata();
     const sourceState = checkpointState(sourceBefore, sourceSession, first);
     sourceBefore.close();
 
@@ -437,7 +438,7 @@ describe("Pi runtime replacement", () => {
     await writeFile(join(workspace, "a.txt"), "fork-only");
     await pi.endTurn();
 
-    const db = metadata();
+    const db = await metadata();
     expect(checkpointState(db, sourceSession, first)).toEqual(sourceState);
     expect(
       checkpointState(db, pi.manager.sessionId, pi.manager.getLeafId()!)
@@ -454,7 +455,7 @@ describe("Pi runtime replacement", () => {
 
     expect(pi.manager.getLeafId()).toBe(first);
     expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-    const db = metadata();
+    const db = await metadata();
     expect(checkpointState(db, pi.manager.sessionId, first)).toBeDefined();
     expect(checkpointState(db, pi.manager.sessionId, second)).toBeUndefined();
     db.close();

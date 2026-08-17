@@ -4,20 +4,34 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { collectCyclotomyGarbage } from "../src/application/gc.ts";
+import { collectCyclotomyGarbage as collectCyclotomyGarbageWithLease } from "../src/application/gc.ts";
+import type { CurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import {
-  createCurrentMetadataStore,
-  type CurrentMetadataStore,
-} from "../src/infrastructure/metadata.ts";
-import { openObjectStore } from "../src/infrastructure/object-store.ts";
+  nativeObjectStoreLayout,
+  openObjectStore,
+} from "../src/infrastructure/object-store.ts";
+import { withWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import {
   checkpointState,
   commitTestNodeState,
+  createTestCurrentMetadataStore,
   readTestSessionRegistration,
   registerTestSession,
+  withTestMetadataWriteAuthority,
 } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
+
+async function collectCyclotomyGarbage(
+  store: Parameters<typeof collectCyclotomyGarbageWithLease>[1],
+  metadata: Parameters<typeof collectCyclotomyGarbageWithLease>[2],
+  options?: Parameters<typeof collectCyclotomyGarbageWithLease>[3],
+): ReturnType<typeof collectCyclotomyGarbageWithLease> {
+  const root = nativeObjectStoreLayout(store, "gc application test").root;
+  return withWorkspaceLock(root, "gc application test", (lease) =>
+    collectCyclotomyGarbageWithLease(lease, store, metadata, options),
+  );
+}
 
 describe("Cyclotomy garbage collection", () => {
   let directory: string;
@@ -25,7 +39,10 @@ describe("Cyclotomy garbage collection", () => {
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "cyclotomy-gc-"));
-    metadata = createCurrentMetadataStore(join(directory, "state.db"));
+    metadata = await createTestCurrentMetadataStore(
+      join(directory, "state.db"),
+      directory,
+    );
   });
 
   afterEach(async () => {
@@ -49,8 +66,10 @@ describe("Cyclotomy garbage collection", () => {
       ALL_MANAGED_SCOPE,
     );
     const sessionFile = join(directory, "not-yet-persisted.jsonl");
-    registerTestSession(metadata, "live", sessionFile, ["entry"]);
-    commitTestNodeState(metadata, "live", "entry", treeOid);
+    await withTestMetadataWriteAuthority(directory, metadata, () => {
+      registerTestSession(metadata, "live", sessionFile, ["entry"]);
+      commitTestNodeState(metadata, "live", "entry", treeOid);
+    });
 
     const report = await collectCyclotomyGarbage(store, metadata, {
       now: Date.now() + 1_000,
@@ -85,7 +104,9 @@ describe("Cyclotomy garbage collection", () => {
       objectGraceMs: 0,
     });
 
-    expect(report.removedTrees).toBe(1);
+    // A v3 snapshot stores its root, entry node, and scope as independent
+    // structural objects; none is retained without a metadata root.
+    expect(report.removedTrees).toBe(3);
     expect(report.removedBlobs).toBe(1);
   });
 });

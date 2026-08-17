@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { WorkspaceRestorePlan } from "../infrastructure/restore-plan.ts";
+import type { GitReplayRisk } from "../infrastructure/git-replay-risk.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
 
 export type RestoreChoiceMode = "manual" | "loaded-session";
@@ -55,11 +56,15 @@ export async function requestRestoreChoice(
   context: ExtensionContext,
   mode: RestoreChoiceMode,
   plan: WorkspaceRestorePlan,
+  replayRisk: GitReplayRisk,
   signal?: AbortSignal,
 ): Promise<boolean> {
   const copy = choiceCopy(runtime, mode);
   const preview = runtime.i18n.formatRestorePreview(plan);
-  const prompt = [copy.title, copy.intro, "", preview].join("\n");
+  const risk = runtime.i18n.formatGitReplayRisk(replayRisk);
+  const prompt = [[copy.title, copy.intro].join("\n"), risk, preview]
+    .filter((part): part is string => part !== undefined && part !== "")
+    .join("\n\n");
   const selected = await selectChoice(
     context,
     prompt,
@@ -77,6 +82,7 @@ export async function requestNavigationChoice(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
   plan: WorkspaceRestorePlan,
+  replayRisk: GitReplayRisk,
   signal?: AbortSignal,
 ): Promise<NavigationChoice> {
   const title = runtime.i18n.t("choiceNavigationTitle");
@@ -85,7 +91,10 @@ export async function requestNavigationChoice(
   const detach = runtime.i18n.t("choiceNavigationDetach");
   const restore = runtime.i18n.t("choiceNavigationRestore");
   const preview = runtime.i18n.formatRestorePreview(plan);
-  const prompt = [title, intro, "", preview].join("\n");
+  const risk = runtime.i18n.formatGitReplayRisk(replayRisk);
+  const prompt = [[title, intro].join("\n"), risk, preview]
+    .filter((part): part is string => part !== undefined && part !== "")
+    .join("\n\n");
   const selected = await selectChoice(
     context,
     prompt,

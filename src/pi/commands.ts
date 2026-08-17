@@ -2,39 +2,75 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
 import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
+import {
+  gitReplayRisk,
+  sameGitOracleVersion,
+} from "../infrastructure/git-replay-risk.ts";
+import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
 import { assertNever } from "./assert-never.ts";
 import { formatCaptureFailure } from "./capture-failure.ts";
 import {
   runConfirmedRestore,
-  type ConfirmedRestoreResult,
+  type ConfirmedRestoreExecution,
 } from "./confirmed-restore.ts";
+import type {
+  CheckpointInitializationConflict,
+  PostMutationConflict,
+  RestorePreparationConflict,
+} from "./post-mutation.ts";
 import {
-  notifyArrivalProtectionFailure,
+  notifyArrivalDispositionFailure,
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
   notifyWorkspaceLockCleanupFailure,
-} from "./restore-outcome.ts";
+} from "./restore-notifications.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import type { ArrivalReceipt } from "./workspace-receipt.ts";
 
 function finishRestore(
   runtime: CyclotomyRuntime,
   context: ExtensionCommandContext,
-  execution: ConfirmedRestoreResult,
+  receipt: ArrivalReceipt<ConfirmedRestoreExecution>,
 ): void {
+  applyActiveArrivalSettlement(runtime, receipt.arrival);
+  const execution = receipt.execution;
   switch (execution.kind) {
     case "initialization-conflict":
-      notifyCheckpointInitializationConflict(runtime, context, execution);
-      break;
+      notifyCheckpointInitializationConflict(
+        runtime,
+        context,
+        receipt as CheckpointInitializationConflict,
+      );
+      return;
     case "post-mutation-conflict":
-      notifyPostMutationConflict(runtime, context, execution);
-      break;
+      notifyPostMutationConflict(
+        runtime,
+        context,
+        receipt as PostMutationConflict,
+      );
+      return;
     case "preparation-conflict":
-      notifyRestorePreparationConflict(runtime, context, execution);
-      break;
+      notifyRestorePreparationConflict(
+        runtime,
+        context,
+        receipt as RestorePreparationConflict,
+      );
+      return;
+    case "outcome":
+      notifyArrivalDispositionFailure(runtime, context, receipt.arrival);
+      notifyRestoreProtocolOutcome(runtime, context, {
+        execution,
+        workspaceLockCleanup: receipt.workspaceLockCleanup,
+      });
+      return;
+  }
+
+  notifyArrivalDispositionFailure(runtime, context, receipt.arrival);
+  switch (execution.kind) {
     case "location-changed":
       runtime.notify(
         context,
@@ -61,9 +97,6 @@ function finishRestore(
         "warning",
       );
       break;
-    case "outcome":
-      notifyRestoreProtocolOutcome(runtime, context, execution);
-      break;
     case "missing":
       runtime.notify(context, runtime.i18n.t("restoreMissing"), "info");
       break;
@@ -81,7 +114,16 @@ function finishRestore(
       runtime.notify(context, runtime.i18n.t("restoreAlreadyMatches"), "info");
       break;
     case "needs-ui":
-      runtime.notify(context, runtime.i18n.t("restoreNeedsUi"), "warning");
+      runtime.notify(
+        context,
+        [
+          runtime.i18n.t("restoreNeedsUi"),
+          runtime.i18n.formatGitReplayRisk(execution.replayRisk),
+        ]
+          .filter((part): part is string => part !== undefined)
+          .join("\n\n"),
+        "warning",
+      );
       break;
     case "cancelled":
       break;
@@ -109,6 +151,11 @@ function finishRestore(
     default:
       assertNever(execution, "unhandled confirmed restore result");
   }
+  notifyWorkspaceLockCleanupFailure(
+    runtime,
+    context,
+    receipt.workspaceLockCleanup,
+  );
 }
 
 async function restoreCommand(
@@ -130,14 +177,14 @@ async function restoreCommand(
     return;
   }
 
-  const execution = await runConfirmedRestore(
+  const receipt = await runConfirmedRestore(
     runtime,
     context,
     view,
     node,
     "manual",
   );
-  finishRestore(runtime, context, execution);
+  finishRestore(runtime, context, receipt);
 }
 
 async function driftCommand(
@@ -155,10 +202,13 @@ async function driftCommand(
     try {
       const execution = await runtime.enqueueWorkspaceExecution(
         "drift",
-        async () => {
+        async (writeAuthority) => {
           if (
-            runtime.workspaceMutations.reconcileSessionBarrier(view, node) ===
-            "unregistered"
+            runtime.workspaceMutations.reconcileSessionBarrier(
+              writeAuthority,
+              view,
+              node,
+            ) === "unregistered"
           ) {
             throw new Error(
               "current session registration changed before drift",
@@ -171,26 +221,34 @@ async function driftCommand(
               writeProtected: runtime.checkpoints.locationIsBlocked(node),
             };
           }
-          const { resolution, manifest } = readable;
+          const { resolution, manifest, scopeValidation } = readable;
           const snapshot = await runtime.scanCurrentWorkspaceForScope(
             view.cwd,
             manifest.scope,
           );
+          if (
+            !sameGitOracleVersion(
+              scopeValidation.gitVersion,
+              snapshot.gitOracleVersion,
+            )
+          ) {
+            throw new Error(
+              "Git evaluator changed while preparing the drift report",
+            );
+          }
           return {
             kind: "checkpoint" as const,
             resolution,
             drift: (await prepareWorkspaceRestorePlan(snapshot, manifest)).plan,
+            replayRisk: gitReplayRisk(
+              manifest.scope,
+              snapshot.gitOracleVersion,
+            ),
             writeProtected: runtime.checkpoints.locationIsBlocked(node),
           };
         },
       );
-      notifyWorkspaceLockCleanupFailure(
-        runtime,
-        context,
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed", cause: execution.cleanup.cause }
-          : { kind: "settled" },
-      );
+      notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
       if (execution.kind === "action-failed") throw execution.cause;
       return execution.value;
     } finally {
@@ -210,20 +268,26 @@ async function driftCommand(
   const inherited =
     prepared.resolution.foundAt.sessionId !== node.sessionId ||
     prepared.resolution.foundAt.entryId !== node.entryId;
+  const riskNotice = runtime.i18n.formatGitReplayRisk(prepared.replayRisk);
   if (
     prepared.drift.problems.length === 0 &&
     !restorePlanHasChanges(prepared.drift)
   ) {
     runtime.notify(
       context,
-      runtime.i18n.t(
-        prepared.writeProtected
-          ? "driftCleanProtected"
-          : inherited
-            ? "driftCleanInherited"
-            : "driftClean",
-      ),
-      "info",
+      [
+        runtime.i18n.t(
+          prepared.writeProtected
+            ? "driftCleanProtected"
+            : inherited
+              ? "driftCleanInherited"
+              : "driftClean",
+        ),
+        riskNotice,
+      ]
+        .filter((part): part is string => part !== undefined)
+        .join("\n\n"),
+      riskNotice === undefined ? "info" : "warning",
     );
     return;
   }
@@ -236,10 +300,14 @@ async function driftCommand(
           ? "driftTitleInherited"
           : "driftTitle",
       {
-        preview: runtime.i18n.formatRestorePreview(prepared.drift),
+        preview: [riskNotice, runtime.i18n.formatRestorePreview(prepared.drift)]
+          .filter((part): part is string => part !== undefined)
+          .join("\n\n"),
       },
     ),
-    prepared.drift.problems.length > 0 ? "warning" : "info",
+    prepared.drift.problems.length > 0 || riskNotice !== undefined
+      ? "warning"
+      : "info",
   );
 }
 
@@ -291,7 +359,8 @@ async function runCommand(
     await action(runtime, context, view);
   } catch (error) {
     const recovery = await runtime.withdrawFromParticipation(context, error);
-    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    applyActiveArrivalSettlement(runtime, recovery.arrival);
+    notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,

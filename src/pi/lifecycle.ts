@@ -13,6 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import type { NodeKey } from "../domain/model.ts";
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
 import type { CaptureFailure } from "../application/capture.ts";
 import type { ResolvedReadableTree } from "../application/checkpoint-service.ts";
 import {
@@ -25,25 +26,32 @@ import {
   type WorkspaceRestorePlan,
 } from "../infrastructure/restore-plan.ts";
 import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
+import { sameGitOracleVersion } from "../infrastructure/git-replay-risk.ts";
 import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
+import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
 import {
   checkpointInitializationDispositionConflict,
+  finalizeArrivalAfterWorkspaceExecution,
   protectCurrentArrivalAfterWorkspaceFailure,
   protectCurrentArrivalInWorkspaceLock,
   restorePreparationConflict,
+  type CheckpointInitializationConflict,
+  type CheckpointInitializationConflictExecution,
+  type PostMutationConflict,
+  type RestorePreparationConflict,
 } from "./post-mutation.ts";
 import {
   locationInitializationAdmission,
   settleCheckpointInitialization,
 } from "./checkpoint-initialization-protocol.ts";
 import {
-  notifyArrivalProtectionFailure,
+  notifyArrivalDispositionFailure,
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
   notifyWorkspaceLockCleanupFailure,
-} from "./restore-outcome.ts";
+} from "./restore-notifications.ts";
 import { registerNavigationLifecycle } from "./navigation-lifecycle.ts";
 import {
   messageEndNeedsSourceCapture,
@@ -51,11 +59,9 @@ import {
   type SessionStartPolicy,
 } from "./host-event-contract.ts";
 import { CyclotomyRuntime } from "./runtime.ts";
+import { runConfirmedRestore } from "./confirmed-restore.ts";
 import {
-  runConfirmedRestore,
-  type ConfirmedRestoreResult,
-} from "./confirmed-restore.ts";
-import {
+  isExactUsableSessionView,
   readSessionView,
   SessionViewTracker,
   type SessionView,
@@ -68,6 +74,10 @@ import {
 } from "./capture-protocol.ts";
 import { PiHostAdapter } from "./pi-host-adapter.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import {
+  type ArrivalReceipt,
+  type LockedArrivalOutcome,
+} from "./workspace-receipt.ts";
 
 function withDetail(message: string, detail: string): string {
   return `${message} ${detail}`;
@@ -81,8 +91,9 @@ function readExactRegisteredView(
   expected: SessionView,
 ): SessionView | undefined {
   const current = views.observe(context);
-  return runtime.registrations.sessionIsUsable(current) &&
-    current.isSameSnapshotAs(expected)
+  return isExactUsableSessionView(current, expected, (candidate) =>
+    runtime.registrations.sessionIsUsable(candidate),
+  )
     ? current
     : undefined;
 }
@@ -96,6 +107,33 @@ type SourceCaptureFailure =
   | { readonly kind: "workspace-unavailable" }
   | { readonly kind: "capture"; readonly value: CaptureFailure }
   | { readonly kind: "exception"; readonly cause: unknown };
+
+type LoadedInitializationExecution =
+  | CheckpointInitializationConflictExecution
+  | { readonly kind: "materialized" }
+  | { readonly kind: "protected" }
+  | { readonly kind: "location-changed" }
+  | { readonly kind: "target-changed" }
+  | { readonly kind: "capture-failed"; readonly failure: CaptureFailure }
+  | { readonly kind: "failed"; readonly cause: unknown };
+
+type LoadedInitializationSettledExecution = Extract<
+  LoadedInitializationExecution,
+  { readonly kind: "initialization-conflict" | "materialized" | "protected" }
+>;
+
+type LoadedInitializationActionResult =
+  | LockedArrivalOutcome<LoadedInitializationSettledExecution>
+  | Exclude<
+      LoadedInitializationExecution,
+      LoadedInitializationSettledExecution
+    >;
+
+function isLoadedInitializationOutcome(
+  value: LoadedInitializationActionResult,
+): value is LockedArrivalOutcome<LoadedInitializationSettledExecution> {
+  return "execution" in value;
+}
 
 function formatSourceCaptureFailure(
   runtime: CyclotomyRuntime,
@@ -163,7 +201,7 @@ async function captureSourceOrCancel(
   const result = await runtime
     .enqueueWorkspaceExecution(
       options.operation ?? "capture-before-transition",
-      async () => {
+      async (writeAuthority) => {
         const execution = await runCaptureProtocol(
           {
             readCurrentView: () => views.observe(context),
@@ -172,7 +210,11 @@ async function captureSourceOrCancel(
             captureAnchor: (current, leafId) =>
               runtime.checkpoints.captureAnchor(current, leafId),
             captureAdmission: (current, node) =>
-              runtime.workspaceMutations.captureAdmission(current, node),
+              runtime.workspaceMutations.captureAdmission(
+                writeAuthority,
+                current,
+                node,
+              ),
             checkpointSlot: (node) => runtime.checkpoints.checkpointSlot(node),
             prepareCurrent: (current) =>
               runtime.checkpoints.prepareCurrent(current),
@@ -186,6 +228,7 @@ async function captureSourceOrCancel(
               ),
             commitPrepared: (current, node, prepared, expectedSlot) =>
               runtime.commitPreparedCapture(
+                writeAuthority,
                 current,
                 node,
                 prepared,
@@ -198,16 +241,7 @@ async function captureSourceOrCancel(
       },
     )
     .then((execution) => {
-      notifyWorkspaceLockCleanupFailure(
-        runtime,
-        context,
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed", cause: execution.cleanup.cause }
-          : { kind: "settled" },
-      );
-      if (execution.cleanup.kind === "failed") {
-        runtime.markSessionUnavailable(execution.cleanup.cause);
-      }
+      notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
       return execution.kind === "completed"
         ? execution.value
         : ({
@@ -292,36 +326,10 @@ const RELOAD_PROTECTED_MISSING = "protected-missing" as const;
 const RELOAD_PROTECTED = "reload-protected" as const;
 type SessionReconciliation =
   typeof SESSION_RECONCILED | typeof SESSION_CAPTURE_BARRIER;
-
-function loadedRestoreNeedsRecovery(result: ConfirmedRestoreResult): boolean {
-  switch (result.kind) {
-    case "needs-ui":
-    case "cancelled":
-    case "location-changed":
-    case "target-changed":
-    case "preview-stale":
-    case "scan-incomplete":
-    case "failed":
-    case "capture-failed":
-      return true;
-    case "outcome":
-      if (result.cutover.kind === "rejected") return true;
-      return (
-        result.outcome.kind !== "restored" &&
-        result.cutover.kind === "not-requested"
-      );
-    case "initialization-conflict":
-    case "post-mutation-conflict":
-    case "preparation-conflict":
-    case "missing":
-    case "protected-missing":
-    case "initialized":
-    case "matches":
-      return false;
-    default:
-      return assertNever(result, "unhandled loaded-session settlement");
-  }
-}
+type ReloadReconciliation =
+  | SessionReconciliation
+  | typeof RELOAD_PROTECTED
+  | typeof RELOAD_PROTECTED_MISSING;
 
 async function recoverLoadedArrival(
   runtime: CyclotomyRuntime,
@@ -335,13 +343,7 @@ async function recoverLoadedArrival(
     : await runtime.workspaceMutations.protectCurrentLocationForRetirement(
         context,
       );
-  notifyArrivalProtectionFailure(runtime, context, recovery.protection);
-  notifyWorkspaceLockCleanupFailure(
-    runtime,
-    context,
-    recovery.workspaceLockCleanup,
-  );
-  return recovery.protection;
+  return recovery;
 }
 
 async function reconcileLoadedSession(
@@ -364,9 +366,17 @@ async function reconcileLoadedSession(
       return SESSION_RECONCILED;
     }
   } catch (cause) {
-    const protection = await recoverLoadedArrival(runtime, context);
+    const recovery = await recoverLoadedArrival(runtime, context);
+    applyActiveArrivalSettlement(runtime, recovery.arrival);
+    notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      recovery.workspaceLockCleanup,
+    );
     runtime.notifyCaptureResult(context, false, messageOf(cause));
-    return protection.kind === "session-barrier"
+    return recovery.arrival.kind === "protected" &&
+      recovery.arrival.evidence.kind === "session-barrier"
       ? SESSION_CAPTURE_BARRIER
       : SESSION_RECONCILED;
   }
@@ -381,7 +391,7 @@ async function reconcileLoadedConcreteSession(
   view: SessionView,
   node: NodeKey,
 ): Promise<void> {
-  let result: ConfirmedRestoreResult;
+  let result: Awaited<ReturnType<typeof runConfirmedRestore>>;
   try {
     result = await runConfirmedRestore(
       runtime,
@@ -395,29 +405,60 @@ async function reconcileLoadedConcreteSession(
       runtime.workspaceMutations,
       context,
       cause,
-      "released",
+      { kind: "released" },
     );
   }
 
-  if (loadedRestoreNeedsRecovery(result)) {
-    await recoverLoadedArrival(runtime, context);
+  const execution = result.execution;
+  const settledResult = "arrival" in result ? result : undefined;
+  if (settledResult !== undefined) {
+    applyActiveArrivalSettlement(runtime, settledResult.arrival);
   }
-
-  switch (result.kind) {
+  switch (execution.kind) {
     case "initialization-conflict":
-      notifyCheckpointInitializationConflict(runtime, context, result);
+      notifyCheckpointInitializationConflict(
+        runtime,
+        context,
+        settledResult as CheckpointInitializationConflict,
+      );
       return;
     case "post-mutation-conflict":
-      notifyPostMutationConflict(runtime, context, result);
+      notifyPostMutationConflict(
+        runtime,
+        context,
+        settledResult as PostMutationConflict,
+      );
       return;
     case "preparation-conflict":
-      notifyRestorePreparationConflict(runtime, context, result);
+      notifyRestorePreparationConflict(
+        runtime,
+        context,
+        settledResult as RestorePreparationConflict,
+      );
       return;
+    case "outcome":
+      notifyArrivalDispositionFailure(runtime, context, settledResult!.arrival);
+      notifyRestoreProtocolOutcome(runtime, context, {
+        execution,
+        workspaceLockCleanup: settledResult!.workspaceLockCleanup,
+      });
+      return;
+  }
+  if (settledResult !== undefined) {
+    notifyArrivalDispositionFailure(runtime, context, settledResult.arrival);
+    notifyWorkspaceLockCleanupFailure(
+      runtime,
+      context,
+      settledResult.workspaceLockCleanup,
+    );
+  }
+
+  switch (execution.kind) {
     case "missing": {
       const anchor = node;
       const locked = await runtime.enqueueWorkspaceExecution(
         "initialize-missing-session",
-        async () => {
+        async (writeAuthority): Promise<LoadedInitializationActionResult> => {
           if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
             return { kind: "location-changed" as const };
           }
@@ -468,6 +509,7 @@ async function reconcileLoadedConcreteSession(
             return { kind: "target-changed" as const };
           }
           const committed = runtime.commitMissingCapture(
+            writeAuthority,
             current,
             anchor,
             prepared.value,
@@ -480,8 +522,15 @@ async function reconcileLoadedConcreteSession(
                 checkpointSlotTreeOid(currentSlot) === undefined &&
                 checkpointSlotIsBlocked(currentSlot)
               ) {
-                runtime.workspaceMutations.protectCurrentNode(current, anchor);
-                return { kind: "protected" as const };
+                const arrival = runtime.workspaceMutations.protectCurrentNode(
+                  writeAuthority,
+                  current,
+                  anchor,
+                );
+                return {
+                  execution: { kind: "protected" as const },
+                  arrival,
+                };
               }
             }
             return {
@@ -502,6 +551,7 @@ async function reconcileLoadedConcreteSession(
                 runtime.checkpoints.captureAnchor(candidate),
               protectCommittedArrival: (_cause) =>
                 runtime.workspaceMutations.recoverUncertainLocationInWorkspaceLock(
+                  writeAuthority,
                   context,
                 ),
             },
@@ -512,6 +562,7 @@ async function reconcileLoadedConcreteSession(
               admit: (candidate, target) =>
                 locationInitializationAdmission(
                   runtime.workspaceMutations.admitLocationIfResolution(
+                    writeAuthority,
                     candidate,
                     target,
                   ),
@@ -519,7 +570,10 @@ async function reconcileLoadedConcreteSession(
             },
           );
           return arrival.kind === "admitted"
-            ? ({ kind: "materialized" } as const)
+            ? ({
+                execution: { kind: "materialized" as const },
+                arrival,
+              } as const)
             : checkpointInitializationDispositionConflict(
                 arrival.kind === "unsettled"
                   ? arrival.cause
@@ -530,33 +584,54 @@ async function reconcileLoadedConcreteSession(
               );
         },
       );
-      const initialized =
-        locked.kind === "action-failed"
-          ? ({
-              kind: "failed" as const,
-              cause: locked.cause,
-            } as const)
-          : locked.value;
-      notifyWorkspaceLockCleanupFailure(
-        runtime,
-        context,
-        locked.cleanup.kind === "failed"
-          ? { kind: "failed", cause: locked.cleanup.cause }
-          : { kind: "settled" },
-      );
-
-      if (
-        initialized.kind === "location-changed" ||
-        initialized.kind === "target-changed" ||
-        initialized.kind === "capture-failed" ||
-        initialized.kind === "failed"
-      ) {
-        await recoverLoadedArrival(runtime, context);
+      const lockCleanup = locked.cleanup;
+      let initialized: ArrivalReceipt<LoadedInitializationExecution>;
+      if (locked.kind === "completed") {
+        if (isLoadedInitializationOutcome(locked.value)) {
+          initialized = await finalizeArrivalAfterWorkspaceExecution(
+            runtime.workspaceMutations,
+            context,
+            locked.value,
+            lockCleanup,
+          );
+        } else {
+          const recovery = await recoverLoadedArrival(runtime, context);
+          initialized = await finalizeArrivalAfterWorkspaceExecution(
+            runtime.workspaceMutations,
+            context,
+            locked.value,
+            lockCleanup,
+            recovery,
+          );
+        }
+      } else {
+        const recovery = await recoverLoadedArrival(runtime, context);
+        initialized = await finalizeArrivalAfterWorkspaceExecution(
+          runtime.workspaceMutations,
+          context,
+          { kind: "failed", cause: locked.cause },
+          lockCleanup,
+          recovery,
+        );
+      }
+      applyActiveArrivalSettlement(runtime, initialized.arrival);
+      const initializedExecution = initialized.execution;
+      if (initializedExecution.kind !== "initialization-conflict") {
+        notifyArrivalDispositionFailure(runtime, context, initialized.arrival);
+        notifyWorkspaceLockCleanupFailure(
+          runtime,
+          context,
+          initialized.workspaceLockCleanup,
+        );
       }
 
-      switch (initialized.kind) {
+      switch (initializedExecution.kind) {
         case "initialization-conflict":
-          notifyCheckpointInitializationConflict(runtime, context, initialized);
+          notifyCheckpointInitializationConflict(
+            runtime,
+            context,
+            initialized as CheckpointInitializationConflict,
+          );
           break;
         case "materialized":
           runtime.notifyCaptureResult(context, true);
@@ -586,19 +661,19 @@ async function reconcileLoadedConcreteSession(
           runtime.notifyCaptureResult(
             context,
             false,
-            formatCaptureFailure(runtime.i18n, initialized.failure),
+            formatCaptureFailure(runtime.i18n, initializedExecution.failure),
           );
           break;
         case "failed":
           runtime.notifyCaptureResult(
             context,
             false,
-            messageOf(initialized.cause),
+            messageOf(initializedExecution.cause),
           );
           break;
         default:
           assertNever(
-            initialized,
+            initializedExecution,
             "unhandled loaded checkpoint initialization",
           );
       }
@@ -617,11 +692,16 @@ async function reconcileLoadedConcreteSession(
     case "needs-ui":
       runtime.notify(
         context,
-        runtime.i18n.t(
-          context.mode === "rpc"
-            ? "sessionRestoreDeferredRpc"
-            : "sessionRestoreNeedsUi",
-        ),
+        [
+          runtime.i18n.t(
+            context.mode === "rpc"
+              ? "sessionRestoreDeferredRpc"
+              : "sessionRestoreNeedsUi",
+          ),
+          runtime.i18n.formatGitReplayRisk(execution.replayRisk),
+        ]
+          .filter((part): part is string => part !== undefined)
+          .join("\n\n"),
         "warning",
       );
       break;
@@ -636,7 +716,7 @@ async function reconcileLoadedConcreteSession(
       runtime.notify(
         context,
         runtime.i18n.t("restoreScanIncomplete", {
-          message: runtime.i18n.formatScanProblems(result.problems),
+          message: runtime.i18n.formatScanProblems(execution.problems),
         }),
         "warning",
       );
@@ -644,7 +724,9 @@ async function reconcileLoadedConcreteSession(
     case "failed":
       runtime.notify(
         context,
-        runtime.i18n.t("restoreFailed", { message: messageOf(result.cause) }),
+        runtime.i18n.t("restoreFailed", {
+          message: messageOf(execution.cause),
+        }),
         "warning",
       );
       break;
@@ -652,7 +734,7 @@ async function reconcileLoadedConcreteSession(
       runtime.notify(
         context,
         runtime.i18n.t("restoreFailed", {
-          message: formatCaptureFailure(runtime.i18n, result.failure),
+          message: formatCaptureFailure(runtime.i18n, execution.failure),
         }),
         "warning",
       );
@@ -674,11 +756,8 @@ async function reconcileLoadedConcreteSession(
         "warning",
       );
       break;
-    case "outcome":
-      notifyRestoreProtocolOutcome(runtime, context, result);
-      return;
     default:
-      assertNever(result, "unhandled loaded-session restore result");
+      assertNever(execution, "unhandled loaded-session restore result");
   }
 }
 
@@ -714,253 +793,297 @@ async function reconcileReloadedSession(
       runtime.workspaceMutations,
       context,
     );
-    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    applyActiveArrivalSettlement(runtime, recovery.arrival);
+    notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,
       recovery.workspaceLockCleanup,
     );
     runtime.notifyCaptureResult(context, false, messageOf(cause));
-    return recovery.protection.kind === "session-barrier"
+    return recovery.arrival.kind === "protected" &&
+      recovery.arrival.evidence.kind === "session-barrier"
       ? SESSION_CAPTURE_BARRIER
       : SESSION_RECONCILED;
   }
   const recoverReloadFailure = async (
     error: unknown,
-  ): Promise<SessionReconciliation | typeof RELOAD_PROTECTED> => {
+    workspaceLockCleanup: CleanupSettlement = { kind: "settled" },
+  ): Promise<ArrivalReceipt<ReloadReconciliation>> => {
     runtime.workspaceMutations.quarantineAdmission();
     const recovery = await protectCurrentArrivalAfterWorkspaceFailure(
       runtime.workspaceMutations,
       context,
     );
-    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
-    notifyWorkspaceLockCleanupFailure(
-      runtime,
-      context,
-      recovery.workspaceLockCleanup,
-    );
     runtime.notifyCaptureResult(context, false, messageOf(error));
-    switch (recovery.protection.kind) {
-      case "exact-slot":
-        return RELOAD_PROTECTED;
-      case "session-barrier":
-        return SESSION_CAPTURE_BARRIER;
-      case "unavailable":
-        return SESSION_RECONCILED;
-      default:
-        return assertNever(
-          recovery.protection,
-          "unhandled reload failure protection",
-        );
+    let execution: ReloadReconciliation;
+    if (recovery.arrival.kind === "unsettled") {
+      execution = SESSION_RECONCILED;
+    } else {
+      switch (recovery.arrival.evidence.kind) {
+        case "exact-slot":
+          execution = RELOAD_PROTECTED;
+          break;
+        case "session-barrier":
+          execution = SESSION_CAPTURE_BARRIER;
+          break;
+        default:
+          return assertNever(
+            recovery.arrival.evidence,
+            "unhandled reload failure protection",
+          );
+      }
     }
+    return finalizeArrivalAfterWorkspaceExecution(
+      runtime.workspaceMutations,
+      context,
+      execution,
+      workspaceLockCleanup,
+      recovery,
+    );
   };
-  const reconciliation = await runtime
-    .enqueueWorkspaceExecution("reload-reconcile", async () => {
-      const readCurrent = (): SessionView | undefined =>
-        readExactRegisteredView(runtime, views, context, view);
-      const protectCurrent = async (
-        current: SessionView | undefined,
-        expectation:
-          | {
-              readonly kind: "current";
-              readonly state: "present" | "missing";
+  let receipt: ArrivalReceipt<ReloadReconciliation>;
+  try {
+    const locked = await runtime.enqueueWorkspaceExecution(
+      "reload-reconcile",
+      async (
+        writeAuthority,
+      ): Promise<LockedArrivalOutcome<ReloadReconciliation>> => {
+        const readCurrent = (): SessionView | undefined =>
+          readExactRegisteredView(runtime, views, context, view);
+        const protectCurrent = async (
+          current: SessionView | undefined,
+          expectation:
+            | {
+                readonly kind: "current";
+                readonly state: "present" | "missing";
+              }
+            | {
+                readonly kind: "exact-resolution";
+                readonly resolution: ResolvedNodeState;
+              },
+        ): Promise<LockedArrivalOutcome<ReloadReconciliation>> => {
+          const classifyProtection = (
+            arrival: Awaited<
+              ReturnType<typeof protectCurrentArrivalInWorkspaceLock>
+            >,
+          ): LockedArrivalOutcome<ReloadReconciliation> => {
+            let execution: ReloadReconciliation;
+            if (arrival.kind === "unsettled") {
+              execution = SESSION_RECONCILED;
+            } else {
+              switch (arrival.evidence.kind) {
+                case "exact-slot":
+                  execution =
+                    expectation.kind === "current" &&
+                    expectation.state === "missing"
+                      ? RELOAD_PROTECTED_MISSING
+                      : RELOAD_PROTECTED;
+                  break;
+                case "session-barrier":
+                  execution = SESSION_CAPTURE_BARRIER;
+                  break;
+                default:
+                  return assertNever(
+                    arrival.evidence,
+                    "unhandled reload arrival protection",
+                  );
+              }
             }
-          | {
-              readonly kind: "exact-resolution";
-              readonly resolution: ResolvedNodeState;
-            },
-      ): Promise<
-        | SessionReconciliation
-        | typeof RELOAD_PROTECTED
-        | typeof RELOAD_PROTECTED_MISSING
-      > => {
-        const classifyProtection = (
-          recovery: Awaited<
-            ReturnType<typeof protectCurrentArrivalInWorkspaceLock>
-          >,
-        ) => {
-          notifyArrivalProtectionFailure(runtime, context, recovery.protection);
-          notifyWorkspaceLockCleanupFailure(
-            runtime,
-            context,
-            recovery.workspaceLockCleanup,
-          );
-          switch (recovery.protection.kind) {
-            case "exact-slot":
-              return expectation.kind === "current" &&
-                expectation.state === "missing"
-                ? RELOAD_PROTECTED_MISSING
-                : RELOAD_PROTECTED;
-            case "session-barrier":
-              return SESSION_CAPTURE_BARRIER;
-            case "unavailable":
-              return SESSION_RECONCILED;
-            default:
-              return assertNever(
-                recovery.protection,
-                "unhandled reload arrival protection",
-              );
+            return { execution, arrival };
+          };
+          if (current === undefined) {
+            return classifyProtection(
+              await protectCurrentArrivalInWorkspaceLock(
+                runtime.workspaceMutations,
+                writeAuthority,
+                context,
+              ),
+            );
           }
+          // A stale inherited pin returns false while still blocking the exact
+          // slot. Notification follows the durable fact, not the pin outcome.
+          const protection =
+            expectation.kind === "exact-resolution"
+              ? runtime.workspaceMutations.protectNodeIfResolution(
+                  writeAuthority,
+                  current,
+                  node,
+                  expectation.resolution,
+                )
+              : runtime.workspaceMutations.protectCurrentNode(
+                  writeAuthority,
+                  current,
+                  node,
+                );
+          if (protection.kind === "unsettled") {
+            return classifyProtection(protection);
+          }
+          if (!runtime.checkpoints.locationIsBlocked(node)) {
+            return classifyProtection(
+              await protectCurrentArrivalInWorkspaceLock(
+                runtime.workspaceMutations,
+                writeAuthority,
+                context,
+              ),
+            );
+          }
+          return classifyProtection(protection);
         };
+
+        if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
+          return protectCurrent(readCurrent(), {
+            kind: "current",
+            state: "present",
+          });
+        }
+        let current = readCurrent();
         if (current === undefined) {
-          return classifyProtection(
-            await protectCurrentArrivalInWorkspaceLock(
-              runtime.workspaceMutations,
-              context,
-            ),
-          );
+          return protectCurrent(undefined, {
+            kind: "current",
+            state: "present",
+          });
         }
-        // A stale inherited pin returns false while still blocking the exact
-        // slot. Notification follows the durable fact, not the pin outcome.
-        if (expectation.kind === "exact-resolution") {
-          runtime.workspaceMutations.protectNodeIfResolution(
-            current,
-            node,
-            expectation.resolution,
-          );
-        } else {
-          runtime.workspaceMutations.protectCurrentNode(current, node);
-        }
-        if (!runtime.checkpoints.locationIsBlocked(node)) {
-          return classifyProtection(
-            await protectCurrentArrivalInWorkspaceLock(
-              runtime.workspaceMutations,
-              context,
-            ),
-          );
-        }
-        return expectation.kind === "current" && expectation.state === "missing"
-          ? RELOAD_PROTECTED_MISSING
-          : RELOAD_PROTECTED;
-      };
 
-      if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
-        return protectCurrent(readCurrent(), {
-          kind: "current",
-          state: "present",
-        });
-      }
-      let current = readCurrent();
-      if (current === undefined) {
-        return protectCurrent(undefined, {
-          kind: "current",
-          state: "present",
-        });
-      }
-
-      let readable: ResolvedReadableTree | undefined;
-      try {
-        readable = await runtime.resolveReadableTreeIn(current, node);
-      } catch {
-        return protectCurrent(readCurrent(), {
-          kind: "current",
-          state: "present",
-        });
-      }
-      current = readCurrent();
-      if (current === undefined) {
-        return protectCurrent(undefined, {
-          kind: "current",
-          state: "present",
-        });
-      }
-      if (readable === undefined) {
-        if (runtime.checkpoints.locationIsBlocked(node)) {
+        let readable: ResolvedReadableTree | undefined;
+        try {
+          readable = await runtime.resolveReadableTreeIn(current, node);
+        } catch {
+          return protectCurrent(readCurrent(), {
+            kind: "current",
+            state: "present",
+          });
+        }
+        current = readCurrent();
+        if (current === undefined) {
+          return protectCurrent(undefined, {
+            kind: "current",
+            state: "present",
+          });
+        }
+        if (readable === undefined) {
+          if (runtime.checkpoints.locationIsBlocked(node)) {
+            return protectCurrent(current, {
+              kind: "current",
+              state: "missing",
+            });
+          }
+          if (
+            runtime.workspaceMutations.locationIsUnresolved(current, node) &&
+            runtime.workspaceMutations.admitCurrentLocation(current)
+          ) {
+            return {
+              execution: SESSION_RECONCILED,
+              arrival: { kind: "admitted" },
+            };
+          }
           return protectCurrent(current, {
             kind: "current",
             state: "missing",
           });
         }
-        if (
-          runtime.workspaceMutations.locationIsUnresolved(current, node) &&
-          runtime.workspaceMutations.admitCurrentLocation(current)
-        ) {
-          return SESSION_RECONCILED;
-        }
-        return protectCurrent(current, {
-          kind: "current",
-          state: "missing",
-        });
-      }
 
-      let snapshot: WorkspaceSnapshot;
-      try {
-        snapshot = await runtime.scanCurrentWorkspaceForScope(
-          view.cwd,
-          readable.manifest.scope,
-        );
-      } catch {
-        return protectCurrent(readCurrent(), {
-          kind: "exact-resolution",
-          resolution: readable.resolution,
-        });
-      }
-      if (snapshot.problems.length > 0) {
-        return protectCurrent(readCurrent(), {
-          kind: "exact-resolution",
-          resolution: readable.resolution,
-        });
-      }
-      let drift: WorkspaceRestorePlan;
-      try {
-        drift = (await prepareWorkspaceRestorePlan(snapshot, readable.manifest))
-          .plan;
-      } catch {
-        return protectCurrent(readCurrent(), {
-          kind: "exact-resolution",
-          resolution: readable.resolution,
-        });
-      }
-      current = readCurrent();
-      if (current === undefined) {
-        return protectCurrent(undefined, {
-          kind: "exact-resolution",
-          resolution: readable.resolution,
-        });
-      }
-      const authoritative =
-        runtime.workspaceMutations.resolutionStillAuthoritative(
+        let snapshot: WorkspaceSnapshot;
+        try {
+          snapshot = await runtime.scanCurrentWorkspaceForScope(
+            view.cwd,
+            readable.manifest.scope,
+          );
+        } catch {
+          return protectCurrent(readCurrent(), {
+            kind: "exact-resolution",
+            resolution: readable.resolution,
+          });
+        }
+        if (snapshot.problems.length > 0) {
+          return protectCurrent(readCurrent(), {
+            kind: "exact-resolution",
+            resolution: readable.resolution,
+          });
+        }
+        if (
+          !sameGitOracleVersion(
+            readable.scopeValidation.gitVersion,
+            snapshot.gitOracleVersion,
+          )
+        ) {
+          return protectCurrent(readCurrent(), {
+            kind: "exact-resolution",
+            resolution: readable.resolution,
+          });
+        }
+        let drift: WorkspaceRestorePlan;
+        try {
+          drift = (
+            await prepareWorkspaceRestorePlan(snapshot, readable.manifest)
+          ).plan;
+        } catch {
+          return protectCurrent(readCurrent(), {
+            kind: "exact-resolution",
+            resolution: readable.resolution,
+          });
+        }
+        current = readCurrent();
+        if (current === undefined) {
+          return protectCurrent(undefined, {
+            kind: "exact-resolution",
+            resolution: readable.resolution,
+          });
+        }
+        const authoritative =
+          runtime.workspaceMutations.resolutionStillAuthoritative(
+            current,
+            node,
+            readable.resolution,
+          );
+        if (
+          drift.problems.length === 0 &&
+          !restorePlanHasChanges(drift) &&
+          authoritative &&
+          runtime.workspaceMutations.admitLocationIfResolution(
+            writeAuthority,
+            current,
+            readable.resolution,
+          )
+        ) {
+          return {
+            execution: SESSION_RECONCILED,
+            arrival: { kind: "admitted" },
+          };
+        }
+        return protectCurrent(
           current,
-          node,
-          readable.resolution,
+          authoritative
+            ? {
+                kind: "exact-resolution",
+                resolution: readable.resolution,
+              }
+            : { kind: "current", state: "present" },
         );
-      if (
-        drift.problems.length === 0 &&
-        !restorePlanHasChanges(drift) &&
-        authoritative &&
-        runtime.workspaceMutations.admitLocationIfResolution(
-          current,
-          readable.resolution,
-        )
-      ) {
-        return SESSION_RECONCILED;
-      }
-      return protectCurrent(
-        current,
-        authoritative
-          ? {
-              kind: "exact-resolution",
-              resolution: readable.resolution,
-            }
-          : { kind: "current", state: "present" },
-      );
-    })
-    .then(async (execution) => {
-      const result =
-        execution.kind === "completed"
-          ? execution.value
-          : await recoverReloadFailure(execution.cause);
-      notifyWorkspaceLockCleanupFailure(
-        runtime,
+      },
+    );
+    if (locked.kind === "completed") {
+      receipt = await finalizeArrivalAfterWorkspaceExecution(
+        runtime.workspaceMutations,
         context,
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed", cause: execution.cleanup.cause }
-          : { kind: "settled" },
+        locked.value,
+        locked.cleanup,
       );
-      return result;
-    })
+    } else {
+      receipt = await recoverReloadFailure(locked.cause, locked.cleanup);
+    }
+  } catch (error) {
     // Acquisition is the only failure without an execution receipt.
-    .catch(recoverReloadFailure);
+    receipt = await recoverReloadFailure(error);
+  }
+  applyActiveArrivalSettlement(runtime, receipt.arrival);
+  notifyArrivalDispositionFailure(runtime, context, receipt.arrival);
+  notifyWorkspaceLockCleanupFailure(
+    runtime,
+    context,
+    receipt.workspaceLockCleanup,
+  );
+  const reconciliation = receipt.execution;
   if (reconciliation === RELOAD_PROTECTED_MISSING) {
     runtime.notify(
       context,
@@ -980,7 +1103,7 @@ function blockedBashResult(runtime: CyclotomyRuntime, render: () => string) {
     result: {
       output: runtime.renderBestEffort(
         render,
-        "Cyclotomy blocked user bash because its safety diagnostic could not be rendered.",
+        "Cyclotomy could not run this command or show the reason.",
       ),
       exitCode: 1,
       cancelled: false,
@@ -1000,13 +1123,7 @@ export function registerCyclotomyLifecycle(
     if (!runtime.isActive) return;
     try {
       const execution = await runtime.maybeRunAutomaticGc();
-      notifyWorkspaceLockCleanupFailure(
-        runtime,
-        context,
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed", cause: execution.cleanup.cause }
-          : { kind: "settled" },
-      );
+      notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
       if (execution.kind === "action-failed") throw execution.cause;
       automaticGcFailureNotified = false;
     } catch (error) {
@@ -1030,17 +1147,13 @@ export function registerCyclotomyLifecycle(
         : await runtime.workspaceMutations.protectCurrentLocationForRetirement(
             context,
           );
-    notifyArrivalProtectionFailure(runtime, context, recovery.protection);
+    applyActiveArrivalSettlement(runtime, recovery.arrival);
+    notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,
       recovery.workspaceLockCleanup,
     );
-    if (recovery.protection.kind === "unavailable") {
-      runtime.markSessionUnavailable(recovery.protection.cause);
-    } else if (recovery.workspaceLockCleanup.kind === "failed") {
-      runtime.markSessionUnavailable(recovery.workspaceLockCleanup.cause);
-    }
   };
 
   const withdrawAfterPreparationFailure = async (
@@ -1048,7 +1161,8 @@ export function registerCyclotomyLifecycle(
     cause: unknown,
   ): Promise<void> => {
     const protection = await runtime.withdrawFromParticipation(context, cause);
-    notifyArrivalProtectionFailure(runtime, context, protection.protection);
+    applyActiveArrivalSettlement(runtime, protection.arrival);
+    notifyArrivalDispositionFailure(runtime, context, protection.arrival);
     notifyWorkspaceLockCleanupFailure(
       runtime,
       context,
@@ -1267,7 +1381,7 @@ export function registerCyclotomyLifecycle(
         }
         const execution = await runtime.enqueueWorkspaceExecution(
           "project-session-capture-barrier",
-          async () => {
+          async (writeAuthority) => {
             const current = readExactRegisteredView(
               runtime,
               views,
@@ -1283,7 +1397,11 @@ export function registerCyclotomyLifecycle(
             ) {
               return;
             }
-            runtime.workspaceMutations.captureAdmission(current, currentNode);
+            runtime.workspaceMutations.captureAdmission(
+              writeAuthority,
+              current,
+              currentNode,
+            );
             if (!runtime.checkpoints.locationIsBlocked(currentNode)) {
               throw new Error(
                 "session capture barrier was not projected onto the current location",
@@ -1291,13 +1409,7 @@ export function registerCyclotomyLifecycle(
             }
           },
         );
-        notifyWorkspaceLockCleanupFailure(
-          runtime,
-          context,
-          execution.cleanup.kind === "failed"
-            ? { kind: "failed", cause: execution.cleanup.cause }
-            : { kind: "settled" },
-        );
+        notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
         if (execution.kind === "action-failed") throw execution.cause;
       } catch (error) {
         await recoverLifecycleFailure(context);
@@ -1556,6 +1668,11 @@ export function registerCyclotomyLifecycle(
                 readExactRegisteredView(runtime, views, context, view) ===
                 undefined
               ) {
+                runtime.notifyBestEffort(
+                  context,
+                  () => runtime.i18n.t("commandLocationChanged"),
+                  "warning",
+                );
                 return { cancel: true } as const;
               }
               return undefined;
@@ -1723,6 +1840,11 @@ export function registerCyclotomyLifecycle(
                 readExactRegisteredView(runtime, views, context, view) ===
                 undefined
               ) {
+                runtime.notifyBestEffort(
+                  context,
+                  () => runtime.i18n.t("commandLocationChanged"),
+                  "warning",
+                );
                 return { cancel: true } as const;
               }
               return undefined;

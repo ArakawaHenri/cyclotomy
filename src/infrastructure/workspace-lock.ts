@@ -1,46 +1,39 @@
-import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { constants, type Stats } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  constants,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  type Stats,
+} from "node:fs";
 import {
   lstat,
   mkdir,
   open,
+  realpath,
   readdir,
-  readFile,
-  rename,
-  rm,
   rmdir,
   unlink,
-  utimes,
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { promisify } from "node:util";
+
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
+import { systemErrorCode } from "./system-error.ts";
 
 const LOCK_DIRECTORY = "workspace.lock";
 const OWNER_PREFIX = "owner-";
 const OWNER_SUFFIX = ".json";
-const HEARTBEAT_PREFIX = "heartbeat-";
-const STEAL_CLAIM_PREFIX = "steal-claim";
 const OWNER_FILE_MAX_BYTES = 16 * 1024;
-const execFileAsync = promisify(execFile);
-
-export type ProcessIdentityResolver = (
-  pid: number,
-) => Promise<string | undefined>;
 
 export interface WorkspaceLockOptions {
   /** Time to wait for another cooperative operation. Default 5 seconds. */
   readonly timeoutMs?: number;
-  /** Heartbeat interval while the lock is held. Default 5 seconds. */
-  readonly heartbeatMs?: number;
-  /** Orphan age after which a dead owner's lock may be stolen. Default 30 seconds. */
-  readonly staleMs?: number;
-  readonly now?: () => number;
-  /** Test/platform seam used to distinguish a live owner from PID reuse. */
-  readonly identifyProcess?: ProcessIdentityResolver;
+  /** Deterministic test seam immediately before the final lock-directory release. */
+  readonly beforeFinalRelease?: () => Promise<void>;
 }
 
 export interface WorkspaceLock {
@@ -49,14 +42,19 @@ export interface WorkspaceLock {
   release(): Promise<void>;
 }
 
+declare const WORKSPACE_WRITE_AUTHORITY: unique symbol;
+
+/** Opaque, root-bound authority for writes during one workspace-lock action. */
+export interface WorkspaceWriteAuthority {
+  readonly [WORKSPACE_WRITE_AUTHORITY]: true;
+}
+
 interface LockOwner {
   readonly token: string;
   readonly pid: number;
   readonly hostname: string;
   readonly operation: string;
   readonly acquiredAt: number;
-  /** OS process-start identity; null when the platform cannot provide one. */
-  readonly processIdentity: string | null;
 }
 
 interface OwnerRecord {
@@ -73,20 +71,66 @@ interface LockObservation {
   readonly device: number;
   readonly inode: number;
   readonly owner: LockOwnerState;
-  readonly heartbeatMtimeMs: number;
 }
 
-interface StealClaim {
+interface DirectoryObservation {
   readonly path: string;
-  readonly ownerPath: string;
+  readonly device: number;
+  readonly inode: number;
 }
+
+type PhysicalWorkspaceOrderKey = Pick<
+  DirectoryObservation,
+  "path" | "device" | "inode"
+>;
+
+interface ProtocolFileObservation {
+  readonly device: number;
+  readonly inode: number;
+  readonly mode: number;
+  readonly links: number;
+  readonly size: number;
+}
+
+type WorkspaceWriteAuthorityPhase =
+  | { readonly kind: "active" }
+  | {
+      readonly kind: "revoked";
+      readonly cause: WorkspaceLockOwnershipLostError;
+    }
+  | {
+      readonly kind: "closed";
+      readonly cause: WorkspaceLockOwnershipLostError;
+    };
+
+interface WorkspaceWriteAuthorityState {
+  readonly binding: DirectoryObservation;
+  readonly lockPath: string;
+  readonly lock: LockObservation;
+  readonly owner: LockOwner;
+  readonly ownerPath: string;
+  readonly ownerFile: ProtocolFileObservation;
+  phase: WorkspaceWriteAuthorityPhase;
+}
+
+const workspaceWriteAuthorityStates = new WeakMap<
+  WorkspaceWriteAuthority,
+  WorkspaceWriteAuthorityState
+>();
+const workspaceLockAuthorities = new WeakMap<
+  WorkspaceLock,
+  WorkspaceWriteAuthority
+>();
 
 export class WorkspaceLockTimeoutError extends Error {
-  constructor(operation: string, timeoutMs: number) {
+  readonly lockPath: string;
+
+  constructor(operation: string, timeoutMs: number, lockPath: string) {
     super(
-      `timed out after ${timeoutMs} ms waiting for the Cyclotomy workspace lock (${operation})`,
+      `timed out after ${timeoutMs} ms waiting for the Cyclotomy workspace lock (${operation}) at ${lockPath}; the lock may be active or abandoned. Confirm that every process using this store has stopped before following the README recovery instructions`,
     );
     this.name = "WorkspaceLockTimeoutError";
+    this.lockPath = lockPath;
   }
 }
 
@@ -94,6 +138,17 @@ export class UnsafeWorkspaceLockPathError extends Error {
   constructor(path: string) {
     super(`refusing to use a non-directory Cyclotomy workspace lock: ${path}`);
     this.name = "UnsafeWorkspaceLockPathError";
+  }
+}
+
+/** The fixed lock path no longer names the exact acquired owner. */
+export class WorkspaceLockOwnershipLostError extends Error {
+  constructor(storeRoot: string, detail: string, options?: ErrorOptions) {
+    super(
+      `workspace lock ownership was lost at ${storeRoot}: ${detail}`,
+      options,
+    );
+    this.name = "WorkspaceLockOwnershipLostError";
   }
 }
 
@@ -130,111 +185,195 @@ class WorkspaceLockFormationChangedError extends Error {
   }
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) {
-    return undefined;
-  }
-  const value = Reflect.get(error, "code");
-  return typeof value === "string" ? value : undefined;
+function isTransientContentionObservationError(error: unknown): boolean {
+  const code = systemErrorCode(error);
+  return code === "EACCES" || code === "EPERM";
 }
 
-function processIsAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means that the process exists but we are not allowed to signal it.
-    return errorCode(error) !== "ESRCH";
-  }
+function sameDirectoryObservation(
+  expected: DirectoryObservation,
+  current: Stats,
+): boolean {
+  return (
+    current.isDirectory() &&
+    !current.isSymbolicLink() &&
+    current.dev === expected.device &&
+    current.ino === expected.inode
+  );
 }
 
-async function defaultProcessIdentity(
-  pid: number,
-): Promise<string | undefined> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  if (process.platform === "linux") {
-    try {
-      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-      const close = stat.lastIndexOf(")");
-      const fields =
-        close === -1
-          ? []
-          : stat
-              .slice(close + 2)
-              .trim()
-              .split(/\s+/u);
-      // The suffix starts at field 3; Linux field 22 is process start ticks.
-      const started = fields[19];
-      return started === undefined ? undefined : `linux:${started}`;
-    } catch {
-      return undefined;
-    }
+async function bindStoreRoot(path: string): Promise<DirectoryObservation> {
+  const canonicalPath = await realpath(path);
+  const first = await lstat(canonicalPath);
+  if (!first.isDirectory() || first.isSymbolicLink()) {
+    throw new UnsafeWorkspaceLockPathError(canonicalPath);
   }
+  const rebound = await realpath(path);
+  const reboundEntry = await lstat(rebound);
+  const binding = {
+    path: canonicalPath,
+    device: first.dev,
+    inode: first.ino,
+  };
   if (
-    process.platform === "darwin" ||
-    process.platform === "freebsd" ||
-    process.platform === "openbsd"
+    rebound !== canonicalPath ||
+    !sameDirectoryObservation(binding, reboundEntry)
   ) {
-    try {
-      const result = await execFileAsync(
-        "ps",
-        ["-p", String(pid), "-o", "lstart="],
-        {
-          encoding: "utf8",
-          timeout: 2_000,
-          maxBuffer: 4_096,
-          env: { ...process.env, LC_ALL: "C", LANG: "C" },
-        },
-      );
-      const started = result.stdout.trim().replace(/\s+/gu, " ");
-      return started.length === 0 ? undefined : `ps:${started}`;
-    } catch {
-      return undefined;
-    }
+    throw new WorkspaceLockOwnershipLostError(
+      canonicalPath,
+      "workspace store changed while its identity was read",
+    );
   }
-  return undefined;
+  return binding;
 }
 
-let selfProcessIdentity: Promise<string | undefined> | undefined;
+function protocolFileObservation(entry: Stats): ProtocolFileObservation {
+  return {
+    device: entry.dev,
+    inode: entry.ino,
+    mode: entry.mode,
+    links: entry.nlink,
+    size: entry.size,
+  };
+}
 
-function identifyCurrentProcess(
-  injected: ProcessIdentityResolver | undefined,
-): Promise<string | undefined> {
-  if (injected !== undefined) {
-    return injected(process.pid).catch(() => undefined);
+function sameProtocolFile(
+  expected: ProtocolFileObservation,
+  current: Stats,
+): boolean {
+  return (
+    current.isFile() &&
+    !current.isSymbolicLink() &&
+    current.nlink === 1 &&
+    current.dev === expected.device &&
+    current.ino === expected.inode &&
+    current.mode === expected.mode &&
+    current.nlink === expected.links &&
+    current.size === expected.size
+  );
+}
+
+function ownershipLoss(
+  state: WorkspaceWriteAuthorityState,
+  detail: string,
+  cause?: unknown,
+): WorkspaceLockOwnershipLostError {
+  return new WorkspaceLockOwnershipLostError(
+    state.binding.path,
+    detail,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function revokeWorkspaceWriteAuthority(
+  state: WorkspaceWriteAuthorityState,
+  detail: string,
+  cause?: unknown,
+): WorkspaceLockOwnershipLostError {
+  if (state.phase.kind !== "active") return state.phase.cause;
+  const loss = ownershipLoss(state, detail, cause);
+  state.phase = { kind: "revoked", cause: loss };
+  return loss;
+}
+
+function closeWorkspaceWriteAuthority(
+  state: WorkspaceWriteAuthorityState,
+): void {
+  if (state.phase.kind === "closed") return;
+  state.phase = {
+    kind: "closed",
+    cause:
+      state.phase.kind === "revoked"
+        ? state.phase.cause
+        : ownershipLoss(state, "write authority is no longer active"),
+  };
+}
+
+function assertBoundDirectory(
+  expected: DirectoryObservation,
+  path: string,
+  label: string,
+): void {
+  const canonical = realpathSync(path);
+  const current = lstatSync(canonical);
+  // The physical directory is the authority boundary. Windows may return a
+  // different canonical spelling for the same directory (for example after
+  // expanding a short path or normalizing case), so comparing realpath text
+  // would revoke a valid authority. Device and inode still reject any path
+  // rebound to another directory, including a lexical alias.
+  if (!sameDirectoryObservation(expected, current)) {
+    throw new Error(`${label} changed`);
   }
-  selfProcessIdentity ??= defaultProcessIdentity(process.pid);
-  return selfProcessIdentity;
+}
+
+/**
+ * Synchronously revalidate an opaque authority immediately before one durable
+ * write. The first failed revalidation revokes it permanently, even if the old
+ * lock pathname is later restored. Callers must not await between this check
+ * and the mutation.
+ */
+export function assertWorkspaceWriteAuthority(
+  authority: WorkspaceWriteAuthority,
+  expectedStoreRoot: string,
+): void {
+  const state = workspaceWriteAuthorityStates.get(authority);
+  if (state === undefined) {
+    throw new WorkspaceLockOwnershipLostError(
+      resolve(expectedStoreRoot),
+      "write authority is not recognized by this process",
+    );
+  }
+  if (state.phase.kind !== "active") throw state.phase.cause;
+  try {
+    assertBoundDirectory(state.binding, state.binding.path, "workspace store");
+    assertBoundDirectory(
+      state.binding,
+      expectedStoreRoot,
+      "expected workspace store",
+    );
+    const lock = lstatSync(state.lockPath);
+    if (
+      !lock.isDirectory() ||
+      lock.isSymbolicLink() ||
+      lock.dev !== state.lock.device ||
+      lock.ino !== state.lock.inode
+    ) {
+      throw new Error("fixed lock path names a different directory");
+    }
+    const names = readdirSync(state.lockPath).sort();
+    const expectedNames = [state.ownerPath.slice(state.lockPath.length + 1)];
+    if (
+      names.length !== expectedNames.length ||
+      names.some((name, index) => name !== expectedNames[index])
+    ) {
+      throw new Error("lock protocol entries changed");
+    }
+    const ownerEntry = lstatSync(state.ownerPath);
+    if (!sameProtocolFile(state.ownerFile, ownerEntry)) {
+      throw new Error("owner record changed");
+    }
+    if (ownerEntry.size > OWNER_FILE_MAX_BYTES) {
+      throw new Error("owner record exceeds its size limit");
+    }
+    const ownerBytes = readFileSync(state.ownerPath);
+    const owner = parseOwner(
+      new TextDecoder("utf-8", { fatal: true }).decode(ownerBytes),
+      state.owner.token,
+    );
+    if (owner === undefined) {
+      throw new Error("owner record is malformed or names another token");
+    }
+  } catch (cause) {
+    throw revokeWorkspaceWriteAuthority(
+      state,
+      "exact owner could not be revalidated",
+      cause,
+    );
+  }
 }
 
 function ownerFileName(token: string): string {
   return `${OWNER_PREFIX}${token}${OWNER_SUFFIX}`;
-}
-
-function heartbeatFileName(token: string): string {
-  return `${HEARTBEAT_PREFIX}${token}`;
-}
-
-function stealClaimPath(
-  lockPath: string,
-  observation: LockObservation,
-): string {
-  const identity = createHash("sha256")
-    .update(String(observation.device))
-    .update("\0")
-    .update(String(observation.inode))
-    .update("\0")
-    .update(
-      observation.owner.kind === "valid"
-        ? observation.owner.record.owner.token
-        : observation.owner.kind,
-    )
-    .digest("hex")
-    .slice(0, 32);
-  return `${lockPath}.${STEAL_CLAIM_PREFIX}-${identity}`;
 }
 
 function parseOwner(
@@ -258,11 +397,7 @@ function parseOwner(
     parsed.hostname.length === 0 ||
     typeof parsed.operation !== "string" ||
     typeof parsed.acquiredAt !== "number" ||
-    !Number.isFinite(parsed.acquiredAt) ||
-    (parsed.processIdentity !== undefined &&
-      parsed.processIdentity !== null &&
-      (typeof parsed.processIdentity !== "string" ||
-        parsed.processIdentity.length === 0))
+    !Number.isFinite(parsed.acquiredAt)
   ) {
     return undefined;
   }
@@ -272,10 +407,6 @@ function parseOwner(
     hostname: parsed.hostname,
     operation: parsed.operation,
     acquiredAt: parsed.acquiredAt,
-    processIdentity:
-      typeof parsed.processIdentity === "string"
-        ? parsed.processIdentity
-        : null,
   };
 }
 
@@ -362,7 +493,7 @@ async function readOwnerState(
   try {
     names = await readdir(lockPath);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") {
+    if (systemErrorCode(error) === "ENOENT") {
       return undefined;
     }
     throw error;
@@ -383,8 +514,7 @@ async function readOwnerState(
   if (record === undefined) {
     return { kind: "ambiguous" };
   }
-  const allowedHeartbeat = heartbeatFileName(record.owner.token);
-  if (names.some((entry) => entry !== name && entry !== allowedHeartbeat)) {
+  if (names.some((entry) => entry !== name)) {
     return { kind: "ambiguous" };
   }
   return { kind: "valid", record };
@@ -397,7 +527,7 @@ async function observeLock(
   try {
     lockInfo = await lstat(lockPath);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") {
+    if (systemErrorCode(error) === "ENOENT") {
       return undefined;
     }
     throw error;
@@ -409,89 +539,11 @@ async function observeLock(
 
   const owner = await readOwnerState(lockPath);
   if (owner === undefined) return undefined;
-  let heartbeatMtimeMs = lockInfo.mtimeMs;
-  if (owner.kind === "valid") {
-    const record = owner.record;
-    const heartbeatPath = join(lockPath, heartbeatFileName(record.owner.token));
-    try {
-      const heartbeatInfo = await lstat(heartbeatPath);
-      if (!heartbeatInfo.isFile()) {
-        throw new UnsafeWorkspaceLockPathError(heartbeatPath);
-      }
-      heartbeatMtimeMs = heartbeatInfo.mtimeMs;
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") {
-        throw error;
-      }
-      // A process can die after publishing its owner record but before
-      // creating the heartbeat marker. The owner-file timestamp is then the
-      // conservative lease timestamp.
-      try {
-        const ownerInfo = await lstat(record.path);
-        if (!ownerInfo.isFile()) {
-          throw new UnsafeWorkspaceLockPathError(record.path);
-        }
-        heartbeatMtimeMs = ownerInfo.mtimeMs;
-      } catch (ownerError) {
-        if (errorCode(ownerError) !== "ENOENT") {
-          throw ownerError;
-        }
-      }
-    }
-  }
-
   return {
     device: lockInfo.dev,
     inode: lockInfo.ino,
     owner,
-    heartbeatMtimeMs,
   };
-}
-
-function sameLock(left: LockObservation, right: LockObservation): boolean {
-  const sameOwner =
-    left.owner.kind === right.owner.kind &&
-    (left.owner.kind !== "valid" ||
-      (right.owner.kind === "valid" &&
-        left.owner.record.owner.token === right.owner.record.owner.token));
-  return (
-    left.device === right.device && left.inode === right.inode && sameOwner
-  );
-}
-
-async function canRecoverOwner(
-  owner: LockOwnerState,
-  identifyProcess: ProcessIdentityResolver,
-): Promise<boolean> {
-  if (owner.kind === "empty") {
-    // Acquisition verifies the directory inode after owner publication. A
-    // process paused in this formation window cannot resume as a second owner
-    // after the stale directory is renamed.
-    return true;
-  }
-  // Multiple, malformed, or stray protocol files are not proof of an empty
-  // formation. Preserve them for audit and require manual recovery.
-  if (owner.kind === "ambiguous") return false;
-  const record = owner.record;
-  if (record.owner.hostname !== hostname()) {
-    // A PID is only meaningful on its originating host. Prefer a timeout to
-    // stealing a potentially live lock on a shared filesystem.
-    return false;
-  }
-  if (!processIsAlive(record.owner.pid)) return true;
-  if (record.owner.processIdentity === null) return false;
-  const current = await identifyProcess(record.owner.pid).catch(
-    () => undefined,
-  );
-  return current !== undefined && current !== record.owner.processIdentity;
-}
-
-function isStale(
-  observation: LockObservation,
-  staleMs: number,
-  now: number,
-): boolean {
-  return now - observation.heartbeatMtimeMs >= staleMs;
 }
 
 async function wait(milliseconds: number): Promise<void> {
@@ -505,9 +557,9 @@ async function removeEmptyDirectory(path: string): Promise<void> {
     await rmdir(path);
   } catch (error) {
     if (
-      errorCode(error) !== "ENOENT" &&
-      errorCode(error) !== "ENOTEMPTY" &&
-      errorCode(error) !== "EEXIST"
+      systemErrorCode(error) !== "ENOENT" &&
+      systemErrorCode(error) !== "ENOTEMPTY" &&
+      systemErrorCode(error) !== "EEXIST"
     ) {
       throw error;
     }
@@ -522,7 +574,7 @@ async function removeDirectoryIfSame(
   try {
     current = await lstat(path);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return;
+    if (systemErrorCode(error) === "ENOENT") return;
     throw error;
   }
   if (current.dev === expected.device && current.ino === expected.inode) {
@@ -533,224 +585,69 @@ async function removeDirectoryIfSame(
 async function releaseDirectoryIfSame(
   path: string,
   expected: LockObservation,
+  storeRoot: string,
 ): Promise<void> {
   let current: Awaited<ReturnType<typeof lstat>>;
   try {
     current = await lstat(path);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return;
+    if (systemErrorCode(error) === "ENOENT") {
+      throw new WorkspaceLockOwnershipLostError(
+        storeRoot,
+        "lock directory disappeared during release",
+        { cause: error },
+      );
+    }
     throw error;
   }
   if (current.dev !== expected.device || current.ino !== expected.inode) {
-    return;
+    throw new WorkspaceLockOwnershipLostError(
+      storeRoot,
+      "lock directory was replaced during release",
+    );
   }
   try {
     await rmdir(path);
   } catch (error) {
-    if (errorCode(error) !== "ENOENT") throw error;
+    if (systemErrorCode(error) === "ENOENT") {
+      throw new WorkspaceLockOwnershipLostError(
+        storeRoot,
+        "lock directory disappeared during final release",
+        { cause: error },
+      );
+    }
+    throw error;
   }
 }
 
-async function removeStaleStealClaim(
-  claimPath: string,
-  staleMs: number,
-  now: number,
-  identifyProcess: ProcessIdentityResolver,
-): Promise<boolean> {
-  const observed = await observeLock(claimPath);
-  if (observed === undefined) return true;
-  if (
-    !isStale(observed, staleMs, now) ||
-    !(await canRecoverOwner(observed.owner, identifyProcess))
-  ) {
-    return false;
-  }
-
-  // Reobserve the directory protocol state and inode before touching a token
-  // path or accepting an actually empty interrupted formation.
-  const confirmed = await observeLock(claimPath);
-  if (confirmed === undefined) return true;
-  if (
-    !sameLock(observed, confirmed) ||
-    !isStale(confirmed, staleMs, now) ||
-    !(await canRecoverOwner(confirmed.owner, identifyProcess))
-  ) {
-    return false;
-  }
-  if (confirmed.owner.kind === "valid") {
-    await unlinkOwnedFile(confirmed.owner.record.path);
-  }
-
-  await removeEmptyDirectory(claimPath);
-  return (await observeLock(claimPath)) === undefined;
-}
-
-async function acquireStealClaim(
-  claimPath: string,
-  staleMs: number,
-  now: number,
-  identifyProcess: ProcessIdentityResolver,
-  processIdentity: string | undefined,
-): Promise<StealClaim | undefined> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await mkdir(claimPath, { mode: 0o700 });
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") {
-        return undefined;
-      }
-      if (errorCode(error) !== "EEXIST") {
-        throw error;
-      }
-      if (
-        !(await removeStaleStealClaim(claimPath, staleMs, now, identifyProcess))
-      ) {
-        return undefined;
-      }
-      continue;
-    }
-
-    const created = await observeLock(claimPath);
-    if (created === undefined || created.owner.kind !== "empty") {
-      return undefined;
-    }
-
-    const claimOwner: LockOwner = {
-      token: randomUUID(),
-      pid: process.pid,
-      hostname: hostname(),
-      operation: "stale-lock-takeover",
-      acquiredAt: now,
-      processIdentity: processIdentity ?? null,
-    };
-    const ownerPath = join(claimPath, ownerFileName(claimOwner.token));
-    try {
-      await writeFile(ownerPath, `${JSON.stringify(claimOwner)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      const published = await observeLock(claimPath);
-      if (
-        published === undefined ||
-        published.device !== created.device ||
-        published.inode !== created.inode ||
-        published.owner.kind !== "valid" ||
-        published.owner.record.owner.token !== claimOwner.token
-      ) {
-        throw new WorkspaceLockFormationChangedError();
-      }
-      return { path: claimPath, ownerPath };
-    } catch (error) {
-      await unlinkOwnedFile(ownerPath);
-      await removeDirectoryIfSame(claimPath, created);
-      if (errorCode(error) === "ENOENT") {
-        return undefined;
-      }
-      if (error instanceof WorkspaceLockFormationChangedError) {
-        return undefined;
-      }
-      throw error;
-    }
-  }
-  return undefined;
-}
-
-async function releaseStealClaim(claim: StealClaim): Promise<void> {
-  await unlinkOwnedFile(claim.ownerPath);
-  await removeEmptyDirectory(claim.path);
-}
-
-/**
- * Remove an orphaned cooperative lock. An adjacent claim keyed to the
- * observed lock identity serializes stale takeover attempts before the
- * directory rename. Without it, two contenders can both observe owner A,
- * then the slower one can rename and delete a fresh lock B installed by the
- * faster contender.
- */
-async function stealIfOrphaned(
-  lockPath: string,
-  staleMs: number,
-  now: number,
-  identifyProcess: ProcessIdentityResolver,
-  processIdentity: string | undefined,
-): Promise<boolean> {
-  const initial = await observeLock(lockPath);
-  if (initial === undefined) {
-    return true;
-  }
-  if (
-    !isStale(initial, staleMs, now) ||
-    !(await canRecoverOwner(initial.owner, identifyProcess))
-  ) {
-    return false;
-  }
-
-  const claim = await acquireStealClaim(
-    stealClaimPath(lockPath, initial),
-    staleMs,
-    now,
-    identifyProcess,
-    processIdentity,
-  );
-  if (claim === undefined) {
-    return (await observeLock(lockPath)) === undefined;
-  }
-
-  const orphanPath = `${lockPath}.orphan-${randomUUID()}`;
-  try {
-    const confirmed = await observeLock(lockPath);
-    if (confirmed === undefined) {
-      return true;
-    }
-    if (
-      !sameLock(initial, confirmed) ||
-      !isStale(confirmed, staleMs, now) ||
-      !(await canRecoverOwner(confirmed.owner, identifyProcess))
-    ) {
-      return false;
-    }
-
-    try {
-      await rename(lockPath, orphanPath);
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") {
-        return true;
-      }
-      throw error;
-    }
-  } finally {
-    await releaseStealClaim(claim);
-  }
-
-  await rm(orphanPath, { recursive: true, force: true });
-  return true;
-}
-
-function validateTimingOptions(
-  timeoutMs: number,
-  heartbeatMs: number,
-  staleMs: number,
-): void {
-  if (
-    !Number.isFinite(timeoutMs) ||
-    timeoutMs < 0 ||
-    !Number.isFinite(heartbeatMs) ||
-    heartbeatMs <= 0 ||
-    !Number.isFinite(staleMs) ||
-    staleMs <= heartbeatMs
-  ) {
+function validateTimingOptions(timeoutMs: number): void {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new RangeError("invalid workspace lock timing options");
   }
 }
 
-async function unlinkOwnedFile(path: string): Promise<void> {
+async function unlinkExactProtocolFile(
+  path: string,
+  expected: ProtocolFileObservation,
+  state: WorkspaceWriteAuthorityState,
+  label: string,
+): Promise<void> {
+  let current: Stats;
+  try {
+    current = await lstat(path);
+  } catch (cause) {
+    throw ownershipLoss(state, `${label} disappeared during release`, cause);
+  }
+  if (!sameProtocolFile(expected, current)) {
+    throw ownershipLoss(state, `${label} was replaced during release`);
+  }
   try {
     await unlink(path);
-  } catch (error) {
-    if (errorCode(error) !== "ENOENT") {
-      throw error;
+  } catch (cause) {
+    if (systemErrorCode(cause) === "ENOENT") {
+      throw ownershipLoss(state, `${label} disappeared during unlink`, cause);
     }
+    throw cause;
   }
 }
 
@@ -765,32 +662,32 @@ export async function acquireWorkspaceLock(
   options: WorkspaceLockOptions = {},
 ): Promise<WorkspaceLock> {
   const timeoutMs = options.timeoutMs ?? 5_000;
-  const heartbeatMs = options.heartbeatMs ?? 5_000;
-  const staleMs = options.staleMs ?? 30_000;
-  const now = options.now ?? Date.now;
-  const identifyProcess = options.identifyProcess ?? defaultProcessIdentity;
-  validateTimingOptions(timeoutMs, heartbeatMs, staleMs);
+  validateTimingOptions(timeoutMs);
 
-  const lockPath = join(resolve(storeRoot), LOCK_DIRECTORY);
-  const wallStartedAt = now();
-  if (!Number.isFinite(wallStartedAt)) {
-    throw new RangeError("workspace lock clock returned a non-finite value");
-  }
+  const binding = await bindStoreRoot(storeRoot);
+  const lockPath = join(binding.path, LOCK_DIRECTORY);
+  const wallStartedAt = Date.now();
   const monotonicStartedAt = performance.now();
-  const processIdentity = await identifyCurrentProcess(options.identifyProcess);
   const owner: LockOwner = {
     token: randomUUID(),
     pid: process.pid,
     hostname: hostname(),
     operation,
     acquiredAt: wallStartedAt,
-    processIdentity: processIdentity ?? null,
   };
   const ownerPath = join(lockPath, ownerFileName(owner.token));
-  const heartbeatPath = join(lockPath, heartbeatFileName(owner.token));
 
   let acquired: LockObservation | undefined;
+  let acquiredOwnerFile: ProtocolFileObservation | undefined;
+  let firstAttempt = true;
   while (acquired === undefined) {
+    if (!firstAttempt) {
+      const elapsed = performance.now() - monotonicStartedAt;
+      if (elapsed >= timeoutMs) {
+        throw new WorkspaceLockTimeoutError(operation, timeoutMs, lockPath);
+      }
+    }
+    firstAttempt = false;
     try {
       await mkdir(lockPath, { mode: 0o700 });
       const created = await observeLock(lockPath);
@@ -803,25 +700,26 @@ export async function acquireWorkspaceLock(
           flag: "wx",
           mode: 0o600,
         });
-        await writeFile(heartbeatPath, "", {
-          encoding: "utf8",
-          flag: "wx",
-          mode: 0o600,
-        });
         const published = await observeLock(lockPath);
+        const publishedOwner = await lstat(ownerPath);
         if (
           published === undefined ||
           published.device !== created.device ||
           published.inode !== created.inode ||
           published.owner.kind !== "valid" ||
-          published.owner.record.owner.token !== owner.token
+          published.owner.record.owner.token !== owner.token ||
+          !publishedOwner.isFile() ||
+          publishedOwner.isSymbolicLink() ||
+          publishedOwner.nlink !== 1
         ) {
           throw new WorkspaceLockFormationChangedError();
         }
         acquired = published;
+        acquiredOwnerFile = protocolFileObservation(publishedOwner);
       } catch (error) {
-        await unlinkOwnedFile(heartbeatPath);
-        await unlinkOwnedFile(ownerPath);
+        // A formation failure cannot safely unlink through the fixed pathname:
+        // an external replacement may already own it. Remove only an unchanged
+        // empty directory; otherwise preserve the residue and fail closed.
         await removeDirectoryIfSame(lockPath, created);
         if (error instanceof WorkspaceLockFormationChangedError) {
           continue;
@@ -832,94 +730,109 @@ export async function acquireWorkspaceLock(
       if (error instanceof WorkspaceLockFormationChangedError) {
         continue;
       }
-      if (errorCode(error) !== "EEXIST") {
+      if (systemErrorCode(error) !== "EEXIST") {
         throw error;
       }
-      const current = now();
-      if (!Number.isFinite(current)) {
-        throw new RangeError(
-          "workspace lock clock returned a non-finite value",
-        );
+      // Automatic stale takeover is deliberately disabled. Renaming a fixed
+      // lock pathname cannot be conditioned on the inode observed earlier, so
+      // an old contender could otherwise move and delete a fresh successor.
+      let observed: LockObservation | undefined;
+      try {
+        observed = await observeLock(lockPath);
+      } catch (error) {
+        // Windows can briefly deny directory enumeration while the current
+        // owner removes the lock. We still cannot acquire through that state,
+        // so treat it as contention and let the shared deadline bound retries.
+        if (isTransientContentionObservationError(error)) {
+          const elapsed = performance.now() - monotonicStartedAt;
+          if (elapsed < timeoutMs) {
+            await wait(Math.min(50, Math.max(1, timeoutMs - elapsed)));
+          }
+          continue;
+        }
+        throw error;
       }
-      if (
-        await stealIfOrphaned(
-          lockPath,
-          staleMs,
-          current,
-          identifyProcess,
-          processIdentity,
-        )
-      ) {
+      if (observed === undefined) {
         continue;
       }
       const elapsed = performance.now() - monotonicStartedAt;
-      if (elapsed >= timeoutMs) {
-        throw new WorkspaceLockTimeoutError(operation, timeoutMs);
+      if (elapsed < timeoutMs) {
+        await wait(Math.min(50, Math.max(1, timeoutMs - elapsed)));
       }
-      await wait(Math.min(50, Math.max(1, timeoutMs - elapsed)));
     }
   }
 
-  let releaseRequested = false;
-  let releaseInFlight: Promise<void> | undefined;
-  let heartbeatInFlight: Promise<void> | undefined;
-  const refreshHeartbeat = (): void => {
-    if (heartbeatInFlight !== undefined || releaseRequested) {
-      return;
-    }
-    const value = now();
-    if (!Number.isFinite(value)) {
-      return;
-    }
-    const time = new Date(value);
-    heartbeatInFlight = utimes(heartbeatPath, time, time)
-      .catch(() => {})
-      .finally(() => {
-        heartbeatInFlight = undefined;
-      });
-  };
-  const heartbeat = setInterval(refreshHeartbeat, heartbeatMs);
-  heartbeat.unref();
+  if (acquiredOwnerFile === undefined) {
+    throw new WorkspaceLockFormationChangedError();
+  }
 
-  return {
+  const authority = Object.freeze({}) as WorkspaceWriteAuthority;
+  const authorityState: WorkspaceWriteAuthorityState = {
+    binding,
+    lockPath,
+    lock: acquired,
+    owner,
+    ownerPath,
+    ownerFile: acquiredOwnerFile,
+    phase: { kind: "active" },
+  };
+  workspaceWriteAuthorityStates.set(authority, authorityState);
+
+  let releaseInFlight: Promise<void> | undefined;
+
+  const lock: WorkspaceLock = {
     operation,
     acquiredAt: owner.acquiredAt,
     async release(): Promise<void> {
       if (releaseInFlight !== undefined) {
         return releaseInFlight;
       }
-      releaseRequested = true;
+      closeWorkspaceWriteAuthority(authorityState);
       releaseInFlight = (async () => {
-        clearInterval(heartbeat);
-        await heartbeatInFlight;
-
         const current = await observeLock(lockPath);
+        if (current === undefined) {
+          throw ownershipLoss(
+            authorityState,
+            "lock directory disappeared before release",
+          );
+        }
         if (
-          current === undefined ||
           current.device !== acquired.device ||
-          current.inode !== acquired.inode ||
-          (current.owner.kind === "valid" &&
-            current.owner.record.owner.token !== owner.token)
+          current.inode !== acquired.inode
         ) {
-          return;
+          throw ownershipLoss(
+            authorityState,
+            "lock directory was replaced before release",
+          );
+        }
+        if (current.owner.kind !== "valid") {
+          throw ownershipLoss(
+            authorityState,
+            `owner state became ${current.owner.kind} before release`,
+          );
+        }
+        if (current.owner.record.owner.token !== owner.token) {
+          throw ownershipLoss(
+            authorityState,
+            "owner token changed before release",
+          );
         }
 
-        // Every removable path includes our random token. If the fixed lock
-        // path has been replaced, these unlinks cannot remove the new owner's
-        // files; the final non-recursive rmdir also refuses to remove a
-        // non-empty lock.
-        await unlinkOwnedFile(heartbeatPath);
-        await unlinkOwnedFile(ownerPath);
-        await releaseDirectoryIfSame(lockPath, acquired);
+        await unlinkExactProtocolFile(
+          ownerPath,
+          authorityState.ownerFile,
+          authorityState,
+          "owner record",
+        );
+        await options.beforeFinalRelease?.();
+        await releaseDirectoryIfSame(lockPath, acquired, binding.path);
       })();
       return releaseInFlight;
     },
   };
+  workspaceLockAuthorities.set(lock, authority);
+  return lock;
 }
-
-export type WorkspaceLockCleanup =
-  | { readonly kind: "released" }
-  | { readonly kind: "failed"; readonly cause: unknown };
 
 /**
  * Preserve the action effect independently from lock cleanup. Acquisition still
@@ -930,30 +843,38 @@ export type WorkspaceLockExecution<T> =
   | {
       readonly kind: "completed";
       readonly value: T;
-      readonly cleanup: WorkspaceLockCleanup;
+      readonly cleanup: CleanupSettlement;
     }
   | {
       readonly kind: "action-failed";
       readonly cause: unknown;
-      readonly cleanup: WorkspaceLockCleanup;
+      readonly cleanup: CleanupSettlement;
     };
 
 export async function runWithWorkspaceLock<T>(
   storeRoot: string,
   operation: string,
-  action: () => Promise<T>,
+  action: (authority: WorkspaceWriteAuthority) => Promise<T>,
   options?: WorkspaceLockOptions,
 ): Promise<WorkspaceLockExecution<T>> {
   const lock = await acquireWorkspaceLock(storeRoot, operation, options);
+  const authority = workspaceLockAuthorities.get(lock);
+  if (authority === undefined) {
+    throw new WorkspaceLockOwnershipLostError(
+      resolve(storeRoot),
+      "acquisition did not produce a write authority",
+    );
+  }
   let actionResult:
     | { readonly kind: "completed"; readonly value: T }
     | { readonly kind: "action-failed"; readonly cause: unknown };
   try {
-    actionResult = { kind: "completed", value: await action() };
+    actionResult = { kind: "completed", value: await action(authority) };
   } catch (cause) {
     actionResult = { kind: "action-failed", cause };
   }
-  let cleanup: WorkspaceLockCleanup = { kind: "released" };
+  closeWorkspaceWriteAuthority(workspaceWriteAuthorityStates.get(authority)!);
+  let cleanup: CleanupSettlement = { kind: "settled" };
   try {
     await lock.release();
   } catch (cause) {
@@ -965,7 +886,7 @@ export async function runWithWorkspaceLock<T>(
 export async function withWorkspaceLock<T>(
   storeRoot: string,
   operation: string,
-  action: () => Promise<T>,
+  action: (authority: WorkspaceWriteAuthority) => Promise<T>,
   options?: WorkspaceLockOptions,
 ): Promise<T> {
   const execution = await runWithWorkspaceLock(
@@ -975,10 +896,10 @@ export async function withWorkspaceLock<T>(
     options,
   );
   if (execution.kind === "completed") {
-    if (execution.cleanup.kind === "released") return execution.value;
+    if (execution.cleanup.kind === "settled") return execution.value;
     throw execution.cleanup.cause;
   }
-  if (execution.cleanup.kind === "released") throw execution.cause;
+  if (execution.cleanup.kind === "settled") throw execution.cause;
   throw new AggregateError(
     [execution.cause, execution.cleanup.cause],
     "workspace-lock operation and cleanup both failed",
@@ -991,12 +912,21 @@ export interface OrderedWorkspaceLockTarget {
   readonly options?: WorkspaceLockOptions;
 }
 
+/** Canonical store root to its one physically deduplicated write authority. */
+export type OrderedWorkspaceAuthorities = ReadonlyMap<
+  string,
+  WorkspaceWriteAuthority
+>;
+
+interface BoundOrderedWorkspaceLockTarget extends OrderedWorkspaceLockTarget {
+  readonly binding: DirectoryObservation;
+}
+
 export type OrderedWorkspaceLockCleanup =
-  | { readonly kind: "released" }
-  | {
-      readonly kind: "failed";
+  | Extract<CleanupSettlement, { readonly kind: "settled" }>
+  | (Extract<CleanupSettlement, { readonly kind: "failed" }> & {
       readonly failures: readonly OrderedWorkspaceLockReleaseError[];
-    };
+    });
 
 export type OrderedWorkspaceLockExecution<T> =
   | {
@@ -1010,17 +940,42 @@ export type OrderedWorkspaceLockExecution<T> =
       readonly cleanup: OrderedWorkspaceLockCleanup;
     };
 
-function orderedTargets(
+async function orderedTargets(
   targets: readonly OrderedWorkspaceLockTarget[],
-): readonly OrderedWorkspaceLockTarget[] {
-  const unique = new Map<string, OrderedWorkspaceLockTarget>();
+): Promise<readonly BoundOrderedWorkspaceLockTarget[]> {
+  const unique = new Map<string, BoundOrderedWorkspaceLockTarget>();
   for (const target of targets) {
-    const storeRoot = resolve(target.storeRoot);
-    if (!unique.has(storeRoot)) unique.set(storeRoot, { ...target, storeRoot });
+    let binding: DirectoryObservation;
+    try {
+      binding = await bindStoreRoot(target.storeRoot);
+    } catch (cause) {
+      throw new OrderedWorkspaceLockAcquisitionError(
+        resolve(target.storeRoot),
+        cause,
+      );
+    }
+    const physicalIdentity = `${binding.device}:${binding.inode}`;
+    if (!unique.has(physicalIdentity)) {
+      unique.set(physicalIdentity, {
+        ...target,
+        storeRoot: binding.path,
+        binding,
+      });
+    }
   }
   return [...unique.values()].sort((left, right) =>
-    Buffer.from(left.storeRoot).compare(Buffer.from(right.storeRoot)),
+    compareWorkspaceLockPhysicalOrder(left.binding, right.binding),
   );
+}
+
+/** @internal Pure ordering seam for physical-identity regression tests. */
+export function compareWorkspaceLockPhysicalOrder(
+  left: PhysicalWorkspaceOrderKey,
+  right: PhysicalWorkspaceOrderKey,
+): number {
+  if (left.device !== right.device) return left.device < right.device ? -1 : 1;
+  if (left.inode !== right.inode) return left.inode < right.inode ? -1 : 1;
+  return Buffer.from(left.path).compare(Buffer.from(right.path));
 }
 
 async function releaseOrderedLocks(
@@ -1029,6 +984,14 @@ async function releaseOrderedLocks(
     readonly lock: WorkspaceLock;
   }[],
 ): Promise<OrderedWorkspaceLockCleanup> {
+  for (const member of acquired) {
+    const authority = workspaceLockAuthorities.get(member.lock);
+    if (authority !== undefined) {
+      closeWorkspaceWriteAuthority(
+        workspaceWriteAuthorityStates.get(authority)!,
+      );
+    }
+  }
   const failures: OrderedWorkspaceLockReleaseError[] = [];
   for (let index = acquired.length - 1; index >= 0; index -= 1) {
     const member = acquired[index]!;
@@ -1040,38 +1003,56 @@ async function releaseOrderedLocks(
       );
     }
   }
-  return failures.length === 0
-    ? { kind: "released" }
-    : { kind: "failed", failures };
+  if (failures.length === 0) return { kind: "settled" };
+  const cause =
+    failures.length === 1
+      ? failures[0]
+      : new AggregateError(failures, "ordered workspace-lock cleanup failed", {
+          cause: failures[0],
+        });
+  return { kind: "failed", cause, failures };
 }
 
 /** Acquire canonically and preserve the action result independently per cleanup root. */
 export async function runWithOrderedWorkspaceLocks<T>(
   targets: readonly OrderedWorkspaceLockTarget[],
   operation: string,
-  action: () => Promise<T>,
+  action: (authorities: OrderedWorkspaceAuthorities) => Promise<T>,
 ): Promise<OrderedWorkspaceLockExecution<T>> {
   const acquired: Array<{
-    readonly target: OrderedWorkspaceLockTarget;
+    readonly target: BoundOrderedWorkspaceLockTarget;
     readonly lock: WorkspaceLock;
   }> = [];
-  for (const target of orderedTargets(targets)) {
+  for (const target of await orderedTargets(targets)) {
     try {
-      acquired.push({
-        target,
-        lock: await acquireWorkspaceLock(
+      const lock = await acquireWorkspaceLock(
+        target.storeRoot,
+        operation,
+        target.options,
+      );
+      acquired.push({ target, lock });
+      const authority = workspaceLockAuthorities.get(lock);
+      const acquiredBinding =
+        authority === undefined
+          ? undefined
+          : workspaceWriteAuthorityStates.get(authority)?.binding;
+      if (
+        acquiredBinding === undefined ||
+        acquiredBinding.device !== target.binding.device ||
+        acquiredBinding.inode !== target.binding.inode
+      ) {
+        throw new WorkspaceLockOwnershipLostError(
           target.storeRoot,
-          operation,
-          target.options,
-        ),
-      });
+          "ordered target changed between physical ordering and acquisition",
+        );
+      }
     } catch (cause) {
       const acquisition = new OrderedWorkspaceLockAcquisitionError(
         target.storeRoot,
         cause,
       );
       const cleanup = await releaseOrderedLocks(acquired);
-      if (cleanup.kind === "released") throw acquisition;
+      if (cleanup.kind === "settled") throw acquisition;
       throw new AggregateError(
         [acquisition, ...cleanup.failures],
         "ordered workspace-lock acquisition and cleanup both failed",
@@ -1084,7 +1065,21 @@ export async function runWithOrderedWorkspaceLocks<T>(
     | { readonly kind: "completed"; readonly value: T }
     | { readonly kind: "action-failed"; readonly cause: unknown };
   try {
-    actionResult = { kind: "completed", value: await action() };
+    const authorities = new Map<string, WorkspaceWriteAuthority>();
+    for (const member of acquired) {
+      const authority = workspaceLockAuthorities.get(member.lock);
+      if (authority === undefined) {
+        throw new WorkspaceLockOwnershipLostError(
+          member.target.storeRoot,
+          "ordered acquisition did not produce a write authority",
+        );
+      }
+      authorities.set(member.target.storeRoot, authority);
+    }
+    actionResult = {
+      kind: "completed",
+      value: await action(authorities),
+    };
   } catch (cause) {
     actionResult = { kind: "action-failed", cause };
   }
@@ -1095,7 +1090,7 @@ export async function runWithOrderedWorkspaceLocks<T>(
 export async function withOrderedWorkspaceLocks<T>(
   targets: readonly OrderedWorkspaceLockTarget[],
   operation: string,
-  action: () => Promise<T>,
+  action: (authorities: OrderedWorkspaceAuthorities) => Promise<T>,
 ): Promise<T> {
   const execution = await runWithOrderedWorkspaceLocks(
     targets,
@@ -1103,17 +1098,10 @@ export async function withOrderedWorkspaceLocks<T>(
     action,
   );
   if (execution.kind === "completed") {
-    if (execution.cleanup.kind === "released") return execution.value;
-    if (execution.cleanup.failures.length === 1) {
-      throw execution.cleanup.failures[0];
-    }
-    throw new AggregateError(
-      execution.cleanup.failures,
-      "ordered workspace-lock cleanup failed",
-      { cause: execution.cleanup.failures[0] },
-    );
+    if (execution.cleanup.kind === "settled") return execution.value;
+    throw execution.cleanup.cause;
   }
-  if (execution.cleanup.kind === "released") throw execution.cause;
+  if (execution.cleanup.kind === "settled") throw execution.cause;
   throw new AggregateError(
     [execution.cause, ...execution.cleanup.failures],
     "ordered workspace-lock operation and cleanup both failed",

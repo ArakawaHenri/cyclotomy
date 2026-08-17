@@ -10,10 +10,19 @@ export interface AllManagedWorkspaceScope {
   readonly kind: "all-managed";
 }
 
+export interface GitWorkspaceEvaluator {
+  /** Exact single-line `git --version` output used during capture. */
+  readonly version: string;
+  /** Captured `core.precomposeUnicode` value. */
+  readonly precomposeUnicode: boolean;
+}
+
 export interface GitWorkspaceScope {
   readonly kind: "git";
   /** Repository-relative workspace directory; the repository root is "". */
   readonly repositoryPrefix: string;
+  /** Evaluator facts captured with v3, or null after a legacy tree upgrade. */
+  readonly evaluator: GitWorkspaceEvaluator | null;
   readonly ignoreCase: boolean;
   /** Repository/worktree `.gitignore` files relevant to this workspace. */
   readonly gitignoreSources: readonly WorkspaceGitignoreSource[];
@@ -29,6 +38,7 @@ export type WorkspaceScope = AllManagedWorkspaceScope | GitWorkspaceScope;
 export const MAX_GITIGNORE_SOURCES = 100_000;
 export const MAX_GITIGNORE_SOURCE_BYTES = 256 * 1024;
 export const MAX_GITIGNORE_POLICY_BYTES = 16 * 1024 * 1024;
+export const MAX_GIT_VERSION_BYTES = 256;
 /**
  * Defaults for newly observed/published paths. Configuration may lower or
  * raise them within the absolute parser ceilings below.
@@ -195,7 +205,60 @@ function decodeCanonicalBase64(value: unknown, label: string): Buffer {
   if (decoded.byteLength > MAX_GITIGNORE_SOURCE_BYTES) {
     return invalidScope(`${label} exceeds the per-source byte limit`);
   }
+  if (decoded.includes(0x00)) {
+    const hasWideTextBom =
+      (decoded[0] === 0xff && decoded[1] === 0xfe) ||
+      (decoded[0] === 0xfe && decoded[1] === 0xff) ||
+      (decoded[0] === 0x00 &&
+        decoded[1] === 0x00 &&
+        decoded[2] === 0xfe &&
+        decoded[3] === 0xff);
+    return invalidScope(
+      hasWideTextBom
+        ? `${label} contains NUL bytes and appears to be UTF-16/UTF-32; save the policy file as UTF-8 or another NUL-free encoding`
+        : `${label} contains a NUL byte; Git policy files must be NUL-free`,
+    );
+  }
   return decoded;
+}
+
+function canonicalGitVersion(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") > MAX_GIT_VERSION_BYTES ||
+    [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 0x20 || code > 0x7e;
+    })
+  ) {
+    return invalidScope(
+      "Git version must be a non-empty printable ASCII line of at most 256 bytes",
+    );
+  }
+  return value;
+}
+
+function canonicalGitEvaluator(value: unknown): GitWorkspaceEvaluator | null {
+  if (value === null) return null;
+  if (
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !exactKeys(value as Record<string, unknown>, [
+      "version",
+      "precomposeUnicode",
+    ])
+  ) {
+    return invalidScope("Git evaluator provenance has an invalid shape");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.precomposeUnicode !== "boolean") {
+    return invalidScope("Git evaluator provenance has an invalid shape");
+  }
+  return {
+    version: canonicalGitVersion(candidate.version),
+    precomposeUnicode: candidate.precomposeUnicode,
+  };
 }
 
 function sourceIsRelevant(path: string, repositoryPrefix: string): boolean {
@@ -270,6 +333,7 @@ export function canonicalizeWorkspaceScope(
     !exactKeys(candidate, [
       "kind",
       "repositoryPrefix",
+      "evaluator",
       "ignoreCase",
       "gitignoreSources",
       "infoExcludeBase64",
@@ -289,6 +353,7 @@ export function canonicalizeWorkspaceScope(
     true,
     limits,
   );
+  const evaluator = canonicalGitEvaluator(candidate.evaluator);
   let totalBytes = 0;
   const decodeBudgeted = (encoded: unknown, label: string): string => {
     const decoded = decodeCanonicalBase64(encoded, label);
@@ -346,6 +411,7 @@ export function canonicalizeWorkspaceScope(
   return {
     kind: "git",
     repositoryPrefix,
+    evaluator,
     ignoreCase: candidate.ignoreCase,
     gitignoreSources,
     infoExcludeBase64,

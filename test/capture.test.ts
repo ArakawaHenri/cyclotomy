@@ -28,10 +28,15 @@ import {
 } from "../src/infrastructure/object-store.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import {
+  bindTestMetadataWriteAuthority,
   checkpointState,
   commitTestNodeState,
   registerTestSession,
 } from "./metadata-fixture.ts";
+import {
+  holdTestWorkspaceWriteAuthority,
+  releaseTestWorkspaceWriteAuthorities,
+} from "./workspace-write-authority-fixture.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -117,18 +122,25 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await releaseTestWorkspaceWriteAuthorities();
   await rm(root, { recursive: true, force: true });
   await rm(storeRoot, { recursive: true, force: true });
 });
 
 async function openDeps() {
   const store = await openObjectStore(storeRoot);
-  const metadata = createCurrentMetadataStore(join(storeRoot, "state.db"));
+  const writeAuthority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  const metadata = createCurrentMetadataStore(
+    join(storeRoot, "state.db"),
+    writeAuthority,
+  );
+  bindTestMetadataWriteAuthority(metadata, writeAuthority, storeRoot);
   const expectedSessionFile = "/test-sessions/s1.jsonl";
   registerTestSession(metadata, "s1", expectedSessionFile);
   return {
     store,
     metadata,
+    writeAuthority,
     expectedRootPath: await realpath(root),
     expectedSessionFile,
     assertWorkspaceAuthority: () => undefined,
@@ -466,9 +478,11 @@ describe("captureNodeState", () => {
             policyChanged = true;
             return publication.publishTree(entries, scope);
           },
+          close: () => publication.close(),
         };
       },
       readBlob: (oid) => baseStore.readBlob(oid),
+      streamBlob: (oid, sink) => baseStore.streamBlob(oid, sink),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
@@ -526,7 +540,7 @@ describe("captureNodeState", () => {
       "root",
       "leaf",
     ]);
-    deps.metadata.raiseSessionBarrier({
+    deps.metadata.raiseSessionBarrier(deps.writeAuthority, {
       sessionId: "s1",
       sessionFile: deps.expectedSessionFile,
     });
@@ -586,8 +600,8 @@ describe("captureNodeState", () => {
   });
 
   it("never captures .git internals", async () => {
-    await mkdir(join(root, ".git", "objects"), { recursive: true });
-    await writeFile(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await execFileAsync("git", ["-C", root, "init", "-q"]);
+    await writeFile(join(root, ".git", "objects", "cyclotomy-secret"), "x");
     await writeFile(join(root, "tracked.txt"), "x");
     const deps = await openDeps();
 

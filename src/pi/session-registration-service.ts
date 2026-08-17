@@ -18,6 +18,8 @@ import {
   type CyclotomyConfig,
 } from "../config.ts";
 import type { TreeOid } from "../domain/model.ts";
+import { retainFailureCause } from "../infrastructure/failure-settlement.ts";
+import { systemErrorCode } from "../infrastructure/system-error.ts";
 import {
   inspectMetadataSessionIdentity,
   openAuthenticatedCurrentMetadataStore,
@@ -30,15 +32,11 @@ import {
   TreeImportAdmissionError,
   type NativeObjectStore,
 } from "../infrastructure/object-store.ts";
-import {
-  TreeManifestError,
-  type TreeManifest,
-} from "../infrastructure/tree-formats/manifest-codec.ts";
+import { TreeManifestError } from "../infrastructure/tree-formats/manifest-codec.ts";
 import {
   createCurrentTreeManifest,
-  encodeCurrentTreeManifest,
+  type CurrentTreeManifest,
 } from "../infrastructure/tree-formats/current.ts";
-import { upgradeTreeManifestToCurrent } from "../infrastructure/tree-formats/history.ts";
 import {
   TreeScopeMismatchError,
   validateTreeEntriesAgainstScope,
@@ -46,6 +44,7 @@ import {
 import {
   runWithOrderedWorkspaceLocks,
   runWithWorkspaceLock,
+  type WorkspaceWriteAuthority,
 } from "../infrastructure/workspace-lock.ts";
 import { workspaceStorePath } from "../infrastructure/workspace-store.ts";
 import {
@@ -255,12 +254,6 @@ type RegistrationExecution =
       readonly disposition: SessionRegistrationDisposition;
       readonly cause: unknown;
     };
-
-function systemErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
-}
 
 function preparationMatchesView(
   preparation: SessionRegistrationPreparation,
@@ -879,19 +872,23 @@ export class SessionRegistrationService {
     const migration = await runWithWorkspaceLock(
       root,
       "tree-format-migrate",
-      () =>
-        openCurrentMetadataStore(join(root, "state.db"), {
-          prepareTreeOidUpgrades: (roots, targetFormat) =>
-            prepareTreeOidUpgrades(store, roots, targetFormat),
-        }),
+      (writeAuthority) =>
+        openCurrentMetadataStore(
+          join(root, "state.db"),
+          {
+            prepareTreeOidUpgrades: (roots, targetFormat) =>
+              prepareTreeOidUpgrades(store, roots, targetFormat),
+          },
+          writeAuthority,
+        ),
       config.lock,
     );
     if (migration.kind === "action-failed") {
-      if (migration.cleanup.kind === "released") throw migration.cause;
-      throw new AggregateError(
-        [migration.cause, migration.cleanup.cause],
+      if (migration.cleanup.kind === "settled") throw migration.cause;
+      throw retainFailureCause(
+        migration.cause,
+        migration.cleanup.cause,
         "metadata migration and workspace-lock cleanup both failed",
-        { cause: migration.cause },
       );
     }
     const metadata = migration.value;
@@ -1136,7 +1133,7 @@ export class SessionRegistrationService {
 
   async #validateImportedManifest(
     treeOid: TreeOid,
-    manifest: TreeManifest,
+    manifest: CurrentTreeManifest,
   ): Promise<
     | { readonly kind: "accepted" }
     | { readonly kind: "rejected"; readonly cause: unknown }
@@ -1150,13 +1147,11 @@ export class SessionRegistrationService {
     };
     let canonical: ReturnType<typeof createCurrentTreeManifest>;
     try {
-      const current = upgradeTreeManifestToCurrent(manifest, limits);
       canonical = createCurrentTreeManifest(
-        current.entries,
-        current.scope,
+        manifest.entries,
+        manifest.scope,
         limits,
       );
-      encodeCurrentTreeManifest(canonical, limits);
     } catch (cause) {
       if (!(cause instanceof TreeManifestError)) throw cause;
       return rejectedImport(cause);
@@ -1210,9 +1205,14 @@ export class SessionRegistrationService {
   }
 
   #commitTarget(
+    writeAuthority: WorkspaceWriteAuthority,
     input: RegistrationTarget,
     readCurrentView: () => SessionView,
     plan: RegistrationPlan,
+    sourceAuthority?: {
+      readonly authority: WorkspaceWriteAuthority;
+      readonly storeRoot: string;
+    },
   ): CommittedRegistration {
     const { view, workspaceBinding, targetSessionFile } = input;
     this.#assertSnapshotStillCurrent(view, readCurrentView);
@@ -1223,18 +1223,27 @@ export class SessionRegistrationService {
       "Cyclotomy workspace store",
     );
     this.#assertOpen("session registration");
-    const report = this.context.metadata.finalizeSessionProjection({
-      targetSessionId: view.sessionId,
-      targetSessionFile,
-      retainedEntryIds: view.stableEntryIds,
-      activeAncestryEntryIds: view.activeStableAncestryIds,
-      seed:
-        plan.kind === "inherit"
-          ? { kind: "fork", projection: plan.projection }
-          : plan.kind === "fresh"
-            ? { kind: "fresh" }
-            : { kind: "untrusted-parent" },
-    });
+    const report = this.context.metadata.finalizeSessionProjection(
+      writeAuthority,
+      {
+        targetSessionId: view.sessionId,
+        targetSessionFile,
+        retainedEntryIds: view.stableEntryIds,
+        activeAncestryEntryIds: view.activeStableAncestryIds,
+        seed:
+          plan.kind === "inherit"
+            ? { kind: "fork", projection: plan.projection }
+            : plan.kind === "fresh"
+              ? { kind: "fresh" }
+              : { kind: "untrusted-parent" },
+      },
+      plan.kind === "inherit"
+        ? (sourceAuthority ?? {
+            authority: writeAuthority,
+            storeRoot: this.context.storeRoot,
+          })
+        : sourceAuthority,
+    );
     const disposition: SessionRegistrationDisposition =
       report.kind === "existing"
         ? { kind: "existing" }
@@ -1247,6 +1256,7 @@ export class SessionRegistrationService {
   }
 
   #finishExistingTarget(
+    writeAuthority: WorkspaceWriteAuthority,
     input: RegistrationTarget,
     readCurrentView: () => SessionView,
   ): CommittedRegistration | undefined {
@@ -1260,10 +1270,13 @@ export class SessionRegistrationService {
         "Pi session identity conflicts with registered Cyclotomy metadata",
       );
     }
-    return this.#commitTarget(input, readCurrentView, { kind: "fresh" });
+    return this.#commitTarget(writeAuthority, input, readCurrentView, {
+      kind: "fresh",
+    });
   }
 
   async #registerTarget(
+    writeAuthority: WorkspaceWriteAuthority,
     input: RegistrationTarget,
     readCurrentView: () => SessionView,
     plan: RegistrationPlan,
@@ -1273,7 +1286,7 @@ export class SessionRegistrationService {
       readCurrentView,
       input.workspaceBinding,
     );
-    return this.#commitTarget(input, readCurrentView, plan);
+    return this.#commitTarget(writeAuthority, input, readCurrentView, plan);
   }
 
   async #commitQuarantineWithTargetLock(
@@ -1285,15 +1298,15 @@ export class SessionRegistrationService {
     const execution = await runWithWorkspaceLock(
       storeRoot,
       "session-register-quarantined-fork",
-      async () => {
+      async (writeAuthority) => {
         await this.#assertStillCurrent(
           input.view,
           readCurrentView,
           input.workspaceBinding,
         );
         return (
-          this.#finishExistingTarget(input, readCurrentView) ??
-          (await this.#registerTarget(input, readCurrentView, {
+          this.#finishExistingTarget(writeAuthority, input, readCurrentView) ??
+          (await this.#registerTarget(writeAuthority, input, readCurrentView, {
             kind: "quarantine",
             rejection: value,
           }))
@@ -1302,14 +1315,14 @@ export class SessionRegistrationService {
       config.lock,
     );
     if (execution.kind === "action-failed") {
-      if (execution.cleanup.kind === "released") throw execution.cause;
-      throw new AggregateError(
-        [execution.cause, execution.cleanup.cause],
+      if (execution.cleanup.kind === "settled") throw execution.cause;
+      throw retainFailureCause(
+        execution.cause,
+        execution.cleanup.cause,
         "fork quarantine and target lock cleanup both failed",
-        { cause: execution.cause },
       );
     }
-    if (execution.cleanup.kind === "released") return execution.value;
+    if (execution.cleanup.kind === "settled") return execution.value;
     return {
       kind: "durable-but-inactive",
       disposition: execution.value.disposition,
@@ -1335,7 +1348,9 @@ export class SessionRegistrationService {
     const initialExecution = await runWithWorkspaceLock(
       storeRoot,
       "session-register",
-      async (): Promise<
+      async (
+        writeAuthority,
+      ): Promise<
         | {
             readonly kind: "complete";
             readonly outcome: CommittedRegistration;
@@ -1343,25 +1358,39 @@ export class SessionRegistrationService {
         | { readonly kind: "external"; readonly source: ForkSourceLocation }
       > => {
         await this.#assertStillCurrent(view, readCurrentView, workspaceBinding);
-        const existing = this.#finishExistingTarget(input, readCurrentView);
+        const existing = this.#finishExistingTarget(
+          writeAuthority,
+          input,
+          readCurrentView,
+        );
         if (existing !== undefined) {
           return { kind: "complete", outcome: existing };
         }
         if (prepared.kind === "independent") {
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "fresh",
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "fresh",
+              },
+            ),
           };
         }
         if (prepared.kind === "rejected") {
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "quarantine",
-              rejection: prepared.rejection,
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: prepared.rejection,
+              },
+            ),
           };
         }
         if (prepared.kind === "indeterminate") throw prepared.cause;
@@ -1374,13 +1403,18 @@ export class SessionRegistrationService {
           if (localIdentity === "conflict") {
             return {
               kind: "complete",
-              outcome: await this.#registerTarget(input, readCurrentView, {
-                kind: "quarantine",
-                rejection: rejection(
-                  "source-registration-conflict",
-                  "Cyclotomy parent registration does not match Pi",
-                ),
-              }),
+              outcome: await this.#registerTarget(
+                writeAuthority,
+                input,
+                readCurrentView,
+                {
+                  kind: "quarantine",
+                  rejection: rejection(
+                    "source-registration-conflict",
+                    "Cyclotomy parent registration does not match Pi",
+                  ),
+                },
+              ),
             };
           }
           if (localIdentity === "exact") {
@@ -1391,10 +1425,15 @@ export class SessionRegistrationService {
             if (localSource === undefined) {
               return {
                 kind: "complete",
-                outcome: await this.#registerTarget(input, readCurrentView, {
-                  kind: "quarantine",
-                  rejection: unverifiedSourceRegistration(),
-                }),
+                outcome: await this.#registerTarget(
+                  writeAuthority,
+                  input,
+                  readCurrentView,
+                  {
+                    kind: "quarantine",
+                    rejection: unverifiedSourceRegistration(),
+                  },
+                ),
               };
             }
             await this.#assertStillCurrent(
@@ -1411,10 +1450,15 @@ export class SessionRegistrationService {
             if (current.kind === "rejected") {
               return {
                 kind: "complete",
-                outcome: await this.#registerTarget(input, readCurrentView, {
-                  kind: "quarantine",
-                  rejection: current.rejection,
-                }),
+                outcome: await this.#registerTarget(
+                  writeAuthority,
+                  input,
+                  readCurrentView,
+                  {
+                    kind: "quarantine",
+                    rejection: current.rejection,
+                  },
+                ),
               };
             }
             if (
@@ -1423,13 +1467,18 @@ export class SessionRegistrationService {
             ) {
               return {
                 kind: "complete",
-                outcome: await this.#registerTarget(input, readCurrentView, {
-                  kind: "quarantine",
-                  rejection: rejection(
-                    "parent-claim-changed",
-                    "Pi parent session changed during fork registration",
-                  ),
-                }),
+                outcome: await this.#registerTarget(
+                  writeAuthority,
+                  input,
+                  readCurrentView,
+                  {
+                    kind: "quarantine",
+                    rejection: rejection(
+                      "parent-claim-changed",
+                      "Pi parent session changed during fork registration",
+                    ),
+                  },
+                ),
               };
             }
             const provenEntryIds = provenStableCoordinateIds(
@@ -1443,10 +1492,15 @@ export class SessionRegistrationService {
             if (localProjection === undefined) {
               return {
                 kind: "complete",
-                outcome: await this.#registerTarget(input, readCurrentView, {
-                  kind: "quarantine",
-                  rejection: unverifiedSourceRegistration(),
-                }),
+                outcome: await this.#registerTarget(
+                  writeAuthority,
+                  input,
+                  readCurrentView,
+                  {
+                    kind: "quarantine",
+                    rejection: unverifiedSourceRegistration(),
+                  },
+                ),
               };
             }
             if (
@@ -1455,21 +1509,31 @@ export class SessionRegistrationService {
             ) {
               return {
                 kind: "complete",
-                outcome: await this.#registerTarget(input, readCurrentView, {
-                  kind: "quarantine",
-                  rejection: rejection(
-                    "source-projection-invalid",
-                    "Cyclotomy parent registration changed during fork projection",
-                  ),
-                }),
+                outcome: await this.#registerTarget(
+                  writeAuthority,
+                  input,
+                  readCurrentView,
+                  {
+                    kind: "quarantine",
+                    rejection: rejection(
+                      "source-projection-invalid",
+                      "Cyclotomy parent registration changed during fork projection",
+                    ),
+                  },
+                ),
               };
             }
             return {
               kind: "complete",
-              outcome: this.#commitTarget(input, readCurrentView, {
-                kind: "inherit",
-                projection: localProjection,
-              }),
+              outcome: this.#commitTarget(
+                writeAuthority,
+                input,
+                readCurrentView,
+                {
+                  kind: "inherit",
+                  projection: localProjection,
+                },
+              ),
             };
           }
         }
@@ -1482,35 +1546,50 @@ export class SessionRegistrationService {
         if (revalidated.kind === "rejected") {
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "quarantine",
-              rejection: revalidated.rejection,
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: revalidated.rejection,
+              },
+            ),
           };
         }
         const source = revalidated.source;
         if (source.sourceSessionId === view.sessionId) {
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "source-registration-conflict",
-                "Pi fork source and target session ids must differ",
-              ),
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "source-registration-conflict",
+                  "Pi fork source and target session ids must differ",
+                ),
+              },
+            ),
           };
         }
         if (source.workspace === workspaceRoot) {
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "source-registration-absent",
-                "Cyclotomy parent registration is absent from its workspace",
-              ),
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "source-registration-absent",
+                  "Cyclotomy parent registration is absent from its workspace",
+                ),
+              },
+            ),
           };
         }
         try {
@@ -1519,10 +1598,15 @@ export class SessionRegistrationService {
           if (!(error instanceof ForkRejectedError)) throw error;
           return {
             kind: "complete",
-            outcome: await this.#registerTarget(input, readCurrentView, {
-              kind: "quarantine",
-              rejection: error.rejection,
-            }),
+            outcome: await this.#registerTarget(
+              writeAuthority,
+              input,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: error.rejection,
+              },
+            ),
           };
         }
         return { kind: "external", source };
@@ -1531,13 +1615,13 @@ export class SessionRegistrationService {
     );
 
     if (initialExecution.kind === "action-failed") {
-      if (initialExecution.cleanup.kind === "released") {
+      if (initialExecution.cleanup.kind === "settled") {
         throw initialExecution.cause;
       }
-      throw new AggregateError(
-        [initialExecution.cause, initialExecution.cleanup.cause],
+      throw retainFailureCause(
+        initialExecution.cause,
+        initialExecution.cleanup.cause,
         "session registration and target lock cleanup both failed",
-        { cause: initialExecution.cause },
       );
     }
     const initial = initialExecution.value;
@@ -1625,7 +1709,19 @@ export class SessionRegistrationService {
         },
       ],
       "fork-import",
-      async () => {
+      async (authorities) => {
+        const targetAuthority = authorities.get(storeRoot);
+        if (targetAuthority === undefined) {
+          throw new Error(
+            "Cyclotomy target workspace write authority is unavailable",
+          );
+        }
+        const sourceAuthority = authorities.get(authenticatedSourceStoreRoot);
+        if (sourceAuthority === undefined) {
+          throw new Error(
+            "Cyclotomy source workspace write authority is unavailable",
+          );
+        }
         await this.#assertStillCurrent(view, readCurrentView, workspaceBinding);
         if (!(await this.#targetStoreStillNamesCurrentContext())) {
           throw new Error("Cyclotomy target store changed during fork import");
@@ -1638,7 +1734,11 @@ export class SessionRegistrationService {
         ) {
           throw new Error("Cyclotomy source store changed during fork import");
         }
-        const existing = this.#finishExistingTarget(request, readCurrentView);
+        const existing = this.#finishExistingTarget(
+          targetAuthority,
+          request,
+          readCurrentView,
+        );
         if (existing !== undefined) return existing;
 
         const revalidated = await revalidatePreparedForkSource(
@@ -1647,20 +1747,30 @@ export class SessionRegistrationService {
           prepared,
         );
         if (revalidated.kind === "rejected") {
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "quarantine",
-            rejection: revalidated.rejection,
-          });
+          return this.#registerTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "quarantine",
+              rejection: revalidated.rejection,
+            },
+          );
         }
         const currentSource = revalidated.source;
         if (!sameForkSource(source, currentSource)) {
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "quarantine",
-            rejection: rejection(
-              "parent-graph-rewritten",
-              "Pi parent session changed during fork import",
-            ),
-          });
+          return this.#registerTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "quarantine",
+              rejection: rejection(
+                "parent-graph-rewritten",
+                "Pi parent session changed during fork import",
+              ),
+            },
+          );
         }
 
         let reboundSource: DirectoryBinding | undefined;
@@ -1671,10 +1781,15 @@ export class SessionRegistrationService {
           );
         } catch (error) {
           if (!(error instanceof ForkRejectedError)) throw error;
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "quarantine",
-            rejection: error.rejection,
-          });
+          return this.#registerTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "quarantine",
+              rejection: error.rejection,
+            },
+          );
         }
         if (
           reboundSource === undefined ||
@@ -1711,6 +1826,12 @@ export class SessionRegistrationService {
                 confirmed.cause,
               );
               break;
+            case "newer":
+              value = rejection(
+                "source-metadata-unrecognized",
+                `Cyclotomy parent metadata schema version ${confirmed.observedVersion} is newer than supported version ${confirmed.supportedVersion}`,
+              );
+              break;
             case "unrecognized":
               value = rejection(
                 "source-metadata-unrecognized",
@@ -1718,10 +1839,15 @@ export class SessionRegistrationService {
               );
               break;
           }
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "quarantine",
-            rejection: value,
-          });
+          return this.#registerTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "quarantine",
+              rejection: value,
+            },
+          );
         }
 
         let sourceMetadata: CurrentMetadataStore | undefined;
@@ -1745,6 +1871,7 @@ export class SessionRegistrationService {
               prepareTreeOidUpgrades: (roots, targetFormat) =>
                 prepareTreeOidUpgrades(sourceStore, roots, targetFormat),
             },
+            sourceAuthority,
           );
           const exported = sourceMetadata.exportForkProjection({
             parentSessionFile,
@@ -1772,20 +1899,30 @@ export class SessionRegistrationService {
             // Preserve the source failure that determines quarantine.
           }
           if (error instanceof TreeFormatUpgradeBlockedError) {
-            return this.#registerTarget(request, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "source-metadata-unrecognized",
-                "Cyclotomy parent tree format cannot be upgraded",
-                error,
-              ),
-            });
+            return this.#registerTarget(
+              targetAuthority,
+              request,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "source-metadata-unrecognized",
+                  "Cyclotomy parent tree format cannot be upgraded",
+                  error,
+                ),
+              },
+            );
           }
           if (!(error instanceof ForkRejectedError)) throw error;
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "quarantine",
-            rejection: error.rejection,
-          });
+          return this.#registerTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "quarantine",
+              rejection: error.rejection,
+            },
+          );
         }
 
         try {
@@ -1810,14 +1947,19 @@ export class SessionRegistrationService {
             );
           } catch (error) {
             if (!(error instanceof TreeImportAdmissionError)) throw error;
-            return this.#registerTarget(request, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "target-import-rejected",
-                "target workspace rejected the inherited checkpoint set",
-                error,
-              ),
-            });
+            return this.#registerTarget(
+              targetAuthority,
+              request,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "target-import-rejected",
+                  "target workspace rejected the inherited checkpoint set",
+                  error,
+                ),
+              },
+            );
           }
           const finalSource = await revalidatePreparedForkSource(
             this.#options.globalConfig,
@@ -1826,28 +1968,43 @@ export class SessionRegistrationService {
           );
           this.#assertSnapshotStillCurrent(view, readCurrentView);
           if (finalSource.kind === "rejected") {
-            return this.#registerTarget(request, readCurrentView, {
-              kind: "quarantine",
-              rejection: finalSource.rejection,
-            });
+            return this.#registerTarget(
+              targetAuthority,
+              request,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: finalSource.rejection,
+              },
+            );
           }
           if (!sameForkSource(currentSource, finalSource.source)) {
-            return this.#registerTarget(request, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "parent-graph-rewritten",
-                "Pi parent session changed during fork import",
-              ),
-            });
+            return this.#registerTarget(
+              targetAuthority,
+              request,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "parent-graph-rewritten",
+                  "Pi parent session changed during fork import",
+                ),
+              },
+            );
           }
           if (!projectionContainsOnly(projection, provenEntryIds)) {
-            return this.#registerTarget(request, readCurrentView, {
-              kind: "quarantine",
-              rejection: rejection(
-                "parent-graph-rewritten",
-                "Pi parent graph changed during fork import",
-              ),
-            });
+            return this.#registerTarget(
+              targetAuthority,
+              request,
+              readCurrentView,
+              {
+                kind: "quarantine",
+                rejection: rejection(
+                  "parent-graph-rewritten",
+                  "Pi parent graph changed during fork import",
+                ),
+              },
+            );
           }
           if (!(await this.#targetStoreStillNamesCurrentContext())) {
             throw new Error(
@@ -1864,10 +2021,24 @@ export class SessionRegistrationService {
               "Cyclotomy source store changed during fork import",
             );
           }
-          return this.#registerTarget(request, readCurrentView, {
-            kind: "inherit",
-            projection,
-          });
+          await this.#assertStillCurrent(
+            request.view,
+            readCurrentView,
+            request.workspaceBinding,
+          );
+          return this.#commitTarget(
+            targetAuthority,
+            request,
+            readCurrentView,
+            {
+              kind: "inherit",
+              projection,
+            },
+            {
+              authority: sourceAuthority,
+              storeRoot: authenticatedSourceStoreRoot,
+            },
+          );
         } finally {
           try {
             sourceMetadata.close();
@@ -1878,25 +2049,18 @@ export class SessionRegistrationService {
       },
     );
     if (execution.kind === "action-failed") {
-      if (execution.cleanup.kind === "released") throw execution.cause;
-      throw new AggregateError(
-        [execution.cause, ...execution.cleanup.failures],
+      if (execution.cleanup.kind === "settled") throw execution.cause;
+      throw retainFailureCause(
+        execution.cause,
+        execution.cleanup.cause,
         "fork import and ordered lock cleanup both failed",
-        { cause: execution.cause },
       );
     }
-    if (execution.cleanup.kind === "released") return execution.value;
+    if (execution.cleanup.kind === "settled") return execution.value;
     const targetCleanupFailed = execution.cleanup.failures.some(
       (failure) => failure.storeRoot === storeRoot,
     );
-    const cleanupCause =
-      execution.cleanup.failures.length === 1
-        ? execution.cleanup.failures[0]
-        : new AggregateError(
-            execution.cleanup.failures,
-            "ordered workspace-lock cleanup failed after session registration",
-            { cause: execution.cleanup.failures[0] },
-          );
+    const cleanupCause = execution.cleanup.cause;
     if (!targetCleanupFailed) {
       return {
         ...execution.value,

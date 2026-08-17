@@ -5,17 +5,20 @@ import {
   link,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   realpath,
   rm,
   symlink,
+  unlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TreeEntry } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import {
@@ -44,6 +47,19 @@ async function workspace(): Promise<string> {
   return root;
 }
 
+async function fileHandlePrototype(root: string): Promise<{
+  readonly stat: FileHandle["stat"];
+}> {
+  const path = join(root, ".file-handle-probe");
+  const probe = await open(path, "w");
+  const prototype = Object.getPrototypeOf(probe) as {
+    readonly stat: FileHandle["stat"];
+  };
+  await probe.close();
+  await unlink(path);
+  return prototype;
+}
+
 async function withSimulatedWindows<T>(action: () => Promise<T>): Promise<T> {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   if (platform === undefined) {
@@ -61,11 +77,48 @@ async function withSimulatedWindows<T>(action: () => Promise<T>): Promise<T> {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 describe("workspace scanner", () => {
+  it("keeps the read failure primary when regular-file cleanup also fails", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "file.txt"), "content");
+    const prototype = await fileHandlePrototype(root);
+    const readFailure = new Error("injected workspace read failure");
+    const cleanupFailure = new Error("injected workspace close failure");
+    let closeCalls = 0;
+    vi.spyOn(prototype, "stat").mockImplementationOnce(async function (
+      this: FileHandle,
+    ) {
+      const originalClose = this.close;
+      Object.defineProperty(this, "close", {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: async (): Promise<void> => {
+          closeCalls += 1;
+          await originalClose.call(this);
+          throw cleanupFailure;
+        },
+      });
+      throw readFailure;
+    });
+
+    const snapshot = await scanWorkspace(root);
+
+    expect(snapshot.problems).toEqual([
+      {
+        path: "file.txt",
+        kind: "read-failed",
+        detail: readFailure.message,
+      },
+    ]);
+    expect(closeCalls).toBe(1);
+  });
+
   it("accepts a workspace root reached through a symlink", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-scan-link-"));
     roots.push(parent);
@@ -95,6 +148,7 @@ describe("workspace scanner", () => {
     expect(snapshot).toEqual({
       problems: [],
       rootPath: canonicalRoot,
+      gitOracleVersion: null,
       excludedOccupancies: [],
       directoryObservations: [
         { path: "", dev: expect.any(Number), ino: expect.any(Number) },
@@ -148,8 +202,8 @@ describe("workspace scanner", () => {
 
   it("structurally excludes .git components at any depth and casing", async () => {
     const root = await workspace();
-    await mkdir(join(root, ".git"));
-    await writeFile(join(root, ".git", "config"), "secret");
+    await execFileAsync("git", ["-C", root, "init", "-q"]);
+    await writeFile(join(root, ".git", "cyclotomy-secret"), "secret");
     await mkdir(join(root, "nested"));
     await mkdir(join(root, "nested", ".GIT"));
     await writeFile(join(root, "nested", ".GIT", "HEAD"), "never read");
@@ -485,7 +539,7 @@ describe("workspace scanner", () => {
     ).rejects.toThrow("2-entry limit");
   });
 
-  it("bounds the exact canonical manifest estimate before publication", async () => {
+  it("uses the current manifest admission boundary before publication", async () => {
     const root = await workspace();
     await writeFile(join(root, "entry-with-a-long-name.txt"), "content");
     const initial = await scanWorkspace(root);
@@ -513,7 +567,7 @@ describe("workspace scanner", () => {
     ).resolves.toMatchObject({ problems: [] });
     await expect(
       scanWorkspace(root, { maxManifestBytes: exactBytes - 1 }),
-    ).rejects.toThrow("manifest estimate");
+    ).rejects.toThrow("current tree manifest contract");
   });
 
   it("compares complete snapshots without treating excluded inode churn as drift", async () => {

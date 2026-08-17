@@ -54,8 +54,6 @@ describe("Cyclotomy configuration", () => {
       },
       lock: {
         timeoutMs: 5_000,
-        heartbeatMs: 5_000,
-        staleMs: 30_000,
       },
     });
     await expect(stat(settingsPath)).rejects.toMatchObject({ code: "ENOENT" });

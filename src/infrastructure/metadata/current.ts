@@ -1,6 +1,6 @@
-import { V3_METADATA_VERSION } from "./versions/v3.ts";
-import { CURRENT_TREE_FORMAT } from "../tree-formats/current.ts";
+import { V4_METADATA_VERSION } from "./versions/v4.ts";
 import { treeFormatChain, type TreeFormatNode } from "../tree-formats/chain.ts";
+import { TREE_FORMAT_REGISTRY } from "../tree-formats/registry.ts";
 import { metadataVersionChain, type MetadataVersionNode } from "./version.ts";
 
 /** Validate the two independent adjacent histories once at their composition root. */
@@ -46,9 +46,9 @@ export function validateMetadataTreeFormatComposition(
 }
 
 /** The sole pointer changed when a new published metadata version is added. */
-export const CURRENT_METADATA_VERSION = V3_METADATA_VERSION;
+export const CURRENT_METADATA_VERSION = V4_METADATA_VERSION;
 
 validateMetadataTreeFormatComposition(
   CURRENT_METADATA_VERSION,
-  CURRENT_TREE_FORMAT,
+  TREE_FORMAT_REGISTRY.current,
 );

@@ -1,11 +1,33 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
   openCurrentMetadataStore,
   type CurrentMetadataStore,
 } from "../../src/infrastructure/metadata.ts";
-import { commitTestNodeState } from "../metadata-fixture.ts";
+import {
+  bindTestMetadataWriteAuthority,
+  commitTestNodeState,
+} from "../metadata-fixture.ts";
+import {
+  runWithWorkspaceLock,
+  type WorkspaceWriteAuthority,
+} from "../../src/infrastructure/workspace-lock.ts";
+
+function openMetadata(
+  path: string,
+  authority: WorkspaceWriteAuthority,
+): Promise<CurrentMetadataStore> {
+  return openCurrentMetadataStore(
+    path,
+    {
+      prepareTreeOidUpgrades: async (roots, _targetFormat) =>
+        new Map(roots.map((treeOid) => [treeOid, treeOid])),
+    },
+    authority,
+  );
+}
 
 interface ChildMessage {
   readonly type: "ready" | "opening" | "opened" | "error";
@@ -46,6 +68,7 @@ async function openAtSchemaGate(
   path: string,
   pausedPath: string,
   releasePath: string,
+  authority: WorkspaceWriteAuthority,
 ): Promise<CurrentMetadataStore> {
   const originalExec = DatabaseSync.prototype.exec;
   let paused = false;
@@ -60,10 +83,7 @@ async function openAtSchemaGate(
     originalExec.call(this, sql);
   };
   try {
-    return await openCurrentMetadataStore(path, {
-      prepareTreeOidUpgrades: async (roots, _targetFormat) =>
-        new Map(roots.map((treeOid) => [treeOid, treeOid])),
-    });
+    return await openMetadata(path, authority);
   } finally {
     DatabaseSync.prototype.exec = originalExec;
   }
@@ -139,21 +159,30 @@ try {
     await started;
     await send({ type: "opening", pid: process.pid });
     for (let iteration = 0; iteration < iterations; iteration += 1) {
-      const store = await (mode === "gated-write" && iteration === 0
-        ? openAtSchemaGate(path, pausedPath!, releasePath!)
-        : openCurrentMetadataStore(path, {
-            prepareTreeOidUpgrades: async (roots, _targetFormat) =>
-              new Map(roots.map((treeOid) => [treeOid, treeOid])),
-          }));
-      if (mode === "write" || mode === "gated-write") {
-        commitTestNodeState(
-          store,
-          `concurrent-open-${process.pid}`,
-          `${process.pid}-${iteration}`,
-          "a".repeat(64),
-        );
-      }
-      store.close();
+      const execution = await runWithWorkspaceLock(
+        dirname(path),
+        "metadata child open",
+        async (authority) => {
+          const store = await (mode === "gated-write" && iteration === 0
+            ? openAtSchemaGate(path, pausedPath!, releasePath!, authority)
+            : openMetadata(path, authority));
+          try {
+            bindTestMetadataWriteAuthority(store, authority, dirname(path));
+            if (mode === "write" || mode === "gated-write") {
+              commitTestNodeState(
+                store,
+                `concurrent-open-${process.pid}`,
+                `${process.pid}-${iteration}`,
+                "a".repeat(64),
+              );
+            }
+          } finally {
+            store.close();
+          }
+        },
+      );
+      if (execution.kind === "action-failed") throw execution.cause;
+      if (execution.cleanup.kind === "failed") throw execution.cleanup.cause;
     }
     await send({ type: "opened", pid: process.pid });
   }

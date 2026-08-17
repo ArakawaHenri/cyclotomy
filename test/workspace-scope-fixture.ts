@@ -1,6 +1,7 @@
 import {
   canonicalizeWorkspaceScope,
   workspaceGitignoreSource,
+  type GitWorkspaceEvaluator,
   type GitWorkspaceScope,
 } from "../src/infrastructure/workspace-scope.ts";
 
@@ -8,6 +9,7 @@ export const ALL_MANAGED_SCOPE = { kind: "all-managed" } as const;
 
 interface GitScopeFixtureOptions {
   readonly repositoryPrefix?: string;
+  readonly evaluator?: GitWorkspaceEvaluator | null;
   readonly ignoreCase?: boolean;
   readonly gitignoreSources?: readonly {
     readonly path: string;
@@ -31,6 +33,13 @@ export function gitScope(
   const scope = canonicalizeWorkspaceScope({
     kind: "git",
     repositoryPrefix: options.repositoryPrefix ?? "",
+    evaluator:
+      options.evaluator === undefined
+        ? {
+            version: "git version fixture",
+            precomposeUnicode: false,
+          }
+        : options.evaluator,
     ignoreCase: options.ignoreCase ?? false,
     gitignoreSources: (options.gitignoreSources ?? []).map((source) =>
       workspaceGitignoreSource(source.path, bytes(source.contents)),

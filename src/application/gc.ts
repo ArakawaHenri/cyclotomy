@@ -1,6 +1,7 @@
 import { collectGarbage, type GcReport } from "../infrastructure/object-gc.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { NativeObjectStore } from "../infrastructure/object-store.ts";
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 
 export interface CyclotomyGcOptions {
   readonly now?: number;
@@ -18,11 +19,12 @@ export interface CyclotomyGcOptions {
  * probe.
  */
 export async function collectCyclotomyGarbage(
+  authority: WorkspaceWriteAuthority,
   store: NativeObjectStore,
   metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
   options: CyclotomyGcOptions = {},
 ): Promise<GcReport> {
-  return collectGarbage(store, metadata, {
+  return collectGarbage(authority, store, metadata, {
     ...(options.objectGraceMs === undefined
       ? {}
       : { graceMs: options.objectGraceMs }),

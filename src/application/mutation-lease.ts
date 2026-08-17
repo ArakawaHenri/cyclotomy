@@ -1,11 +1,16 @@
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
+
 declare const WORKSPACE_MUTATION_LEASE: unique symbol;
 
 export interface WorkspaceMutationAuthorization<Resolution> {
   readonly kind: "authorized";
   readonly pinnedResolution: Resolution;
+  /** The physical authority and store binding captured by this cutover. */
+  readonly writeAuthority: WorkspaceWriteAuthority;
+  readonly storeRoot: string;
 }
 
-export type SynchronousMutationCutover<Resolution> =
+type SynchronousMutationCutover<Resolution> =
   () => WorkspaceMutationAuthorization<Resolution>;
 
 /**
@@ -19,7 +24,7 @@ export interface WorkspaceMutationLease<Resolution> {
   readonly [WORKSPACE_MUTATION_LEASE]: (resolution: Resolution) => Resolution;
 }
 
-export type WorkspaceMutationLeaseState<Resolution> =
+type WorkspaceMutationLeaseState<Resolution> =
   | { readonly kind: "pending" }
   | {
       readonly kind: "authorized";
@@ -70,7 +75,11 @@ export function consumeWorkspaceMutationLease<Resolution>(
       authorization === null ||
       Reflect.get(authorization, "kind") !== "authorized" ||
       typeof Reflect.get(authorization, "then") === "function" ||
-      !Reflect.has(authorization, "pinnedResolution")
+      !Reflect.has(authorization, "pinnedResolution") ||
+      typeof Reflect.get(authorization, "writeAuthority") !== "object" ||
+      Reflect.get(authorization, "writeAuthority") === null ||
+      typeof Reflect.get(authorization, "storeRoot") !== "string" ||
+      Reflect.get(authorization, "storeRoot") === ""
     ) {
       throw new Error(
         "workspace mutation authority must complete synchronously",

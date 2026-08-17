@@ -1,95 +1,102 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { RestoreOutcome } from "../application/restore.ts";
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 import {
-  type ArrivalProtection,
-  unavailableProtection,
-} from "./arrival-protection.ts";
-import {
-  arrivalProtectionFromDisposition,
-  type ArrivalDisposition,
+  type NonAdmittedArrivalDisposition,
+  unsettledArrival,
 } from "./arrival-settlement.ts";
+import {
+  mergeCleanupSettlements,
+  type ArrivalReceipt,
+  type ArrivalRecoverySettlement,
+  type LockedArrivalOutcome,
+} from "./workspace-receipt.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 
-type WorkspaceLockScope = "held" | "released";
-export type CleanupSettlement =
-  | { readonly kind: "settled" }
-  | { readonly kind: "failed"; readonly cause: unknown };
-
-/** Combine independent lock-release receipts without losing either failure. */
-export function mergeCleanupSettlements(
-  ...settlements: readonly CleanupSettlement[]
-): CleanupSettlement {
-  const failures = settlements.flatMap((settlement) =>
-    settlement.kind === "failed" ? [settlement.cause] : [],
-  );
-  if (failures.length === 0) return { kind: "settled" };
-  if (failures.length === 1) return { kind: "failed", cause: failures[0] };
-  return {
-    kind: "failed",
-    cause: new AggregateError(
-      failures,
-      "multiple workspace-lock cleanup attempts failed",
-      { cause: failures[0] },
-    ),
-  };
-}
-
-export interface ArrivalRecoveryExecution {
-  readonly protection: ArrivalProtection;
-  readonly workspaceLockCleanup: CleanupSettlement;
-}
+type WorkspaceLockScope =
+  | {
+      readonly kind: "held";
+      readonly writeAuthority: WorkspaceWriteAuthority;
+    }
+  | { readonly kind: "released" };
 
 /** Narrow recovery capability shared by restore and lifecycle settlements. */
 export interface ArrivalRecovery {
   recoverUncertainLocationInWorkspaceLock(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
-  ): ArrivalProtection;
+  ): NonAdmittedArrivalDisposition;
   recoverUncertainLocation(
     context: ExtensionContext,
-  ): Promise<ArrivalRecoveryExecution>;
+  ): Promise<ArrivalRecoverySettlement>;
 }
 
-export interface CheckpointInitializationConflict {
+export interface CheckpointInitializationConflictExecution {
   readonly kind: "initialization-conflict";
   readonly cause: unknown;
-  readonly arrivalProtection: ArrivalProtection;
 }
+
+export type CheckpointInitializationConflict =
+  ArrivalReceipt<CheckpointInitializationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
+
+type LockedCheckpointInitializationConflict =
+  LockedArrivalOutcome<CheckpointInitializationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
 
 /** Preserve a settlement already completed by InitializationProtocol. */
 export function checkpointInitializationDispositionConflict(
   cause: unknown,
-  arrival: Exclude<ArrivalDisposition, { readonly kind: "admitted" }>,
-): CheckpointInitializationConflict {
+  arrival: NonAdmittedArrivalDisposition,
+): LockedCheckpointInitializationConflict {
   return {
-    kind: "initialization-conflict",
-    cause,
-    arrivalProtection: arrivalProtectionFromDisposition(arrival),
+    execution: { kind: "initialization-conflict", cause },
+    arrival,
   };
 }
 
-export interface RestorePreparationConflict {
+export interface RestorePreparationConflictExecution {
   readonly kind: "preparation-conflict";
   readonly cause: unknown;
-  readonly arrivalProtection: ArrivalProtection;
-  readonly workspaceLockCleanup: CleanupSettlement;
 }
 
-export type PostMutationConflict =
+export type RestorePreparationConflict =
+  ArrivalReceipt<RestorePreparationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
+
+type LockedRestorePreparationConflict =
+  LockedArrivalOutcome<RestorePreparationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
+
+export type PostMutationConflictExecution = {
+  readonly kind: "post-mutation-conflict";
+  readonly outcome: RestoreOutcome;
+  readonly preparationCleanup: CleanupSettlement;
+} & (
   | {
-      readonly kind: "post-mutation-conflict";
       readonly reason: "location-changed" | "target-changed";
-      readonly outcome: RestoreOutcome;
-      readonly arrivalProtection: ArrivalProtection;
-      readonly workspaceLockCleanup: CleanupSettlement;
     }
   | {
-      readonly kind: "post-mutation-conflict";
       readonly reason: "control-failed";
-      readonly outcome: RestoreOutcome;
       readonly cause: unknown;
-      readonly arrivalProtection: ArrivalProtection;
-      readonly workspaceLockCleanup: CleanupSettlement;
-    };
+    }
+);
+
+export type PostMutationConflict =
+  ArrivalReceipt<PostMutationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
+
+type LockedPostMutationConflict =
+  LockedArrivalOutcome<PostMutationConflictExecution> & {
+    readonly arrival: NonAdmittedArrivalDisposition;
+  };
 
 /**
  * The sole recovery facade for callers already holding the workspace lock.
@@ -98,21 +105,16 @@ export type PostMutationConflict =
  */
 export async function protectCurrentArrivalInWorkspaceLock(
   recovery: ArrivalRecovery,
+  writeAuthority: WorkspaceWriteAuthority,
   context: ExtensionContext,
-): Promise<ArrivalRecoveryExecution> {
+): Promise<NonAdmittedArrivalDisposition> {
   try {
-    return {
-      protection: recovery.recoverUncertainLocationInWorkspaceLock(context),
-      workspaceLockCleanup: { kind: "settled" },
-    };
+    return recovery.recoverUncertainLocationInWorkspaceLock(
+      writeAuthority,
+      context,
+    );
   } catch (cause) {
-    return {
-      protection: unavailableProtection(
-        "current arrival could not be protected",
-        [cause],
-      ),
-      workspaceLockCleanup: { kind: "settled" },
-    };
+    return unsettledArrival("current arrival could not be protected", [cause]);
   }
 }
 
@@ -120,12 +122,12 @@ export async function protectCurrentArrivalInWorkspaceLock(
 export async function protectCurrentArrivalAfterWorkspaceFailure(
   recovery: ArrivalRecovery,
   context: ExtensionContext,
-): Promise<ArrivalRecoveryExecution> {
+): Promise<ArrivalRecoverySettlement> {
   try {
     return await recovery.recoverUncertainLocation(context);
   } catch (cause) {
     return {
-      protection: unavailableProtection(
+      arrival: unsettledArrival(
         "current arrival protection could not reacquire the workspace lock",
         [cause],
       ),
@@ -134,49 +136,194 @@ export async function protectCurrentArrivalAfterWorkspaceFailure(
   }
 }
 
-function protectCurrentArrivalForLockScope(
+export function isLockedArrivalOutcome<Execution>(
+  value: Execution | LockedArrivalOutcome<Execution>,
+): value is LockedArrivalOutcome<Execution> {
+  return typeof value === "object" && value !== null && "execution" in value;
+}
+
+/**
+ * Construct the sole final arrival receipt after the action lock has unwound.
+ * A locked outcome never guesses at cleanup, and held recovery is retried once.
+ */
+export function finalizeArrivalAfterWorkspaceExecution<Execution>(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  outcome: LockedArrivalOutcome<Execution>,
+  workspaceLockCleanup: ArrivalReceipt<Execution>["workspaceLockCleanup"],
+): Promise<ArrivalReceipt<Execution>>;
+export function finalizeArrivalAfterWorkspaceExecution<Execution>(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  execution: Execution,
+  workspaceLockCleanup: ArrivalReceipt<Execution>["workspaceLockCleanup"],
+  releasedSettlement: ArrivalRecoverySettlement,
+): Promise<ArrivalReceipt<Execution>>;
+export async function finalizeArrivalAfterWorkspaceExecution<Execution>(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  outcome: Execution | LockedArrivalOutcome<Execution>,
+  workspaceLockCleanup: ArrivalReceipt<Execution>["workspaceLockCleanup"],
+  releasedSettlement?: ArrivalRecoverySettlement,
+): Promise<ArrivalReceipt<Execution>> {
+  if (releasedSettlement !== undefined) {
+    return {
+      execution: outcome as Execution,
+      arrival: releasedSettlement.arrival,
+      workspaceLockCleanup: mergeCleanupSettlements(
+        workspaceLockCleanup,
+        releasedSettlement.workspaceLockCleanup,
+      ),
+    };
+  }
+  const receipt: ArrivalReceipt<Execution> = {
+    ...(outcome as LockedArrivalOutcome<Execution>),
+    workspaceLockCleanup,
+  };
+  if (receipt.arrival.kind !== "unsettled") return receipt;
+  const retried = await protectCurrentArrivalAfterWorkspaceFailure(
+    recovery,
+    context,
+  );
+  return {
+    ...receipt,
+    arrival:
+      retried.arrival.kind === "unsettled"
+        ? unsettledArrival(messageOfUnknown(receipt.arrival.cause), [
+            receipt.arrival.cause,
+            retried.arrival.cause,
+          ])
+        : retried.arrival,
+    workspaceLockCleanup: mergeCleanupSettlements(
+      receipt.workspaceLockCleanup,
+      retried.workspaceLockCleanup,
+    ),
+  };
+}
+
+async function protectCurrentArrivalForLockScope(
   recovery: ArrivalRecovery,
   context: ExtensionContext,
   lockScope: WorkspaceLockScope,
-): Promise<ArrivalRecoveryExecution> {
-  return lockScope === "held"
-    ? protectCurrentArrivalInWorkspaceLock(recovery, context)
-    : protectCurrentArrivalAfterWorkspaceFailure(recovery, context);
+): Promise<
+  | {
+      readonly kind: "held";
+      readonly arrival: NonAdmittedArrivalDisposition;
+    }
+  | {
+      readonly kind: "released";
+      readonly settlement: ArrivalRecoverySettlement;
+    }
+> {
+  return lockScope.kind === "held"
+    ? {
+        kind: "held",
+        arrival: await protectCurrentArrivalInWorkspaceLock(
+          recovery,
+          lockScope.writeAuthority,
+          context,
+        ),
+      }
+    : {
+        kind: "released",
+        settlement: await protectCurrentArrivalAfterWorkspaceFailure(
+          recovery,
+          context,
+        ),
+      };
 }
 
 /** A loaded arrival could not even authenticate its checkpoint. */
+export function restorePreparationConflict(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  cause: unknown,
+  lockScope: Extract<WorkspaceLockScope, { readonly kind: "held" }>,
+): Promise<LockedRestorePreparationConflict>;
+export function restorePreparationConflict(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  cause: unknown,
+  lockScope: Extract<WorkspaceLockScope, { readonly kind: "released" }>,
+): Promise<RestorePreparationConflict>;
 export async function restorePreparationConflict(
   recovery: ArrivalRecovery,
   context: ExtensionContext,
   cause: unknown,
   lockScope: WorkspaceLockScope,
-): Promise<RestorePreparationConflict> {
-  const recoveryExecution = await protectCurrentArrivalForLockScope(
+): Promise<LockedRestorePreparationConflict | RestorePreparationConflict> {
+  const recovered = await protectCurrentArrivalForLockScope(
     recovery,
     context,
     lockScope,
   );
-  return {
-    kind: "preparation-conflict",
-    cause,
-    arrivalProtection: recoveryExecution.protection,
-    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
-  };
+  if (recovered.kind === "held") {
+    return {
+      execution: { kind: "preparation-conflict", cause },
+      arrival: recovered.arrival,
+    };
+  }
+  return finalizeArrivalAfterWorkspaceExecution(
+    recovery,
+    context,
+    { kind: "preparation-conflict", cause },
+    { kind: "settled" },
+    recovered.settlement,
+  ) as Promise<RestorePreparationConflict>;
 }
 
 /** Preserve the destructive outcome when a later control-plane step fails. */
+export function postMutationControlFailure(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  error: unknown,
+  outcome: RestoreOutcome | undefined,
+  preparationCleanup: CleanupSettlement,
+  lockScope: Extract<WorkspaceLockScope, { readonly kind: "held" }>,
+): Promise<LockedPostMutationConflict>;
+export function postMutationControlFailure(
+  recovery: ArrivalRecovery,
+  context: ExtensionContext,
+  error: unknown,
+  outcome: RestoreOutcome | undefined,
+  preparationCleanup: CleanupSettlement,
+  lockScope: Extract<WorkspaceLockScope, { readonly kind: "released" }>,
+): Promise<PostMutationConflict>;
 export async function postMutationControlFailure(
   recovery: ArrivalRecovery,
   context: ExtensionContext,
   error: unknown,
   outcome: RestoreOutcome | undefined,
+  preparationCleanup: CleanupSettlement,
   lockScope: WorkspaceLockScope,
-): Promise<PostMutationConflict> {
-  const recoveryExecution = await protectCurrentArrivalForLockScope(
+): Promise<LockedPostMutationConflict | PostMutationConflict> {
+  const recovered = await protectCurrentArrivalForLockScope(
     recovery,
     context,
     lockScope,
   );
+  const execution = postMutationControlFailureExecution(
+    error,
+    outcome,
+    preparationCleanup,
+  );
+  if (recovered.kind === "held") {
+    return { execution, arrival: recovered.arrival };
+  }
+  return finalizeArrivalAfterWorkspaceExecution(
+    recovery,
+    context,
+    execution,
+    { kind: "settled" },
+    recovered.settlement,
+  ) as Promise<PostMutationConflict>;
+}
+
+export function postMutationControlFailureExecution(
+  error: unknown,
+  outcome: RestoreOutcome | undefined,
+  preparationCleanup: CleanupSettlement,
+): PostMutationConflictExecution {
   return {
     kind: "post-mutation-conflict",
     reason: "control-failed",
@@ -188,8 +335,7 @@ export async function postMutationControlFailure(
         cause: error,
       } satisfies RestoreOutcome),
     cause: error,
-    arrivalProtection: recoveryExecution.protection,
-    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
+    preparationCleanup,
   };
 }
 
@@ -199,18 +345,21 @@ export async function postMutationStateConflict(
   context: ExtensionContext,
   reason: "location-changed" | "target-changed",
   outcome: RestoreOutcome,
-  lockScope: WorkspaceLockScope,
-): Promise<PostMutationConflict> {
-  const recoveryExecution = await protectCurrentArrivalForLockScope(
+  preparationCleanup: CleanupSettlement,
+  lockScope: Extract<WorkspaceLockScope, { readonly kind: "held" }>,
+): Promise<LockedPostMutationConflict> {
+  const arrival = await protectCurrentArrivalInWorkspaceLock(
     recovery,
+    lockScope.writeAuthority,
     context,
-    lockScope,
   );
   return {
-    kind: "post-mutation-conflict",
-    reason,
-    outcome,
-    arrivalProtection: recoveryExecution.protection,
-    workspaceLockCleanup: recoveryExecution.workspaceLockCleanup,
+    execution: {
+      kind: "post-mutation-conflict",
+      reason,
+      outcome,
+      preparationCleanup,
+    },
+    arrival,
   };
 }

@@ -36,27 +36,20 @@ function waitForRelease(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const [root, operation, rawMode, rawTimeout, rawHeartbeat, rawStale] =
-    process.argv.slice(2);
+  const [root, operation, rawMode, rawTimeout] = process.argv.slice(2);
   const mode = rawMode as ChildMode;
   const timeoutMs = Number(rawTimeout);
-  const heartbeatMs = Number(rawHeartbeat);
-  const staleMs = Number(rawStale);
   if (
     root === undefined ||
     operation === undefined ||
     (mode !== "hold" && mode !== "once") ||
-    !Number.isFinite(timeoutMs) ||
-    !Number.isFinite(heartbeatMs) ||
-    !Number.isFinite(staleMs)
+    !Number.isFinite(timeoutMs)
   ) {
     throw new Error("invalid workspace-lock child arguments");
   }
 
   const lock = await acquireWorkspaceLock(root, operation, {
     timeoutMs,
-    heartbeatMs,
-    staleMs,
   });
   await send({ type: "acquired", pid: process.pid });
   if (mode === "hold") {

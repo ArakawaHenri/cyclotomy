@@ -1,10 +1,83 @@
 import { DatabaseSync } from "node:sqlite";
 
-import type {
-  CurrentMetadataStore,
-  MetadataSessionIdentity,
-  ProtectLocationResult,
+import {
+  createCurrentMetadataStore,
+  type CurrentMetadataStore,
+  type MetadataSessionIdentity,
+  type ProtectLocationResult,
 } from "../src/infrastructure/metadata.ts";
+import type { WorkspaceWriteAuthority } from "../src/infrastructure/workspace-lock.ts";
+import { runWithWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
+
+interface TestMetadataWriteAuthorityBinding {
+  readonly authority: WorkspaceWriteAuthority;
+  readonly storeRoot: string;
+}
+
+const writeAuthorities = new WeakMap<
+  MetadataFixtureStore,
+  TestMetadataWriteAuthorityBinding
+>();
+
+export function bindTestMetadataWriteAuthority(
+  store: MetadataFixtureStore,
+  authority: WorkspaceWriteAuthority,
+  storeRoot: string,
+): void {
+  writeAuthorities.set(store, { authority, storeRoot });
+}
+
+export function testMetadataWriteAuthority(
+  store: MetadataFixtureStore,
+): WorkspaceWriteAuthority {
+  const binding = writeAuthorities.get(store);
+  if (binding === undefined) {
+    throw new Error("test metadata store has no workspace write authority");
+  }
+  return binding.authority;
+}
+
+export function testMetadataWriteAuthorityBinding(
+  store: MetadataFixtureStore,
+): TestMetadataWriteAuthorityBinding {
+  const binding = writeAuthorities.get(store);
+  if (binding === undefined) {
+    throw new Error("test metadata store has no workspace write authority");
+  }
+  return binding;
+}
+
+export async function withTestMetadataWriteAuthority<T>(
+  storeRoot: string,
+  store: MetadataFixtureStore,
+  operation: () => T,
+): Promise<T> {
+  const execution = await runWithWorkspaceLock(
+    storeRoot,
+    "test metadata mutation",
+    async (authority) => {
+      bindTestMetadataWriteAuthority(store, authority, storeRoot);
+      return operation();
+    },
+  );
+  if (execution.kind === "action-failed") throw execution.cause;
+  if (execution.cleanup.kind === "failed") throw execution.cleanup.cause;
+  return execution.value;
+}
+
+export async function createTestCurrentMetadataStore(
+  path: string,
+  storeRoot: string,
+): Promise<CurrentMetadataStore> {
+  const execution = await runWithWorkspaceLock(
+    storeRoot,
+    "test metadata open",
+    async (authority) => createCurrentMetadataStore(path, authority),
+  );
+  if (execution.kind === "action-failed") throw execution.cause;
+  if (execution.cleanup.kind === "failed") throw execution.cleanup.cause;
+  return execution.value;
+}
 
 const sessionFilesByStore = new WeakMap<
   MetadataFixtureStore,
@@ -42,7 +115,7 @@ export function registerTestSession(
     sessionFile ??
     rememberedSessionFile(store, sessionId) ??
     `/test-sessions/${encodeURIComponent(sessionId)}.jsonl`;
-  store.finalizeSessionProjection({
+  store.finalizeSessionProjection(testMetadataWriteAuthority(store), {
     targetSessionId: sessionId,
     targetSessionFile: resolvedSessionFile,
     retainedEntryIds,
@@ -50,6 +123,18 @@ export function registerTestSession(
     seed: { kind: "fresh" },
   });
   rememberTestSession(store, sessionId, resolvedSessionFile);
+}
+
+export function finalizeTestSessionProjection(
+  store: MetadataFixtureStore,
+  input: Parameters<CurrentMetadataStore["finalizeSessionProjection"]>[1],
+): ReturnType<CurrentMetadataStore["finalizeSessionProjection"]> {
+  const binding = testMetadataWriteAuthorityBinding(store);
+  return store.finalizeSessionProjection(
+    binding.authority,
+    input,
+    input.seed.kind === "fork" ? binding : undefined,
+  );
 }
 
 /** Seed a node through the same guarded commit API used by production. */
@@ -67,7 +152,7 @@ export function commitTestNodeState(
   }
   if (registeredFile === undefined)
     throw new Error("test fixture lost session");
-  const result = store.commitCapture({
+  const result = store.commitCapture(testMetadataWriteAuthority(store), {
     identity: { sessionId, sessionFile: registeredFile },
     entryId,
     activeAncestryEntryIds: [entryId],
@@ -107,7 +192,7 @@ export function protectTestLocation(
   entryId: string,
   activeAncestryEntryIds: readonly string[] = [entryId],
 ): ProtectLocationResult {
-  return store.protectLocation({
+  return store.protectLocation(testMetadataWriteAuthority(store), {
     identity,
     entryId,
     activeAncestryEntryIds,

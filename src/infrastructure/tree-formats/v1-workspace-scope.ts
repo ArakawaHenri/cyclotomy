@@ -225,6 +225,7 @@ export function canonicalizeV1WorkspaceScope(value: unknown): WorkspaceScope {
   return {
     kind: "git",
     repositoryPrefix,
+    evaluator: null,
     ignoreCase: candidate.ignoreCase,
     gitignoreSources,
     infoExcludeBase64,

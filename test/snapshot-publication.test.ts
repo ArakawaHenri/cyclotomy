@@ -17,6 +17,7 @@ import {
   openObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
+import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
 import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   IncompleteSnapshotError,
@@ -42,6 +43,7 @@ async function tempRoot(prefix: string): Promise<string> {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -61,6 +63,148 @@ async function scanTempWorkspace(): Promise<WorkspaceSnapshot> {
 }
 
 describe("snapshot publication", () => {
+  it("rejects unattested or mismatched Git capture before opening publication", async () => {
+    const scanned = await scanWorkspace(
+      await tempRoot("cyclotomy-publish-evaluator-workspace-"),
+    );
+    const store = await openObjectStore(
+      await tempRoot("cyclotomy-publish-evaluator-objects-"),
+    );
+    const begin = vi.spyOn(store, "beginSnapshotPublication");
+
+    await expect(
+      publishSnapshot(store, {
+        ...scanned,
+        gitOracleVersion: "git version fixture",
+        scope: gitScope({ evaluator: null }),
+      }),
+    ).rejects.toThrow("legacy-unknown evaluator provenance");
+    await expect(
+      publishSnapshot(store, {
+        ...scanned,
+        gitOracleVersion: "git version changed",
+        scope: gitScope(),
+      }),
+    ).rejects.toThrow("does not match its workspace observation");
+    expect(begin).not.toHaveBeenCalled();
+  });
+
+  it("does not let a direct snapshot publication create unattested v3", async () => {
+    const store = await openObjectStore(
+      await tempRoot("cyclotomy-publish-evaluator-direct-"),
+    );
+    const publication = store.beginSnapshotPublication();
+
+    await expect(
+      Promise.resolve().then(() =>
+        publication.publishTree([], gitScope({ evaluator: null })),
+      ),
+    ).rejects.toMatchObject({ code: "invalid-tree-manifest" });
+    await publication.close();
+  });
+
+  it("preserves both a tree failure and resolution cleanup failure", async () => {
+    const store = await openObjectStore(
+      await tempRoot("cyclotomy-publish-cleanup-"),
+    );
+    const cleanupFailure = new Error("resolution cleanup failed");
+    vi.spyOn(
+      ContentRepository.prototype,
+      "closeResolutionScope",
+    ).mockRejectedValue(cleanupFailure);
+    const publication = store.beginSnapshotPublication();
+    let observed: unknown;
+    try {
+      await publication.publishTree(
+        [
+          {
+            path: "missing.txt",
+            type: "regular",
+            blobOid: "00".repeat(32),
+            recreationMode: 0o644,
+          },
+        ],
+        scope,
+      );
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(AggregateError);
+    const failures = (observed as AggregateError).errors;
+    expect(failures[0]).toMatchObject({ code: "invalid-tree-manifest" });
+    expect(failures[1]).toBe(cleanupFailure);
+  });
+
+  it("reports native tree and cleanup failures once through publishSnapshot", async () => {
+    const snapshot = await scanWorkspace(
+      await tempRoot("cyclotomy-publish-native-cleanup-workspace-"),
+    );
+    const store = await openObjectStore(
+      await tempRoot("cyclotomy-publish-native-cleanup-objects-"),
+    );
+    const primary = new Error("tree publication failed");
+    const cleanup = new Error("resolution cleanup failed");
+    vi.spyOn(
+      ContentRepository.prototype,
+      "publishStructural",
+    ).mockRejectedValue(primary);
+    vi.spyOn(
+      ContentRepository.prototype,
+      "closeResolutionScope",
+    ).mockRejectedValue(cleanup);
+
+    let observed: unknown;
+    try {
+      await publishSnapshot(store, snapshot);
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(AggregateError);
+    const failures = (observed as AggregateError).errors;
+    expect(failures).toHaveLength(2);
+    expect(failures[0]).toMatchObject({
+      code: "storage-failure",
+      cause: primary,
+    });
+    expect(failures[1]).toBe(cleanup);
+  });
+
+  it("does not mistake a thrown undefined value for publication success", async () => {
+    const snapshot = await scanWorkspace(
+      await tempRoot("cyclotomy-publish-undefined-"),
+    );
+    const cleanupFailure = new Error("outer cleanup failed");
+    const base = await openObjectStore(
+      await tempRoot("cyclotomy-publish-undefined-objects-"),
+    );
+    const store: ObjectStore = {
+      storageRoot: base.storageRoot,
+      beginSnapshotPublication: () => ({
+        publishBlobFromFile: async () => "00".repeat(32),
+        publishTree: () => Promise.reject(undefined),
+        close: () => Promise.reject(cleanupFailure),
+      }),
+      readBlob: (oid) => base.readBlob(oid),
+      streamBlob: (oid, sink) => base.streamBlob(oid, sink),
+      readTree: (oid) => base.readTree(oid),
+      readTreeManifest: (oid) => base.readTreeManifest(oid),
+      verifyBlobs: (oids) => base.verifyBlobs(oids),
+    };
+
+    let observed: unknown;
+    try {
+      await publishSnapshot(store, snapshot);
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(AggregateError);
+    expect((observed as AggregateError).errors).toEqual([
+      undefined,
+      cleanupFailure,
+    ]);
+  });
+
   it("allows an archived policy source that Git excluded from the managed tree", async () => {
     const store = await openObjectStore(
       await tempRoot("cyclotomy-publish-objects-"),
@@ -69,6 +213,7 @@ describe("snapshot publication", () => {
     const scanned = await scanWorkspace(workspace);
     const snapshot: WorkspaceSnapshot = {
       ...scanned,
+      gitOracleVersion: "git version fixture",
       scope: gitScope({
         gitignoreSources: [
           {
@@ -93,6 +238,7 @@ describe("snapshot publication", () => {
     const scanned = await scanWorkspace(workspace);
     const inconsistent: WorkspaceSnapshot = {
       ...scanned,
+      gitOracleVersion: "git version fixture",
       scope: gitScope({
         gitignoreSources: [{ path: ".gitignore", contents: "secret\n" }],
       }),
@@ -218,9 +364,11 @@ describe("snapshot publication", () => {
           },
           publishTree: (entries, scope) =>
             publication.publishTree(entries, scope),
+          close: () => publication.close(),
         };
       },
       readBlob: (oid) => baseStore.readBlob(oid),
+      streamBlob: (oid, sink) => baseStore.streamBlob(oid, sink),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
@@ -277,9 +425,11 @@ describe("snapshot publication", () => {
             treePublications += 1;
             return publication.publishTree(entries, targetScope);
           },
+          close: () => publication.close(),
         };
       },
       readBlob: (oid) => baseStore.readBlob(oid),
+      streamBlob: (oid, sink) => baseStore.streamBlob(oid, sink),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
@@ -303,6 +453,7 @@ describe("snapshot publication", () => {
       await tempRoot("cyclotomy-publish-fail-objects-"),
     );
     let treePublications = 0;
+    const close = vi.fn(() => Promise.resolve());
     const store: ObjectStore = {
       storageRoot: baseStore.storageRoot,
       beginSnapshotPublication() {
@@ -318,9 +469,11 @@ describe("snapshot publication", () => {
             treePublications += 1;
             throw new Error("tree must not be published");
           },
+          close,
         };
       },
       readBlob: (oid) => baseStore.readBlob(oid),
+      streamBlob: (oid, sink) => baseStore.streamBlob(oid, sink),
       readTree: (oid) => baseStore.readTree(oid),
       readTreeManifest: (oid) => baseStore.readTreeManifest(oid),
       verifyBlobs: (oids) => baseStore.verifyBlobs(oids),
@@ -330,6 +483,7 @@ describe("snapshot publication", () => {
       "first input failed",
     );
     expect(treePublications).toBe(0);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a source file changed after its streamed scan", async () => {
@@ -384,9 +538,11 @@ describe("snapshot publication", () => {
           publishBlobFromFile: () => Promise.resolve("0".repeat(64)),
           publishTree: (entries, targetScope) =>
             store.beginSnapshotPublication().publishTree(entries, targetScope),
+          close: () => Promise.resolve(),
         };
       },
       readBlob: (oid) => store.readBlob(oid),
+      streamBlob: (oid, sink) => store.streamBlob(oid, sink),
       readTree: (oid) => store.readTree(oid),
       readTreeManifest: (oid) => store.readTreeManifest(oid),
       verifyBlobs: (oids) => store.verifyBlobs(oids),

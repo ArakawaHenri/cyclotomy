@@ -14,10 +14,12 @@ import {
   checkpointSlotIsBlocked,
   type CheckpointSlot,
 } from "../domain/checkpoint-slot.ts";
-import type { NodeKey, Result, TreeOid } from "../domain/model.ts";
+import type { NodeKey, Result } from "../domain/model.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { NativeObjectStore } from "../infrastructure/object-store.ts";
-import type { TreeManifest } from "../infrastructure/tree-formats/manifest-codec.ts";
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
+import type { GitReplayAttestation } from "../infrastructure/git-replay-risk.ts";
+import type { CurrentTreeManifest } from "../infrastructure/tree-formats/current.ts";
 import type {
   ScanOptions,
   WorkspaceSnapshot,
@@ -34,10 +36,13 @@ export interface CheckpointSessionView {
 
 export interface ResolvedReadableTree {
   readonly resolution: ResolvedNodeState;
-  readonly manifest: TreeManifest;
+  readonly manifest: CurrentTreeManifest;
+  /** Evaluator that authenticated this manifest's archived ownership scope. */
+  readonly scopeValidation: GitReplayAttestation;
 }
 
 export interface CheckpointCommitAuthority {
+  readonly writeAuthority: WorkspaceWriteAuthority;
   readonly expectedSessionFile: string;
   readonly assertWorkspaceAuthority: () => undefined;
 }
@@ -48,9 +53,8 @@ export interface CheckpointServiceOptions {
   readonly expectedRootPath: string;
   readonly scanOptions?: ScanOptions;
   readonly validateManifestScope: (
-    treeOid: TreeOid,
-    manifest: TreeManifest,
-  ) => Promise<void>;
+    manifest: CurrentTreeManifest,
+  ) => Promise<GitReplayAttestation>;
 }
 
 /**
@@ -131,8 +135,8 @@ export class CheckpointService {
     const resolution = this.resolve(view, node);
     if (resolution === undefined) return undefined;
     const manifest = await this.#options.store.readTree(resolution.treeOid);
-    await this.#options.validateManifestScope(resolution.treeOid, manifest);
-    return { resolution, manifest };
+    const scopeValidation = await this.#options.validateManifestScope(manifest);
+    return { resolution, manifest, scopeValidation };
   }
 
   /** Scan and publish the service's current workspace policy. */
@@ -227,6 +231,7 @@ export class CheckpointService {
     return {
       ...this.#captureDeps(),
       metadata: this.#options.metadata,
+      writeAuthority: authority.writeAuthority,
       expectedSessionFile: authority.expectedSessionFile,
       assertWorkspaceAuthority: authority.assertWorkspaceAuthority,
     };

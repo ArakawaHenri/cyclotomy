@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import {
+  notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
-  notifyArrivalProtectionFailure,
+  notifyArrivalDispositionFailure,
+  notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
-} from "../src/pi/restore-outcome.ts";
+} from "../src/pi/restore-notifications.ts";
 import { formatUiDetail } from "../src/pi/restore-presentation.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 
@@ -28,13 +30,168 @@ function preview(value: WorkspaceRestorePlan): string {
   return new CyclotomyI18n("en").formatRestorePreview(value);
 }
 
-const exactProtection = {
-  kind: "exact-slot",
-  slot: { kind: "blocked-missing" },
-  admission: { kind: "settled" },
+const exactArrival = {
+  kind: "protected",
+  evidence: {
+    kind: "exact-slot",
+    slot: { kind: "blocked-missing" },
+    expectation: "matched",
+    admission: { kind: "settled" },
+  },
 } as const;
 
 describe("restore presentation", () => {
+  it("presents initialization cleanup exactly once from its receipt owner", () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: "info" | "warning" | "error";
+    }> = [];
+    const cleanup = new Error("initialization lock remained");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (
+        _context: unknown,
+        message: string,
+        level: "info" | "warning" | "error",
+      ) => notifications.push({ message, level }),
+    } as unknown as CyclotomyRuntime;
+
+    notifyCheckpointInitializationConflict(runtime, {} as never, {
+      execution: {
+        kind: "initialization-conflict",
+        cause: new Error("arrival changed"),
+      },
+      arrival: exactArrival,
+      workspaceLockCleanup: { kind: "failed", cause: cleanup },
+    });
+
+    expect(
+      notifications.filter(({ message }) =>
+        message.includes("initialization lock remained"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not duplicate an unsettled initialization diagnostic", () => {
+    const notifications: string[] = [];
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyCheckpointInitializationConflict(runtime, {} as never, {
+      execution: {
+        kind: "initialization-conflict",
+        cause: new Error("arrival changed"),
+      },
+      arrival: {
+        kind: "unsettled",
+        cause: new Error("protection failed once"),
+      },
+      workspaceLockCleanup: { kind: "settled" },
+    });
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.match(/protection failed once/gu)).toHaveLength(1);
+  });
+
+  it("does not repeat a shared initialization and arrival failure", () => {
+    const notifications: string[] = [];
+    const shared = new Error("shared initialization failure");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyCheckpointInitializationConflict(runtime, {} as never, {
+      execution: { kind: "initialization-conflict", cause: shared },
+      arrival: { kind: "unsettled", cause: shared },
+      workspaceLockCleanup: { kind: "settled" },
+    });
+
+    expect(notifications).toHaveLength(1);
+    expect(
+      notifications[0]?.match(/shared initialization failure/gu),
+    ).toHaveLength(1);
+  });
+
+  it("does not present a cleanup-only preparation failure twice", () => {
+    const notifications: string[] = [];
+    const cleanup = new Error("preparation lock remained");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyRestorePreparationConflict(runtime, {} as never, {
+      execution: { kind: "preparation-conflict", cause: cleanup },
+      arrival: exactArrival,
+      workspaceLockCleanup: { kind: "failed", cause: cleanup },
+    });
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.match(/preparation lock remained/gu)).toHaveLength(
+      1,
+    );
+  });
+
+  it("preserves a distinct unsettled arrival beside cleanup-only preparation failure", () => {
+    const notifications: string[] = [];
+    const cleanup = new Error("preparation lock remained");
+    const protection = new Error("durable protection failed");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyRestorePreparationConflict(runtime, {} as never, {
+      execution: { kind: "preparation-conflict", cause: cleanup },
+      arrival: { kind: "unsettled", cause: protection },
+      workspaceLockCleanup: { kind: "failed", cause: cleanup },
+    });
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications.join("\n")).toContain("durable protection failed");
+    expect(notifications.join("\n")).toContain("preparation lock remained");
+  });
+
+  it("preserves distinct preparation and cleanup failures", () => {
+    const notifications: string[] = [];
+    const primary = new Error("preparation action failed");
+    const cleanup = new Error("preparation release failed");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyRestorePreparationConflict(runtime, {} as never, {
+      execution: { kind: "preparation-conflict", cause: primary },
+      arrival: exactArrival,
+      workspaceLockCleanup: { kind: "failed", cause: cleanup },
+    });
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications.join("\n")).toContain("preparation action failed");
+    expect(notifications.join("\n")).toContain("preparation release failed");
+  });
+
   it("presents a rejected cutover as not started", () => {
     const notifications: Array<{
       readonly message: string;
@@ -51,14 +208,16 @@ describe("restore presentation", () => {
     } as unknown as CyclotomyRuntime;
 
     notifyRestoreProtocolOutcome(runtime, {} as never, {
-      kind: "outcome",
-      outcome: {
-        kind: "failed",
-        stage: "apply",
-        cause: new Error("application wrapper"),
+      execution: {
+        kind: "outcome",
+        outcome: {
+          kind: "failed",
+          stage: "apply",
+          cause: new Error("application wrapper"),
+        },
+        cutover: { kind: "rejected", cause: new Error("Pi became busy") },
+        preparationCleanup: { kind: "settled" },
       },
-      cutover: { kind: "rejected", cause: new Error("Pi became busy") },
-      stagingCleanup: { kind: "settled" },
       workspaceLockCleanup: { kind: "settled" },
     });
 
@@ -66,7 +225,7 @@ describe("restore presentation", () => {
       {
         level: "warning",
         message:
-          "Restore did not start (Pi became busy). Current files were not changed.",
+          "Restore did not start (Pi became busy). No files were changed.",
       },
     ]);
   });
@@ -88,16 +247,18 @@ describe("restore presentation", () => {
     } as unknown as CyclotomyRuntime;
 
     notifyRestoreProtocolOutcome(runtime, {} as never, {
-      kind: "outcome",
-      outcome: {
-        kind: "failed",
-        stage: "apply",
-        cause: new Error("Pi became busy"),
-      },
-      cutover: { kind: "rejected", cause: new Error("Pi became busy") },
-      stagingCleanup: {
-        kind: "failed",
-        cause: new Error("scratch remained"),
+      execution: {
+        kind: "outcome",
+        outcome: {
+          kind: "failed",
+          stage: "apply",
+          cause: new Error("Pi became busy"),
+        },
+        cutover: { kind: "rejected", cause: new Error("Pi became busy") },
+        preparationCleanup: {
+          kind: "failed",
+          cause: new Error("scratch remained"),
+        },
       },
       workspaceLockCleanup: {
         kind: "failed",
@@ -108,7 +269,7 @@ describe("restore presentation", () => {
     expect(notifications).toHaveLength(3);
     expect(notifications[0]).toMatchObject({
       level: "warning",
-      message: expect.stringContaining("files were not changed"),
+      message: expect.stringContaining("No files were changed"),
     });
     expect(notifications[1]).toMatchObject({
       level: "error",
@@ -118,6 +279,56 @@ describe("restore presentation", () => {
       level: "error",
       message: expect.stringContaining("lock remained"),
     });
+  });
+
+  it("reports preparation cleanup once beside a post-mutation lock failure", () => {
+    const notifications: string[] = [];
+    const preparationCleanup = new Error("restore staging remained");
+    const lockCleanup = new Error("restore action lock remained");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyPostMutationConflict(runtime, {} as never, {
+      execution: {
+        kind: "post-mutation-conflict",
+        reason: "control-failed",
+        outcome: {
+          kind: "restored",
+          treeOid: "a".repeat(64),
+          report: {
+            created: [],
+            updated: [],
+            deleted: [],
+            renamed: [],
+            unchangedCount: 1,
+            problems: [],
+          },
+        },
+        cause: lockCleanup,
+        preparationCleanup: {
+          kind: "failed",
+          cause: preparationCleanup,
+        },
+      },
+      arrival: exactArrival,
+      workspaceLockCleanup: { kind: "failed", cause: lockCleanup },
+    });
+
+    expect(
+      notifications.filter((message) =>
+        message.includes("restore staging remained"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      notifications.filter((message) =>
+        message.includes("restore action lock remained"),
+      ),
+    ).toHaveLength(1);
   });
 
   it("reports unavailable durable arrival protection at error level", () => {
@@ -136,8 +347,8 @@ describe("restore presentation", () => {
       ) => notifications.push({ message, level }),
     } as unknown as CyclotomyRuntime;
 
-    notifyArrivalProtectionFailure(runtime, {} as never, {
-      kind: "unavailable",
+    notifyArrivalDispositionFailure(runtime, {} as never, {
+      kind: "unsettled",
       cause: new Error("protect\n\u001b[31mfailed"),
     });
 
@@ -147,7 +358,7 @@ describe("restore presentation", () => {
     expect(notifications[0]?.message).toContain("protect\\n\\u001b[31mfailed");
   });
 
-  it("reports a failed in-memory settle without hiding exact durable protection", () => {
+  it("reports a failed checkpoint admission by user-visible impact", () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: "info" | "warning" | "error";
@@ -162,15 +373,20 @@ describe("restore presentation", () => {
       ) => notifications.push({ message, level }),
     } as unknown as CyclotomyRuntime;
 
-    notifyArrivalProtectionFailure(runtime, {} as never, {
-      ...exactProtection,
-      admission: { kind: "failed", cause: new Error("admission failed") },
+    notifyArrivalDispositionFailure(runtime, {} as never, {
+      ...exactArrival,
+      evidence: {
+        ...exactArrival.evidence,
+        admission: { kind: "failed", cause: new Error("admission failed") },
+      },
     });
 
     expect(notifications).toEqual([
       expect.objectContaining({
         level: "error",
-        message: expect.stringContaining("durably protected"),
+        message: expect.stringContaining(
+          "Automatic checkpoints are paused at the current node",
+        ),
       }),
     ]);
   });
@@ -297,22 +513,25 @@ describe("restore presentation", () => {
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
-      kind: "post-mutation-conflict",
-      reason: "target-changed",
-      outcome: {
-        kind: "verify-failed",
-        reason: "mismatch",
-        treeOid: "a".repeat(64),
-        report: {
-          created: [],
-          updated: ["changed.txt"],
-          deleted: [],
-          renamed: [],
-          unchangedCount: 0,
-          problems: [],
+      execution: {
+        kind: "post-mutation-conflict",
+        reason: "target-changed",
+        preparationCleanup: { kind: "settled" },
+        outcome: {
+          kind: "verify-failed",
+          reason: "mismatch",
+          treeOid: "a".repeat(64),
+          report: {
+            created: [],
+            updated: ["changed.txt"],
+            deleted: [],
+            renamed: [],
+            unchangedCount: 0,
+            problems: [],
+          },
         },
       },
-      arrivalProtection: exactProtection,
+      arrival: exactArrival,
       workspaceLockCleanup: { kind: "settled" },
     });
 
@@ -322,7 +541,10 @@ describe("restore presentation", () => {
     expect(notifications[0]?.message).toContain("~ changed.txt");
     expect(notifications[1]).toMatchObject({ level: "warning" });
     expect(notifications[1]?.message).toContain(
-      "entered the file-application phase before the checkpoint target changed",
+      "The checkpoint changed during restore",
+    );
+    expect(notifications[1]?.message).toContain(
+      "will not be saved automatically at this node",
     );
     expect(
       notifications.map(({ message }) => message).join("\n"),
@@ -340,16 +562,19 @@ describe("restore presentation", () => {
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
-      kind: "post-mutation-conflict",
-      reason: "control-failed",
-      outcome: {
-        kind: "failed",
-        stage: "apply",
-        cause: new Error("apply stopped"),
+      execution: {
+        kind: "post-mutation-conflict",
+        reason: "control-failed",
+        preparationCleanup: { kind: "settled" },
+        outcome: {
+          kind: "failed",
+          stage: "apply",
+          cause: new Error("apply stopped"),
+        },
+        cause: new Error("control\n\u001b[31mforged"),
       },
-      cause: new Error("control\n\u001b[31mforged"),
-      arrivalProtection: {
-        kind: "unavailable",
+      arrival: {
+        kind: "unsettled",
         cause: new Error("protect\n\u001b[32mforged"),
       },
       workspaceLockCleanup: { kind: "settled" },
@@ -362,7 +587,7 @@ describe("restore presentation", () => {
     expect(output.split("\n")).not.toContain("forged");
   });
 
-  it("reports a durable session capture barrier without claiming a node was protected", () => {
+  it("reports an unassigned restore without exposing the history barrier", () => {
     const notifications: string[] = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
@@ -373,30 +598,39 @@ describe("restore presentation", () => {
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
-      kind: "post-mutation-conflict",
-      reason: "location-changed",
-      outcome: {
-        kind: "restored",
-        treeOid: "a".repeat(64),
-        report: {
-          created: [],
-          updated: [],
-          deleted: [],
-          renamed: [],
-          unchangedCount: 1,
-          problems: [],
+      execution: {
+        kind: "post-mutation-conflict",
+        reason: "location-changed",
+        preparationCleanup: { kind: "settled" },
+        outcome: {
+          kind: "restored",
+          treeOid: "a".repeat(64),
+          report: {
+            created: [],
+            updated: [],
+            deleted: [],
+            renamed: [],
+            unchangedCount: 1,
+            problems: [],
+          },
         },
       },
-      arrivalProtection: { kind: "session-barrier" },
+      arrival: {
+        kind: "protected",
+        evidence: {
+          kind: "session-barrier",
+          admission: { kind: "settled" },
+        },
+      },
       workspaceLockCleanup: { kind: "settled" },
     });
 
     const output = notifications.join("\n");
-    expect(output).toContain("session capture barrier");
-    expect(output).toContain("Reloading does not clear it");
-    expect(output).toContain("next complete concrete ancestry");
-    expect(output).not.toContain("pending checkpoint guard");
-    expect(output).not.toContain("write-protected the current arrival");
+    expect(output).toContain("not attached to a checkpoint");
+    expect(output).toContain("This state will not be saved automatically");
+    expect(output).toContain("/drift");
+    expect(output).not.toContain("barrier");
+    expect(output).not.toContain("ancestry");
   });
 
   it("lists every applied mutation by destructive priority including directory renames", () => {

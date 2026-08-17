@@ -1,18 +1,20 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { renameSync } from "node:fs";
+import { lstat, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  openCurrentMetadataStore,
+  createCurrentMetadataStore,
+  openCurrentMetadataStore as openCurrentMetadataStoreWithLease,
   type CurrentMetadataStore,
 } from "../src/infrastructure/metadata.ts";
 import {
   CURRENT_METADATA_VERSION,
   validateMetadataTreeFormatComposition,
 } from "../src/infrastructure/metadata/current.ts";
-import { migrateMetadataToCurrent } from "../src/infrastructure/metadata/migration-engine.ts";
+import { migrateMetadataToCurrent as migrateMetadataToCurrentWithAuthority } from "../src/infrastructure/metadata/migration-engine.ts";
 import {
   dropWriterFences,
   METADATA_WRITER_PROTOCOL_FUNCTION,
@@ -35,13 +37,61 @@ import {
   SESSION_REGISTRY_V1_SCHEMA_SQL,
 } from "../src/infrastructure/metadata/versions/v1.ts";
 import { TREE_MANIFEST_FORMAT_V2 } from "../src/infrastructure/tree-formats/v2.ts";
-import { CURRENT_TREE_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
+import { TREE_MANIFEST_FORMAT_V3 } from "../src/infrastructure/tree-formats/v3.ts";
+import { TREE_FORMAT_REGISTRY } from "../src/infrastructure/tree-formats/registry.ts";
 import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
+import {
+  runWithWorkspaceLock,
+  WorkspaceLockOwnershipLostError,
+} from "../src/infrastructure/workspace-lock.ts";
+import {
+  bindTestMetadataWriteAuthority,
+  finalizeTestSessionProjection,
+  testMetadataWriteAuthority,
+} from "./metadata-fixture.ts";
+import {
+  holdTestWorkspaceWriteAuthority,
+  releaseTestWorkspaceWriteAuthorities,
+} from "./workspace-write-authority-fixture.ts";
 
 const roots: string[] = [];
 const CURRENT_METADATA_SCHEMA_VERSION = CURRENT_METADATA_VERSION.version;
 const SUCCESSOR_METADATA_VERSION = CURRENT_METADATA_SCHEMA_VERSION + 1;
 const SYNTHETIC_SUCCESSOR_TREE_FORMAT = "cyclotomy-tree-successor-test";
+
+async function migrateTestMetadataToCurrent(
+  db: DatabaseSync,
+  dependencies: Parameters<typeof migrateMetadataToCurrentWithAuthority>[1],
+  current: MetadataVersionNode,
+): Promise<void> {
+  const storeRoot = await mkdtemp(
+    join(tmpdir(), "cyclotomy-migration-engine-"),
+  );
+  roots.push(storeRoot);
+  const authority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  await migrateMetadataToCurrentWithAuthority(
+    db,
+    dependencies,
+    authority,
+    storeRoot,
+    current,
+  );
+}
+
+async function openCurrentMetadataStore(
+  path: string,
+  dependencies: Parameters<typeof openCurrentMetadataStoreWithLease>[1],
+): ReturnType<typeof openCurrentMetadataStoreWithLease> {
+  const storeRoot = dirname(path);
+  const authority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  const store = await openCurrentMetadataStoreWithLease(
+    path,
+    dependencies,
+    authority,
+  );
+  bindTestMetadataWriteAuthority(store, authority, storeRoot);
+  return store;
+}
 
 function createPublishedV1(db: DatabaseSync, treeOid?: string): void {
   db.exec(`
@@ -145,12 +195,144 @@ function syntheticTreeFormatSuccessor(
 }
 
 afterEach(async () => {
+  await releaseTestWorkspaceWriteAuthorities();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 
 describe("metadata adjacent-version chain", () => {
+  it("creates no database or sidecars after its lease is already displaced", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-open-lease-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const displacedLock = join(root, "displaced-workspace.lock");
+    const prepareTreeOidUpgrades = vi.fn(async () => new Map<string, string>());
+
+    const execution = await runWithWorkspaceLock(
+      root,
+      "metadata first-write lease-fence test",
+      async (lease) => {
+        await rename(join(root, "workspace.lock"), displacedLock);
+        return openCurrentMetadataStoreWithLease(
+          path,
+          { prepareTreeOidUpgrades },
+          lease,
+        );
+      },
+    );
+
+    expect(execution).toMatchObject({
+      kind: "action-failed",
+      cause: expect.any(WorkspaceLockOwnershipLostError),
+      cleanup: { kind: "failed" },
+    });
+    expect(prepareTreeOidUpgrades).not.toHaveBeenCalled();
+    for (const candidate of [
+      path,
+      `${path}-journal`,
+      `${path}-wal`,
+      `${path}-shm`,
+    ]) {
+      await expect(lstat(candidate)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await rm(displacedLock, { recursive: true, force: true });
+  });
+
+  it("refuses the adjacent cutover after its exclusive lease is displaced", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-chain-lease-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const source = "1".repeat(64);
+    const published = new DatabaseSync(path);
+    createPublishedV1(published, source);
+    published.close();
+    const displacedLock = join(root, "displaced-workspace.lock");
+
+    const execution = await runWithWorkspaceLock(
+      root,
+      "metadata lease-fence test",
+      (lease) =>
+        openCurrentMetadataStoreWithLease(
+          path,
+          {
+            prepareTreeOidUpgrades: async (treeOids) => {
+              await rename(join(root, "workspace.lock"), displacedLock);
+              return new Map(treeOids.map((treeOid) => [treeOid, treeOid]));
+            },
+          },
+          lease,
+        ),
+    );
+
+    expect(execution).toMatchObject({
+      kind: "action-failed",
+      cause: expect.any(WorkspaceLockOwnershipLostError),
+      cleanup: { kind: "failed" },
+    });
+    const check = new DatabaseSync(path);
+    expect(
+      Number(
+        (check.prepare("PRAGMA user_version").get() as { user_version: number })
+          .user_version,
+      ),
+    ).toBe(1);
+    check.close();
+    await rm(displacedLock, { recursive: true, force: true });
+  });
+
+  it("rechecks current metadata authority inside the writer transaction", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-write-fence-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const displacedLock = join(root, "displaced-workspace.lock");
+    const originalExec = DatabaseSync.prototype.exec;
+    let armed = false;
+    const exec = vi
+      .spyOn(DatabaseSync.prototype, "exec")
+      .mockImplementation(function (this: DatabaseSync, sql: string): void {
+        originalExec.call(this, sql);
+        if (armed && /^\s*BEGIN IMMEDIATE\s*;?\s*$/u.test(sql)) {
+          armed = false;
+          renameSync(join(root, "workspace.lock"), displacedLock);
+        }
+      });
+    try {
+      const execution = await runWithWorkspaceLock(
+        root,
+        "metadata in-transaction fence test",
+        async (authority) => {
+          const store = createCurrentMetadataStore(path, authority);
+          try {
+            armed = true;
+            store.finalizeSessionProjection(authority, {
+              targetSessionId: "session",
+              targetSessionFile: "/sessions/session.jsonl",
+              retainedEntryIds: [],
+              activeAncestryEntryIds: [],
+              seed: { kind: "fresh" },
+            });
+          } finally {
+            store.close();
+          }
+        },
+      );
+      expect(execution).toMatchObject({
+        kind: "action-failed",
+        cause: expect.any(WorkspaceLockOwnershipLostError),
+        cleanup: { kind: "failed" },
+      });
+      const check = new DatabaseSync(path, { readOnly: true });
+      expect(
+        check.prepare("SELECT count(*) AS count FROM session_registry").get(),
+      ).toEqual({ count: 0 });
+      check.close();
+    } finally {
+      exec.mockRestore();
+      await rm(displacedLock, { recursive: true, force: true });
+    }
+  });
+
   it("does not encode a named or numeric legacy root in the chain engine", () => {
     const rootSchema = metadataSchemaSpec({
       version: 7,
@@ -238,7 +420,10 @@ describe("metadata adjacent-version chain", () => {
     });
 
     expect(() =>
-      validateMetadataTreeFormatComposition(outside, CURRENT_TREE_FORMAT),
+      validateMetadataTreeFormatComposition(
+        outside,
+        TREE_FORMAT_REGISTRY.current,
+      ),
     ).toThrow("outside the supported history");
   });
 
@@ -255,7 +440,10 @@ describe("metadata adjacent-version chain", () => {
     });
 
     expect(() =>
-      validateMetadataTreeFormatComposition(backwards, CURRENT_TREE_FORMAT),
+      validateMetadataTreeFormatComposition(
+        backwards,
+        TREE_FORMAT_REGISTRY.current,
+      ),
     ).toThrow("moves its durable tree format backwards");
   });
 
@@ -283,30 +471,35 @@ describe("metadata adjacent-version chain", () => {
     db.close();
   });
 
-  it("lets the v1-to-v2 edge prepare and atomically retarget tree roots", async () => {
+  it("walks every published tree edge from v1 to current metadata", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-chain-v1-"));
     roots.push(root);
     const path = join(root, "state.db");
     const oldTreeOid = "a".repeat(64);
-    const newTreeOid = "b".repeat(64);
+    const v2TreeOid = "b".repeat(64);
+    const v3TreeOid = "c".repeat(64);
     const legacy = new DatabaseSync(path);
     createPublishedV1(legacy, oldTreeOid);
     legacy.close();
     const prepareTreeOidUpgrades = vi.fn(
       async (treeOids: readonly string[], targetFormat: string) => {
-        expect(treeOids).toEqual([oldTreeOid]);
-        expect(targetFormat).toBe(TREE_MANIFEST_FORMAT_V2);
-        return new Map([[oldTreeOid, newTreeOid]]);
+        if (targetFormat === TREE_MANIFEST_FORMAT_V2) {
+          expect(treeOids).toEqual([oldTreeOid]);
+          return new Map([[oldTreeOid, v2TreeOid]]);
+        }
+        expect(targetFormat).toBe(TREE_MANIFEST_FORMAT_V3);
+        expect(treeOids).toEqual([v2TreeOid]);
+        return new Map([[v2TreeOid, v3TreeOid]]);
       },
     );
 
     const store: CurrentMetadataStore = await openCurrentMetadataStore(path, {
       prepareTreeOidUpgrades,
     });
-    expect(prepareTreeOidUpgrades).toHaveBeenCalledTimes(1);
+    expect(prepareTreeOidUpgrades).toHaveBeenCalledTimes(2);
     expect(store.getCheckpointSlot("session", "entry")).toEqual({
       kind: "open-checkpoint",
-      treeOid: newTreeOid,
+      treeOid: v3TreeOid,
     });
     store.close();
   });
@@ -351,7 +544,7 @@ describe("metadata adjacent-version chain", () => {
       sessionId: "session",
       sessionFile: "/sessions/session.jsonl",
     };
-    store.finalizeSessionProjection({
+    finalizeTestSessionProjection(store, {
       targetSessionId: identity.sessionId,
       targetSessionFile: identity.sessionFile,
       retainedEntryIds: ["root"],
@@ -360,7 +553,7 @@ describe("metadata adjacent-version chain", () => {
     });
     const treeOid = "e".repeat(64);
     expect(
-      store.commitCapture({
+      store.commitCapture(testMetadataWriteAuthority(store), {
         identity,
         entryId: "root",
         activeAncestryEntryIds: ["root"],
@@ -375,7 +568,7 @@ describe("metadata adjacent-version chain", () => {
       resolution: { kind: "checkpoint", entryId: "root", treeOid },
       targetSlot: { kind: "open-missing" },
     });
-    store.protectLocation({
+    store.protectLocation(testMetadataWriteAuthority(store), {
       identity,
       entryId: "target",
       activeAncestryEntryIds: ["target"],
@@ -394,6 +587,7 @@ describe("metadata adjacent-version chain", () => {
     const db = new DatabaseSync(":memory:");
     const oldTreeOid = "c".repeat(64);
     const v2TreeOid = "d".repeat(64);
+    const v3TreeOid = "e".repeat(64);
     createPublishedV1(db, oldTreeOid);
     const successor = syntheticTreeFormatSuccessor();
     const prepareTreeOidUpgrades = vi.fn(
@@ -402,14 +596,18 @@ describe("metadata adjacent-version chain", () => {
           expect(treeOids).toEqual([oldTreeOid]);
           return new Map([[oldTreeOid, v2TreeOid]]);
         }
+        if (targetFormat === TREE_MANIFEST_FORMAT_V3) {
+          expect(treeOids).toEqual([v2TreeOid]);
+          return new Map([[v2TreeOid, v3TreeOid]]);
+        }
         expect(targetFormat).toBe(SYNTHETIC_SUCCESSOR_TREE_FORMAT);
-        expect(treeOids).toEqual([v2TreeOid]);
+        expect(treeOids).toEqual([v3TreeOid]);
         throw new Error("synthetic successor tree upgrade unavailable");
       },
     );
 
     await expect(
-      migrateMetadataToCurrent(db, { prepareTreeOidUpgrades }, successor),
+      migrateTestMetadataToCurrent(db, { prepareTreeOidUpgrades }, successor),
     ).rejects.toThrow("synthetic successor tree upgrade unavailable");
 
     // Published adjacent edges reach the current schema first; the unavailable
@@ -428,7 +626,7 @@ describe("metadata adjacent-version chain", () => {
            WHERE session_id = 'session' AND entry_id = 'entry'`,
         )
         .get(),
-    ).toEqual({ tree_oid: v2TreeOid });
+    ).toEqual({ tree_oid: v3TreeOid });
     expect(prepareTreeOidUpgrades).toHaveBeenNthCalledWith(
       1,
       [oldTreeOid],
@@ -437,6 +635,11 @@ describe("metadata adjacent-version chain", () => {
     expect(prepareTreeOidUpgrades).toHaveBeenNthCalledWith(
       2,
       [v2TreeOid],
+      TREE_MANIFEST_FORMAT_V3,
+    );
+    expect(prepareTreeOidUpgrades).toHaveBeenNthCalledWith(
+      3,
+      [v3TreeOid],
       SYNTHETIC_SUCCESSOR_TREE_FORMAT,
     );
     db.close();
@@ -450,7 +653,7 @@ describe("metadata adjacent-version chain", () => {
     const successor = syntheticSuccessor(() => {});
     const prepareTreeOidUpgrades = vi.fn(async () => new Map());
 
-    await migrateMetadataToCurrent(
+    await migrateTestMetadataToCurrent(
       db,
       {
         prepareTreeOidUpgrades,
@@ -467,6 +670,157 @@ describe("metadata adjacent-version chain", () => {
     ).toBe(SUCCESSOR_METADATA_VERSION);
     validateMetadataVersion(db, successor);
     db.close();
+  });
+
+  it("fences every operation from a current store kept live across a successor migration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-chain-live-current-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    const store = await openCurrentMetadataStore(path, {
+      prepareTreeOidUpgrades: async () => new Map(),
+    });
+    const identity = {
+      sessionId: "session",
+      sessionFile: "/sessions/session.jsonl",
+    };
+    const treeOid = "7".repeat(64);
+    finalizeTestSessionProjection(store, {
+      targetSessionId: identity.sessionId,
+      targetSessionFile: identity.sessionFile,
+      retainedEntryIds: ["entry"],
+      activeAncestryEntryIds: ["entry"],
+      seed: { kind: "fresh" },
+    });
+    expect(
+      store.commitCapture(testMetadataWriteAuthority(store), {
+        identity,
+        entryId: "entry",
+        activeAncestryEntryIds: ["entry"],
+        treeOid,
+        expectedSlot: { kind: "open-missing" },
+      }),
+    ).toBe("committed");
+
+    const successor = syntheticSuccessor(() => {});
+    const migrator = new DatabaseSync(path);
+    migrator.function(
+      METADATA_WRITER_PROTOCOL_FUNCTION,
+      { deterministic: true, directOnly: false },
+      () => SUCCESSOR_METADATA_VERSION,
+    );
+    await migrateTestMetadataToCurrent(
+      migrator,
+      { prepareTreeOidUpgrades: async () => new Map() },
+      successor,
+    );
+    migrator.close();
+
+    const operations: readonly (readonly [string, () => unknown])[] = [
+      ["get checkpoint", () => store.getCheckpointSlot("session", "entry")],
+      ["resolve lineage", () => store.resolveLineage("session", ["entry"])],
+      [
+        "commit capture",
+        () =>
+          store.commitCapture(testMetadataWriteAuthority(store), {
+            identity,
+            entryId: "entry",
+            activeAncestryEntryIds: ["entry"],
+            treeOid,
+            expectedSlot: { kind: "open-checkpoint", treeOid },
+          }),
+      ],
+      [
+        "protect location",
+        () =>
+          store.protectLocation(testMetadataWriteAuthority(store), {
+            identity,
+            entryId: "entry",
+            activeAncestryEntryIds: ["entry"],
+            expectation: { kind: "any-current" },
+          }),
+      ],
+      [
+        "admit resolution",
+        () =>
+          store.admitResolvedLocation(testMetadataWriteAuthority(store), {
+            identity,
+            entryId: "entry",
+            activeAncestryEntryIds: ["entry"],
+            expectedResolution: {
+              kind: "checkpoint",
+              entryId: "entry",
+              treeOid,
+            },
+          }),
+      ],
+      [
+        "adopt missing",
+        () =>
+          store.adoptBlockedMissing(testMetadataWriteAuthority(store), {
+            identity,
+            entryId: "other",
+            treeOid,
+          }),
+      ],
+      [
+        "raise barrier",
+        () =>
+          store.raiseSessionBarrier(
+            testMetadataWriteAuthority(store),
+            identity,
+          ),
+      ],
+      ["read barrier", () => store.hasSessionBarrier(identity)],
+      [
+        "reconcile barrier",
+        () =>
+          store.reconcileSessionBarrier(
+            testMetadataWriteAuthority(store),
+            identity,
+            ["entry"],
+          ),
+      ],
+      [
+        "match identity",
+        () =>
+          store.matchSessionIdentity(identity.sessionId, identity.sessionFile),
+      ],
+      [
+        "export projection",
+        () =>
+          store.exportForkProjection({
+            parentSessionFile: identity.sessionFile,
+            retainedEntryIds: ["entry"],
+          }),
+      ],
+      [
+        "finalize projection",
+        () =>
+          finalizeTestSessionProjection(store, {
+            targetSessionId: identity.sessionId,
+            targetSessionFile: identity.sessionFile,
+            retainedEntryIds: ["entry"],
+            activeAncestryEntryIds: ["entry"],
+            seed: { kind: "fresh" },
+          }),
+      ],
+      ["list GC roots", () => store.listReferencedTreeOids()],
+    ];
+    for (const [, operation] of operations) {
+      expect(operation).toThrow(
+        `metadata schema version changed from ${CURRENT_METADATA_SCHEMA_VERSION} to ${SUCCESSOR_METADATA_VERSION}`,
+      );
+    }
+    store.close();
+
+    const check = new DatabaseSync(path, { readOnly: true });
+    validateMetadataVersion(check, successor);
+    expect(check.prepare("SELECT tree_oid FROM checkpoint_slot").get()).toEqual(
+      {
+        tree_oid: treeOid,
+      },
+    );
+    check.close();
   });
 
   it("lets a successor generation upgrade roots already stored by current metadata", async () => {
@@ -495,7 +849,7 @@ describe("metadata adjacent-version chain", () => {
       async () => new Map([[source, target]]),
     );
 
-    await migrateMetadataToCurrent(
+    await migrateTestMetadataToCurrent(
       db,
       { prepareTreeOidUpgrades },
       syntheticTreeFormatSuccessor(),
@@ -565,7 +919,7 @@ describe("metadata adjacent-version chain", () => {
       },
     );
 
-    await migrateMetadataToCurrent(
+    await migrateTestMetadataToCurrent(
       db,
       { prepareTreeOidUpgrades },
       syntheticTreeFormatSuccessor(),
@@ -628,7 +982,7 @@ describe("metadata adjacent-version chain", () => {
     );
 
     await expect(
-      migrateMetadataToCurrent(
+      migrateTestMetadataToCurrent(
         db,
         { prepareTreeOidUpgrades },
         syntheticTreeFormatSuccessor(),
@@ -671,7 +1025,7 @@ describe("metadata adjacent-version chain", () => {
     );
 
     await expect(
-      migrateMetadataToCurrent(
+      migrateTestMetadataToCurrent(
         db,
         { prepareTreeOidUpgrades: async () => new Map() },
         syntheticTreeFormatSuccessor(),
@@ -714,7 +1068,7 @@ describe("metadata adjacent-version chain", () => {
     );
 
     await expect(
-      migrateMetadataToCurrent(
+      migrateTestMetadataToCurrent(
         db,
         {
           prepareTreeOidUpgrades: async () => new Map([[source, target]]),
@@ -741,7 +1095,11 @@ describe("metadata adjacent-version chain", () => {
     const prepareTreeOidUpgrades = vi.fn(async () => new Map());
     const successor = syntheticSuccessor(() => {});
 
-    await migrateMetadataToCurrent(db, { prepareTreeOidUpgrades }, successor);
+    await migrateTestMetadataToCurrent(
+      db,
+      { prepareTreeOidUpgrades },
+      successor,
+    );
 
     expect(prepareTreeOidUpgrades).not.toHaveBeenCalled();
     validateMetadataVersion(db, successor);
@@ -773,7 +1131,7 @@ describe("metadata adjacent-version chain", () => {
       { deterministic: true, directOnly: false },
       () => SUCCESSOR_METADATA_VERSION,
     );
-    await migrateMetadataToCurrent(
+    await migrateTestMetadataToCurrent(
       migrator,
       { prepareTreeOidUpgrades: async () => new Map() },
       syntheticSuccessor(() => {}),

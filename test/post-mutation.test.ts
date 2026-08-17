@@ -1,17 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  finalizeArrivalAfterWorkspaceExecution,
   protectCurrentArrivalAfterWorkspaceFailure,
   protectCurrentArrivalInWorkspaceLock,
+  postMutationStateConflict,
   restorePreparationConflict,
   type ArrivalRecovery,
 } from "../src/pi/post-mutation.ts";
-import { unavailableProtection } from "../src/pi/arrival-protection.ts";
+import { aggregateFailures } from "../src/infrastructure/failure-settlement.ts";
+import type { WorkspaceWriteAuthority } from "../src/infrastructure/workspace-lock.ts";
 
-const exactProtection = {
-  kind: "exact-slot",
-  slot: { kind: "blocked-missing" },
-  admission: { kind: "settled" },
+const writeAuthority = {} as WorkspaceWriteAuthority;
+
+const exactArrival = {
+  kind: "protected",
+  evidence: {
+    kind: "exact-slot",
+    slot: { kind: "blocked-missing" },
+    expectation: "matched",
+    admission: { kind: "settled" },
+  },
+} as const;
+
+const barrierArrival = {
+  kind: "protected",
+  evidence: {
+    kind: "session-barrier",
+    admission: { kind: "settled" },
+  },
 } as const;
 
 function recoveryWith(overrides: Partial<ArrivalRecovery>): ArrivalRecovery {
@@ -21,7 +38,7 @@ function recoveryWith(overrides: Partial<ArrivalRecovery>): ArrivalRecovery {
   return {
     recoverUncertainLocationInWorkspaceLock: unexpected,
     recoverUncertainLocation: async () => ({
-      protection: unexpected(),
+      arrival: unexpected(),
       workspaceLockCleanup: { kind: "settled" },
     }),
     ...overrides,
@@ -29,56 +46,23 @@ function recoveryWith(overrides: Partial<ArrivalRecovery>): ArrivalRecovery {
 }
 
 describe("post-mutation recovery facade", () => {
-  it("preserves an explicit undefined throw as the sole recovery cause", () => {
-    const result = unavailableProtection("recovery failed", [undefined]);
-
-    expect(result.cause).toBeInstanceOf(Error);
-    expect(result.cause).not.toBeInstanceOf(AggregateError);
-    expect(Object.hasOwn(result.cause as object, "cause")).toBe(true);
-    expect((result.cause as Error).cause).toBeUndefined();
-  });
-
-  it.each([exactProtection, { kind: "session-barrier" }] as const)(
-    "forwards core $kind recovery without duplicating policy",
-    async (report) => {
-      const recover = vi.fn(() => report);
+  it.each([exactArrival, barrierArrival] as const)(
+    "forwards canonical $kind recovery without duplicating policy",
+    async (arrival) => {
+      const recover = vi.fn(() => arrival);
       const recovery = recoveryWith({
         recoverUncertainLocationInWorkspaceLock: recover,
       });
       const context = {} as never;
 
       await expect(
-        protectCurrentArrivalInWorkspaceLock(recovery, context),
-      ).resolves.toEqual({
-        protection: report,
-        workspaceLockCleanup: { kind: "settled" },
-      });
-      expect(recover).toHaveBeenCalledWith(context);
+        protectCurrentArrivalInWorkspaceLock(recovery, writeAuthority, context),
+      ).resolves.toBe(arrival);
+      expect(recover).toHaveBeenCalledWith(writeAuthority, context);
     },
   );
 
-  it("reports unavailable lock-scoped recovery", async () => {
-    const recovery = recoveryWith({
-      recoverUncertainLocationInWorkspaceLock: () => ({
-        kind: "unavailable",
-        cause: new Error("current arrival could not be protected"),
-      }),
-    });
-
-    await expect(
-      protectCurrentArrivalInWorkspaceLock(recovery, {} as never),
-    ).resolves.toEqual({
-      protection: {
-        kind: "unavailable",
-        cause: expect.objectContaining({
-          message: "current arrival could not be protected",
-        }),
-      },
-      workspaceLockCleanup: { kind: "settled" },
-    });
-  });
-
-  it("preserves a thrown recovery cause as unavailable", async () => {
+  it("preserves a thrown recovery cause as an unsettled arrival", async () => {
     const cause = new Error("metadata unavailable");
     const recovery = recoveryWith({
       recoverUncertainLocationInWorkspaceLock: () => {
@@ -87,67 +71,63 @@ describe("post-mutation recovery facade", () => {
     });
 
     await expect(
-      protectCurrentArrivalInWorkspaceLock(recovery, {} as never),
+      protectCurrentArrivalInWorkspaceLock(
+        recovery,
+        writeAuthority,
+        {} as never,
+      ),
     ).resolves.toEqual({
-      protection: {
-        kind: "unavailable",
-        cause: expect.objectContaining({
-          message: "current arrival could not be protected",
-          cause,
-        }),
-      },
-      workspaceLockCleanup: { kind: "settled" },
+      kind: "unsettled",
+      cause: expect.objectContaining({
+        message: "current arrival could not be protected",
+        cause,
+      }),
     });
   });
 
-  it("delegates reacquisition to the same runtime recovery core", async () => {
-    const recover = vi.fn(async () => ({
-      protection: { kind: "session-barrier" as const },
-      workspaceLockCleanup: { kind: "settled" as const },
-    }));
-    const recovery = recoveryWith({
-      recoverUncertainLocation: recover,
-    });
+  it("delegates reacquisition without translating its receipt", async () => {
+    const receipt = {
+      arrival: barrierArrival,
+      workspaceLockCleanup: {
+        kind: "failed" as const,
+        cause: new Error("release failed"),
+      },
+    };
+    const recover = vi.fn(async () => receipt);
+    const recovery = recoveryWith({ recoverUncertainLocation: recover });
     const context = {} as never;
 
     await expect(
       protectCurrentArrivalAfterWorkspaceFailure(recovery, context),
-    ).resolves.toEqual({
-      protection: { kind: "session-barrier" },
-      workspaceLockCleanup: { kind: "settled" },
-    });
+    ).resolves.toEqual(receipt);
     expect(recover).toHaveBeenCalledWith(context);
   });
 
-  it("keeps a loaded primary failure when protection is also unavailable", async () => {
+  it("keeps execution, arrival, and cleanup in one preparation receipt", async () => {
     const primary = new Error("checkpoint unreadable");
-    const protection = new Error("metadata protection failed");
+    const cleanup = new Error("recovery release failed");
     const recovery = recoveryWith({
-      recoverUncertainLocationInWorkspaceLock: () => {
-        throw protection;
-      },
+      recoverUncertainLocation: async () => ({
+        arrival: barrierArrival,
+        workspaceLockCleanup: { kind: "failed", cause: cleanup },
+      }),
     });
 
     await expect(
-      restorePreparationConflict(recovery, {} as never, primary, "held"),
+      restorePreparationConflict(recovery, {} as never, primary, {
+        kind: "released",
+      }),
     ).resolves.toEqual({
-      kind: "preparation-conflict",
-      cause: primary,
-      arrivalProtection: {
-        kind: "unavailable",
-        cause: expect.objectContaining({
-          message: "current arrival could not be protected",
-          cause: protection,
-        }),
-      },
-      workspaceLockCleanup: { kind: "settled" },
+      execution: { kind: "preparation-conflict", cause: primary },
+      arrival: barrierArrival,
+      workspaceLockCleanup: { kind: "failed", cause: cleanup },
     });
   });
 
-  it("reacquires recovery only when the lock scope was released", async () => {
-    const recoverHeld = vi.fn(() => exactProtection);
+  it("uses only the recovery permitted by the current lock scope", async () => {
+    const recoverHeld = vi.fn(() => exactArrival);
     const recoverReleased = vi.fn(async () => ({
-      protection: { kind: "session-barrier" as const },
+      arrival: barrierArrival,
       workspaceLockCleanup: { kind: "settled" as const },
     }));
     const recovery = recoveryWith({
@@ -160,13 +140,173 @@ describe("post-mutation recovery facade", () => {
         recovery,
         {} as never,
         new Error("checkpoint unreadable"),
-        "released",
+        { kind: "released" },
       ),
     ).resolves.toMatchObject({
-      kind: "preparation-conflict",
-      arrivalProtection: { kind: "session-barrier" },
+      execution: { kind: "preparation-conflict" },
+      arrival: barrierArrival,
     });
     expect(recoverReleased).toHaveBeenCalledOnce();
     expect(recoverHeld).not.toHaveBeenCalled();
+  });
+
+  it("constructs a released receipt without rerunning completed recovery", async () => {
+    const execution = { kind: "failed-after-release" } as const;
+    const outerCleanup = new Error("action lock release failed");
+    const recoveryCleanup = new Error("recovery lock release failed");
+    const recover = vi.fn();
+
+    const result = await finalizeArrivalAfterWorkspaceExecution(
+      recoveryWith({ recoverUncertainLocation: recover }),
+      {} as never,
+      execution,
+      { kind: "failed", cause: outerCleanup },
+      {
+        arrival: barrierArrival,
+        workspaceLockCleanup: { kind: "failed", cause: recoveryCleanup },
+      },
+    );
+
+    expect(result.execution).toBe(execution);
+    expect(result.arrival).toBe(barrierArrival);
+    expect(
+      (result.workspaceLockCleanup as { cause: AggregateError }).cause.errors,
+    ).toEqual([outerCleanup, recoveryCleanup]);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("does not retry an arrival that is already settled", async () => {
+    const recover = vi.fn();
+    const receipt = {
+      execution: { kind: "kept" },
+      arrival: barrierArrival,
+      workspaceLockCleanup: { kind: "settled" as const },
+    };
+
+    await expect(
+      finalizeArrivalAfterWorkspaceExecution(
+        recoveryWith({ recoverUncertainLocation: recover }),
+        {} as never,
+        {
+          execution: receipt.execution,
+          arrival: receipt.arrival,
+        },
+        receipt.workspaceLockCleanup,
+      ),
+    ).resolves.toEqual(receipt);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("retries a held failure once while preserving its execution", async () => {
+    const execution = { kind: "kept" } as const;
+    const recovery = recoveryWith({
+      recoverUncertainLocation: async () => ({
+        arrival: exactArrival,
+        workspaceLockCleanup: { kind: "settled" },
+      }),
+    });
+
+    const result = await finalizeArrivalAfterWorkspaceExecution(
+      recovery,
+      {} as never,
+      {
+        execution,
+        arrival: { kind: "unsettled", cause: new Error("held recovery") },
+      },
+      { kind: "settled" },
+    );
+
+    expect(result.execution).toBe(execution);
+    expect(result.arrival).toBe(exactArrival);
+  });
+
+  it("flattens failures from both recovery attempts", async () => {
+    const first = new Error("first");
+    const second = new Error("second");
+    const third = new Error("third");
+    const recovery = recoveryWith({
+      recoverUncertainLocation: async () => ({
+        arrival: { kind: "unsettled", cause: third },
+        workspaceLockCleanup: { kind: "settled" },
+      }),
+    });
+
+    const result = await finalizeArrivalAfterWorkspaceExecution(
+      recovery,
+      {} as never,
+      {
+        execution: { kind: "kept" },
+        arrival: {
+          kind: "unsettled",
+          cause: aggregateFailures([first, second], "earlier failures"),
+        },
+      },
+      { kind: "settled" },
+    );
+
+    expect(result.arrival.kind).toBe("unsettled");
+    if (result.arrival.kind !== "unsettled") {
+      throw new Error("expected both recovery attempts to remain unsettled");
+    }
+    expect((result.arrival.cause as AggregateError).message).toBe(
+      "earlier failures",
+    );
+    expect((result.arrival.cause as AggregateError).errors).toEqual([
+      first,
+      second,
+      third,
+    ]);
+  });
+
+  it("merges cleanup independently from a successful retry", async () => {
+    const firstCleanup = new Error("first cleanup");
+    const secondCleanup = new Error("second cleanup");
+    const recovery = recoveryWith({
+      recoverUncertainLocation: async () => ({
+        arrival: barrierArrival,
+        workspaceLockCleanup: { kind: "failed", cause: secondCleanup },
+      }),
+    });
+
+    const result = await finalizeArrivalAfterWorkspaceExecution(
+      recovery,
+      {} as never,
+      {
+        execution: { kind: "kept" },
+        arrival: { kind: "unsettled", cause: new Error("held recovery") },
+      },
+      { kind: "failed", cause: firstCleanup },
+    );
+
+    expect(result.arrival).toBe(barrierArrival);
+    expect(
+      (result.workspaceLockCleanup as { cause: AggregateError }).cause.errors,
+    ).toEqual([firstCleanup, secondCleanup]);
+  });
+
+  it("carries preparation cleanup through a late state conflict", async () => {
+    const cleanup = {
+      kind: "failed" as const,
+      cause: new Error("restore staging remained"),
+    };
+    const recovery = recoveryWith({
+      recoverUncertainLocationInWorkspaceLock: () => exactArrival,
+    });
+
+    const result = await postMutationStateConflict(
+      recovery,
+      {} as never,
+      "target-changed",
+      {
+        kind: "failed",
+        stage: "verification",
+        cause: new Error("verification stopped"),
+      },
+      cleanup,
+      { kind: "held", writeAuthority },
+    );
+
+    expect(result.execution.preparationCleanup).toBe(cleanup);
+    expect(result.execution.reason).toBe("target-changed");
   });
 });

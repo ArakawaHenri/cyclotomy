@@ -9,7 +9,6 @@ import {
   DEFAULT_WORKSPACE_PATH_LIMITS,
   portableWorkspacePathKey,
   workspaceLocalGitignorePath,
-  workspaceScopeBytes,
   type WorkspacePathLimits,
   type WorkspaceScope,
 } from "../workspace-scope.ts";
@@ -89,6 +88,23 @@ export interface TreeManifest {
   readonly format: string;
   readonly entries: readonly TreeEntry[];
   readonly scope: WorkspaceScope;
+}
+
+/** Freeze the complete canonical manifest graph at a trust boundary. */
+export function freezeTreeManifest<Manifest extends TreeManifest>(
+  manifest: Manifest,
+): Manifest {
+  for (const entry of manifest.entries) Object.freeze(entry);
+  Object.freeze(manifest.entries);
+  if (manifest.scope.kind === "git") {
+    if (manifest.scope.evaluator !== null) {
+      Object.freeze(manifest.scope.evaluator);
+    }
+    for (const source of manifest.scope.gitignoreSources) Object.freeze(source);
+    Object.freeze(manifest.scope.gitignoreSources);
+  }
+  Object.freeze(manifest.scope);
+  return Object.freeze(manifest);
 }
 export function exactKeys(
   value: Record<string, unknown>,
@@ -361,7 +377,10 @@ function validateTreeScopeBindings(
     }
 
     const key = portableWorkspacePathKey(localPath);
-    const expectedOid = sha256(workspaceScopeBytes(source.contentsBase64));
+    // The selected scope codec has already authenticated canonical base64.
+    // Decode without reapplying current policy so frozen historical codecs
+    // retain their released acceptance set.
+    const expectedOid = sha256(Buffer.from(source.contentsBase64, "base64"));
     const previousPolicyPath = policyNamespace.get(key);
     if (
       previousPolicyPath !== undefined &&
@@ -407,10 +426,28 @@ export function canonicalizeTreeManifest(
   scope: unknown,
   limits: TreeManifestLimits = DEFAULT_TREE_MANIFEST_LIMITS,
 ): { readonly entries: readonly TreeEntry[]; readonly scope: WorkspaceScope } {
+  return canonicalizeTreeManifestUsingScopeCodec(
+    entries,
+    scope,
+    limits,
+    canonicalizeWorkspaceScope,
+  );
+}
+
+/** Shared v2/v3 entry grammar with an explicitly versioned scope codec. */
+export function canonicalizeTreeManifestUsingScopeCodec(
+  entries: unknown,
+  scope: unknown,
+  limits: TreeManifestLimits,
+  canonicalizeScope: (
+    value: unknown,
+    limits: WorkspacePathLimits,
+  ) => WorkspaceScope,
+): { readonly entries: readonly TreeEntry[]; readonly scope: WorkspaceScope } {
   const canonicalEntries = canonicalizeTreeEntries(entries, limits);
   let canonicalScope: WorkspaceScope;
   try {
-    canonicalScope = canonicalizeWorkspaceScope(scope, limits);
+    canonicalScope = canonicalizeScope(scope, limits);
     validateTreeScopeBindings(canonicalEntries, canonicalScope, limits);
   } catch (error) {
     if (error instanceof TreeManifestError) throw error;

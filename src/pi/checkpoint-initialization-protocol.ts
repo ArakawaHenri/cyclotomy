@@ -1,11 +1,11 @@
 import type { ResolvedNodeState } from "../application/resolve.ts";
 import type { NodeKey } from "../domain/model.ts";
-import type { ArrivalProtection } from "./arrival-protection.ts";
 import {
-  dispositionFromArrivalProtection,
   type ArrivalDisposition,
+  type NonAdmittedArrivalDisposition,
+  unsettledArrival,
 } from "./arrival-settlement.ts";
-import type { SessionView } from "./session-view.ts";
+import { isExactUsableSessionView, type SessionView } from "./session-view.ts";
 
 export interface CheckpointInitializationProtocolDeps {
   readonly readCurrentView: () => SessionView;
@@ -14,7 +14,7 @@ export interface CheckpointInitializationProtocolDeps {
   /** Runs in the caller's current lock scope and must durably fail closed. */
   readonly protectCommittedArrival: (
     cause: unknown,
-  ) => ArrivalProtection | Promise<ArrivalProtection>;
+  ) => NonAdmittedArrivalDisposition | Promise<NonAdmittedArrivalDisposition>;
 }
 
 export interface CheckpointInitializationRequest {
@@ -48,27 +48,17 @@ async function protectAfterInitialization(
   primary: unknown,
 ): Promise<ArrivalDisposition> {
   try {
-    const disposition = dispositionFromArrivalProtection(
-      await deps.protectCommittedArrival(primary),
-    );
+    const disposition = await deps.protectCommittedArrival(primary);
     if (disposition.kind !== "unsettled") return disposition;
-    return {
-      kind: "unsettled",
-      cause: new AggregateError(
-        [primary, disposition.cause],
-        "checkpoint initialization and arrival protection both failed",
-        { cause: primary },
-      ),
-    };
+    return unsettledArrival(
+      "checkpoint initialization and arrival protection both failed",
+      [primary, disposition.cause],
+    );
   } catch (secondary) {
-    return {
-      kind: "unsettled",
-      cause: new AggregateError(
-        [primary, secondary],
-        "checkpoint initialization and arrival protection both failed",
-        { cause: primary },
-      ),
-    };
+    return unsettledArrival(
+      "checkpoint initialization and arrival protection both failed",
+      [primary, secondary],
+    );
   }
 }
 
@@ -87,8 +77,9 @@ export async function settleCheckpointInitialization(
   try {
     current = deps.readCurrentView();
     if (
-      !deps.sessionIsUsable(current) ||
-      !current.isSameSnapshotAs(request.expected) ||
+      !isExactUsableSessionView(current, request.expected, (candidate) =>
+        deps.sessionIsUsable(candidate),
+      ) ||
       !(
         request.locationMatches?.(current, request.node) ??
         sameNode(deps.captureAnchor(current), request.node)

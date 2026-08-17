@@ -5,7 +5,7 @@ import type {
   AdmissionDecision,
   AdmissionLease,
 } from "./checkpoint-admission.ts";
-import type { SessionView } from "./session-view.ts";
+import { isExactUsableSessionView, type SessionView } from "./session-view.ts";
 
 export type CaptureProtocolFailure =
   | {
@@ -64,7 +64,9 @@ function exactCurrentView(
   expected: SessionView,
 ): SessionView | undefined {
   const current = deps.readCurrentView();
-  return deps.sessionIsUsable(current) && current.isSameSnapshotAs(expected)
+  return isExactUsableSessionView(current, expected, (candidate) =>
+    deps.sessionIsUsable(candidate),
+  )
     ? current
     : undefined;
 }

@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import {
   readSessionView,
   SessionViewTracker,
@@ -17,6 +16,7 @@ import {
 import { RealPiHarness } from "./real-pi.ts";
 import {
   checkpointState,
+  createTestCurrentMetadataStore,
   readTestSessionRegistration,
 } from "./metadata-fixture.ts";
 
@@ -57,12 +57,15 @@ async function startHarnessWithRootUser(): Promise<RealPiHarness> {
   return started;
 }
 
-function readState(
+async function readState(
   pi: RealPiHarness,
   sessionId: string,
   entryId: string,
-): string | undefined {
-  const db = createCurrentMetadataStore(join(pi.storeRoot, "state.db"));
+): Promise<string | undefined> {
+  const db = await createTestCurrentMetadataStore(
+    join(pi.storeRoot, "state.db"),
+    pi.storeRoot,
+  );
   try {
     return checkpointState(db, sessionId, entryId)?.treeOid;
   } finally {
@@ -118,7 +121,7 @@ describe("real Pi integration", () => {
     expect(pi.session.isStreaming).toBe(true);
     expect(
       pi.notifications.some(({ message }) =>
-        message.includes("Cyclotomy stopped for this Pi runtime"),
+        message.includes("Cyclotomy stopped"),
       ),
     ).toBe(true);
 
@@ -154,7 +157,7 @@ describe("real Pi integration", () => {
 
     await pi.writeWorkspaceFile("after-resume.txt", "captured");
     await pi.turn("capture after local resume");
-    expect(readState(pi, pi.sessionId, pi.leafId)).toBeDefined();
+    expect(await readState(pi, pi.sessionId, pi.leafId)).toBeDefined();
   });
 
   it("exposes cold-fork provenance through Pi's package-root API", async () => {
@@ -216,7 +219,7 @@ describe("real Pi integration", () => {
     await pi.turn("persist the source");
     const sourceSessionId = pi.sessionId;
     const sourceLeafId = pi.leafId;
-    const sourceTreeOid = readState(pi, sourceSessionId, sourceLeafId);
+    const sourceTreeOid = await readState(pi, sourceSessionId, sourceLeafId);
     expect(sourceTreeOid).toBeDefined();
 
     // Select the destructive loaded-session option in the fresh target. The
@@ -230,7 +233,7 @@ describe("real Pi integration", () => {
     expect(pi.sessionManager.getHeader()?.parentSession).toBe(
       source.sourceSessionFile,
     );
-    expect(readState(pi, pi.sessionId, sourceLeafId)).toBe(sourceTreeOid);
+    expect(await readState(pi, pi.sessionId, sourceLeafId)).toBe(sourceTreeOid);
     expect(await readFile(join(pi.workspace, "forked.txt"), "utf8")).toBe(
       "source checkpoint",
     );
@@ -248,7 +251,10 @@ describe("real Pi integration", () => {
     // A concrete cold-start leaf is materialized from the first observed
     // workspace so later navigation has an honest baseline.
     await expect(stat(join(pi.storeRoot, "state.db"))).resolves.toBeDefined();
-    const db = createCurrentMetadataStore(join(pi.storeRoot, "state.db"));
+    const db = await createTestCurrentMetadataStore(
+      join(pi.storeRoot, "state.db"),
+      pi.storeRoot,
+    );
     try {
       const treeOids = db.listReferencedTreeOids();
       expect(treeOids).toHaveLength(1);
@@ -266,12 +272,12 @@ describe("real Pi integration", () => {
     await pi.writeWorkspaceFile("a.txt", "v1");
     await pi.turn();
     const first = pi.leafId;
-    const firstOid = readState(pi, pi.sessionId, first);
+    const firstOid = await readState(pi, pi.sessionId, first);
 
     await pi.writeWorkspaceFile("a.txt", "v2");
     await pi.turn();
     const second = pi.leafId;
-    const secondOid = readState(pi, pi.sessionId, second);
+    const secondOid = await readState(pi, pi.sessionId, second);
 
     expect(first).not.toBe(second);
     expect(firstOid).toBeDefined();
@@ -305,7 +311,10 @@ describe("real Pi integration", () => {
     );
 
     const metadataPath = join(pi.storeRoot, "state.db");
-    const metadata = createCurrentMetadataStore(metadataPath);
+    const metadata = await createTestCurrentMetadataStore(
+      metadataPath,
+      pi.storeRoot,
+    );
     try {
       expect(
         readTestSessionRegistration(metadataPath, childSessionId),
@@ -318,7 +327,7 @@ describe("real Pi integration", () => {
 
     await pi.writeWorkspaceFile("after-fork.txt", "child state");
     await pi.turn("first child turn");
-    expect(readState(pi, childSessionId, pi.leafId)).toBeDefined();
+    expect(await readState(pi, childSessionId, pi.leafId)).toBeDefined();
   });
 
   it("restores the selected checkpoint through real Pi tree navigation", async () => {
@@ -374,7 +383,7 @@ describe("real Pi integration", () => {
     await pi.writeWorkspaceFile("a.txt", "saved");
     await pi.turn();
     const leaf = pi.leafId;
-    const savedOid = readState(pi, pi.sessionId, leaf);
+    const savedOid = await readState(pi, pi.sessionId, leaf);
     await pi.writeWorkspaceFile("a.txt", "current");
 
     pi.selectIndex = 1;
@@ -382,7 +391,7 @@ describe("real Pi integration", () => {
 
     expect(await readFile(join(pi.workspace, "a.txt"), "utf8")).toBe("saved");
     // Restore is a pure apply: the node keeps its original retry target.
-    expect(readState(pi, pi.sessionId, leaf)).toBe(savedOid);
+    expect(await readState(pi, pi.sessionId, leaf)).toBe(savedOid);
   });
 
   it("captures between-turn edits at the source before a new turn", async () => {
@@ -390,13 +399,13 @@ describe("real Pi integration", () => {
     await pi.writeWorkspaceFile("a.txt", "turn-1");
     await pi.turn();
     const source = pi.leafId;
-    const afterTurn = readState(pi, pi.sessionId, source);
+    const afterTurn = await readState(pi, pi.sessionId, source);
 
     // An edit made while Pi is idle belongs to the node standing there now.
     await pi.writeWorkspaceFile("a.txt", "edited-between-turns");
     await pi.turn();
 
-    const reassigned = readState(pi, pi.sessionId, source);
+    const reassigned = await readState(pi, pi.sessionId, source);
     expect(afterTurn).toBeDefined();
     expect(reassigned).toBeDefined();
     expect(reassigned).not.toBe(afterTurn);

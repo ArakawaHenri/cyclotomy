@@ -12,12 +12,15 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { CyclotomyEngine } from "../src/pi/cyclotomy-engine.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { FakePi, FakeSessionManager } from "./fake-pi.ts";
-import { checkpointIsBlocked, checkpointState } from "./metadata-fixture.ts";
+import {
+  checkpointIsBlocked,
+  checkpointState,
+  createTestCurrentMetadataStore,
+} from "./metadata-fixture.ts";
 
 let workspace: string;
 let agentDir: string;
@@ -165,7 +168,7 @@ describe("Cyclotomy participation boundary", () => {
       return {
         kind: "completed",
         value: undefined,
-        cleanup: { kind: "released" },
+        cleanup: { kind: "settled" },
       };
     });
     const close = vi.spyOn(CyclotomyRuntime.prototype, "close");
@@ -219,14 +222,20 @@ describe("Cyclotomy participation boundary", () => {
     const leaf = pi.manager.appendEntry().id;
     await writeFile(join(workspace, "state.txt"), "checkpoint");
     await pi.startSession("startup");
-    const before = createCurrentMetadataStore(join(storeRoot, "state.db"));
+    const before = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
     const saved = checkpointState(before, pi.manager.sessionId, leaf);
     before.close();
     expect(saved).toBeDefined();
 
     await pi.runCommand("adjunct");
     await pi.runCommand("cyclotomy", "stop");
-    const stopped = createCurrentMetadataStore(join(storeRoot, "state.db"));
+    const stopped = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
     expect(checkpointIsBlocked(stopped, pi.manager.sessionId, leaf)).toBe(true);
     stopped.close();
     await writeFile(join(workspace, "state.txt"), "changed while stopped");
@@ -240,7 +249,10 @@ describe("Cyclotomy participation boundary", () => {
     expect(await readFile(join(workspace, "state.txt"), "utf8")).toBe(
       "changed while stopped",
     );
-    const after = createCurrentMetadataStore(join(storeRoot, "state.db"));
+    const after = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
     expect(checkpointState(after, pi.manager.sessionId, leaf)).toEqual(saved);
     expect(checkpointIsBlocked(after, pi.manager.sessionId, leaf)).toBe(true);
     after.close();
@@ -260,7 +272,10 @@ describe("Cyclotomy participation boundary", () => {
     expect(pi.reloadCalls).toBe(0);
     expect(pi.waitForIdleCalls).toBe(1);
     await pi.endTurn();
-    const db = createCurrentMetadataStore(join(storeRoot, "state.db"));
+    const db = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
     expect(checkpointState(db, pi.manager.sessionId, original)).toBeUndefined();
     expect(
       checkpointState(db, pi.manager.sessionId, pi.manager.getLeafId()!),
@@ -276,16 +291,14 @@ describe("Cyclotomy participation boundary", () => {
     await pi.startSession("startup");
     await pi.runCommand("cyclotomy");
     expect(pi.notifications.at(-1)).toEqual({
-      message:
-        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+      message: "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
       level: "info",
     });
 
     pi.notifications.length = 0;
     await pi.runCommand("cyclotomy", "resume");
     expect(pi.notifications.at(-1)).toEqual({
-      message:
-        "Cyclotomy is not active for this Pi session. Pi remains available.",
+      message: "Cyclotomy is unavailable in this session.",
       level: "info",
     });
     expect(
@@ -311,16 +324,14 @@ describe("Cyclotomy participation boundary", () => {
     await pi.startSession("resume");
     await pi.runCommand("cyclotomy");
     expect(pi.notifications.at(-1)).toEqual({
-      message:
-        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+      message: "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
       level: "info",
     });
 
     pi.notifications.length = 0;
     await pi.runCommand("cyclotomy", "resume");
     expect(pi.notifications.at(-1)).toEqual({
-      message:
-        "Cyclotomy is not active for this Pi session. Pi remains available.",
+      message: "Cyclotomy is unavailable in this session.",
       level: "info",
     });
     expect(

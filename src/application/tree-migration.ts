@@ -1,7 +1,8 @@
 import type { TreeOid } from "../domain/model.ts";
-import type {
-  NativeObjectStore,
-  TreeFormatUpgradeResult,
+import {
+  upgradeStoredTree,
+  type NativeObjectStore,
+  type TreeFormatUpgradeResult,
 } from "../infrastructure/object-store.ts";
 
 export type TreeFormatUpgradeBlocker = Extract<
@@ -21,7 +22,7 @@ export class TreeFormatUpgradeBlockedError extends Error {
     super(
       `${incompatibleTrees.length} rooted tree${
         incompatibleTrees.length === 1 ? " is" : "s are"
-      } not losslessly upgradeable to tree format ${targetFormat}; metadata was left unchanged${
+      } not losslessly upgradeable to tree format ${targetFormat}${
         first === undefined
           ? ""
           : `; first incompatible tree ${first.treeOid}: ${first.cause.message}`
@@ -50,7 +51,7 @@ export async function prepareTreeOidUpgrades(
   const incompatibleTrees: TreeFormatUpgradeBlocker[] = [];
 
   for (const treeOid of roots) {
-    const result = await store.upgradeTree(treeOid, targetFormat);
+    const result = await upgradeStoredTree(store, treeOid, targetFormat);
     switch (result.kind) {
       case "already-target":
         upgraded.set(treeOid, result.treeOid);

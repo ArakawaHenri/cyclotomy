@@ -114,6 +114,15 @@ export interface SessionView {
   ): boolean;
 }
 
+/** Exact snapshot equality after the caller's current usability policy. */
+export function isExactUsableSessionView(
+  current: SessionView,
+  expected: SessionView,
+  isUsable: (view: SessionView) => boolean,
+): boolean {
+  return isUsable(current) && current.isSameSnapshotAs(expected);
+}
+
 interface SessionIdentityProjection {
   readonly sessionId: string;
   readonly cwd: string;

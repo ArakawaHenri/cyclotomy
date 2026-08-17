@@ -8,7 +8,6 @@ import {
   type FileRecreationMode,
   type SymlinkKind,
   type TreeEntry,
-  type TreeManifest,
   type TreeManifestLimits,
 } from "./manifest-codec.ts";
 import {
@@ -260,7 +259,21 @@ export function encodeV1TreeManifest(
 ): Buffer {
   assertTreeManifestLimits(limits);
   assertEntryLimit(entries, limits);
-  const manifest: TreeManifest = { format, entries, scope };
+  if (scope.kind === "git" && scope.evaluator !== null) {
+    invalidManifest("tree format v1 cannot represent Git provenance");
+  }
+  const legacyScope =
+    scope.kind === "all-managed"
+      ? scope
+      : {
+          kind: scope.kind,
+          repositoryPrefix: scope.repositoryPrefix,
+          ignoreCase: scope.ignoreCase,
+          gitignoreSources: scope.gitignoreSources,
+          infoExcludeBase64: scope.infoExcludeBase64,
+          globalExcludeBase64: scope.globalExcludeBase64,
+        };
+  const manifest = { format, entries, scope: legacyScope };
   const encoded = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
   if (encoded.byteLength > limits.maxManifestBytes) {
     invalidManifest(

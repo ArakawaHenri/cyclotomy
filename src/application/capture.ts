@@ -1,6 +1,7 @@
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
+import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 import { publishSnapshot } from "../infrastructure/snapshot-publication.ts";
 import {
   scanWorkspace,
@@ -30,9 +31,10 @@ export interface CaptureCommitDeps extends CaptureDeps {
     CurrentMetadataStore,
     "adoptBlockedMissing" | "commitCapture"
   >;
+  readonly writeAuthority: WorkspaceWriteAuthority;
   /** Persisted file that must own the verified session coordinate. */
   readonly expectedSessionFile: string;
-  /** Final synchronous process-local workspace identity gate. */
+  /** Final synchronous workspace identity and lock-ownership gate. */
   readonly assertWorkspaceAuthority: () => undefined;
 }
 
@@ -166,7 +168,7 @@ export function commitPreparedNodeState(
     if (deps.assertWorkspaceAuthority() !== undefined) {
       throw new Error("workspace authority check must complete synchronously");
     }
-    const committed = deps.metadata.commitCapture({
+    const committed = deps.metadata.commitCapture(deps.writeAuthority, {
       identity: {
         sessionId: node.sessionId,
         sessionFile: deps.expectedSessionFile,
@@ -214,12 +216,12 @@ export function commitPreparedMissingNodeState(
     };
     const committed =
       intent === "adopt-protected"
-        ? deps.metadata.adoptBlockedMissing({
+        ? deps.metadata.adoptBlockedMissing(deps.writeAuthority, {
             identity,
             entryId: node.entryId,
             treeOid: prepared.treeOid,
           })
-        : deps.metadata.commitCapture({
+        : deps.metadata.commitCapture(deps.writeAuthority, {
             identity,
             entryId: node.entryId,
             activeAncestryEntryIds: authority.activeAncestryEntryIds,

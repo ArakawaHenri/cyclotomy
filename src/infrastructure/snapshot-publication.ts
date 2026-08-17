@@ -1,11 +1,12 @@
 import { isAbsolute, join } from "node:path";
 
-import type { TreeEntry } from "./tree-formats/manifest-codec.ts";
+import { retainFailureCause } from "./failure-settlement.ts";
 import type { ObjectStore } from "./object-store.ts";
 import {
   summarizeScanProblems,
   type ScanProblem,
   type WorkspaceSnapshot,
+  workspaceEntryAsTreeEntry,
 } from "./workspace-scan.ts";
 
 const PUBLICATION_CONCURRENCY = 8;
@@ -95,6 +96,27 @@ function assertEntrySourcesBound(snapshot: WorkspaceSnapshot): void {
   }
 }
 
+function assertCaptureEvaluatorBound(snapshot: WorkspaceSnapshot): void {
+  if (snapshot.scope.kind === "all-managed") {
+    if (snapshot.gitOracleVersion !== null) {
+      throw new InconsistentSnapshotScopeError(
+        "all-managed snapshot unexpectedly names a Git evaluator",
+      );
+    }
+    return;
+  }
+  if (snapshot.scope.evaluator === null) {
+    throw new InconsistentSnapshotScopeError(
+      "new Git snapshot has legacy-unknown evaluator provenance",
+    );
+  }
+  if (snapshot.scope.evaluator.version !== snapshot.gitOracleVersion) {
+    throw new InconsistentSnapshotScopeError(
+      "snapshot Git evaluator does not match its workspace observation",
+    );
+  }
+}
+
 /**
  * Materialize a scan-time observation and assemble its tree object. Missing
  * blobs are streamed from scanner-bound source paths; authenticated CAS hits
@@ -109,55 +131,60 @@ export async function publishSnapshot(
     throw new IncompleteSnapshotError(snapshot.problems);
   }
   assertEntrySourcesBound(snapshot);
+  assertCaptureEvaluatorBound(snapshot);
   const publication = store.beginSnapshotPublication();
-
-  const publishedBlobs = new Set<string>();
-  const blobSources: Array<{
-    readonly sourcePath: string;
-    readonly oid: string;
-    readonly byteLength: number;
-    readonly entryPath: string;
-  }> = [];
-  for (const entry of snapshot.entries) {
-    if (entry.kind === "regular" && !publishedBlobs.has(entry.sha256)) {
-      publishedBlobs.add(entry.sha256);
-      blobSources.push({
-        sourcePath: entry.sourcePath,
-        oid: entry.sha256,
-        byteLength: entry.byteLength,
-        entryPath: entry.path,
-      });
+  let publicationFailed = false;
+  let publicationFailure: unknown;
+  try {
+    const publishedBlobs = new Set<string>();
+    const blobSources: Array<{
+      readonly sourcePath: string;
+      readonly oid: string;
+      readonly byteLength: number;
+      readonly entryPath: string;
+    }> = [];
+    for (const entry of snapshot.entries) {
+      if (entry.kind === "regular" && !publishedBlobs.has(entry.sha256)) {
+        publishedBlobs.add(entry.sha256);
+        blobSources.push({
+          sourcePath: entry.sourcePath,
+          oid: entry.sha256,
+          byteLength: entry.byteLength,
+          entryPath: entry.path,
+        });
+      }
     }
-  }
 
-  await runPublicationPool(blobSources, async (source) => {
-    const blobOid = await publication.publishBlobFromFile(
-      source.sourcePath,
-      source.oid,
-      source.byteLength,
-    );
-    if (blobOid !== source.oid) {
-      throw new Error(
-        `object store is broken: blob id ${blobOid} does not match the scanned digest ${source.oid} of "${source.entryPath}"`,
+    await runPublicationPool(blobSources, async (source) => {
+      const blobOid = await publication.publishBlobFromFile(
+        source.sourcePath,
+        source.oid,
+        source.byteLength,
+      );
+      if (blobOid !== source.oid) {
+        throw new Error(
+          `object store is broken: blob id ${blobOid} does not match the scanned digest ${source.oid} of "${source.entryPath}"`,
+        );
+      }
+    });
+
+    const treeEntries = snapshot.entries.map(workspaceEntryAsTreeEntry);
+
+    return await publication.publishTree(treeEntries, snapshot.scope);
+  } catch (error) {
+    publicationFailed = true;
+    publicationFailure = error;
+    throw error;
+  } finally {
+    try {
+      await publication.close();
+    } catch (cleanupError) {
+      if (!publicationFailed) throw cleanupError;
+      throw retainFailureCause(
+        publicationFailure,
+        cleanupError,
+        "snapshot publication and cleanup both failed",
       );
     }
-  });
-
-  const treeEntries: TreeEntry[] = snapshot.entries.map((entry) =>
-    entry.kind === "symlink"
-      ? {
-          path: entry.path,
-          type: "symlink",
-          target: entry.target,
-          symlinkKind: entry.symlinkKind,
-        }
-      : {
-          path: entry.path,
-          type: "regular",
-          blobOid: entry.sha256,
-          recreationMode: entry.recreationMode,
-        },
-  );
-
-  return publication.publishTree(treeEntries, snapshot.scope);
+  }
 }

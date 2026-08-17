@@ -7,12 +7,14 @@ import { describe, expect, it, vi } from "vitest";
 import { prepareWorkspaceMutationLease } from "../src/application/mutation-lease.ts";
 import type { RestoreOutcome } from "../src/application/restore.ts";
 import { createCurrentTreeManifest } from "../src/infrastructure/tree-formats/current.ts";
+import type { WorkspaceWriteAuthority } from "../src/infrastructure/workspace-lock.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import {
   WorkspaceMutationProtocol,
   type WorkspaceMutationProtocolAuthority,
 } from "../src/pi/workspace-mutation-protocol.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
+import type { SessionView } from "../src/pi/session-view.ts";
 
 const outcome = {
   kind: "restored",
@@ -26,78 +28,36 @@ const outcome = {
     problems: [],
   },
 } satisfies RestoreOutcome;
-const exactProtection = {
-  kind: "exact-slot",
-  slot: { kind: "blocked-missing" },
-  admission: { kind: "settled" },
-} as const;
+const writeAuthority = {} as WorkspaceWriteAuthority;
 const settledCleanup = { kind: "settled" } as const;
 
 describe("workspace mutation protocol recovery", () => {
-  it("preserves a no-write execution when queue cleanup later fails", async () => {
-    const recover = vi.fn();
-    const runtime = {
-      recoverUncertainLocation: recover,
-    } as unknown as WorkspaceMutationProtocolAuthority;
-    const protocol = new WorkspaceMutationProtocol(runtime, {} as never, () => {
-      throw new Error("unused");
-    });
+  it.each(["not-requested", "rejected"] as const)(
+    "does not rewrite a %s no-write execution after cleanup failure",
+    (cutoverKind) => {
+      const protocol = new WorkspaceMutationProtocol(
+        {} as WorkspaceMutationProtocolAuthority,
+        {} as never,
+      );
+      const cause = new Error("release");
+      const cutover =
+        cutoverKind === "rejected"
+          ? ({ kind: "rejected", cause } as const)
+          : ({ kind: "not-requested" } as const);
 
-    const release = new Error("release");
-    await expect(
-      protocol.recoverAfterWorkspaceFailure(
-        release,
-        {
-          kind: "outcome",
-          outcome,
-          cutover: { kind: "not-requested" },
-          stagingCleanup: settledCleanup,
-          workspaceLockCleanup: settledCleanup,
-        },
-        { kind: "failed", cause: release },
-      ),
-    ).resolves.toEqual({
-      kind: "outcome",
-      outcome,
-      cutover: { kind: "not-requested" },
-      stagingCleanup: settledCleanup,
-      workspaceLockCleanup: { kind: "failed", cause: release },
-    });
-    expect(recover).not.toHaveBeenCalled();
-  });
-
-  it("preserves a rejected no-write execution when queue cleanup later fails", async () => {
-    const recover = vi.fn();
-    const runtime = {
-      recoverUncertainLocation: recover,
-    } as unknown as WorkspaceMutationProtocolAuthority;
-    const protocol = new WorkspaceMutationProtocol(runtime, {} as never, () => {
-      throw new Error("unused");
-    });
-    const rejection = new Error("Pi became busy");
-    const release = new Error("release");
-
-    await expect(
-      protocol.recoverAfterWorkspaceFailure(
-        release,
-        {
-          kind: "outcome",
-          outcome: { kind: "failed", stage: "apply", cause: rejection },
-          cutover: { kind: "rejected", cause: rejection },
-          stagingCleanup: settledCleanup,
-          workspaceLockCleanup: settledCleanup,
-        },
-        { kind: "failed", cause: release },
-      ),
-    ).resolves.toEqual({
-      kind: "outcome",
-      outcome: { kind: "failed", stage: "apply", cause: rejection },
-      cutover: { kind: "rejected", cause: rejection },
-      stagingCleanup: settledCleanup,
-      workspaceLockCleanup: { kind: "failed", cause: release },
-    });
-    expect(recover).not.toHaveBeenCalled();
-  });
+      expect(
+        protocol.recoveryExecutionAfterCleanupFailure(
+          {
+            kind: "outcome",
+            outcome,
+            cutover,
+            preparationCleanup: settledCleanup,
+          },
+          cause,
+        ),
+      ).toBeUndefined();
+    },
+  );
 
   it("returns a rejected cutover without manufacturing post-mutation recovery", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-protocol-ws-"));
@@ -117,7 +77,7 @@ describe("workspace mutation protocol recovery", () => {
               createCurrentTreeManifest([], ALL_MANAGED_SCOPE),
             verifyBlobs: async () => undefined,
           },
-          validateManifestScope: async () => undefined,
+          validateManifestScope: async () => ({ gitVersion: null }),
         }),
         prepareLocationMutation: () =>
           prepareWorkspaceMutationLease(() => {
@@ -138,18 +98,20 @@ describe("workspace mutation protocol recovery", () => {
       };
 
       await expect(
-        protocol.restoreLocation({
-          expected: { cwd: root } as never,
-          node: resolution.foundAt,
-          resolution,
-          current: await scanWorkspace(root),
-        }),
+        protocol.restoreLocation(
+          {
+            expected: { cwd: root } as never,
+            node: resolution.foundAt,
+            resolution,
+            current: await scanWorkspace(root),
+          },
+          writeAuthority,
+        ),
       ).resolves.toEqual({
         kind: "outcome",
         outcome: { kind: "failed", stage: "apply", cause: rejection },
         cutover: { kind: "rejected", cause: rejection },
-        stagingCleanup: settledCleanup,
-        workspaceLockCleanup: settledCleanup,
+        preparationCleanup: settledCleanup,
       });
       expect(await readFile(path, "utf8")).toBe("current");
       expect(recover).not.toHaveBeenCalled();
@@ -159,86 +121,94 @@ describe("workspace mutation protocol recovery", () => {
     }
   });
 
-  it("recovers an explicitly authorized execution after queue release fails", async () => {
-    const recover = vi.fn(async () => ({
-      protection: { kind: "session-barrier" as const },
-      workspaceLockCleanup: settledCleanup,
-    }));
-    const runtime = {
-      recoverUncertainLocation: recover,
-    } as unknown as WorkspaceMutationProtocolAuthority;
-    const protocol = new WorkspaceMutationProtocol(runtime, {} as never, () => {
-      throw new Error("unused");
-    });
+  it("rewrites an authorized execution after queue release fails", () => {
+    const protocol = new WorkspaceMutationProtocol(
+      {} as WorkspaceMutationProtocolAuthority,
+      {} as never,
+    );
     const cause = new Error("release");
+    const preparationCleanup = {
+      kind: "failed" as const,
+      cause: new Error("restore staging remained"),
+    };
 
-    await expect(
-      protocol.recoverAfterWorkspaceFailure(
-        cause,
-        {
-          kind: "outcome",
-          outcome,
-          cutover: {
-            kind: "authorized",
-            pinnedResolution: {
-              treeOid: "a".repeat(64),
-              foundAt: { sessionId: "s", entryId: "e" },
-            },
+    const recovered = protocol.recoveryExecutionAfterCleanupFailure(
+      {
+        kind: "outcome",
+        outcome,
+        cutover: {
+          kind: "authorized",
+          pinnedResolution: {
+            treeOid: "a".repeat(64),
+            foundAt: { sessionId: "s", entryId: "e" },
           },
-          stagingCleanup: settledCleanup,
-          workspaceLockCleanup: settledCleanup,
+          writeAuthority,
+          storeRoot: "/unused",
         },
-        { kind: "failed", cause },
-      ),
-    ).resolves.toEqual({
+        preparationCleanup,
+      },
+      cause,
+    );
+
+    expect(recovered).toEqual({
       kind: "post-mutation-conflict",
       reason: "control-failed",
       outcome,
       cause,
-      arrivalProtection: { kind: "session-barrier" },
-      workspaceLockCleanup: { kind: "failed", cause },
+      preparationCleanup,
     });
-    expect(recover).toHaveBeenCalledTimes(1);
+    if (recovered?.kind !== "post-mutation-conflict") {
+      throw new Error("expected post-mutation cleanup recovery");
+    }
+    expect(recovered.preparationCleanup).toBe(preparationCleanup);
   });
 
-  it("preserves an established exact protection when lock cleanup later fails", async () => {
-    const recover = vi.fn(async () => ({
-      protection: {
-        kind: "unavailable" as const,
-        cause: new Error("retry"),
-      },
-      workspaceLockCleanup: settledCleanup,
-    }));
-    const runtime = {
-      recoverUncertainLocation: recover,
+  it("retains both failed tree-arrival protection attempts", async () => {
+    const tokenFailure = new Error("token protection failed");
+    const fallbackFailure = new Error("fallback protection failed");
+    const expected = {
+      cwd: "/unused",
+      isSameSnapshotAs: () => true,
+    } as unknown as SessionView;
+    const authority = {
+      prepareTreeArrivalMutation: () => undefined,
+      sessionIsUsable: () => true,
+      protectCurrentTreeArrival: () => ({
+        kind: "unsettled" as const,
+        cause: tokenFailure,
+      }),
+      recoverUncertainLocationInWorkspaceLock: () => ({
+        kind: "unsettled" as const,
+        cause: fallbackFailure,
+      }),
     } as unknown as WorkspaceMutationProtocolAuthority;
-    const protocol = new WorkspaceMutationProtocol(runtime, {} as never, () => {
-      throw new Error("unused");
-    });
-    const primary = new Error("cutover");
-    const release = new Error("release");
+    const protocol = new WorkspaceMutationProtocol(
+      authority,
+      {} as never,
+      () => expected,
+    );
 
-    await expect(
-      protocol.recoverAfterWorkspaceFailure(
-        release,
-        {
-          kind: "post-mutation-conflict",
-          reason: "control-failed",
-          outcome,
-          cause: primary,
-          arrivalProtection: exactProtection,
-          workspaceLockCleanup: { kind: "settled" },
+    const result = await protocol.restoreTreeArrival(
+      {
+        arrival: {} as never,
+        expected,
+        node: { sessionId: "s", entryId: "e" },
+        resolution: {
+          treeOid: "b".repeat(64),
+          foundAt: { sessionId: "s", entryId: "e" },
         },
-        { kind: "failed", cause: release },
-      ),
-    ).resolves.toEqual({
-      kind: "post-mutation-conflict",
-      reason: "control-failed",
-      outcome,
-      cause: primary,
-      arrivalProtection: exactProtection,
-      workspaceLockCleanup: { kind: "failed", cause: release },
-    });
-    expect(recover).not.toHaveBeenCalled();
+        current: {} as never,
+      },
+      writeAuthority,
+    );
+
+    expect(result.execution).toEqual({ kind: "target-changed" });
+    expect(result.arrival.kind).toBe("unsettled");
+    const cause = (result.arrival as { readonly cause: unknown }).cause;
+    expect(cause).toBeInstanceOf(AggregateError);
+    expect((cause as AggregateError).errors).toEqual([
+      tokenFailure,
+      fallbackFailure,
+    ]);
   });
 });

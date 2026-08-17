@@ -26,14 +26,16 @@ async function withSourceDirectory<T>(
 }
 
 /** Seed one authenticated blob through the same file-bound publication API. */
-export function publishTestBlob(
+export async function publishTestBlob(
   store: ObjectStore,
   content: Uint8Array,
 ): Promise<string> {
-  return publishTestBlobInPublication(
-    store.beginSnapshotPublication(),
-    content,
-  );
+  const publication = store.beginSnapshotPublication();
+  try {
+    return await publishTestBlobInPublication(publication, content);
+  } finally {
+    await publication.close();
+  }
 }
 
 /** Publish fixture bytes inside a caller-owned snapshot boundary. */
@@ -63,23 +65,27 @@ export function publishTestTree(
 ): Promise<string> {
   return withSourceDirectory(async (directory) => {
     const publication = store.beginSnapshotPublication();
-    const published = new Set<string>();
-    let sourceIndex = 0;
-    for (const entry of entries) {
-      if (entry.type !== "regular" || published.has(entry.blobOid)) {
-        continue;
+    try {
+      const published = new Set<string>();
+      let sourceIndex = 0;
+      for (const entry of entries) {
+        if (entry.type !== "regular" || published.has(entry.blobOid)) {
+          continue;
+        }
+        const content = await store.readBlob(entry.blobOid);
+        const source = join(directory, `${sourceIndex}.blob`);
+        sourceIndex += 1;
+        await writeFile(source, content);
+        await publication.publishBlobFromFile(
+          source,
+          entry.blobOid,
+          content.byteLength,
+        );
+        published.add(entry.blobOid);
       }
-      const content = await store.readBlob(entry.blobOid);
-      const source = join(directory, `${sourceIndex}.blob`);
-      sourceIndex += 1;
-      await writeFile(source, content);
-      await publication.publishBlobFromFile(
-        source,
-        entry.blobOid,
-        content.byteLength,
-      );
-      published.add(entry.blobOid);
+      return await publication.publishTree(entries, scope);
+    } finally {
+      await publication.close();
     }
-    return publication.publishTree(entries, scope);
   });
 }

@@ -14,9 +14,16 @@ import {
 } from "../src/infrastructure/tree-formats/current.ts";
 import {
   parseTreeManifest,
-  upgradeTreeManifestToCurrent,
+  upgradeTreeManifest,
 } from "../src/infrastructure/tree-formats/history.ts";
-import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
+import {
+  TREE_FORMAT_V1,
+  TREE_MANIFEST_FORMAT_V1,
+} from "../src/infrastructure/tree-formats/v1.ts";
+import {
+  TREE_FORMAT_V2,
+  TREE_MANIFEST_FORMAT_V2,
+} from "../src/infrastructure/tree-formats/v2.ts";
 import { validateTreeEntriesAgainstScope } from "../src/infrastructure/tree-scope-validation.ts";
 import {
   DEFAULT_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
@@ -27,6 +34,21 @@ import {
 } from "../src/infrastructure/workspace-scope.ts";
 
 const allManaged = { kind: "all-managed" } as const;
+const evaluator = {
+  version: "git version fixture",
+  precomposeUnicode: false,
+} as const;
+
+function upgradeTreeManifestToCurrent(
+  legacy: Parameters<typeof upgradeTreeManifest>[0],
+  pathLimits?: Parameters<typeof upgradeTreeManifest>[2],
+): CurrentTreeManifest {
+  return upgradeTreeManifest(
+    legacy,
+    CURRENT_TREE_MANIFEST_FORMAT,
+    pathLimits,
+  ) as CurrentTreeManifest;
+}
 
 function manifest(
   entries: readonly TreeEntry[],
@@ -51,7 +73,7 @@ describe("versioned tree manifests", () => {
     );
   });
 
-  it("writes only v2 and requires the final symlink shape", () => {
+  it("creates v3 semantics and requires the final symlink shape", () => {
     const encoded = encodeCurrentTreeManifest(
       createCurrentTreeManifest(
         [
@@ -65,9 +87,9 @@ describe("versioned tree manifests", () => {
         allManaged,
       ),
     );
-    expect(CURRENT_TREE_MANIFEST_FORMAT).toBe("cyclotomy-tree-v2");
-    expect(parseTreeManifest(encoded)).toEqual({
-      format: "cyclotomy-tree-v2",
+    expect(CURRENT_TREE_MANIFEST_FORMAT).toBe("cyclotomy-tree-v3");
+    expect(JSON.parse(encoded.toString("utf8"))).toEqual({
+      format: "cyclotomy-tree-v3",
       entries: [
         {
           path: "link",
@@ -78,6 +100,8 @@ describe("versioned tree manifests", () => {
       ],
       scope: allManaged,
     });
+    // A graph-format semantic projection is never accepted as a stored root.
+    expect(() => parseTreeManifest(encoded)).toThrow();
     for (const candidate of [
       { format: "unsupported-tree-format", entries: [], scope: allManaged },
       {
@@ -92,7 +116,34 @@ describe("versioned tree manifests", () => {
     }
   });
 
-  it("parses the exact published v1 contract before migrating to v2", () => {
+  it("admits new current manifests through the exact semantic byte ceiling", () => {
+    const entries = [
+      {
+        path: "entry-with-a-long-name",
+        type: "regular",
+        blobOid: "a".repeat(64),
+        recreationMode: 0o644,
+      },
+    ] as const;
+    const created = createCurrentTreeManifest(entries, allManaged);
+    const exactBytes = encodeCurrentTreeManifest(created).byteLength;
+    const exactLimits = {
+      ...DEFAULT_TREE_MANIFEST_LIMITS,
+      maxManifestBytes: exactBytes,
+    };
+
+    expect(createCurrentTreeManifest(entries, allManaged, exactLimits)).toEqual(
+      created,
+    );
+    expect(() =>
+      createCurrentTreeManifest(entries, allManaged, {
+        ...exactLimits,
+        maxManifestBytes: exactBytes - 1,
+      }),
+    ).toThrow("exceeding");
+  });
+
+  it("parses the exact published v1 contract before migrating to current", () => {
     const legacyBytes = Buffer.from(
       `${JSON.stringify({
         format: TREE_MANIFEST_FORMAT_V1,
@@ -114,6 +165,71 @@ describe("versioned tree manifests", () => {
       entries: legacy.entries,
       scope: legacy.scope,
     });
+  });
+
+  it("projects v1 Git provenance as unknown without changing historical bytes", () => {
+    const legacyBytes = Buffer.from(
+      `${JSON.stringify({
+        format: TREE_MANIFEST_FORMAT_V1,
+        entries: [],
+        scope: {
+          kind: "git",
+          repositoryPrefix: "",
+          ignoreCase: false,
+          gitignoreSources: [],
+          infoExcludeBase64: "",
+          globalExcludeBase64: "",
+        },
+      })}\n`,
+    );
+    const legacy = parseTreeManifest(legacyBytes);
+    expect(legacy.scope).toMatchObject({
+      kind: "git",
+      evaluator: null,
+    });
+    expect(
+      TREE_FORMAT_V1.encode!(legacy, DEFAULT_TREE_MANIFEST_LIMITS),
+    ).toEqual(legacyBytes);
+  });
+
+  it("authenticates frozen v1/v2 NUL policy bytes but blocks v2 admission to v3", () => {
+    const legacyBytes = (format: string) =>
+      Buffer.from(
+        `${JSON.stringify({
+          format,
+          entries: [],
+          scope: {
+            kind: "git",
+            repositoryPrefix: "",
+            ignoreCase: false,
+            gitignoreSources: [],
+            infoExcludeBase64: "AA==",
+            globalExcludeBase64: "",
+          },
+        })}\n`,
+      );
+    const v1Bytes = legacyBytes(TREE_MANIFEST_FORMAT_V1);
+    expect(createHash("sha256").update(v1Bytes).digest("hex")).toBe(
+      "8a87c9797e9922bb8d263eb8e033ce266d2b1b92ab7157fc81e2b2d0454a5d9d",
+    );
+    const v1 = parseTreeManifest(v1Bytes);
+    expect(TREE_FORMAT_V1.encode!(v1, DEFAULT_TREE_MANIFEST_LIMITS)).toEqual(
+      v1Bytes,
+    );
+
+    const v2 = upgradeTreeManifest(v1, TREE_MANIFEST_FORMAT_V2);
+    const v2Bytes = legacyBytes(TREE_MANIFEST_FORMAT_V2);
+    expect(createHash("sha256").update(v2Bytes).digest("hex")).toBe(
+      "11c64fedf373d0ddd8086ecf64809e82dd87762fd738780ff6cfe20d185a7ca5",
+    );
+    expect(TREE_FORMAT_V2.encode!(v2, DEFAULT_TREE_MANIFEST_LIMITS)).toEqual(
+      v2Bytes,
+    );
+    expect(parseTreeManifest(v2Bytes)).toEqual(v2);
+
+    expect(() => upgradeTreeManifestToCurrent(v2)).toThrow(
+      expect.objectContaining({ kind: "format-incompatible" }),
+    );
   });
 
   it("recognizes valid published v1 trees that cannot be losslessly migrated", () => {
@@ -174,6 +290,7 @@ describe("versioned tree manifests", () => {
     const scope = {
       kind: "git",
       repositoryPrefix: "",
+      evaluator,
       ignoreCase: false,
       gitignoreSources: [workspaceGitignoreSource(".gitignore", bytes)],
       infoExcludeBase64: "",
@@ -186,7 +303,7 @@ describe("versioned tree manifests", () => {
     });
     await expect(
       validateTreeEntriesAgainstScope(manifest([], scope)),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ gitVersion: expect.any(String) });
   });
 
   it("binds a managed .gitignore entry to the archived raw bytes", () => {
@@ -195,6 +312,7 @@ describe("versioned tree manifests", () => {
     const scope = {
       kind: "git",
       repositoryPrefix: "project",
+      evaluator,
       ignoreCase: false,
       gitignoreSources: [workspaceGitignoreSource("project/.gitignore", bytes)],
       infoExcludeBase64: "",
@@ -247,6 +365,7 @@ describe("versioned tree manifests", () => {
     const scope = {
       kind: "git",
       repositoryPrefix: "",
+      evaluator,
       ignoreCase: true,
       gitignoreSources: [workspaceGitignoreSource(".gitignore", bytes)],
       infoExcludeBase64: "",
@@ -261,7 +380,7 @@ describe("versioned tree manifests", () => {
 
     await expect(
       validateTreeEntriesAgainstScope(manifest([alias], scope)),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ gitVersion: expect.any(String) });
     const selfIgnoredBytes = Buffer.from(".gitignore\n*.tmp\n");
     const caseSensitiveScope = {
       ...scope,
@@ -278,7 +397,7 @@ describe("versioned tree manifests", () => {
       validateTreeEntriesAgainstScope(
         manifest([caseSensitiveAlias], caseSensitiveScope),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ gitVersion: expect.any(String) });
     expect(() =>
       manifest([{ ...alias, blobOid: "0".repeat(64) }], scope),
     ).toThrow("does not match");
@@ -305,6 +424,7 @@ describe("versioned tree manifests", () => {
     const scope = {
       kind: "git",
       repositoryPrefix: "",
+      evaluator,
       ignoreCase: false,
       gitignoreSources: [
         workspaceGitignoreSource(".gitignore", rootPolicy),
@@ -367,6 +487,7 @@ describe("versioned tree manifests", () => {
       manifest([entry("ς/file")], {
         kind: "git",
         repositoryPrefix: "",
+        evaluator,
         ignoreCase: false,
         gitignoreSources: [
           workspaceGitignoreSource("Σ/.gitignore", Buffer.alloc(0)),
@@ -383,6 +504,7 @@ describe("versioned tree manifests", () => {
     const scope = {
       kind: "git",
       repositoryPrefix: "",
+      evaluator,
       ignoreCase: false,
       gitignoreSources: [
         workspaceGitignoreSource(".gitignore", rootPolicy),
@@ -409,9 +531,9 @@ describe("versioned tree manifests", () => {
       scope,
     );
 
-    await expect(
-      validateTreeEntriesAgainstScope(target),
-    ).resolves.toBeUndefined();
+    await expect(validateTreeEntriesAgainstScope(target)).resolves.toEqual({
+      gitVersion: expect.any(String),
+    });
   });
 
   it("bounds portable tree paths by UTF-8 bytes and component count", () => {
@@ -455,7 +577,13 @@ describe("versioned tree manifests", () => {
     );
     expect(raised.entries).toHaveLength(2);
     const raisedBytes = encodeCurrentTreeManifest(raised, raisedLimits);
-    expect(parseTreeManifest(raisedBytes).entries).toHaveLength(2);
+    expect(
+      (
+        JSON.parse(raisedBytes.toString("utf8")) as {
+          readonly entries: readonly unknown[];
+        }
+      ).entries,
+    ).toHaveLength(2);
 
     const sourceSuffix = "/.gitignore";
     const sourceBoundary = `${"a".repeat(

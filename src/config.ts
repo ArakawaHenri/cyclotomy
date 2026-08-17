@@ -35,8 +35,6 @@ export interface CyclotomyConfig {
   };
   readonly lock: {
     readonly timeoutMs: number;
-    readonly heartbeatMs: number;
-    readonly staleMs: number;
   };
   /** Minimum gap between automatic GC runs; 0 disables automatic GC. */
   readonly autoGcIntervalMs: number;
@@ -74,8 +72,6 @@ interface ConfigOverrides {
 type SettingsScope = "global" | "workspace";
 
 const MIB = 1024 * 1024;
-const LOCK_HEARTBEAT_MS = 5_000;
-const LOCK_STALE_MS = 30_000;
 const SETTINGS_FILE = "settings.json";
 
 function configError(
@@ -342,8 +338,6 @@ function applyOverrides(
     },
     lock: {
       timeoutMs: overrides.lockTimeoutMs ?? base.lock.timeoutMs,
-      heartbeatMs: LOCK_HEARTBEAT_MS,
-      staleMs: LOCK_STALE_MS,
     },
     autoGcIntervalMs: overrides.autoGcIntervalMs ?? base.autoGcIntervalMs,
     locale: overrides.locale ?? base.locale,
@@ -370,8 +364,6 @@ export function defaultCyclotomyConfig(agentDir: string): CyclotomyConfig {
     },
     lock: {
       timeoutMs: 5_000,
-      heartbeatMs: LOCK_HEARTBEAT_MS,
-      staleMs: LOCK_STALE_MS,
     },
     autoGcIntervalMs: 24 * 60 * 60 * 1000,
     locale: "auto",

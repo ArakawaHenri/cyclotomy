@@ -7,6 +7,7 @@ import {
 } from "../src/infrastructure/tree-formats/chain.ts";
 import {
   canonicalizeTreeManifest,
+  freezeTreeManifest,
   type TreeManifest,
 } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import { referencedTreeBlobOids } from "../src/infrastructure/tree-formats/references.ts";
@@ -125,7 +126,7 @@ describe("tree format chain", () => {
     expect(upgrades).toEqual(["v1->v2"]);
     expect(
       engine.parse(
-        engine.encode(intermediate, {
+        v2.encode!(intermediate, {
           maxEntries: 100,
           maxManifestBytes: 1024,
           ...DEFAULT_WORKSPACE_PATH_LIMITS,
@@ -147,11 +148,17 @@ describe("tree format chain", () => {
     });
     expectFrozenManifestGraph(current);
     expect(upgrades).toEqual(["v1->v2", "v2->v3"]);
-    const created = engine.createCurrent([], scope);
+    const created = freezeTreeManifest(
+      v3.create([], scope, {
+        maxEntries: 100,
+        maxManifestBytes: 1024,
+        ...DEFAULT_WORKSPACE_PATH_LIMITS,
+      }),
+    );
     expectFrozenManifestGraph(created);
     expect(
       engine.parse(
-        v3.encode(created, {
+        v3.encode!(created, {
           maxEntries: 100,
           maxManifestBytes: 1024,
           ...DEFAULT_WORKSPACE_PATH_LIMITS,
@@ -160,7 +167,7 @@ describe("tree format chain", () => {
     ).toEqual(created);
     expect(
       engine.parse(
-        v3.encode(current, {
+        v3.encode!(current, {
           maxEntries: 100,
           maxManifestBytes: 1024,
           ...DEFAULT_WORKSPACE_PATH_LIMITS,
@@ -183,7 +190,7 @@ describe("tree format chain", () => {
     ).toThrow("outside the supported history");
   });
 
-  it("deep-freezes current creation, decoding, and no-op upgrade results", () => {
+  it("deep-freezes explicit creation, decoding, and no-op upgrade results", () => {
     const engine = createTreeFormatEngine(TREE_FORMAT_V2);
     const limits = {
       maxEntries: 100,
@@ -204,6 +211,7 @@ describe("tree format chain", () => {
       scope: {
         kind: "git" as const,
         repositoryPrefix: "",
+        evaluator: null,
         ignoreCase: false,
         gitignoreSources: [{ path: ".gitignore", contentsBase64: "" }],
         infoExcludeBase64: "",
@@ -223,21 +231,65 @@ describe("tree format chain", () => {
     );
     expect(Reflect.set(noOp.scope, "repositoryPrefix", "mutated")).toBe(false);
 
-    const created = engine.createCurrent(
-      [
-        {
-          path: "created.txt",
-          type: "regular",
-          blobOid,
-          recreationMode: 0o600,
-        },
-      ],
-      { kind: "all-managed" },
-      limits,
+    const created = freezeTreeManifest(
+      TREE_FORMAT_V2.create(
+        [
+          {
+            path: "created.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        { kind: "all-managed" },
+        limits,
+      ),
     );
-    const decoded = engine.parse(engine.encode(created, limits));
+    const decoded = engine.parse(TREE_FORMAT_V2.encode!(created, limits));
     expectFrozenManifestGraph(created);
     expectFrozenManifestGraph(decoded);
+  });
+
+  it("projects v2 Git provenance as unknown without changing historical bytes", () => {
+    const engine = createTreeFormatEngine(TREE_FORMAT_V2);
+    const limits = {
+      maxEntries: 100,
+      maxManifestBytes: 16 * 1024,
+      ...DEFAULT_WORKSPACE_PATH_LIMITS,
+    };
+    const bytes = Buffer.from(
+      `${JSON.stringify({
+        format: TREE_FORMAT_V2.format,
+        entries: [],
+        scope: {
+          kind: "git",
+          repositoryPrefix: "",
+          ignoreCase: false,
+          gitignoreSources: [],
+          infoExcludeBase64: "",
+          globalExcludeBase64: "",
+        },
+      })}\n`,
+    );
+
+    const parsed = engine.parse(bytes);
+    expect(parsed.scope).toMatchObject({
+      kind: "git",
+      evaluator: null,
+    });
+    expect(TREE_FORMAT_V2.encode!(parsed, limits)).toEqual(bytes);
+    expect(() =>
+      engine.parse(
+        Buffer.from(
+          bytes
+            .toString("utf8")
+            .replace(
+              '"ignoreCase":false',
+              '"gitVersion":null,"ignoreCase":false',
+            ),
+        ),
+      ),
+    ).toThrow("invalid manifest");
   });
 
   it("rejects a malformed history when an adjacent upgrade is missing", () => {
@@ -246,8 +298,8 @@ describe("tree format chain", () => {
         format: "broken-v2",
         previous: TREE_FORMAT_V1,
         create: TREE_FORMAT_V1.create,
-        decode: TREE_FORMAT_V1.decode,
-        encode: TREE_FORMAT_V1.encode,
+        decode: TREE_FORMAT_V1.decode!,
+        encode: TREE_FORMAT_V1.encode!,
         referencedBlobOids: TREE_FORMAT_V1.referencedBlobOids,
       }),
     ).toThrow("omits its adjacent upgrade");

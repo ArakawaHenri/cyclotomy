@@ -1,7 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import type {
@@ -11,20 +8,26 @@ import type {
 } from "../application/capture.ts";
 import {
   CheckpointService,
+  type CheckpointCommitAuthority,
   type ResolvedReadableTree,
 } from "../application/checkpoint-service.ts";
 import { CyclotomyConfigError, type CyclotomyConfig } from "../config.ts";
 import { collectCyclotomyGarbage } from "../application/gc.ts";
-import type { NodeKey, Result, TreeOid } from "../domain/model.ts";
+import type { NodeKey, Result } from "../domain/model.ts";
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { NativeObjectStore } from "../infrastructure/object-store.ts";
-import type { TreeManifest } from "../infrastructure/tree-formats/manifest-codec.ts";
-import { upgradeTreeManifestToCurrent } from "../infrastructure/tree-formats/history.ts";
+import {
+  readLastAutomaticGcAt,
+  writeLastAutomaticGcAt,
+} from "../infrastructure/gc-state.ts";
+import type { GitReplayAttestation } from "../infrastructure/git-replay-risk.ts";
+import type { CurrentTreeManifest } from "../infrastructure/tree-formats/current.ts";
 import { validateTreeEntriesAgainstScope } from "../infrastructure/tree-scope-validation.ts";
 import {
   runWithWorkspaceLock,
   type WorkspaceLockExecution,
+  type WorkspaceWriteAuthority,
 } from "../infrastructure/workspace-lock.ts";
 import {
   scanWorkspace,
@@ -40,7 +43,7 @@ import {
 } from "./checkpoint-admission.ts";
 import type { PendingNavigation } from "./navigation-plan.ts";
 import type { SessionActivation } from "./pi-host-adapter.ts";
-import type { ArrivalRecoveryExecution } from "./post-mutation.ts";
+import type { ArrivalRecoverySettlement } from "./workspace-receipt.ts";
 import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
 import { messageOfUnknown } from "./unknown-error.ts";
@@ -53,88 +56,8 @@ import { WorkspaceMutationAuthority } from "./workspace-mutation-authority.ts";
 const GC_STATE_FILE = "gc-state.json";
 const GC_OBJECT_GRACE_MS = 3_600_000;
 const PRESENTATION_FAILURE_MESSAGE =
-  "Cyclotomy blocked this operation, but could not render its diagnostic message.";
-const PRESENTATION_STATUS_FALLBACK = "Cyclotomy · safety check in progress…";
-
-function systemErrorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null
-    ? typeof Reflect.get(error, "code") === "string"
-      ? (Reflect.get(error, "code") as string)
-      : undefined
-    : undefined;
-}
-
-type GcScheduleState =
-  | { readonly kind: "absent" }
-  | { readonly kind: "valid"; readonly lastRunAt: number }
-  | { readonly kind: "invalid"; readonly cause: unknown };
-
-async function readAutomaticGcSchedule(path: string): Promise<GcScheduleState> {
-  let contents: string;
-  try {
-    contents = await readFile(path, "utf8");
-  } catch (cause) {
-    return systemErrorCode(cause) === "ENOENT"
-      ? { kind: "absent" }
-      : { kind: "invalid", cause };
-  }
-  try {
-    const parsed = JSON.parse(contents) as { lastGcAt?: unknown };
-    if (
-      typeof parsed.lastGcAt === "number" &&
-      Number.isFinite(parsed.lastGcAt) &&
-      parsed.lastGcAt >= 0
-    ) {
-      return { kind: "valid", lastRunAt: parsed.lastGcAt };
-    }
-    throw new Error("automatic GC schedule has an invalid lastGcAt value");
-  } catch (cause) {
-    return { kind: "invalid", cause };
-  }
-}
-
-async function lastAutomaticGcAt(path: string): Promise<number> {
-  const state = await readAutomaticGcSchedule(path);
-  switch (state.kind) {
-    case "absent":
-      return 0;
-    case "valid":
-      return state.lastRunAt;
-    case "invalid":
-      throw new Error("automatic GC schedule is unreadable", {
-        cause: state.cause,
-      });
-  }
-}
-
-async function writeLastAutomaticGcAt(
-  path: string,
-  lastGcAt: number,
-): Promise<void> {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(
-      temporary,
-      constants.O_CREAT |
-        constants.O_EXCL |
-        constants.O_WRONLY |
-        (constants.O_NOFOLLOW ?? 0),
-      0o600,
-    );
-    await handle.writeFile(`${JSON.stringify({ lastGcAt })}\n`, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporary, path);
-  } catch (error) {
-    if (handle !== undefined) {
-      await handle.close().catch(() => {});
-    }
-    await unlink(temporary).catch(() => {});
-    throw error;
-  }
-}
+  "Cyclotomy could not complete this operation or show the reason.";
+const PRESENTATION_STATUS_FALLBACK = "Cyclotomy · working…";
 
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
@@ -159,8 +82,6 @@ export class CyclotomyRuntime {
     kind: "unavailable",
     cause: new Error("Pi session registration has not completed"),
   };
-  /** One-entry cache avoids repeating the same Git oracle across preview/apply. */
-  #scopeValidatedTreeOid: TreeOid | undefined;
 
   constructor(
     config: CyclotomyConfig,
@@ -179,11 +100,12 @@ export class CyclotomyRuntime {
       registrations: this.#registrations,
       checkpoints: () => this.checkpoints,
       metadata: () => this.metadata,
+      workspaceStoreRoot: () => this.storeRoot,
       restoreDeps: () => ({
         store: this.store,
         scanOptions: this.#scanOptions(),
-        validateManifestScope: (treeOid, manifest) =>
-          this.#validateManifestScope(treeOid, manifest),
+        validateManifestScope: (manifest) =>
+          this.#validateManifestScope(manifest),
       }),
       enqueueWorkspaceExecution: (operation, action) =>
         this.enqueueWorkspaceExecution(operation, action),
@@ -279,7 +201,7 @@ export class CyclotomyRuntime {
   withdrawFromParticipation(
     context: ExtensionContext,
     cause: unknown,
-  ): Promise<ArrivalRecoveryExecution> {
+  ): Promise<ArrivalRecoverySettlement> {
     this.markSessionUnavailable(cause);
     return this.#workspaceMutations.protectCurrentLocationForRetirement(
       context,
@@ -308,27 +230,20 @@ export class CyclotomyRuntime {
         metadata: this.metadata,
         expectedRootPath: this.workspaceRoot,
         scanOptions: this.#scanOptions(),
-        validateManifestScope: (treeOid, manifest) =>
-          this.#validateManifestScope(treeOid, manifest),
+        validateManifestScope: (manifest) =>
+          this.#validateManifestScope(manifest),
       });
     }
     return this.#checkpointService;
   }
 
   async #validateManifestScope(
-    treeOid: TreeOid,
-    manifest: TreeManifest,
-  ): Promise<void> {
-    if (this.#scopeValidatedTreeOid === treeOid) return;
-    const current = upgradeTreeManifestToCurrent(manifest, {
-      maxPathBytes: this.config.scan.maxPathBytes,
-      maxPathComponents: this.config.scan.maxPathComponents,
-    });
-    await validateTreeEntriesAgainstScope(current, {
+    manifest: CurrentTreeManifest,
+  ): Promise<GitReplayAttestation> {
+    return validateTreeEntriesAgainstScope(manifest, {
       scratchParent: this.storeRoot,
       forbiddenRoots: [this.workspaceRoot],
     });
-    this.#scopeValidatedTreeOid = treeOid;
   }
 
   notify(
@@ -505,7 +420,7 @@ export class CyclotomyRuntime {
 
   enqueueWorkspaceExecution<T>(
     operation: string,
-    action: () => Promise<T>,
+    action: (writeAuthority: WorkspaceWriteAuthority) => Promise<T>,
   ): Promise<WorkspaceLockExecution<T>> {
     return this.enqueue(async () => {
       const execution = await runWithWorkspaceLock(
@@ -561,26 +476,27 @@ export class CyclotomyRuntime {
       return {
         kind: "completed",
         value: undefined,
-        cleanup: { kind: "released" },
+        cleanup: { kind: "settled" },
       };
     }
-    const statePath = join(this.storeRoot, GC_STATE_FILE);
-    if (Date.now() - (await lastAutomaticGcAt(statePath)) < intervalMs) {
+    const storeRoot = this.storeRoot;
+    const statePath = join(storeRoot, GC_STATE_FILE);
+    if (Date.now() - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
       return {
         kind: "completed",
         value: undefined,
-        cleanup: { kind: "released" },
+        cleanup: { kind: "settled" },
       };
     }
-    return this.enqueueWorkspaceExecution("auto-gc", async () => {
+    return this.enqueueWorkspaceExecution("auto-gc", async (writeAuthority) => {
       const startedAt = Date.now();
-      if (startedAt - (await lastAutomaticGcAt(statePath)) < intervalMs) {
+      if (startedAt - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
         return;
       }
-      await collectCyclotomyGarbage(this.store, this.metadata, {
+      await collectCyclotomyGarbage(writeAuthority, this.store, this.metadata, {
         objectGraceMs: GC_OBJECT_GRACE_MS,
       });
-      await writeLastAutomaticGcAt(statePath, startedAt);
+      await writeLastAutomaticGcAt(statePath, startedAt, writeAuthority);
     });
   }
 
@@ -595,44 +511,39 @@ export class CyclotomyRuntime {
   }
 
   commitPreparedCapture(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     prepared: CaptureSuccess,
     expectedSlot: CheckpointSlot,
   ): Result<CaptureSuccess, CaptureFailure> {
-    const authority = this.#registrations.registeredAuthority;
-    if (authority === undefined) {
-      throw new Error("Pi session registration authority is unavailable");
-    }
-    return this.checkpoints.commitPrepared(view, node, prepared, expectedSlot, {
-      expectedSessionFile: authority.sessionFile,
-      assertWorkspaceAuthority: () => {
-        this.#registrations.assertActiveWorkspaceAuthority(authority);
-        return undefined;
-      },
-    });
+    return this.checkpoints.commitPrepared(
+      view,
+      node,
+      prepared,
+      expectedSlot,
+      this.#captureCommitAuthority(writeAuthority),
+    );
   }
 
   commitMissingCapture(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     prepared: CaptureSuccess,
     intent: MissingNodeStateIntent,
   ): Result<CaptureSuccess, CaptureFailure> {
-    const authority = this.#registrations.registeredAuthority;
-    if (authority === undefined) {
-      throw new Error("Pi session registration authority is unavailable");
-    }
-    return this.checkpoints.commitMissing(view, node, prepared, intent, {
-      expectedSessionFile: authority.sessionFile,
-      assertWorkspaceAuthority: () => {
-        this.#registrations.assertActiveWorkspaceAuthority(authority);
-        return undefined;
-      },
-    });
+    return this.checkpoints.commitMissing(
+      view,
+      node,
+      prepared,
+      intent,
+      this.#captureCommitAuthority(writeAuthority),
+    );
   }
 
   commitTreeArrivalCapture(
+    writeAuthority: WorkspaceWriteAuthority,
     arrival: ArrivalAttempt<PendingNavigation | undefined>,
     view: SessionView,
     node: NodeKey,
@@ -642,23 +553,30 @@ export class CyclotomyRuntime {
     if (!this.#workspaceMutations.treeArrivalCanProceed(arrival, view, node)) {
       throw new Error("tree arrival authority changed before capture commit");
     }
-    const authority = this.#registrations.registeredAuthority;
-    if (authority === undefined) {
-      throw new Error("Pi session registration authority is unavailable");
-    }
     return this.checkpoints.commitPreparedTreeArrival(
       view,
       node,
       prepared,
       expectedSlot,
-      {
-        expectedSessionFile: authority.sessionFile,
-        assertWorkspaceAuthority: () => {
-          this.#registrations.assertActiveWorkspaceAuthority(authority);
-          return undefined;
-        },
-      },
+      this.#captureCommitAuthority(writeAuthority),
     );
+  }
+
+  #captureCommitAuthority(
+    writeAuthority: WorkspaceWriteAuthority,
+  ): CheckpointCommitAuthority {
+    const authority = this.#registrations.registeredAuthority;
+    if (authority === undefined) {
+      throw new Error("Pi session registration authority is unavailable");
+    }
+    return {
+      writeAuthority,
+      expectedSessionFile: authority.sessionFile,
+      assertWorkspaceAuthority: () => {
+        this.#registrations.assertActiveWorkspaceAuthority(authority);
+        return undefined;
+      },
+    };
   }
 
   close(): void {
@@ -668,6 +586,5 @@ export class CyclotomyRuntime {
     this.#admission.reset();
     this.#initFailureNotified = false;
     this.#captureFailureNotified = false;
-    this.#scopeValidatedTreeOid = undefined;
   }
 }

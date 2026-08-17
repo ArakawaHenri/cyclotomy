@@ -4,6 +4,7 @@ import type { WorkspacePathLimits } from "../workspace-scope.ts";
 import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   ABSOLUTE_TREE_MANIFEST_LIMITS,
+  freezeTreeManifest,
   TreeManifestError,
   type TreeManifest,
   type TreeManifestLimits,
@@ -16,17 +17,22 @@ import {
 export interface TreeFormatNode<Format extends string = string> {
   readonly format: Format;
   readonly previous?: TreeFormatNode;
-  /** Construct new current semantics without pretending they came from disk. */
+  /** Construct canonical semantics for this format node. */
   readonly create: (
     entries: unknown,
     scope: unknown,
     limits: TreeManifestLimits,
   ) => TreeManifest;
-  readonly decode: (
+  /**
+   * Inline formats authenticate one self-contained object synchronously.
+   * Graph formats omit both codecs and are read through a
+   * StoredTreeFormatAdapter instead.
+   */
+  readonly decode?: (
     candidate: Readonly<Record<string, unknown>>,
     limits: TreeManifestLimits,
   ) => TreeManifest;
-  readonly encode: (
+  readonly encode?: (
     manifest: TreeManifest,
     limits: TreeManifestLimits,
   ) => Buffer;
@@ -39,19 +45,12 @@ export interface TreeFormatNode<Format extends string = string> {
 
 export interface TreeFormatEngine {
   readonly current: TreeFormatNode;
-  createCurrent(
-    entries: unknown,
-    scope: unknown,
-    limits?: TreeManifestLimits,
-  ): TreeManifest;
   parse(content: Uint8Array): TreeManifest;
-  encode(manifest: TreeManifest, limits?: TreeManifestLimits): Buffer;
   upgradeTo(
     manifest: TreeManifest,
     targetFormat: string,
     pathLimits: WorkspacePathLimits,
   ): TreeManifest;
-  isCurrent(manifest: TreeManifest): boolean;
   referencedBlobOids(manifest: TreeManifest): readonly string[];
 }
 
@@ -84,6 +83,11 @@ export function treeFormatChain(
     ) {
       throw new Error("first tree format cannot have an adjacent upgrade");
     }
+    if ((cursor.decode === undefined) !== (cursor.encode === undefined)) {
+      throw new Error(
+        `tree format ${cursor.format} must define both inline codecs or neither`,
+      );
+    }
     seen.add(cursor);
     newestFirst.push(cursor);
     byFormat.set(cursor.format, cursor);
@@ -94,20 +98,6 @@ export function treeFormatChain(
   // part of construction instead of relying on TypeScript's erased readonly.
   for (const node of newestFirst) Object.freeze(node);
   return Object.freeze(newestFirst.reverse());
-}
-
-/** Freeze the complete stable semantic graph returned across engine boundaries. */
-function freezeManifestGraph<Manifest extends TreeManifest>(
-  manifest: Manifest,
-): Manifest {
-  for (const entry of manifest.entries) Object.freeze(entry);
-  Object.freeze(manifest.entries);
-  if (manifest.scope.kind === "git") {
-    for (const source of manifest.scope.gitignoreSources) Object.freeze(source);
-    Object.freeze(manifest.scope.gitignoreSources);
-  }
-  Object.freeze(manifest.scope);
-  return Object.freeze(manifest);
 }
 
 /** Build parser lookup solely from the authenticated adjacent format chain. */
@@ -144,7 +134,7 @@ export function createTreeFormatEngine(
         `target tree format ${JSON.stringify(targetFormat)} is outside the supported history`,
       );
     }
-    if (source === target) return freezeManifestGraph(manifest);
+    if (source === target) return freezeTreeManifest(manifest);
 
     const sourceIndex = newestFirst.indexOf(source);
     const targetIndex = newestFirst.indexOf(target);
@@ -170,18 +160,11 @@ export function createTreeFormatEngine(
       }
       upgraded = candidate;
     }
-    return freezeManifestGraph(upgraded);
+    return freezeTreeManifest(upgraded);
   };
 
   return Object.freeze<TreeFormatEngine>({
     current,
-    createCurrent(entries, scope, limits = ABSOLUTE_TREE_MANIFEST_LIMITS) {
-      const manifest = current.create(entries, scope, limits);
-      if (manifest.format !== current.format) {
-        throw new Error("current tree creator returned a different format");
-      }
-      return freezeManifestGraph(manifest);
-    },
     parse(content) {
       if (content.byteLength > ABSOLUTE_MAX_TREE_MANIFEST_BYTES) {
         throw new TreeManifestError(
@@ -225,6 +208,12 @@ export function createTreeFormatEngine(
 
       let manifest: TreeManifest;
       try {
+        if (node.decode === undefined || node.encode === undefined) {
+          throw new TreeManifestError(
+            "format-incompatible",
+            `tree format ${node.format} requires its store-aware adapter`,
+          );
+        }
         manifest = node.decode(candidate, ABSOLUTE_TREE_MANIFEST_LIMITS);
         if (manifest.format !== node.format) {
           throw new Error("tree format decoder returned a different format");
@@ -236,7 +225,7 @@ export function createTreeFormatEngine(
           error,
         );
       }
-      const frozen = freezeManifestGraph(manifest);
+      const frozen = freezeTreeManifest(manifest);
       const canonicalBytes = node.encode(frozen, ABSOLUTE_TREE_MANIFEST_LIMITS);
       if (!canonicalBytes.equals(Buffer.from(content))) {
         throw new TreeManifestError(
@@ -246,13 +235,7 @@ export function createTreeFormatEngine(
       }
       return frozen;
     },
-    encode(manifest, limits = ABSOLUTE_TREE_MANIFEST_LIMITS) {
-      return nodeFor(manifest).encode(manifest, limits);
-    },
     upgradeTo,
-    isCurrent(manifest) {
-      return nodeFor(manifest) === current;
-    },
     referencedBlobOids(manifest) {
       return nodeFor(manifest).referencedBlobOids(manifest);
     },

@@ -51,6 +51,7 @@ function targetScope(
   return canonicalizeWorkspaceScope({
     kind: "git",
     repositoryPrefix: "",
+    evaluator: null,
     ignoreCase,
     gitignoreSources: [
       {
@@ -221,6 +222,74 @@ describe("workspace scanner Git policy integration", () => {
     });
   });
 
+  it("does not turn a CRLF blank policy line into a directory match", async () => {
+    const root = await temporaryWorkspace();
+    await initializeRepository(root);
+    await writeFile(join(root, ".gitignore"), "src/\r\n\r\n");
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src", "hidden.txt"), "hidden");
+    await mkdir(join(root, "visible"));
+    await writeFile(join(root, "visible", "kept.txt"), "kept");
+
+    const snapshot = await scanWorkspace(root);
+
+    expect(pathsOf(snapshot)).toEqual([".gitignore", "visible/kept.txt"]);
+    expect(snapshot.excludedOccupancies).toEqual([
+      expect.objectContaining({ path: "src", kind: "directory" }),
+    ]);
+  });
+
+  it("rejects a NUL-bearing policy before asking Git to classify paths", async () => {
+    const root = await temporaryWorkspace();
+    await initializeRepository(root);
+    await writeFile(
+      join(root, ".gitignore"),
+      Buffer.from("*.log\n", "utf16le"),
+    );
+    await writeFile(join(root, "visible.txt"), "visible");
+
+    await expect(scanWorkspace(root)).rejects.toThrow(
+      "Git policy files must be NUL-free",
+    );
+  });
+
+  it("keeps a nested self-matching policy from excluding its own directory", async () => {
+    const root = await temporaryWorkspace();
+    await initializeRepository(root);
+    await writeFile(join(root, ".gitignore"), "");
+    await mkdir(join(root, "sub"));
+    await writeFile(join(root, "sub", ".gitignore"), "*\n");
+    await writeFile(join(root, "sub", "hidden.txt"), "hidden");
+
+    const snapshot = await scanWorkspace(root);
+
+    expect(pathsOf(snapshot)).toEqual([".gitignore"]);
+    expect(snapshot.excludedOccupancies).toEqual([
+      expect.objectContaining({ path: "sub/.gitignore", kind: "regular" }),
+      expect.objectContaining({ path: "sub/hidden.txt", kind: "regular" }),
+    ]);
+    expect(snapshot.scope).toMatchObject({
+      kind: "git",
+      gitignoreSources: [{ path: ".gitignore" }, { path: "sub/.gitignore" }],
+    });
+  });
+
+  it("descends into a partially ignored directory to retain a negated child", async () => {
+    const root = await temporaryWorkspace();
+    await initializeRepository(root);
+    await writeFile(join(root, ".gitignore"), "foo/*\n!foo/keep\n");
+    await mkdir(join(root, "foo"));
+    await writeFile(join(root, "foo", "drop"), "drop");
+    await writeFile(join(root, "foo", "keep"), "keep");
+
+    const snapshot = await scanWorkspace(root);
+
+    expect(pathsOf(snapshot)).toEqual([".gitignore", "foo/keep"]);
+    expect(snapshot.excludedOccupancies).toEqual([
+      expect.objectContaining({ path: "foo/drop", kind: "regular" }),
+    ]);
+  });
+
   it("prunes an ignored directory without importing unreachable policy", async () => {
     const root = await temporaryWorkspace();
     await initializeRepository(root);
@@ -363,6 +432,7 @@ describe("workspace scanner Git policy integration", () => {
     const scope = canonicalizeWorkspaceScope({
       kind: "git",
       repositoryPrefix: "",
+      evaluator: null,
       ignoreCase: false,
       gitignoreSources: [
         {
@@ -417,9 +487,14 @@ describe("workspace scanner Git policy integration", () => {
     );
 
     if (!aliasesCanonicalName) {
-      await expect(scanWorkspace(root)).rejects.toThrow(
-        "workspace entries do not match the captured Git ignore sources",
-      );
+      await expect(scanWorkspace(root)).rejects.toMatchObject({
+        message:
+          "workspace entries do not satisfy the current tree manifest contract",
+        cause: {
+          name: "TreeManifestError",
+          kind: "invalid-tree-manifest",
+        },
+      });
       return;
     }
     const snapshot = await scanWorkspace(root);
@@ -460,9 +535,14 @@ describe("workspace scanner Git policy integration", () => {
     );
     await writeFile(join(root, ".gitignore"), "canonical\n");
 
-    await expect(scanWorkspace(root)).rejects.toThrow(
-      "workspace entries do not match the captured Git ignore sources",
-    );
+    await expect(scanWorkspace(root)).rejects.toMatchObject({
+      message:
+        "workspace entries do not satisfy the current tree manifest contract",
+      cause: {
+        name: "TreeManifestError",
+        kind: "invalid-tree-manifest",
+      },
+    });
   });
 
   it("archives non-UTF-8 policy bytes without interpreting them in JavaScript", async () => {
@@ -490,7 +570,7 @@ describe("workspace scanner Git policy integration", () => {
     });
   });
 
-  it("does not follow a symlinked .gitignore as policy", async (context) => {
+  it("fails closed on Git's warning for a symlinked .gitignore", async (context) => {
     context.skip(
       process.platform === "win32",
       "Windows symlink creation requires host-specific privileges",
@@ -502,12 +582,8 @@ describe("workspace scanner Git policy integration", () => {
     await symlink(outside, join(root, ".gitignore"));
     await writeFile(join(root, "hidden.txt"), "managed");
 
-    const snapshot = await scanWorkspace(root);
-
-    expect(pathsOf(snapshot)).toEqual([".gitignore", "hidden.txt"]);
-    expect(snapshot.scope).toMatchObject({
-      kind: "git",
-      gitignoreSources: [],
-    });
+    await expect(scanWorkspace(root)).rejects.toThrow(
+      "Git ignore oracle produced diagnostics",
+    );
   });
 });

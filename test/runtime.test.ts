@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import {
   appendFile,
   lstat,
@@ -24,21 +24,24 @@ import {
   loadCyclotomyConfig,
 } from "../src/config.ts";
 import {
-  openObjectStore,
   TreeImportAdmissionError,
   TreeImportSourceError,
-  type NativeObjectStore,
 } from "../src/infrastructure/object-store.ts";
-import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
+import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
 import { CURRENT_METADATA_VERSION } from "../src/infrastructure/metadata/current.ts";
 import { METADATA_WRITER_PROTOCOL_FUNCTION } from "../src/infrastructure/metadata/schema.ts";
 import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
-import { TREE_MANIFEST_FORMAT_V1 } from "../src/infrastructure/tree-formats/v1.ts";
 import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
 import {
   acquireWorkspaceLock,
   OrderedWorkspaceLockAcquisitionError,
+  runWithWorkspaceLock,
+  type WorkspaceWriteAuthority,
 } from "../src/infrastructure/workspace-lock.ts";
+import {
+  nativeLooseRecordPath,
+  nativeObjectLayout,
+} from "../src/infrastructure/workspace-store.ts";
 import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import { SessionRegistrationService } from "../src/pi/session-registration-service.ts";
 import { projectStableGraph } from "../src/pi/extension-boundary.ts";
@@ -48,9 +51,11 @@ import {
   checkpointIsBlocked,
   checkpointState,
   commitTestNodeState,
+  createTestCurrentMetadataStore,
   protectTestLocation,
   readTestSessionRegistration,
   registerTestSession,
+  withTestMetadataWriteAuthority,
 } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
@@ -61,6 +66,8 @@ const compatibleV1TreeOid =
   "0c53042c58202208b41f5cf8fd2b96f7c9f275ba2a38fb4d884831eae5ed5557";
 const compatibleV2TreeOid =
   "0500eb0932f28766eda94dfb32673db387e463cb3b56e1eaf6dfb89b1c794568";
+const compatibleV3TreeOid =
+  "07932c7d17030c109a7d199af9a7a972153597341b1cc66c11c379d88d6d52fa";
 const compatibleV1BlobOid =
   "657ac5c3ed8157bd26ba717404992b3a2e7eb771d53dd299c631c637a8aa3f33";
 
@@ -74,13 +81,7 @@ function objectPath(
 
 function makeCurrentWorkspaceLockReleaseFail(storeRoot: string): void {
   const lockPath = join(storeRoot, "workspace.lock");
-  const heartbeat = readdirSync(lockPath).find((name) =>
-    name.startsWith("heartbeat-"),
-  );
-  if (heartbeat === undefined) throw new Error("missing lock heartbeat");
-  const heartbeatPath = join(lockPath, heartbeat);
-  rmSync(heartbeatPath);
-  mkdirSync(heartbeatPath);
+  writeFileSync(join(lockPath, "unexpected-entry"), "preserve");
 }
 
 async function seedCompatiblePublishedV1Store(
@@ -140,6 +141,17 @@ async function createRuntime() {
   );
   expect(await runtime.ensureStore(workspace)).toBe(true);
   return { parent, workspace, home, runtime };
+}
+
+async function mutateRuntimeMetadata<T>(
+  runtime: CyclotomyRuntime,
+  operation: () => T,
+): Promise<T> {
+  return withTestMetadataWriteAuthority(
+    runtime.storeRoot,
+    runtime.metadata,
+    operation,
+  );
 }
 
 function view(
@@ -346,10 +358,12 @@ async function createExternalForkFixture(
     ],
     scope,
   );
-  registerTestSession(sourceRuntime.metadata, "parent", parentFile, [
-    "retained",
-  ]);
-  commitTestNodeState(sourceRuntime.metadata, "parent", "retained", treeOid);
+  await mutateRuntimeMetadata(sourceRuntime, () => {
+    registerTestSession(sourceRuntime.metadata, "parent", parentFile, [
+      "retained",
+    ]);
+    commitTestNodeState(sourceRuntime.metadata, "parent", "retained", treeOid);
+  });
   const sourceStoreRoot = sourceRuntime.storeRoot;
   sourceRuntime.close();
 
@@ -534,12 +548,15 @@ describe("Cyclotomy runtime", () => {
     expect(await runtime.ensureStore(workspace)).toBe(true);
     expect(
       checkpointState(runtime.metadata, "legacy", "checkpoint")?.treeOid,
-    ).toBe(compatibleV2TreeOid);
+    ).toBe(compatibleV3TreeOid);
     await expect(
       runtime.store.readTree(compatibleV1TreeOid),
-    ).resolves.toMatchObject({ format: TREE_MANIFEST_FORMAT_V1 });
+    ).rejects.toMatchObject({ code: "object-integrity" });
     await expect(
       runtime.store.readTree(compatibleV2TreeOid),
+    ).rejects.toMatchObject({ code: "object-integrity" });
+    await expect(
+      runtime.store.readTree(compatibleV3TreeOid),
     ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
     await expect(
       lstat(objectPath(storeRoot, "trees", compatibleV1TreeOid)),
@@ -556,25 +573,18 @@ describe("Cyclotomy runtime", () => {
     const home = join(parent, "home");
     await Promise.all([mkdir(workspace), mkdir(home)]);
     const storeRoot = await seedCompatiblePublishedV1Store(home, workspace);
-    const probeStore = await openObjectStore(storeRoot);
-    const storePrototype = Object.getPrototypeOf(probeStore) as Pick<
-      NativeObjectStore,
-      "upgradeTree"
-    >;
-    const originalUpgrade = storePrototype.upgradeTree;
-    const upgrade = vi
-      .spyOn(storePrototype, "upgradeTree")
-      .mockImplementation(async function (
-        this: NativeObjectStore,
-        treeOid,
-        targetFormat,
-      ) {
-        const result = await originalUpgrade.call(this, treeOid, targetFormat);
-        makeCurrentWorkspaceLockReleaseFail(storeRoot);
-        return result;
+    const originalPublish = ContentRepository.prototype.publishStructural;
+    const publish = vi
+      .spyOn(ContentRepository.prototype, "publishStructural")
+      .mockImplementation(async function (this: ContentRepository, ...args) {
+        await originalPublish.call(this, ...args);
+        if (args[1] === compatibleV3TreeOid) {
+          makeCurrentWorkspaceLockReleaseFail(storeRoot);
+        }
       });
-    const metadataProbe = createCurrentMetadataStore(
+    const metadataProbe = await createTestCurrentMetadataStore(
       join(parent, "metadata-probe.db"),
+      parent,
     );
     const metadataPrototype = Object.getPrototypeOf(metadataProbe) as {
       close(): void;
@@ -592,7 +602,7 @@ describe("Cyclotomy runtime", () => {
     } finally {
       runtime.close();
       close.mockRestore();
-      upgrade.mockRestore();
+      publish.mockRestore();
     }
   });
 
@@ -1009,6 +1019,7 @@ describe("Cyclotomy runtime", () => {
       runtime.registrations.workspaceStillBound(workspace),
     ).resolves.toBe(false);
     const committed = runtime.commitPreparedCapture(
+      {} as WorkspaceWriteAuthority,
       child,
       { sessionId: "child", entryId: "retained" },
       {
@@ -1024,6 +1035,55 @@ describe("Cyclotomy runtime", () => {
     expect(
       checkpointState(runtime.metadata, "child", "retained"),
     ).toBeUndefined();
+    runtime.close();
+  });
+
+  it("rejects a prepared capture at the metadata fence after lock ownership is lost", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "capture-lock-loss",
+      sessionFile: join(home, "capture-lock-loss.jsonl"),
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+    const commitCapture = vi.spyOn(runtime.metadata, "commitCapture");
+    const storeRoot = runtime.storeRoot;
+
+    const execution = await runWithWorkspaceLock(
+      storeRoot,
+      "capture-lock-loss-test",
+      async (writeAuthority) => {
+        await rename(
+          join(storeRoot, "workspace.lock"),
+          join(storeRoot, "displaced.lock"),
+        );
+        return runtime.commitPreparedCapture(
+          writeAuthority,
+          current,
+          { sessionId: current.sessionId, entryId: "retained" },
+          { treeOid: "a".repeat(64), snapshot: {} as never },
+          { kind: "open-missing" },
+        );
+      },
+    );
+
+    expect(execution.kind).toBe("completed");
+    if (execution.kind !== "completed") throw execution.cause;
+    expect(execution.value).toMatchObject({
+      ok: false,
+      error: {
+        kind: "metadata-failed",
+        cause: { name: "WorkspaceLockOwnershipLostError" },
+      },
+    });
+    expect(commitCapture).toHaveBeenCalledOnce();
+    expect(execution.cleanup.kind).toBe("failed");
     runtime.close();
   });
 
@@ -1056,6 +1116,7 @@ describe("Cyclotomy runtime", () => {
     ).resolves.toBe(false);
     expect(await runtime.ensureStore(workspace)).toBe(false);
     const committed = runtime.commitPreparedCapture(
+      {} as WorkspaceWriteAuthority,
       current,
       { sessionId: current.sessionId, entryId: "retained" },
       {
@@ -1124,8 +1185,8 @@ describe("Cyclotomy runtime", () => {
       runtime.metadata,
     );
     vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
-      (input) => {
-        const report = originalFinalize(input);
+      (authority, input, sourceAuthority) => {
+        const report = originalFinalize(authority, input, sourceAuthority);
         makeCurrentWorkspaceLockReleaseFail(storeRoot);
         return report;
       },
@@ -1168,8 +1229,8 @@ describe("Cyclotomy runtime", () => {
       runtime.metadata,
     );
     vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
-      (input) => {
-        const report = originalFinalize(input);
+      (authority, input, sourceAuthority) => {
+        const report = originalFinalize(authority, input, sourceAuthority);
         makeCurrentWorkspaceLockReleaseFail(runtime.storeRoot);
         return report;
       },
@@ -1195,11 +1256,13 @@ describe("Cyclotomy runtime", () => {
       parentSessionFile: parentFile,
       retainedEntryIds: ["retained"],
     });
-    registerTestSession(
-      runtime.metadata,
-      child.sessionId,
-      child.sessionFile!,
-      child.stableEntryIds,
+    await mutateRuntimeMetadata(runtime, () =>
+      registerTestSession(
+        runtime.metadata,
+        child.sessionId,
+        child.sessionFile!,
+        child.stableEntryIds,
+      ),
     );
     const cause = Object.assign(new Error("permission denied"), {
       code: "EACCES",
@@ -1379,9 +1442,11 @@ describe("Cyclotomy runtime", () => {
         }),
       ].join("\n") + "\n",
     );
-    registerTestSession(runtime.metadata, "parent", parentFile, ["shared"]);
     const treeOid = "a".repeat(64);
-    commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+    await mutateRuntimeMetadata(runtime, () => {
+      registerTestSession(runtime.metadata, "parent", parentFile, ["shared"]);
+      commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+    });
     const child = registrationView({
       cwd: workspace,
       sessionId: "projection-child",
@@ -1432,16 +1497,18 @@ describe("Cyclotomy runtime", () => {
           }),
         ].join("\n") + "\n",
       );
-      registerTestSession(runtime.metadata, "pending-parent", parentFile, [
-        "shared",
-      ]);
       const treeOid = "e".repeat(64);
-      commitTestNodeState(
-        runtime.metadata,
-        "pending-parent",
-        "shared",
-        treeOid,
-      );
+      await mutateRuntimeMetadata(runtime, () => {
+        registerTestSession(runtime.metadata, "pending-parent", parentFile, [
+          "shared",
+        ]);
+        commitTestNodeState(
+          runtime.metadata,
+          "pending-parent",
+          "shared",
+          treeOid,
+        );
+      });
       const child = registrationView({
         cwd: workspace,
         sessionId: "pending-child",
@@ -1500,16 +1567,18 @@ describe("Cyclotomy runtime", () => {
   it("quarantines a declared fork when its parent file is unavailable", async () => {
     const { workspace, home, runtime } = await createRuntime();
     const parentFile = join(home, "unavailable-parent.jsonl");
-    registerTestSession(runtime.metadata, "unavailable-parent", parentFile, [
-      "shared",
-    ]);
     const treeOid = "c".repeat(64);
-    commitTestNodeState(
-      runtime.metadata,
-      "unavailable-parent",
-      "shared",
-      treeOid,
-    );
+    await mutateRuntimeMetadata(runtime, () => {
+      registerTestSession(runtime.metadata, "unavailable-parent", parentFile, [
+        "shared",
+      ]);
+      commitTestNodeState(
+        runtime.metadata,
+        "unavailable-parent",
+        "shared",
+        treeOid,
+      );
+    });
 
     const child = registrationView({
       cwd: workspace,
@@ -1547,11 +1616,13 @@ describe("Cyclotomy runtime", () => {
         cwd: workspace,
       })}\n`,
     );
-    registerTestSession(runtime.metadata, "cold-parent", parentFile, [
-      "shared",
-    ]);
     const treeOid = "d".repeat(64);
-    commitTestNodeState(runtime.metadata, "cold-parent", "shared", treeOid);
+    await mutateRuntimeMetadata(runtime, () => {
+      registerTestSession(runtime.metadata, "cold-parent", parentFile, [
+        "shared",
+      ]);
+      commitTestNodeState(runtime.metadata, "cold-parent", "shared", treeOid);
+    });
 
     const child = registrationView({
       cwd: workspace,
@@ -1607,12 +1678,14 @@ describe("Cyclotomy runtime", () => {
           }),
         ].join("\n") + "\n",
       );
-      registerTestSession(runtime.metadata, "parent", parentFile, [
-        "source-root",
-        "shared",
-      ]);
       const treeOid = "b".repeat(64);
-      commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+      await mutateRuntimeMetadata(runtime, () => {
+        registerTestSession(runtime.metadata, "parent", parentFile, [
+          "source-root",
+          "shared",
+        ]);
+        commitTestNodeState(runtime.metadata, "parent", "shared", treeOid);
+      });
 
       const base = registrationView({
         cwd: workspace,
@@ -1667,26 +1740,38 @@ describe("Cyclotomy runtime", () => {
     ).resolves.toEqual(activeRegistration("fresh"));
 
     const treeOid = "a".repeat(64);
-    commitTestNodeState(
-      runtime.metadata,
-      current.sessionId,
-      "retained",
-      treeOid,
-      sessionFile,
+    await mutateRuntimeMetadata(runtime, () =>
+      commitTestNodeState(
+        runtime.metadata,
+        current.sessionId,
+        "retained",
+        treeOid,
+        sessionFile,
+      ),
     );
     const resolution = {
       treeOid,
       foundAt: { sessionId: current.sessionId, entryId: "retained" },
     };
+    await expect(
+      runtime.enqueueWorkspaceExecution("test-admit-location", async (lease) =>
+        runtime.workspaceMutations.admitLocationIfResolution(
+          lease,
+          current,
+          resolution,
+        ),
+      ),
+    ).resolves.toMatchObject({ kind: "completed", value: true });
     expect(
-      runtime.workspaceMutations.admitLocationIfResolution(current, resolution),
-    ).toBe(true);
-    expect(
-      protectTestLocation(
-        runtime.metadata,
-        { sessionId: current.sessionId, sessionFile },
-        "retained",
-      ).kind,
+      await mutateRuntimeMetadata(
+        runtime,
+        () =>
+          protectTestLocation(
+            runtime.metadata,
+            { sessionId: current.sessionId, sessionFile },
+            "retained",
+          ).kind,
+      ),
     ).toBe("protected");
 
     const arrival = runtime.admission.beginTreeArrival();
@@ -1694,13 +1779,19 @@ describe("Cyclotomy runtime", () => {
       ...current,
       isAppendOnlyExtensionOf: () => false,
     };
-    expect(
-      runtime.workspaceMutations.admitTreeArrivalIfResolution(
-        arrival,
-        rewritten,
-        resolution,
+    await expect(
+      runtime.enqueueWorkspaceExecution("test-admit-arrival", async (lease) =>
+        runtime.workspaceMutations.admitTreeArrivalIfResolution(
+          lease,
+          arrival,
+          rewritten,
+          resolution,
+        ),
       ),
-    ).toMatchObject({ kind: "unsettled", cause: expect.any(Error) });
+    ).resolves.toMatchObject({
+      kind: "completed",
+      value: { kind: "unsettled", cause: expect.any(Error) },
+    });
     expect(
       checkpointIsBlocked(runtime.metadata, current.sessionId, "retained"),
     ).toBe(true);
@@ -1725,12 +1816,14 @@ describe("Cyclotomy runtime", () => {
 
     const before = "a".repeat(64);
     const after = "b".repeat(64);
-    commitTestNodeState(
-      runtime.metadata,
-      rootView.sessionId,
-      "root",
-      before,
-      sessionFile,
+    await mutateRuntimeMetadata(runtime, () =>
+      commitTestNodeState(
+        runtime.metadata,
+        rootView.sessionId,
+        "root",
+        before,
+        sessionFile,
+      ),
     );
     const leafView = registrationView({
       cwd: workspace,
@@ -1742,36 +1835,53 @@ describe("Cyclotomy runtime", () => {
       treeOid: before,
       foundAt: { sessionId: rootView.sessionId, entryId: "root" },
     };
-    expect(
-      runtime.workspaceMutations.admitLocationIfResolution(
-        leafView,
-        staleResolution,
+    await expect(
+      runtime.enqueueWorkspaceExecution("test-admit-inherited", async (lease) =>
+        runtime.workspaceMutations.admitLocationIfResolution(
+          lease,
+          leafView,
+          staleResolution,
+        ),
       ),
-    ).toBe(true);
+    ).resolves.toMatchObject({ kind: "completed", value: true });
 
-    const concurrent = createCurrentMetadataStore(
+    const concurrent = await createTestCurrentMetadataStore(
       join(runtime.storeRoot, "state.db"),
+      runtime.storeRoot,
     );
-    expect(
-      concurrent.commitCapture({
-        identity: { sessionId: rootView.sessionId, sessionFile },
-        entryId: "root",
-        activeAncestryEntryIds: ["root"],
-        treeOid: after,
-        expectedSlot: { kind: "open-checkpoint", treeOid: before },
-      }),
-    ).toBe("committed");
+    await expect(
+      runWithWorkspaceLock(
+        runtime.storeRoot,
+        "runtime metadata concurrency test",
+        async (authority) =>
+          concurrent.commitCapture(authority, {
+            identity: { sessionId: rootView.sessionId, sessionFile },
+            entryId: "root",
+            activeAncestryEntryIds: ["root"],
+            treeOid: after,
+            expectedSlot: { kind: "open-checkpoint", treeOid: before },
+          }),
+      ),
+    ).resolves.toMatchObject({ kind: "completed", value: "committed" });
     concurrent.close();
 
-    expect(
-      runtime.workspaceMutations.protectNodeIfResolution(
-        leafView,
-        { sessionId: rootView.sessionId, entryId: "leaf" },
-        staleResolution,
+    await expect(
+      runtime.enqueueWorkspaceExecution(
+        "test-protect-inherited",
+        async (lease) =>
+          runtime.workspaceMutations.protectNodeIfResolution(
+            lease,
+            leafView,
+            { sessionId: rootView.sessionId, entryId: "leaf" },
+            staleResolution,
+          ),
       ),
-    ).toMatchObject({
-      kind: "protected",
-      evidence: { kind: "exact-slot", expectation: "stale" },
+    ).resolves.toMatchObject({
+      kind: "completed",
+      value: {
+        kind: "protected",
+        evidence: { kind: "exact-slot", expectation: "stale" },
+      },
     });
     expect(
       runtime.metadata.getCheckpointSlot(rootView.sessionId, "leaf"),
@@ -1901,8 +2011,15 @@ describe("Cyclotomy runtime", () => {
     expect(await runtime.ensureRegistrationStore(workspace, preparation)).toBe(
       true,
     );
-    registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
-    commitTestNodeState(runtime.metadata, "parent", "retained", "a".repeat(64));
+    await mutateRuntimeMetadata(runtime, () => {
+      registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
+      commitTestNodeState(
+        runtime.metadata,
+        "parent",
+        "retained",
+        "a".repeat(64),
+      );
+    });
 
     const originalExport = runtime.metadata.exportForkProjection.bind(
       runtime.metadata,
@@ -2144,11 +2261,13 @@ describe("Cyclotomy runtime", () => {
       "cyclotomy-runtime-source-config-shortcut-",
     );
     const { preparation, runtime } = await openExternalForkTarget(fixture);
-    registerTestSession(
-      runtime.metadata,
-      fixture.child.sessionId,
-      fixture.child.sessionFile!,
-      fixture.child.stableEntryIds,
+    await mutateRuntimeMetadata(runtime, () =>
+      registerTestSession(
+        runtime.metadata,
+        fixture.child.sessionId,
+        fixture.child.sessionFile!,
+        fixture.child.stableEntryIds,
+      ),
     );
     await writeFile(join(fixture.sourceStoreRoot, "settings.json"), "{");
 
@@ -2187,6 +2306,44 @@ describe("Cyclotomy runtime", () => {
 
     await writeFile(settingsPath, "{}");
     await expectExternalForkInheritance(fixture);
+  });
+
+  it("quarantines a newer source metadata schema with its unsupported version", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-metadata-newer-",
+    );
+    const newerVersion = CURRENT_METADATA_VERSION.version + 1;
+    const metadataPath = join(fixture.sourceStoreRoot, "state.db");
+    const metadata = new DatabaseSync(metadataPath);
+    metadata.exec(`PRAGMA user_version = ${newerVersion}`);
+    metadata.close();
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).resolves.toMatchObject({
+      kind: "active",
+      disposition: {
+        kind: "quarantined",
+        rejection: {
+          kind: "source-metadata-unrecognized",
+          cause: {
+            message: `Cyclotomy parent metadata schema version ${newerVersion} is newer than supported version ${CURRENT_METADATA_VERSION.version}`,
+          },
+        },
+      },
+    });
+    expect(
+      readTestSessionRegistration(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toBeDefined();
+    runtime.close();
   });
 
   it("quarantines ancestry when source metadata sidecars require recovery", async () => {
@@ -2333,8 +2490,8 @@ describe("Cyclotomy runtime", () => {
       runtime.metadata,
     );
     vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
-      (input) => {
-        const report = originalFinalize(input);
+      (authority, input, sourceAuthority) => {
+        const report = originalFinalize(authority, input, sourceAuthority);
         makeCurrentWorkspaceLockReleaseFail(fixture.sourceStoreRoot);
         return report;
       },
@@ -2367,8 +2524,8 @@ describe("Cyclotomy runtime", () => {
       runtime.metadata,
     );
     vi.spyOn(runtime.metadata, "finalizeSessionProjection").mockImplementation(
-      (input) => {
-        const report = originalFinalize(input);
+      (authority, input, sourceAuthority) => {
+        const report = originalFinalize(authority, input, sourceAuthority);
         makeCurrentWorkspaceLockReleaseFail(targetStoreRoot);
         return report;
       },
@@ -2430,6 +2587,81 @@ describe("Cyclotomy runtime", () => {
         fixture.child.sessionId,
       ),
     ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+  });
+
+  it("does not commit an imported projection after target lock ownership is lost", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows does not rename a live workspace lock directory reliably",
+    );
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-target-lock-replaced-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const targetStoreRoot = runtime.storeRoot;
+    const lockPath = join(targetStoreRoot, "workspace.lock");
+    const displacedLock = `${lockPath}.displaced`;
+    const importTrees = runtime.store.importTreesFrom.bind(runtime.store);
+    vi.spyOn(runtime.store, "importTreesFrom").mockImplementation(
+      async (...args) => {
+        await importTrees(...args);
+        await rename(lockPath, displacedLock);
+        await mkdir(lockPath);
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toThrow(/workspace lock ownership was lost/u);
+    expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(false);
+    expect(
+      readSessionProjectionResidue(
+        join(targetStoreRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
+  });
+
+  it("does not commit an imported projection after source lock ownership is lost", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows does not rename a live workspace lock directory reliably",
+    );
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-source-lock-replaced-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const lockPath = join(fixture.sourceStoreRoot, "workspace.lock");
+    const displacedLock = `${lockPath}.displaced`;
+    const importTrees = runtime.store.importTreesFrom.bind(runtime.store);
+    vi.spyOn(runtime.store, "importTreesFrom").mockImplementation(
+      async (...args) => {
+        await importTrees(...args);
+        await rename(lockPath, displacedLock);
+        await mkdir(lockPath);
+      },
+    );
+
+    await expect(
+      runtime.registrations.register(
+        fixture.child,
+        () => fixture.child,
+        preparation,
+      ),
+    ).rejects.toThrow(/workspace lock ownership was lost/u);
+    expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(false);
+    expect(
+      readSessionProjectionResidue(
+        join(runtime.storeRoot, "state.db"),
+        fixture.child.sessionId,
+      ),
+    ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    runtime.close();
   });
 
   it("does not quarantine a same-path source store replacement", async (context) => {
@@ -2597,8 +2829,15 @@ describe("Cyclotomy runtime", () => {
     expect(
       await runtime.ensureRegistrationStore(targetWorkspace, preparation),
     ).toBe(true);
-    registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
-    commitTestNodeState(runtime.metadata, "parent", "retained", "a".repeat(64));
+    await mutateRuntimeMetadata(runtime, () => {
+      registerTestSession(runtime.metadata, "parent", parentFile, ["retained"]);
+      commitTestNodeState(
+        runtime.metadata,
+        "parent",
+        "retained",
+        "a".repeat(64),
+      );
+    });
 
     await writeFile(
       parentFile,
@@ -2769,7 +3008,9 @@ describe("Cyclotomy runtime", () => {
     );
     expect(await runtime.ensureStore(first)).toBe(true);
     const firstRoot = runtime.storeRoot;
-    commitTestNodeState(runtime.metadata, "s", "e", "a".repeat(64));
+    await mutateRuntimeMetadata(runtime, () =>
+      commitTestNodeState(runtime.metadata, "s", "e", "a".repeat(64)),
+    );
     expect(await runtime.ensureStore(second)).toBe(false);
     expect(runtime.storeRoot).toBe(firstRoot);
     expect(checkpointState(runtime.metadata, "s", "e")?.treeOid).toBe(
@@ -2897,16 +3138,16 @@ describe("Cyclotomy runtime", () => {
       ],
       TEST_SCOPE,
     );
-    commitTestNodeState(runtime.metadata, "s", "parent", parentTree);
-    commitTestNodeState(runtime.metadata, "s", "leaf", leafTree);
+    await mutateRuntimeMetadata(runtime, () => {
+      commitTestNodeState(runtime.metadata, "s", "parent", parentTree);
+      commitTestNodeState(runtime.metadata, "s", "leaf", leafTree);
+    });
     await writeFile(join(workspace, "file.txt"), "current");
     await rm(
-      join(
-        runtime.storeRoot,
-        "objects",
-        "blobs",
-        leafBlob.slice(0, 2),
-        leafBlob.slice(2),
+      nativeLooseRecordPath(
+        nativeObjectLayout(runtime.storeRoot),
+        "content",
+        leafBlob,
       ),
     );
 

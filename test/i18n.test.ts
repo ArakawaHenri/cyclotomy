@@ -30,8 +30,8 @@ describe("Cyclotomy Pi localization", () => {
     expect(zh.t("driftCommandDescription")).toContain("/restore");
     expect(en.t("cyclotomyCommandDescription")).toContain("resume");
     expect(zh.t("cyclotomyCommandDescription")).toContain("恢复");
-    expect(en.t("cyclotomyInactive")).toContain("not active");
-    expect(zh.t("cyclotomyInactive")).toContain("未在当前 Pi 会话中启用");
+    expect(en.t("cyclotomyInactive")).toContain("unavailable");
+    expect(zh.t("cyclotomyInactive")).toContain("无法使用");
   });
 
   it("keeps command references and session-identity failures localized", () => {
@@ -42,12 +42,13 @@ describe("Cyclotomy Pi localization", () => {
     expect(en.t("commandTargetChanged")).toContain("/restore");
     expect(zh.t("commandPreviewStale")).toContain("/restore");
     expect(zh.t("commandTargetChanged")).toContain("/restore");
-    expect(zh.t("sessionIdentityUnavailable")).toBe(
-      "Cyclotomy 无法确认此会话的持久化身份，因此不会为它保存或恢复工作区。",
+    expect(en.t("sessionIdentityUnavailable")).toContain(
+      "Checkpoints and restore are unavailable",
     );
+    expect(zh.t("sessionIdentityUnavailable")).toContain("检查点与恢复不可用");
   });
 
-  it("explains that skipped ancestry does not disable the child", () => {
+  it("explains that a skipped parent import does not block new work", () => {
     const en = new CyclotomyI18n("en").t("forkInheritanceSkipped", {
       message: "source unavailable",
     });
@@ -55,10 +56,12 @@ describe("Cyclotomy Pi localization", () => {
       message: "来源不可用",
     });
 
-    expect(en).toContain("No parent state was imported");
-    expect(en).toContain("retained locations are blocked");
-    expect(zh).toContain("没有导入父会话状态");
-    expect(zh).toContain("阻止保留落点");
+    expect(en).toContain("Parent checkpoints were not imported");
+    expect(en).toContain("New work can still be checkpointed");
+    expect(en).toContain("existing nodes need /restore");
+    expect(zh).toContain("未导入父会话的检查点");
+    expect(zh).toContain("新工作仍会保存检查点");
+    expect(zh).toContain("已有节点需要先执行 /restore");
   });
 
   it("makes a transient fork import failure retryable", () => {
@@ -71,7 +74,7 @@ describe("Cyclotomy Pi localization", () => {
 
     for (const message of [en, zh])
       expect(message).toContain("/cyclotomy resume");
-    expect(en).toContain("retry");
+    expect(en).toContain("try again");
     expect(zh).toContain("重试");
   });
 
@@ -79,10 +82,10 @@ describe("Cyclotomy Pi localization", () => {
     const en = new CyclotomyI18n("en");
     const zh = new CyclotomyI18n("zh-CN");
     expect(en.t("restoreExecutionFailed", { message: "failure" })).toContain(
-      "Files may have changed",
+      "Some files may have changed",
     );
     expect(zh.t("restoreExecutionFailed", { message: "失败" })).toContain(
-      "文件可能已发生改动",
+      "部分文件可能已改动",
     );
     for (const i18n of [en, zh]) {
       const message = i18n.t("restorePostMutationControlUnavailable", {
@@ -115,21 +118,23 @@ describe("Cyclotomy Pi localization", () => {
     for (const message of zh) expect(message).toContain("交互式 TUI");
   });
 
-  it("explains the durable session capture barrier without treating reload as authority", () => {
+  it("explains a session-history pause without exposing its mechanism", () => {
     const en = new CyclotomyI18n("en").t("sessionCaptureBarrier");
     const zh = new CyclotomyI18n("zh-CN").t("sessionCaptureBarrier");
 
-    expect(en).toContain("session capture barrier");
-    expect(en).toContain("/reload does not grant ownership or clear");
-    expect(en).toContain("next complete concrete ancestry");
-    expect(en).toContain("unassigned");
-    expect(zh).toContain("会话捕获屏障");
-    expect(zh).toContain("/reload 不会授予归属或清除");
-    expect(zh).toContain("下一条可认证的完整、具体祖先链");
-    expect(zh).toContain("未归属");
+    for (const message of [en, zh]) {
+      expect(message).toContain("/drift");
+      expect(message).toContain("/restore");
+    }
+    expect(en).toContain(
+      "current state will not be checkpointed automatically",
+    );
+    expect(en).not.toContain("barrier");
+    expect(zh).toContain("不会自动保存当前状态");
+    expect(zh).not.toContain("屏障");
   });
 
-  it("presents every barrier conflict as an atomic projection, not a reload remedy", () => {
+  it("presents history conflicts by impact and next action", () => {
     const english = new CyclotomyI18n("en");
     const chinese = new CyclotomyI18n("zh-CN");
     const en = [
@@ -148,16 +153,16 @@ describe("Cyclotomy Pi localization", () => {
     ];
 
     for (const message of en) {
-      expect(message).toContain("session capture barrier");
-      expect(message).toContain("Reloading does not clear it");
-      expect(message).toContain("next complete concrete ancestry");
-      expect(message).not.toContain("pending checkpoint guard");
+      expect(message).toContain("will not be saved automatically");
+      expect(message).toContain("/drift");
+      expect(message).not.toContain("barrier");
+      expect(message).not.toContain("ancestry");
     }
     for (const message of zh) {
-      expect(message).toContain("会话捕获屏障");
-      expect(message).toContain("重新载入扩展不会清除");
-      expect(message).toContain("下一条可认证的完整、具体祖先链");
-      expect(message).not.toContain("待落实的检查点保护");
+      expect(message).toContain("不会自动保存");
+      expect(message).toContain("/drift");
+      expect(message).not.toContain("屏障");
+      expect(message).not.toContain("祖先链");
     }
   });
 
@@ -169,25 +174,49 @@ describe("Cyclotomy Pi localization", () => {
       expect(message).toContain("/drift");
       expect(message).toContain("/restore");
     }
-    expect(en).toContain("capture remains protected");
-    expect(zh).toContain("捕获仍受保护");
+    expect(en).toContain("Current files were kept");
+    expect(en).toContain("this node will not be checkpointed automatically");
+    expect(zh).toContain("已保留当前文件");
+    expect(zh).toContain("当前节点不会自动保存检查点");
   });
 
-  it("does not promise that a protected navigation source will be saved", () => {
+  it("offers navigation choices without explaining internal protection", () => {
     const en = new CyclotomyI18n("en").t("choiceNavigationIntro");
     const zh = new CyclotomyI18n("zh-CN").t("choiceNavigationIntro");
 
-    expect(en).toContain("current workspace");
-    expect(en).toContain("protects the destination checkpoint");
-    expect(en).toContain("destination changes");
+    expect(en).toContain("current files");
+    expect(en).toContain("Detached");
+    expect(en).toContain("destination checkpoint");
     expect(en).not.toContain("save this node");
-    expect(zh).toContain("保留当前工作区");
-    expect(zh).toContain("保护目标保存状态");
-    expect(zh).toContain("目标状态");
+    expect(zh).toContain("保留当前文件");
+    expect(zh).toContain("Detached");
+    expect(zh).toContain("目标检查点");
     expect(zh).not.toContain("保存当前节点");
   });
 
-  it("explains how to reconcile a Detached arrival", () => {
+  it("renders Git replay provenance risks in both locales", () => {
+    const en = new CyclotomyI18n("en");
+    const zh = new CyclotomyI18n("zh-CN");
+    const mismatch = {
+      kind: "version-mismatch" as const,
+      capturedGitVersion: "git version 2.50.1",
+      currentGitVersion: "git version 2.54.0",
+    };
+
+    expect(en.formatGitReplayRisk({ kind: "none" })).toBeUndefined();
+    expect(en.formatGitReplayRisk(mismatch)).toContain("git version 2.50.1");
+    expect(en.formatGitReplayRisk(mismatch)).toContain("git version 2.54.0");
+    expect(en.formatGitReplayRisk(mismatch)).toContain("Warning");
+    expect(zh.formatGitReplayRisk(mismatch)).toContain("警告");
+    expect(
+      zh.formatGitReplayRisk({
+        kind: "legacy-unattested",
+        currentGitVersion: null,
+      }),
+    ).toContain("未知 Git 版本");
+  });
+
+  it("explains how to leave Detached state", () => {
     const en = new CyclotomyI18n("en").t("navigationDetached");
     const zh = new CyclotomyI18n("zh-CN").t("navigationDetached");
 
@@ -196,9 +225,11 @@ describe("Cyclotomy Pi localization", () => {
       expect(message).toContain("/restore");
     }
     expect(en).toContain("Detached");
-    expect(en).toContain("remains protected");
+    expect(en).toContain("current files");
+    expect(en).toContain("new branch");
     expect(zh).toContain("Detached");
-    expect(zh).toContain("仍受保护");
+    expect(zh).toContain("当前文件");
+    expect(zh).toContain("新分支");
   });
 
   it("marks both clean and changed protected workspaces as Detached", () => {
@@ -222,14 +253,14 @@ describe("Cyclotomy Pi localization", () => {
     }
   });
 
-  it("explains both first-checkpoint recording and resumed capture", () => {
+  it("confirms the first checkpoint without implementation detail", () => {
     const en = new CyclotomyI18n("en").t("restoreInitialized");
     const zh = new CyclotomyI18n("zh-CN").t("restoreInitialized");
 
     expect(en).toContain("first checkpoint");
-    expect(en).toContain("capture resumed");
-    expect(zh).toContain("首个保存状态");
-    expect(zh).toContain("恢复后续检查点捕获");
+    expect(en).not.toContain("capture");
+    expect(zh).toContain("首个检查点");
+    expect(zh).not.toContain("捕获");
   });
 
   it("resolves auto from process locale before the host locale", () => {
@@ -289,7 +320,7 @@ describe("Cyclotomy Pi localization", () => {
       problems: [],
     });
 
-    expect(applied).toContain("Completed before the stop");
+    expect(applied).toContain("Changed before restore stopped");
     expect(applied).toContain("~ changed.txt");
     expect(applied).toContain('+ "new\\nfile"');
     expect(applied).toContain("- old.txt");

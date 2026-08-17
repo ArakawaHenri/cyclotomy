@@ -8,20 +8,22 @@ import {
 import type { ResolvedNodeState } from "../application/resolve.ts";
 import type { RestoreDeps } from "../application/restore.ts";
 import type { NodeKey } from "../domain/model.ts";
-import type { WorkspaceLockExecution } from "../infrastructure/workspace-lock.ts";
+import {
+  assertWorkspaceWriteAuthority,
+  type WorkspaceWriteAuthority,
+  type WorkspaceLockExecution,
+} from "../infrastructure/workspace-lock.ts";
 import type { PendingNavigation } from "./navigation-plan.ts";
 import type {
   CurrentMetadataStore,
   ProtectLocationResult,
 } from "../infrastructure/metadata.ts";
 import {
-  type ArrivalProtection,
-  unavailableProtection,
-} from "./arrival-protection.ts";
-import {
   type ArrivalAdmissionSettlement,
   type ArrivalDisposition,
   type LocationProtectionDisposition,
+  type NonAdmittedArrivalDisposition,
+  unsettledArrival,
 } from "./arrival-settlement.ts";
 import {
   type AdmissionDecision,
@@ -31,6 +33,7 @@ import {
   type EphemeralArrivalSettlement,
 } from "./checkpoint-admission.ts";
 import {
+  isExactUsableSessionView,
   persistedSessionIdentityOf,
   readPersistedSessionIdentity,
   readSessionView,
@@ -38,7 +41,7 @@ import {
   type SessionView,
 } from "./session-view.ts";
 import type { SessionRegistrationService } from "./session-registration-service.ts";
-import type { ArrivalRecoveryExecution } from "./post-mutation.ts";
+import type { ArrivalRecoverySettlement } from "./workspace-receipt.ts";
 
 type LocationExpectation =
   | { readonly kind: "any-current" }
@@ -75,9 +78,10 @@ export interface WorkspaceMutationAuthorityOptions {
   readonly checkpoints: () => CheckpointService;
   readonly metadata: () => CurrentMetadataStore;
   readonly restoreDeps: () => RestoreDeps;
+  readonly workspaceStoreRoot: () => string;
   readonly enqueueWorkspaceExecution: <T>(
     operation: string,
-    action: () => Promise<T>,
+    action: (writeAuthority: WorkspaceWriteAuthority) => Promise<T>,
   ) => Promise<WorkspaceLockExecution<T>>;
 }
 
@@ -147,6 +151,7 @@ export class WorkspaceMutationAuthority {
    * boundary immediately before the restore application's first write.
    */
   prepareLocationMutation(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
     expected: SessionView,
     node: NodeKey,
@@ -156,8 +161,9 @@ export class WorkspaceMutationAuthority {
     try {
       current = readSessionView(context);
       if (
-        !this.sessionIsUsable(current) ||
-        !current.isSameSnapshotAs(expected) ||
+        !isExactUsableSessionView(current, expected, (candidate) =>
+          this.sessionIsUsable(candidate),
+        ) ||
         !this.resolutionStillAuthoritative(current, node, resolution)
       ) {
         return undefined;
@@ -170,20 +176,28 @@ export class WorkspaceMutationAuthority {
       return undefined;
     }
     return prepareWorkspaceMutationLease(() => {
+      const storeRoot = this.#options.workspaceStoreRoot();
+      assertWorkspaceWriteAuthority(writeAuthority, storeRoot);
       const finalView = readSessionView(context);
       if (
-        !this.sessionIsUsable(finalView) ||
-        !finalView.isSameSnapshotAs(expected)
+        !isExactUsableSessionView(finalView, expected, (candidate) =>
+          this.sessionIsUsable(candidate),
+        )
       ) {
         throw new Error("active location changed before workspace mutation");
       }
       if (!context.isIdle()) {
         throw new Error("Pi became busy before workspace mutation");
       }
-      const protection = this.#protectLocation(finalView, node, {
-        kind: "exact-resolution",
-        resolution,
-      });
+      const protection = this.#protectLocation(
+        writeAuthority,
+        finalView,
+        node,
+        {
+          kind: "exact-resolution",
+          resolution,
+        },
+      );
       if (protection.kind === "unregistered") {
         throw new Error("workspace registration changed before mutation");
       }
@@ -199,12 +213,15 @@ export class WorkspaceMutationAuthority {
       return {
         kind: "authorized",
         pinnedResolution,
+        writeAuthority,
+        storeRoot,
       };
     });
   }
 
   /** Tree-arrival variant bound to the same opaque one-shot arrival attempt. */
   prepareTreeArrivalMutation(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
     attempt: ArrivalAttempt,
     expected: SessionView,
@@ -215,20 +232,28 @@ export class WorkspaceMutationAuthority {
       return undefined;
     }
     return prepareWorkspaceMutationLease(() => {
+      const storeRoot = this.#options.workspaceStoreRoot();
+      assertWorkspaceWriteAuthority(writeAuthority, storeRoot);
       const finalView = readSessionView(context);
       if (
-        !this.sessionIsUsable(finalView) ||
-        !finalView.isSameSnapshotAs(expected)
+        !isExactUsableSessionView(finalView, expected, (candidate) =>
+          this.sessionIsUsable(candidate),
+        )
       ) {
         throw new Error("tree arrival changed before workspace mutation");
       }
       if (!context.isIdle()) {
         throw new Error("Pi became busy before tree workspace mutation");
       }
-      const protection = this.#protectLocation(finalView, node, {
-        kind: "exact-resolution",
-        resolution,
-      });
+      const protection = this.#protectLocation(
+        writeAuthority,
+        finalView,
+        node,
+        {
+          kind: "exact-resolution",
+          resolution,
+        },
+      );
       if (protection.kind === "unregistered") {
         throw new Error("workspace registration changed before tree mutation");
       }
@@ -250,6 +275,8 @@ export class WorkspaceMutationAuthority {
       return {
         kind: "authorized",
         pinnedResolution,
+        writeAuthority,
+        storeRoot,
       };
     });
   }
@@ -257,46 +284,44 @@ export class WorkspaceMutationAuthority {
   /** Reacquire the cooperative workspace lock and run the same settlement. */
   async recoverUncertainLocation(
     context: ExtensionContext,
-  ): Promise<ArrivalRecoveryExecution> {
+  ): Promise<ArrivalRecoverySettlement> {
     return this.#recoverUncertainLocation(context, true);
   }
 
   /** Durably close the current location without reopening runtime authority. */
   async protectCurrentLocationForRetirement(
     context: ExtensionContext,
-  ): Promise<ArrivalRecoveryExecution> {
+  ): Promise<ArrivalRecoverySettlement> {
     return this.#recoverUncertainLocation(context, false);
   }
 
   async #recoverUncertainLocation(
     context: ExtensionContext,
     restoreAdmission: boolean,
-  ): Promise<ArrivalRecoveryExecution> {
+  ): Promise<ArrivalRecoverySettlement> {
     this.quarantineAdmission();
     try {
       const execution = await this.#options.enqueueWorkspaceExecution(
         restoreAdmission
           ? "recover-uncertain-location"
           : "protect-location-for-retirement",
-        async () =>
+        async (writeAuthority) =>
           this.#recoverUncertainLocationInWorkspaceLock(
+            writeAuthority,
             context,
             restoreAdmission,
           ),
       );
-      const workspaceLockCleanup =
-        execution.cleanup.kind === "failed"
-          ? { kind: "failed" as const, cause: execution.cleanup.cause }
-          : { kind: "settled" as const };
+      const workspaceLockCleanup = execution.cleanup;
       if (execution.kind === "completed") {
         return {
-          protection: execution.value,
+          arrival: execution.value,
           workspaceLockCleanup,
         };
       }
       this.quarantineAdmission();
       return {
-        protection: unavailableProtection(
+        arrival: unsettledArrival(
           "arrival protection failed after reacquiring the workspace lock",
           [execution.cause],
         ),
@@ -305,7 +330,7 @@ export class WorkspaceMutationAuthority {
     } catch (cause) {
       this.quarantineAdmission();
       return {
-        protection: unavailableProtection(
+        arrival: unsettledArrival(
           "arrival protection could not reacquire the workspace lock",
           [cause],
         ),
@@ -316,15 +341,21 @@ export class WorkspaceMutationAuthority {
 
   /** Settle an uncertain arrival while the caller already owns the lock. */
   recoverUncertainLocationInWorkspaceLock(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
-  ): ArrivalProtection {
-    return this.#recoverUncertainLocationInWorkspaceLock(context, true);
+  ): NonAdmittedArrivalDisposition {
+    return this.#recoverUncertainLocationInWorkspaceLock(
+      writeAuthority,
+      context,
+      true,
+    );
   }
 
   #recoverUncertainLocationInWorkspaceLock(
+    writeAuthority: WorkspaceWriteAuthority,
     context: ExtensionContext,
     restoreAdmission: boolean,
-  ): ArrivalProtection {
+  ): NonAdmittedArrivalDisposition {
     this.quarantineAdmission();
     let current: SessionView;
     try {
@@ -334,30 +365,40 @@ export class WorkspaceMutationAuthority {
       if (node === undefined) {
         const identity = persistedSessionIdentityOf(current);
         if (identity === undefined) {
-          return unavailableProtection(
+          return unsettledArrival(
             "current arrival has no persisted session identity",
             [new Error("persisted session identity is unavailable")],
           );
         }
-        return this.#raiseSessionBarrierByIdentity(identity)
-          ? { kind: "session-barrier" }
-          : unavailableProtection("session barrier could not be raised", [
+        return this.#raiseSessionBarrierByIdentity(writeAuthority, identity)
+          ? {
+              kind: "protected",
+              evidence: {
+                kind: "session-barrier",
+                admission: { kind: "settled" },
+              },
+            }
+          : unsettledArrival("session barrier could not be raised", [
               new Error("registered session authority is unavailable"),
             ]);
       }
-      const protection = this.#protectLocation(current, node, {
+      const protection = this.#protectLocation(writeAuthority, current, node, {
         kind: "any-current",
       });
       if (protection.kind === "unregistered") {
-        return unavailableProtection("exact arrival could not be protected", [
+        return unsettledArrival("exact arrival could not be protected", [
           new Error("registered session authority is unavailable"),
         ]);
       }
       if (!restoreAdmission || !this.#options.participationIsActive()) {
         return {
-          kind: "exact-slot",
-          slot: protection.protectedSlot,
-          admission: { kind: "settled" },
+          kind: "protected",
+          evidence: {
+            kind: "exact-slot",
+            slot: protection.protectedSlot,
+            expectation: protection.kind === "protected" ? "matched" : "stale",
+            admission: { kind: "settled" },
+          },
         };
       }
       // The slot is now durably closed against capture. Recovery keeps the
@@ -366,31 +407,45 @@ export class WorkspaceMutationAuthority {
       try {
         this.#options.admission.admit(current, node);
         return {
-          kind: "exact-slot",
-          slot: protection.protectedSlot,
-          admission: { kind: "settled" },
+          kind: "protected",
+          evidence: {
+            kind: "exact-slot",
+            slot: protection.protectedSlot,
+            expectation: protection.kind === "protected" ? "matched" : "stale",
+            admission: { kind: "settled" },
+          },
         };
       } catch (secondaryFailure) {
         // The metadata transaction is authoritative even when rebuilding the
         // replaceable in-memory admission state fails. Never downgrade this
         // exact durable fact to a weaker barrier or unavailable settlement.
         return {
-          kind: "exact-slot",
-          slot: protection.protectedSlot,
-          admission: { kind: "failed", cause: secondaryFailure },
+          kind: "protected",
+          evidence: {
+            kind: "exact-slot",
+            slot: protection.protectedSlot,
+            expectation: protection.kind === "protected" ? "matched" : "stale",
+            admission: { kind: "failed", cause: secondaryFailure },
+          },
         };
       }
     } catch (primary) {
       try {
         const identity = readPersistedSessionIdentity(context);
-        return this.#raiseSessionBarrierByIdentity(identity)
-          ? { kind: "session-barrier" }
-          : unavailableProtection("session barrier could not be raised", [
+        return this.#raiseSessionBarrierByIdentity(writeAuthority, identity)
+          ? {
+              kind: "protected",
+              evidence: {
+                kind: "session-barrier",
+                admission: { kind: "settled" },
+              },
+            }
+          : unsettledArrival("session barrier could not be raised", [
               primary,
               new Error("registered session authority is unavailable"),
             ]);
       } catch (secondary) {
-        return unavailableProtection("arrival recovery failed", [
+        return unsettledArrival("arrival recovery failed", [
           primary,
           secondary,
         ]);
@@ -398,23 +453,32 @@ export class WorkspaceMutationAuthority {
     }
   }
 
-  #raiseSessionBarrier(view: SessionView): boolean {
+  #raiseSessionBarrier(
+    writeAuthority: WorkspaceWriteAuthority,
+    view: SessionView,
+  ): boolean {
     const identity = persistedSessionIdentityOf(view);
     return (
-      identity !== undefined && this.#raiseSessionBarrierByIdentity(identity)
+      identity !== undefined &&
+      this.#raiseSessionBarrierByIdentity(writeAuthority, identity)
     );
   }
 
-  #raiseSessionBarrierByIdentity(identity: PersistedSessionIdentity): boolean {
+  #raiseSessionBarrierByIdentity(
+    writeAuthority: WorkspaceWriteAuthority,
+    identity: PersistedSessionIdentity,
+  ): boolean {
     try {
       this.#options.registrations.assertActiveWorkspaceAuthority(identity);
     } catch {
       return false;
     }
-    return this.#options.metadata().raiseSessionBarrier({
+    const metadata = this.#options.metadata();
+    const input = {
       sessionId: identity.sessionId,
       sessionFile: identity.sessionFile,
-    });
+    };
+    return metadata.raiseSessionBarrier(writeAuthority, input);
   }
 
   sessionHasBarrier(view: SessionView): boolean | undefined {
@@ -427,6 +491,7 @@ export class WorkspaceMutationAuthority {
   }
 
   reconcileSessionBarrier(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
   ): "reconciled" | "absent" | "unregistered" {
@@ -445,12 +510,17 @@ export class WorkspaceMutationAuthority {
     ) {
       return "absent";
     }
-    const result = this.#options
-      .metadata()
-      .reconcileSessionBarrier(
-        { sessionId: view.sessionId, sessionFile: identity.sessionFile },
-        this.#ancestryIds(view, node.entryId),
-      );
+    const metadata = this.#options.metadata();
+    const metadataIdentity = {
+      sessionId: view.sessionId,
+      sessionFile: identity.sessionFile,
+    };
+    const ancestry = this.#ancestryIds(view, node.entryId);
+    const result = metadata.reconcileSessionBarrier(
+      writeAuthority,
+      metadataIdentity,
+      ancestry,
+    );
     if (result === "unregistered") this.quarantineAdmission();
     return result;
   }
@@ -468,13 +538,14 @@ export class WorkspaceMutationAuthority {
   }
 
   admitLocationIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     resolution: ResolvedNodeState,
   ): boolean {
     const node = this.captureAnchor(view);
     if (
       node === undefined ||
-      !this.#admitResolvedLocation(view, node, resolution)
+      !this.#admitResolvedLocation(writeAuthority, view, node, resolution)
     ) {
       return false;
     }
@@ -483,6 +554,7 @@ export class WorkspaceMutationAuthority {
   }
 
   admitCurrentTreeArrival(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
   ): ArrivalDisposition {
@@ -498,7 +570,9 @@ export class WorkspaceMutationAuthority {
       this.sessionHasBarrier(view) !== false ||
       (node !== undefined && this.#locationIsBlocked(node))
     ) {
-      return this.#protectTreeArrival(attempt, view, { kind: "any-current" });
+      return this.#protectTreeArrival(writeAuthority, attempt, view, {
+        kind: "any-current",
+      });
     }
     return this.#options.admission.admitArrival(attempt, view, node)
       ? { kind: "admitted" }
@@ -509,6 +583,7 @@ export class WorkspaceMutationAuthority {
   }
 
   admitTreeArrivalIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
     resolution: ResolvedNodeState,
@@ -524,8 +599,8 @@ export class WorkspaceMutationAuthority {
         cause: new Error("tree arrival no longer matches its target"),
       };
     }
-    if (!this.#admitResolvedLocation(view, node, resolution)) {
-      return this.#protectTreeArrival(attempt, view, {
+    if (!this.#admitResolvedLocation(writeAuthority, view, node, resolution)) {
+      return this.#protectTreeArrival(writeAuthority, attempt, view, {
         kind: "exact-resolution",
         resolution,
       });
@@ -536,51 +611,68 @@ export class WorkspaceMutationAuthority {
     // Metadata admission may have reopened an exact pin before the replaceable
     // arrival token became stale. Close the coordinate again and preserve the
     // durable fact even though this attempt can no longer be settled.
-    return this.#protectNodeAfterArrivalSettlementFailure(view, node);
+    return this.#protectNodeAfterArrivalSettlementFailure(
+      writeAuthority,
+      view,
+      node,
+    );
   }
 
   protectCurrentTreeArrival(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
   ): ArrivalDisposition {
-    return this.#protectTreeArrival(attempt, view, { kind: "any-current" });
+    return this.#protectTreeArrival(writeAuthority, attempt, view, {
+      kind: "any-current",
+    });
   }
 
   protectTreeArrivalIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
     resolution: ResolvedNodeState,
   ): ArrivalDisposition {
-    return this.#protectTreeArrival(attempt, view, {
+    return this.#protectTreeArrival(writeAuthority, attempt, view, {
       kind: "exact-resolution",
       resolution,
     });
   }
 
   protectCurrentNode(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
   ): LocationProtectionDisposition {
-    return this.#protectNode(view, node, { kind: "any-current" });
+    return this.#protectNode(writeAuthority, view, node, {
+      kind: "any-current",
+    });
   }
 
   protectNodeIfResolution(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     resolution: ResolvedNodeState,
   ): LocationProtectionDisposition {
-    return this.#protectNode(view, node, {
+    return this.#protectNode(writeAuthority, view, node, {
       kind: "exact-resolution",
       resolution,
     });
   }
 
   captureAdmission(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey | undefined,
   ): AdmissionDecision {
     if (node !== undefined) {
-      const reconciled = this.reconcileSessionBarrier(view, node);
+      const reconciled = this.reconcileSessionBarrier(
+        writeAuthority,
+        view,
+        node,
+      );
       if (reconciled === "reconciled") {
         this.#options.admission.admit(view, node);
         return { kind: "write-protected" };
@@ -594,7 +686,7 @@ export class WorkspaceMutationAuthority {
       writeProtected,
     });
     if (decision.kind === "not-admitted" && node !== undefined) {
-      this.protectCurrentNode(view, node);
+      this.protectCurrentNode(writeAuthority, view, node);
     }
     return decision;
   }
@@ -622,6 +714,7 @@ export class WorkspaceMutationAuthority {
   }
 
   #admitResolvedLocation(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     resolution: ResolvedNodeState,
@@ -633,8 +726,9 @@ export class WorkspaceMutationAuthority {
     } catch {
       return false;
     }
-    return (
-      this.#options.metadata().admitResolvedLocation({
+    const metadata = this.#options.metadata();
+    const input: Parameters<CurrentMetadataStore["admitResolvedLocation"]>[1] =
+      {
         identity: {
           sessionId: node.sessionId,
           sessionFile: identity.sessionFile,
@@ -642,15 +736,18 @@ export class WorkspaceMutationAuthority {
         entryId: node.entryId,
         activeAncestryEntryIds: this.#ancestryIds(view, node.entryId),
         expectedResolution: {
-          kind: "checkpoint",
+          kind: "checkpoint" as const,
           entryId: resolution.foundAt.entryId,
           treeOid: resolution.treeOid,
         },
-      }) !== "slot-changed"
+      };
+    return (
+      metadata.admitResolvedLocation(writeAuthority, input) !== "slot-changed"
     );
   }
 
   #protectTreeArrival(
+    writeAuthority: WorkspaceWriteAuthority,
     attempt: ArrivalAttempt,
     view: SessionView,
     expectation: LocationExpectation,
@@ -673,7 +770,7 @@ export class WorkspaceMutationAuthority {
     if (node === undefined) {
       let raised: boolean;
       try {
-        raised = this.#raiseSessionBarrier(view);
+        raised = this.#raiseSessionBarrier(writeAuthority, view);
       } catch (cause) {
         return { kind: "unsettled", cause };
       }
@@ -694,7 +791,12 @@ export class WorkspaceMutationAuthority {
     }
     let protection: ProtectLocationResult | { readonly kind: "unregistered" };
     try {
-      protection = this.#protectLocation(view, node, expectation);
+      protection = this.#protectLocation(
+        writeAuthority,
+        view,
+        node,
+        expectation,
+      );
     } catch (cause) {
       return { kind: "unsettled", cause };
     }
@@ -717,13 +819,19 @@ export class WorkspaceMutationAuthority {
   }
 
   #protectNode(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     expectation: LocationExpectation,
   ): LocationProtectionDisposition {
     let protection: ProtectLocationResult | { readonly kind: "unregistered" };
     try {
-      protection = this.#protectLocation(view, node, expectation);
+      protection = this.#protectLocation(
+        writeAuthority,
+        view,
+        node,
+        expectation,
+      );
     } catch (cause) {
       return { kind: "unsettled", cause };
     }
@@ -752,12 +860,13 @@ export class WorkspaceMutationAuthority {
   }
 
   #protectNodeAfterArrivalSettlementFailure(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
   ): ArrivalDisposition {
     let protection: ProtectLocationResult | { readonly kind: "unregistered" };
     try {
-      protection = this.#protectLocation(view, node, {
+      protection = this.#protectLocation(writeAuthority, view, node, {
         kind: "any-current",
       });
     } catch (cause) {
@@ -810,6 +919,7 @@ export class WorkspaceMutationAuthority {
   }
 
   #protectLocation(
+    writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     expectation: LocationExpectation,
@@ -823,7 +933,8 @@ export class WorkspaceMutationAuthority {
     } catch {
       return { kind: "unregistered" };
     }
-    const result = this.#options.metadata().protectLocation({
+    const metadata = this.#options.metadata();
+    const input: Parameters<CurrentMetadataStore["protectLocation"]>[1] = {
       identity: {
         sessionId: node.sessionId,
         sessionFile: identity.sessionFile,
@@ -841,7 +952,7 @@ export class WorkspaceMutationAuthority {
                 treeOid: expectation.resolution.treeOid,
               },
             },
-    });
-    return result;
+    };
+    return metadata.protectLocation(writeAuthority, input);
   }
 }

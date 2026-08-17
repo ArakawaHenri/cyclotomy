@@ -11,13 +11,19 @@ import { createCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import {
+  bindTestMetadataWriteAuthority,
   commitTestNodeState,
   registerTestSession,
 } from "./metadata-fixture.ts";
+import {
+  holdTestWorkspaceWriteAuthority,
+  releaseTestWorkspaceWriteAuthorities,
+} from "./workspace-write-authority-fixture.ts";
 
 const roots: string[] = [];
 
 afterEach(async () => {
+  await releaseTestWorkspaceWriteAuthorities();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -61,15 +67,20 @@ async function fixture() {
   const storeRoot = join(root, "store");
   await mkdir(workspace);
   const store = await openObjectStore(storeRoot);
-  const metadata = createCurrentMetadataStore(join(storeRoot, "state.db"));
+  const writeAuthority = await holdTestWorkspaceWriteAuthority(storeRoot);
+  const metadata = createCurrentMetadataStore(
+    join(storeRoot, "state.db"),
+    writeAuthority,
+  );
+  bindTestMetadataWriteAuthority(metadata, writeAuthority, storeRoot);
   const workspaceRoot = await realpath(workspace);
   const service = new CheckpointService({
     store,
     metadata,
     expectedRootPath: workspaceRoot,
-    validateManifestScope: async () => {},
+    validateManifestScope: async () => ({ gitVersion: null }),
   });
-  return { metadata, service, workspace: workspaceRoot };
+  return { metadata, service, workspace: workspaceRoot, writeAuthority };
 }
 
 describe("CheckpointService capture boundary", () => {
@@ -116,7 +127,7 @@ describe("CheckpointService capture boundary", () => {
   });
 
   it("commits only the exact active stable coordinate", async () => {
-    const { metadata, service, workspace } = await fixture();
+    const { metadata, service, workspace, writeAuthority } = await fixture();
     const sessionFile = join(workspace, "session.jsonl");
     registerTestSession(
       metadata,
@@ -144,6 +155,7 @@ describe("CheckpointService capture boundary", () => {
     }
     expect(prepared).toMatchObject({ ok: true });
     const authority = {
+      writeAuthority,
       expectedSessionFile: sessionFile,
       assertWorkspaceAuthority: () => undefined,
     };
@@ -214,6 +226,7 @@ describe("CheckpointService capture boundary", () => {
         arrivalPrepared.value,
         arrival.metadata.getCheckpointSlot("session", "parent"),
         {
+          writeAuthority: arrival.writeAuthority,
           expectedSessionFile: arrivalSessionFile,
           assertWorkspaceAuthority: () => undefined,
         },
@@ -226,6 +239,7 @@ describe("CheckpointService capture boundary", () => {
         arrivalPrepared.value,
         arrival.metadata.getCheckpointSlot("session", "inactive"),
         {
+          writeAuthority: arrival.writeAuthority,
           expectedSessionFile: arrivalSessionFile,
           assertWorkspaceAuthority: () => undefined,
         },

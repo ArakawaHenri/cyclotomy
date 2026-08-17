@@ -2,7 +2,8 @@ import type { Stats } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import type { TreeManifest } from "./tree-formats/manifest-codec.ts";
+import type { CurrentTreeManifest } from "./tree-formats/current.ts";
+import { systemErrorCode } from "./system-error.ts";
 import {
   planWorkspaceRestore,
   type RestoreScopeBlocker,
@@ -16,6 +17,11 @@ import type {
   WorkspaceSnapshot,
 } from "./workspace-scan.ts";
 import { portableWorkspacePathKey } from "./workspace-scope.ts";
+import {
+  addWorkspacePathAncestors,
+  workspacePathIsAtOrBelow,
+  workspacePathSetHasAtOrAbove,
+} from "./workspace-path-relations.ts";
 
 type WorkspacePathAliasSourceKind = "entry" | "directory";
 
@@ -64,10 +70,6 @@ type CurrentNamespaceCandidate =
       readonly kind: "excluded";
       readonly observation: ExcludedWorkspaceObservation;
     };
-
-function errorCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException).code;
-}
 
 function usableIdentity(metadata: Stats): boolean {
   // A zero inode is the portable "identity unavailable" signal. Device alone
@@ -118,29 +120,6 @@ function sameInode(left: Stats, right: Stats): boolean {
   );
 }
 
-function isAtOrBelow(path: string, root: string): boolean {
-  return path === root || path.startsWith(`${root}/`);
-}
-
-function hasPathAtOrAbove(path: string, paths: ReadonlySet<string>): boolean {
-  let candidate = path;
-  while (true) {
-    if (paths.has(candidate)) return true;
-    const separator = candidate.lastIndexOf("/");
-    if (separator === -1) return false;
-    candidate = candidate.slice(0, separator);
-  }
-}
-
-function ancestorDirectories(path: string, into: Set<string>): void {
-  let separator = path.lastIndexOf("/");
-  while (separator !== -1) {
-    const ancestor = path.slice(0, separator);
-    into.add(ancestor);
-    separator = ancestor.lastIndexOf("/");
-  }
-}
-
 async function observeWorkspacePath(
   workspaceRoot: string,
   path: string,
@@ -153,7 +132,10 @@ async function observeWorkspacePath(
     try {
       metadata = await lstat(absolute);
     } catch (error) {
-      if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") {
+      if (
+        systemErrorCode(error) === "ENOENT" ||
+        systemErrorCode(error) === "ENOTDIR"
+      ) {
         return undefined;
       }
       throw error;
@@ -219,7 +201,7 @@ function withAliasScopeBlockers(
  */
 export async function prepareWorkspaceRestorePlan(
   current: WorkspaceSnapshot,
-  target: TreeManifest,
+  target: CurrentTreeManifest,
 ): Promise<PreparedWorkspaceRestorePlan> {
   const basePlan = planWorkspaceRestore(current, target);
   if (basePlan.problems.length > 0) {
@@ -259,7 +241,7 @@ export async function prepareWorkspaceRestorePlan(
 
   const targetDirectories = new Set<string>();
   for (const entry of target.entries) {
-    ancestorDirectories(entry.path, targetDirectories);
+    addWorkspacePathAncestors(entry.path, targetDirectories);
   }
   const targetNamespacePaths = new Set<string>([
     ...targetDirectories,
@@ -267,7 +249,7 @@ export async function prepareWorkspaceRestorePlan(
   ]);
   const currentManagedDirectories = new Set<string>();
   for (const entry of current.entries) {
-    ancestorDirectories(entry.path, currentManagedDirectories);
+    addWorkspacePathAncestors(entry.path, currentManagedDirectories);
   }
   const workspaceAliases: WorkspacePathAlias[] = [];
   const aliasBlockers: RestoreScopeBlocker[] = [];
@@ -310,7 +292,9 @@ export async function prepareWorkspaceRestorePlan(
     // descendants are already explained by that boundary. The scanner rightly
     // did not enumerate inside the excluded root, so probing those descendants
     // would misreport them as post-scan namespace additions.
-    if (hasPathAtOrAbove(targetPath, excludedAliasTargetRoots)) continue;
+    if (workspacePathSetHasAtOrAbove(targetPath, excludedAliasTargetRoots)) {
+      continue;
+    }
     if (exactCurrentPaths.has(targetPath)) continue;
     let targetMetadata: Stats | undefined;
     try {
@@ -354,7 +338,10 @@ export async function prepareWorkspaceRestorePlan(
         targetExisted: false,
         canRecaseDirectory:
           candidate.kind === "directory" &&
-          !hasPathAtOrAbove(candidate.path, currentManagedDirectories),
+          !workspacePathSetHasAtOrAbove(
+            candidate.path,
+            currentManagedDirectories,
+          ),
         dev: metadata.dev,
         ino: metadata.ino,
       });
@@ -422,7 +409,7 @@ export async function prepareWorkspaceRestorePlan(
   for (const alias of workspaceAliases) {
     if (alias.sourceKind !== "directory") continue;
     for (const occupancy of current.excludedOccupancies) {
-      if (isAtOrBelow(occupancy.path, alias.from)) {
+      if (workspacePathIsAtOrBelow(occupancy.path, alias.from)) {
         aliasBlockers.push({
           path: occupancy.path,
           targetPath: alias.to,

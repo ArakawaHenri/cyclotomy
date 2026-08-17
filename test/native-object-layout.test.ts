@@ -13,7 +13,9 @@ import {
 import {
   nativeObjectEntry,
   nativeObjectLayout,
+  nativeLooseRecordPath,
   nativeObjectPath,
+  nativePackPath,
   nativeTemporaryObjectName,
 } from "../src/infrastructure/workspace-store.ts";
 
@@ -29,6 +31,8 @@ describe("native object layout", () => {
       target: NativeObjectStore,
       source: NativeObjectStore,
     ): void => {
+      // @ts-expect-error Runtime-native stores do not expose historical migration.
+      target.upgradeTree("0".repeat(64), "future");
       // @ts-expect-error Cross-store import requires an explicit admission policy.
       target.importTreesFrom(source, []);
       // @ts-expect-error Snapshot quota cannot be omitted from admission.
@@ -50,9 +54,24 @@ describe("native object layout", () => {
       objects: join(root, "objects"),
       blobs: join(root, "objects", "blobs"),
       trees: join(root, "objects", "trees"),
+      records: join(root, "objects", "records"),
+      contentRecords: join(root, "objects", "records", "content"),
+      recipeRecords: join(root, "objects", "records", "recipe"),
+      packs: join(root, "objects", "packs"),
+      incomingPacks: join(root, "objects", "packs", "incoming"),
+      multiPackIndex: join(root, "objects", "packs", "multi-pack-index"),
     });
     expect(nativeObjectPath(layout, "blob", oid)).toBe(
       join(root, "objects", "blobs", "aa", "b".repeat(62)),
+    );
+    expect(nativeLooseRecordPath(layout, "content", oid)).toBe(
+      join(root, "objects", "records", "content", "aa", "b".repeat(62)),
+    );
+    expect(nativeLooseRecordPath(layout, "recipe", oid)).toBe(
+      join(root, "objects", "records", "recipe", "aa", "b".repeat(62)),
+    );
+    expect(nativePackPath(layout, oid)).toBe(
+      join(root, "objects", "packs", "aa", `${"b".repeat(62)}.pack`),
     );
     expect(nativeObjectEntry("aa", "b".repeat(62))).toEqual({
       kind: "object",

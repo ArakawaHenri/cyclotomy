@@ -4,12 +4,19 @@ import { isAbsolute, join, resolve } from "node:path";
 import { isTreeOid } from "../domain/model.ts";
 
 export type NativeObjectKind = "blob" | "tree";
+export type NativeLooseRecordKind = "content" | "recipe";
 
 export interface NativeObjectLayout {
   readonly root: string;
   readonly objects: string;
   readonly blobs: string;
   readonly trees: string;
+  readonly records: string;
+  readonly contentRecords: string;
+  readonly recipeRecords: string;
+  readonly packs: string;
+  readonly incomingPacks: string;
+  readonly multiPackIndex: string;
 }
 
 const OBJECT_DIRECTORY = "objects";
@@ -17,17 +24,34 @@ const OBJECT_NAMESPACES: Readonly<Record<NativeObjectKind, string>> = {
   blob: "blobs",
   tree: "trees",
 };
+const LOOSE_RECORD_DIRECTORY = "records";
+const LOOSE_RECORD_NAMESPACES: Readonly<Record<NativeLooseRecordKind, string>> =
+  {
+    content: "content",
+    recipe: "recipe",
+  };
+const PACK_DIRECTORY = "packs";
+const INCOMING_PACK_DIRECTORY = "incoming";
+const MULTI_PACK_INDEX = "multi-pack-index";
 const OBJECT_SHARD = /^[0-9a-f]{2}$/u;
 const TEMPORARY_OBJECT = /^\.[0-9a-f]{64}\.[0-9]+\.[0-9a-f-]{36}\.tmp$/u;
 
 /** One owner for the native CAS directory layout. */
 export function nativeObjectLayout(root: string): NativeObjectLayout {
   const objects = join(root, OBJECT_DIRECTORY);
+  const records = join(objects, LOOSE_RECORD_DIRECTORY);
+  const packs = join(objects, PACK_DIRECTORY);
   return Object.freeze({
     root,
     objects,
     blobs: join(objects, OBJECT_NAMESPACES.blob),
     trees: join(objects, OBJECT_NAMESPACES.tree),
+    records,
+    contentRecords: join(records, LOOSE_RECORD_NAMESPACES.content),
+    recipeRecords: join(records, LOOSE_RECORD_NAMESPACES.recipe),
+    packs,
+    incomingPacks: join(packs, INCOMING_PACK_DIRECTORY),
+    multiPackIndex: join(packs, MULTI_PACK_INDEX),
   });
 }
 
@@ -54,6 +78,49 @@ export function nativeObjectPath(
   return join(
     nativeObjectShardPath(layout, kind, oid.slice(0, 2)),
     oid.slice(2),
+  );
+}
+
+export function nativeLooseRecordNamespacePath(
+  layout: NativeObjectLayout,
+  kind: NativeLooseRecordKind,
+): string {
+  return kind === "content" ? layout.contentRecords : layout.recipeRecords;
+}
+
+export function nativeLooseRecordShardPath(
+  layout: NativeObjectLayout,
+  kind: NativeLooseRecordKind,
+  shard: string,
+): string {
+  return join(nativeLooseRecordNamespacePath(layout, kind), shard);
+}
+
+export function nativeLooseRecordPath(
+  layout: NativeObjectLayout,
+  kind: NativeLooseRecordKind,
+  oid: string,
+): string {
+  return join(
+    nativeLooseRecordShardPath(layout, kind, oid.slice(0, 2)),
+    oid.slice(2),
+  );
+}
+
+export function nativePackShardPath(
+  layout: NativeObjectLayout,
+  shard: string,
+): string {
+  return join(layout.packs, shard);
+}
+
+export function nativePackPath(
+  layout: NativeObjectLayout,
+  packId: string,
+): string {
+  return join(
+    nativePackShardPath(layout, packId.slice(0, 2)),
+    `${packId.slice(2)}.pack`,
   );
 }
 

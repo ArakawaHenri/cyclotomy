@@ -2,6 +2,8 @@ import {
   createSyntheticGitIgnoreOracle,
   type SyntheticGitIgnoreScratchOptions,
 } from "./git-ignore-oracle.ts";
+import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
+import type { GitReplayAttestation } from "./git-replay-risk.ts";
 import { TreeManifestError } from "./tree-formats/manifest-codec.ts";
 import type { CurrentTreeManifest } from "./tree-formats/current.ts";
 import {
@@ -23,15 +25,16 @@ export class TreeScopeMismatchError extends TreeManifestError {
 /**
  * Authenticate the mutation boundary between a durable manifest and its
  * archived Git policy. Structural parsing proves that paths are safe; this
- * check additionally proves that every path is owned by the target policy.
+ * check additionally proves that every path is owned by the target policy
+ * and returns the evaluator provenance that made that decision.
  */
 export async function validateTreeEntriesAgainstScope(
   manifest: CurrentTreeManifest,
   scratchOptions: SyntheticGitIgnoreScratchOptions = {},
-): Promise<void> {
+): Promise<GitReplayAttestation> {
   const scope = manifest.scope;
   if (scope.kind === "all-managed") {
-    return;
+    return { gitVersion: null };
   }
 
   interface ValidationPath {
@@ -65,7 +68,6 @@ export async function validateTreeEntriesAgainstScope(
     });
   }
   const paths = [...pathsByKey.values()];
-  if (paths.length === 0) return;
 
   let oracle: Awaited<ReturnType<typeof createSyntheticGitIgnoreOracle>>;
   try {
@@ -81,59 +83,69 @@ export async function validateTreeEntriesAgainstScope(
     );
   }
 
-  let failed = false;
   try {
-    for (
-      let offset = 0;
-      offset < paths.length;
-      offset += VALIDATION_BATCH_SIZE
-    ) {
-      const batch = paths.slice(offset, offset + VALIDATION_BATCH_SIZE);
-      const managed = await oracle.managed(
-        batch.map(({ path }) => ({ path, isDirectory: false })),
-      );
-      if (managed.length !== batch.length) {
-        throw new TreeManifestError(
-          "object-integrity",
-          "Git ignore oracle returned the wrong result count while validating a tree",
-        );
-      }
-      for (let index = 0; index < batch.length; index += 1) {
-        const item = batch[index]!;
-        const isManaged = managed[index]!;
-        if (item.isEntry && !isManaged) {
-          throw new TreeScopeMismatchError(
-            `tree entry is excluded by its archived workspace scope: ${item.path}`,
+    await withRetainedCleanup(
+      async () => {
+        try {
+          for (
+            let offset = 0;
+            offset < paths.length;
+            offset += VALIDATION_BATCH_SIZE
+          ) {
+            const batch = paths.slice(offset, offset + VALIDATION_BATCH_SIZE);
+            const managed = await oracle.managed(
+              batch.map(({ path }) => ({ path, kind: "non-directory" })),
+            );
+            if (managed.length !== batch.length) {
+              throw new TreeManifestError(
+                "object-integrity",
+                "Git ignore oracle returned the wrong result count while validating a tree",
+              );
+            }
+            for (let index = 0; index < batch.length; index += 1) {
+              const item = batch[index]!;
+              const isManaged = managed[index]!;
+              if (item.isEntry && !isManaged) {
+                throw new TreeScopeMismatchError(
+                  `tree entry is excluded by its archived workspace scope: ${item.path}`,
+                );
+              }
+              if (item.isLocalIgnoreSource && isManaged && !item.isEntry) {
+                throw new TreeScopeMismatchError(
+                  `tree omits a managed archived .gitignore source: ${item.path}`,
+                );
+              }
+            }
+          }
+        } catch (error) {
+          if (error instanceof TreeManifestError) throw error;
+          throw new TreeManifestError(
+            "object-integrity",
+            "tree entries could not be validated against their archived workspace scope",
+            error,
           );
         }
-        if (item.isLocalIgnoreSource && isManaged && !item.isEntry) {
-          throw new TreeScopeMismatchError(
-            `tree omits a managed archived .gitignore source: ${item.path}`,
+      },
+      async () => {
+        try {
+          await oracle.close();
+        } catch (error) {
+          throw new TreeManifestError(
+            "object-integrity",
+            "tree workspace scope validator did not close cleanly",
+            error,
           );
         }
-      }
-    }
-  } catch (error) {
-    failed = true;
-    if (error instanceof TreeManifestError) throw error;
-    throw new TreeManifestError(
-      "object-integrity",
-      "tree entries could not be validated against their archived workspace scope",
-      error,
+      },
+      "tree workspace scope validation and cleanup both failed",
     );
-  } finally {
-    if (failed) {
-      await oracle.close().catch(() => {});
-    } else {
-      try {
-        await oracle.close();
-      } catch (error) {
-        throw new TreeManifestError(
-          "object-integrity",
-          "tree workspace scope validator did not close cleanly",
-          error,
-        );
-      }
+  } catch (error) {
+    const primary = primaryFailure(error);
+    if (primary instanceof TreeManifestError) {
+      if (primary === error) throw primary;
+      throw new TreeManifestError(primary.kind, primary.message, error);
     }
+    throw error;
   }
+  return { gitVersion: oracle.gitVersion };
 }

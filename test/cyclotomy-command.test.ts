@@ -45,8 +45,7 @@ describe("/cyclotomy command presentation", () => {
       level: "info",
     });
     expect(presentCyclotomyStatus({ running: false }, en)).toEqual({
-      message:
-        "Cyclotomy is stopped for this Pi runtime. Run /cyclotomy resume to try starting it.",
+      message: "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
       level: "info",
     });
 
@@ -56,7 +55,6 @@ describe("/cyclotomy command presentation", () => {
     );
     expect(failed.level).toBe("warning");
     expect(failed.message).toContain("bad\\nstore");
-    expect(failed.message).toContain("Pi remains available");
     expect(failed.message).toContain("/cyclotomy resume");
     expect(failed.message).not.toContain("\n");
 

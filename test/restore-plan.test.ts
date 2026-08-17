@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import type { TreeManifest } from "../src/infrastructure/tree-formats/manifest-codec.ts";
+import type { CurrentTreeManifest } from "../src/infrastructure/tree-formats/current.ts";
 import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   planWorkspaceRestore,
@@ -45,7 +45,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope: gitScope({ ignoreCase: true }),
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [],
       scope: gitScope(),
@@ -66,6 +66,7 @@ describe("workspace restore plan", () => {
       {
         kind: "git",
         repositoryPrefix,
+        evaluator: null,
         ignoreCase: false,
         gitignoreSources: [],
         infoExcludeBase64: "",
@@ -78,7 +79,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope: durableScope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [],
       scope: durableScope,
@@ -108,7 +109,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
@@ -153,7 +154,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
@@ -173,7 +174,7 @@ describe("workspace restore plan", () => {
 
   it("deduplicates and sorts required blobs", () => {
     const blobOid = oid("shared");
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: ["b.txt", "a.txt"].map((path) => ({
         path,
@@ -216,7 +217,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope: targetScope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
@@ -244,7 +245,7 @@ describe("workspace restore plan", () => {
       problems: [{ path: "other", kind: "read-failed", detail: "denied" }],
       scope: targetScope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: [
         {
@@ -312,7 +313,7 @@ describe("workspace restore plan", () => {
       problems: [],
       scope,
     });
-    const target: TreeManifest = {
+    const target: CurrentTreeManifest = {
       format: CURRENT_TREE_MANIFEST_FORMAT,
       entries: targetEntries,
       scope,

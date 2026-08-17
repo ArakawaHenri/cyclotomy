@@ -7,7 +7,6 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   readdir,
   readFile,
   realpath,
@@ -15,7 +14,6 @@ import {
   stat,
   symlink,
   writeFile,
-  type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -33,7 +31,13 @@ import {
   openObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
-import { acquireWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
+import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
+import {
+  acquireWorkspaceLock,
+  compareWorkspaceLockPhysicalOrder,
+  runWithWorkspaceLock,
+  type WorkspaceWriteAuthority,
+} from "../src/infrastructure/workspace-lock.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import {
@@ -46,14 +50,17 @@ import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { WorkspaceMutationAuthority } from "../src/pi/workspace-mutation-authority.ts";
 import { FakePi, FakeSessionManager, type FakeEntry } from "./fake-pi.ts";
 import {
+  bindTestMetadataWriteAuthority,
   captureBarrier,
   checkpointIsBlocked,
   checkpointState,
   commitTestNodeState,
+  createTestCurrentMetadataStore,
   protectTestLocation,
   readTestSessionRegistration,
   readTestSessionRegistrations,
   registerTestSession,
+  withTestMetadataWriteAuthority,
 } from "./metadata-fixture.ts";
 import { gitScope } from "./workspace-scope-fixture.ts";
 
@@ -92,8 +99,15 @@ afterEach(async () => {
   await rm(home, { recursive: true, force: true });
 });
 
-function metadata(): CurrentMetadataStore {
-  return createCurrentMetadataStore(metadataPath());
+async function metadata(): Promise<CurrentMetadataStore> {
+  return createTestCurrentMetadataStore(metadataPath(), storeRoot);
+}
+
+async function mutateMetadata<T>(
+  store: CurrentMetadataStore,
+  operation: () => T,
+): Promise<T> {
+  return withTestMetadataWriteAuthority(storeRoot, store, operation);
 }
 
 function metadataPath(): string {
@@ -133,7 +147,8 @@ function registerPreparedRuntime(
 }
 
 async function metadataFor(cwd: string): Promise<CurrentMetadataStore> {
-  return createCurrentMetadataStore(await metadataPathFor(cwd));
+  const path = await metadataPathFor(cwd);
+  return createTestCurrentMetadataStore(path, dirname(path));
 }
 
 async function metadataPathFor(cwd: string): Promise<string> {
@@ -156,7 +171,9 @@ function messageFor(key: MessageKey): string {
   // `formatUiDetail`, which escapes control characters, so it stays ASCII.
   return TEST_I18N.t(key, {
     applied: SENTINEL,
+    captured: SENTINEL,
     count: SENTINEL,
+    current: SENTINEL,
     message: SENTINEL,
     mutations: SENTINEL,
     preview: SENTINEL,
@@ -198,20 +215,22 @@ function failWorkspaceLockCleanup(
     .mockImplementation(function <T>(
       this: CyclotomyRuntime,
       candidate: string,
-      action: () => Promise<T>,
+      action: (lease: WorkspaceWriteAuthority) => Promise<T>,
     ) {
       const enqueue = original.bind(this) as (
         name: string,
-        run: () => Promise<T>,
+        run: (lease: WorkspaceWriteAuthority) => Promise<T>,
       ) => ReturnType<CyclotomyRuntime["enqueueWorkspaceExecution"]>;
-      return enqueue(candidate, action).then((execution) =>
-        candidate === operation
-          ? {
-              ...execution,
-              cleanup: { kind: "failed" as const, cause },
-            }
-          : execution,
-      );
+      return enqueue(candidate, action).then((execution) => {
+        if (candidate !== operation) return execution;
+        if (this.activation.kind === "active") {
+          this.markSessionUnavailable(cause);
+        }
+        return {
+          ...execution,
+          cleanup: { kind: "failed" as const, cause },
+        };
+      });
     });
 }
 
@@ -261,12 +280,57 @@ async function spyOnReadTree() {
   );
 }
 
-async function spyOnReadTreeManifest() {
-  const store = await openObjectStore(storeRoot);
-  return vi.spyOn(
-    Object.getPrototypeOf(store) as Pick<ObjectStore, "readTreeManifest">,
-    "readTreeManifest",
+async function spyOnReadTreeRoots() {
+  return vi.spyOn(ContentRepository.prototype, "readStructural");
+}
+
+function rootStructuralReads(
+  spy: Awaited<ReturnType<typeof spyOnReadTreeRoots>>,
+  treeOid?: string,
+) {
+  return spy.mock.calls.filter(
+    ([kind, oid]) =>
+      kind === "root" && (treeOid === undefined || oid === treeOid),
   );
+}
+
+function contentIdForText(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function interceptRepositoryContentStream(input: {
+  readonly storageRoot: string;
+  readonly contentId: string;
+  readonly occurrence: number;
+  readonly action: () => void | Promise<void>;
+}) {
+  let matchingStreams = 0;
+  let triggered = false;
+  const original = ContentRepository.prototype.streamContent;
+  const spy = vi
+    .spyOn(ContentRepository.prototype, "streamContent")
+    .mockImplementation(async function (
+      this: ContentRepository,
+      ...args: Parameters<ContentRepository["streamContent"]>
+    ) {
+      const streamed = await original.apply(this, args);
+      if (
+        this.layout.root === input.storageRoot &&
+        args[0] === input.contentId
+      ) {
+        matchingStreams += 1;
+        if (matchingStreams === input.occurrence) {
+          triggered = true;
+          await input.action();
+        }
+      }
+      return streamed;
+    });
+  return Object.freeze({
+    spy,
+    matchingStreams: () => matchingStreams,
+    triggered: () => triggered,
+  });
 }
 
 async function twoStates(pi: FakePi) {
@@ -326,7 +390,7 @@ describe("checkpoint authority lifecycle", () => {
         .mockResolvedValueOnce({
           kind: "completed",
           value: undefined,
-          cleanup: { kind: "released" },
+          cleanup: { kind: "settled" },
         })
         .mockRejectedValueOnce(new Error("new failure"));
       try {
@@ -367,7 +431,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(maybeRunAutomaticGc).toHaveBeenCalledTimes(2);
         expect(pi.notifications).toContainEqual({
           message:
-            "Cyclotomy blocked this operation, but could not render its diagnostic message.",
+            "Cyclotomy could not complete this operation or show the reason.",
           level: "warning",
         });
       } finally {
@@ -447,7 +511,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "user.txt"), "utf8")).toBe(
         "untouched",
       );
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf.id)).toBeDefined();
       db.close();
     });
@@ -505,29 +569,60 @@ describe("checkpoint authority lifecycle", () => {
       const leaf = pi.manager.appendEntry();
 
       await pi.startSession("startup");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf.id)).toBeDefined();
       db.close();
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       const saved = checkpointState(db, pi.manager.sessionId, leaf.id);
       db.close();
       await writeFile(join(workspace, "a.txt"), "external");
       await pi.replaceRuntime(registerCyclotomy, "reload");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("external");
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf.id)).toEqual(saved);
       db.close();
       expect(notified(pi, "reloadProtected")).toBe(true);
     });
 
-    it("keeps a completed reload admission when only lock cleanup fails", async () => {
+    it("keeps reload protected when scope validation and scanning use different Git versions", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const leaf = pi.manager.appendEntry();
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.startSession("startup");
-      const before = metadata();
+      const runtime = await preparedRuntime();
+      const original = runtime.scanCurrentWorkspaceForScope.bind(runtime);
+      const scan = vi
+        .spyOn(runtime, "scanCurrentWorkspaceForScope")
+        .mockImplementation(async (...args) => ({
+          ...(await original(...args)),
+          gitOracleVersion: "git version changed-during-reload",
+        }));
+
+      try {
+        await pi.replaceRuntime(
+          (api) => registerPreparedRuntime(api, runtime),
+          "reload",
+        );
+      } finally {
+        scan.mockRestore();
+      }
+
+      const db = await metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
+      expect(notified(pi, "reloadProtected")).toBe(true);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
+    });
+
+    it("preserves a completed reload admission but retires after cleanup fails", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.startSession("startup");
+      const before = await metadata();
       const saved = checkpointState(before, pi.manager.sessionId, leaf.id)!;
       expect(checkpointIsBlocked(before, pi.manager.sessionId, leaf.id)).toBe(
         false,
@@ -538,14 +633,19 @@ describe("checkpoint authority lifecycle", () => {
         "reload-reconcile",
         new Error("reload lock release failed"),
       );
+      const automaticGc = vi.spyOn(
+        CyclotomyRuntime.prototype,
+        "maybeRunAutomaticGc",
+      );
 
       try {
         await pi.replaceRuntime(registerCyclotomy, "reload");
       } finally {
+        automaticGc.mockRestore();
         cleanupFailure.mockRestore();
       }
 
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, leaf.id)).toEqual(
         saved,
       );
@@ -560,6 +660,8 @@ describe("checkpoint authority lifecycle", () => {
           message.includes(messageFor("workspaceLockCleanupFailed")),
         ),
       ).toHaveLength(1);
+      expect(automaticGc).not.toHaveBeenCalled();
+      expect(await pi.submitInput("after-cleanup-failure")).toBe("continued");
     });
 
     it("keeps a completed barrier projection when only lock cleanup fails", async () => {
@@ -569,13 +671,18 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.startSession("startup");
       const sessionFile = pi.manager.getSessionFile()!;
-      const before = metadata();
-      expect(
-        before.raiseSessionBarrier({
-          sessionId: pi.manager.sessionId,
-          sessionFile,
-        }),
-      ).toBe(true);
+      const before = await metadata();
+      await expect(
+        runWithWorkspaceLock(
+          storeRoot,
+          "barrier projection test",
+          async (authority) =>
+            before.raiseSessionBarrier(authority, {
+              sessionId: pi.manager.sessionId,
+              sessionFile,
+            }),
+        ),
+      ).resolves.toMatchObject({ kind: "completed", value: true });
       before.close();
       pi.notifications.length = 0;
       const cleanupFailure = failWorkspaceLockCleanup(
@@ -589,7 +696,7 @@ describe("checkpoint authority lifecycle", () => {
         cleanupFailure.mockRestore();
       }
 
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointIsBlocked(after, pi.manager.sessionId, leaf.id)).toBe(
         true,
       );
@@ -621,8 +728,12 @@ describe("checkpoint authority lifecycle", () => {
         replacementMetadata.protectLocation.bind(replacementMetadata);
       const raced = vi
         .spyOn(replacementMetadata, "protectLocation")
-        .mockImplementationOnce((input) => {
-          const concurrent = metadata();
+        .mockImplementationOnce((authority, input) => {
+          const concurrent = createCurrentMetadataStore(
+            metadataPath(),
+            authority,
+          );
+          bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
           try {
             commitTestNodeState(
               concurrent,
@@ -634,7 +745,7 @@ describe("checkpoint authority lifecycle", () => {
           } finally {
             concurrent.close();
           }
-          return original(input);
+          return original(authority, input);
         });
 
       try {
@@ -646,7 +757,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf.id)?.treeOid).toBe(
         concurrentTreeOid,
       );
@@ -656,18 +767,23 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("external");
     });
 
-    it("reports a guard installed between missing authority and reload admission", async () => {
+    it("reports a guard installed between registration and reload admission", async () => {
       const pi = new FakePi(workspace);
       const runtime = await preparedRuntime();
       registerPreparedRuntime(pi.api, runtime);
       const leaf = pi.manager.appendEntry();
-      const original = runtime.workspaceMutations.admitCurrentLocation.bind(
-        runtime.workspaceMutations,
+      const original = runtime.metadata.finalizeSessionProjection.bind(
+        runtime.metadata,
       );
       const raced = vi
-        .spyOn(runtime.workspaceMutations, "admitCurrentLocation")
-        .mockImplementationOnce((view) => {
-          const concurrent = metadata();
+        .spyOn(runtime.metadata, "finalizeSessionProjection")
+        .mockImplementationOnce((authority, input, sourceAuthority) => {
+          const report = original(authority, input, sourceAuthority);
+          const concurrent = createCurrentMetadataStore(
+            metadataPath(),
+            authority,
+          );
+          bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
           try {
             expect(
               protectTestLocation(
@@ -682,7 +798,7 @@ describe("checkpoint authority lifecycle", () => {
           } finally {
             concurrent.close();
           }
-          return original(view);
+          return report;
         });
 
       try {
@@ -691,7 +807,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, leaf.id),
       ).toBeUndefined();
@@ -735,7 +851,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, firstHost.manager.sessionId, missingArrival.id),
       ).toBeUndefined();
@@ -751,7 +867,7 @@ describe("checkpoint authority lifecycle", () => {
       registerCyclotomy(restarted.api);
       await restarted.startSession("startup");
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, missingArrival.id),
       ).toBeUndefined();
@@ -775,7 +891,7 @@ describe("checkpoint authority lifecycle", () => {
 
         await pi.startSession(reason);
 
-        const db = metadata();
+        const db = await metadata();
         expect(
           checkpointState(db, pi.manager.sessionId, leaf.id),
         ).toBeDefined();
@@ -815,7 +931,7 @@ describe("checkpoint authority lifecycle", () => {
           failure.mockRestore();
         }
 
-        const db = metadata();
+        const db = await metadata();
         expect(
           checkpointState(db, pi.manager.sessionId, leaf.id),
         ).toBeUndefined();
@@ -839,13 +955,52 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.replaceRuntime(registerCyclotomy, "resume");
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
       db.close();
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "kept-current",
       );
+    });
+
+    it("preserves a loaded preparation failure when lock cleanup also fails", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.startSession("startup");
+      pi.notifications.length = 0;
+
+      const replacement = await preparedRuntime();
+      const primary = new Error("loaded checkpoint read failed");
+      const cleanup = new Error("loaded preparation release failed");
+      const readFailure = vi
+        .spyOn(replacement, "resolveReadableTreeIn")
+        .mockRejectedValueOnce(primary);
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "loaded-session-restore-prepare",
+        cleanup,
+      );
+
+      try {
+        await pi.replaceRuntime(
+          (api) => registerPreparedRuntime(api, replacement),
+          "startup",
+        );
+      } finally {
+        cleanupFailure.mockRestore();
+        readFailure.mockRestore();
+      }
+
+      const output = pi.notifications.map(({ message }) => message).join("\n");
+      expect(output.match(/loaded checkpoint read failed/gu)).toHaveLength(1);
+      expect(output.match(/loaded preparation release failed/gu)).toHaveLength(
+        1,
+      );
+      const db = await metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
     });
 
     it("retries durable arrival recovery when reload queue control fails", async () => {
@@ -865,7 +1020,7 @@ describe("checkpoint authority lifecycle", () => {
         queueFailure.mockRestore();
       }
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf.id)).toBe(true);
       db.close();
       expect(notified(pi, "reloadProtected")).toBe(true);
@@ -883,9 +1038,13 @@ describe("checkpoint authority lifecycle", () => {
       const original = metadataStore.commitCapture.bind(metadataStore);
       const raced = vi
         .spyOn(metadataStore, "commitCapture")
-        .mockImplementationOnce((input) => {
+        .mockImplementationOnce((authority, input) => {
           expect(input.expectedSlot).toEqual({ kind: "open-missing" });
-          const concurrent = metadata();
+          const concurrent = createCurrentMetadataStore(
+            metadataPath(),
+            authority,
+          );
+          bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
           try {
             expect(
               protectTestLocation(concurrent, input.identity, input.entryId)
@@ -894,7 +1053,7 @@ describe("checkpoint authority lifecycle", () => {
           } finally {
             concurrent.close();
           }
-          return original(input);
+          return original(authority, input);
         });
 
       try {
@@ -903,7 +1062,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, leaf.id),
       ).toBeUndefined();
@@ -915,7 +1074,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "sessionMissingProtected")).toBe(true);
 
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, leaf.id),
       ).toBeUndefined();
@@ -937,10 +1096,10 @@ describe("checkpoint authority lifecycle", () => {
       const original = metadataStore.commitCapture.bind(metadataStore);
       const raced = vi
         .spyOn(metadataStore, "commitCapture")
-        .mockImplementationOnce((input) => {
+        .mockImplementationOnce((authority, input) => {
           expect(input.entryId).toBe(intended.id);
           expect(input.expectedSlot).toEqual({ kind: "open-missing" });
-          const result = original(input);
+          const result = original(authority, input);
           pi.manager.setLeaf(lateArrival.id);
           return result;
         });
@@ -951,7 +1110,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, intended.id),
       ).toBeDefined();
@@ -966,7 +1125,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "restoreInitialized")).toBe(false);
 
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, lateArrival.id),
       ).toBeUndefined();
@@ -981,13 +1140,13 @@ describe("checkpoint authority lifecycle", () => {
       registerCyclotomy(empty.api);
       await writeFile(join(workspace, "a.txt"), "empty");
       await empty.startSession("startup");
-      let db = metadata();
+      let db = await metadata();
       expect(db.listReferencedTreeOids()).toEqual([]);
       db.close();
 
       const leaf = empty.manager.appendEntry();
       await empty.replaceRuntime(registerCyclotomy, "reload");
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, empty.manager.sessionId, leaf.id),
       ).toBeUndefined();
@@ -1008,6 +1167,7 @@ describe("checkpoint authority lifecycle", () => {
         await pi.startSession("startup");
         pi.notifications.length = 0;
         const replacement = await preparedRuntime();
+        const automaticGc = vi.spyOn(replacement, "maybeRunAutomaticGc");
 
         const primary =
           fault === "barrier-read"
@@ -1037,13 +1197,15 @@ describe("checkpoint authority lifecycle", () => {
         } finally {
           recovery.mockRestore();
           primary.mockRestore();
+          automaticGc.mockRestore();
         }
 
         const unavailable = pi.notifications.find(({ message }) =>
           message.includes(messageFor("arrivalProtectionUnavailable")),
         );
         expect(unavailable?.level).toBe("error");
-        expect(await pi.submitInput("still-unassigned")).toBe("handled");
+        expect(automaticGc).not.toHaveBeenCalled();
+        expect(await pi.submitInput("still-unassigned")).toBe("continued");
       },
     );
 
@@ -1104,7 +1266,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       const compacted = pi.manager.getLeafId()!;
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, compacted),
       ).toBeDefined();
@@ -1124,7 +1286,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.startSession("startup");
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, parent.id),
       ).toBeDefined();
@@ -1149,7 +1311,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "ancestor-state",
       );
-      const db = metadata();
+      const db = await metadata();
       const ancestorState = checkpointState(db, pi.manager.sessionId, ancestor);
       expect(ancestorState).toBeDefined();
       expect(checkpointState(db, pi.manager.sessionId, child.id)).toEqual(
@@ -1249,7 +1411,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "kept-current",
       );
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, loaded)).toBe(true);
       db.close();
     });
@@ -1261,7 +1423,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const loaded = pi.manager.getLeafId()!;
-      let db = metadata();
+      let db = await metadata();
       const savedState = checkpointState(db, pi.manager.sessionId, loaded)!;
       db.close();
       await writeFile(join(workspace, "a.txt"), "kept-current");
@@ -1272,7 +1434,7 @@ describe("checkpoint authority lifecycle", () => {
       const descendant = pi.manager.getLeafId()!;
       await pi.endTurn(0);
 
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, loaded)).toEqual(
         savedState,
       );
@@ -1317,27 +1479,24 @@ describe("checkpoint authority lifecycle", () => {
       const loaded = pi.manager.getLeafId()!;
       await writeFile(join(workspace, "a.txt"), "current");
 
-      const store = await openObjectStore(storeRoot);
-      const prototype = Object.getPrototypeOf(store) as Pick<
-        ObjectStore,
-        "readBlob"
-      >;
-      const original = prototype.readBlob;
       let actualArrival: FakeEntry | undefined;
-      const readBlob = vi
-        .spyOn(prototype, "readBlob")
-        .mockImplementation(async function (this: ObjectStore, oid: string) {
-          const content = await original.call(this, oid);
+      const streamBlob = await interceptRepositoryContentStream({
+        storageRoot: await realpath(storeRoot),
+        contentId: contentIdForText("saved"),
+        occurrence: 2,
+        action: async () => {
           actualArrival ??= pi.manager.appendEntry();
-          return content;
-        });
+        },
+      });
 
       try {
         await pi.replaceRuntime(registerCyclotomy, "startup");
       } finally {
-        readBlob.mockRestore();
+        streamBlob.spy.mockRestore();
       }
 
+      expect(streamBlob.triggered()).toBe(true);
+      expect(streamBlob.matchingStreams()).toBe(2);
       expect(actualArrival).toBeDefined();
       expect(pi.manager.getLeafId()).toBe(actualArrival!.id);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
@@ -1348,7 +1507,7 @@ describe("checkpoint authority lifecycle", () => {
           "active location changed before workspace mutation",
         ),
       ).toBe(true);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, loaded)).toBe(true);
       expect(
         checkpointIsBlocked(db, pi.manager.sessionId, actualArrival!.id),
@@ -1363,13 +1522,13 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "one");
       const leaf = pi.manager.appendEntry();
       await pi.endTurn(0);
-      let db = metadata();
+      let db = await metadata();
       const first = checkpointState(db, pi.manager.sessionId, leaf.id)!;
       db.close();
 
       await writeFile(join(workspace, "a.txt"), "two");
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       const second = checkpointState(db, pi.manager.sessionId, leaf.id)!;
       db.close();
       expect(second.treeOid).not.toBe(first.treeOid);
@@ -1392,7 +1551,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       const leaf = pi.manager.getLeafId()!;
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf)).toBeDefined();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(false);
       db.close();
@@ -1424,7 +1583,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "one");
       const capturedLeaf = pi.manager.appendEntry();
       await pi.endTurn(0);
-      let db = metadata();
+      let db = await metadata();
       const original = checkpointState(
         db,
         pi.manager.sessionId,
@@ -1462,7 +1621,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(advancedLeaf).toBeDefined();
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, capturedLeaf.id),
       ).toEqual(original);
@@ -1506,13 +1665,15 @@ describe("checkpoint authority lifecycle", () => {
         gitScope({ globalExclude: "secret.txt\n" }),
       );
       await rm(targetPath);
-      const db = metadata();
-      commitTestNodeState(
-        db,
-        pi.manager.sessionId,
-        leaf.id,
-        treeOid,
-        pi.manager.getSessionFile(),
+      const db = await metadata();
+      await mutateMetadata(db, () =>
+        commitTestNodeState(
+          db,
+          pi.manager.sessionId,
+          leaf.id,
+          treeOid,
+          pi.manager.getSessionFile(),
+        ),
       );
       db.close();
       const selectionsBefore = pi.selections.length;
@@ -1552,7 +1713,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const stateBefore = checkpointState(before, pi.manager.sessionId, leaf);
       const sessionsBefore = readTestSessionRegistrations(metadataPath());
       const rootsBefore = before.listReferencedTreeOids();
@@ -1569,7 +1730,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(driftMessage).not.toMatch(
         /(?:session|entry|tree OID|\+0|~0|-0)/iu,
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, leaf)).toEqual(
         stateBefore,
       );
@@ -1578,6 +1739,98 @@ describe("checkpoint authority lifecycle", () => {
       );
       expect(after.listReferencedTreeOids()).toEqual(rootsBefore);
       after.close();
+    });
+
+    it("shows archived Git evaluator drift in /drift and the restore confirmation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      const leaf = pi.manager.appendEntry();
+      const targetPath = join(workspace, "a.txt");
+      const targetBytes = Buffer.from("saved", "utf8");
+      const blobOid = createHash("sha256").update(targetBytes).digest("hex");
+      await writeFile(targetPath, targetBytes);
+      const store = await openObjectStore(storeRoot);
+      const publication = store.beginSnapshotPublication();
+      await publication.publishBlobFromFile(
+        targetPath,
+        blobOid,
+        targetBytes.byteLength,
+      );
+      const capturedGitVersion = "git version 0.0.0-cyclotomy-test";
+      const treeOid = await publication.publishTree(
+        [
+          {
+            path: "a.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o600,
+          },
+        ],
+        gitScope({
+          evaluator: {
+            version: capturedGitVersion,
+            precomposeUnicode: false,
+          },
+        }),
+      );
+      const db = await metadata();
+      await mutateMetadata(db, () =>
+        commitTestNodeState(
+          db,
+          pi.manager.sessionId,
+          leaf.id,
+          treeOid,
+          pi.manager.getSessionFile(),
+        ),
+      );
+      db.close();
+      await writeFile(targetPath, "current");
+
+      await pi.runCommand("drift");
+      expect(pi.notifications.at(-1)).toMatchObject({ level: "warning" });
+      expect(pi.notifications.at(-1)?.message).toContain(capturedGitVersion);
+      expect(await readFile(targetPath, "utf8")).toBe("current");
+
+      const selectionsBeforeRpc = pi.selections.length;
+      pi.mode = "rpc";
+      await pi.replaceRuntime(registerCyclotomy, "resume");
+      expect(pi.selections).toHaveLength(selectionsBeforeRpc);
+      expect(notified(pi, "sessionRestoreDeferredRpc")).toBe(true);
+      expect(pi.notifications.at(-1)?.message).toContain(capturedGitVersion);
+      expect(await readFile(targetPath, "utf8")).toBe("current");
+      pi.mode = "tui";
+
+      pi.selectDestructive = false;
+      await pi.replaceRuntime(registerCyclotomy, "resume");
+      expect(pi.selections.at(-1)?.prompt).toContain(capturedGitVersion);
+      expect(await readFile(targetPath, "utf8")).toBe("current");
+      pi.selectDestructive = true;
+
+      pi.hasUI = false;
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await pi.runCommand("restore");
+        expect(stderr).toHaveBeenCalledWith(
+          expect.stringContaining(capturedGitVersion),
+        );
+      } finally {
+        stderr.mockRestore();
+      }
+      expect(await readFile(targetPath, "utf8")).toBe("current");
+      pi.hasUI = true;
+
+      await pi.runCommand("restore");
+      expect(pi.selections.at(-1)?.prompt).toContain(capturedGitVersion);
+      expect(pi.selections.at(-1)?.prompt).toContain(
+        messageFor("gitReplayRiskVersionMismatch"),
+      );
+      expect(await readFile(targetPath, "utf8")).toBe("saved");
+
+      const selectionsAfterRestore = pi.selections.length;
+      await pi.runCommand("restore");
+      expect(pi.selections).toHaveLength(selectionsAfterRestore);
+      expect(notified(pi, "restoreAlreadyMatches")).toBe(true);
     });
 
     it("uses the checkpoint scope when Git ignoreCase drifts", async () => {
@@ -1649,7 +1902,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const stateBefore = checkpointState(before, pi.manager.sessionId, leaf);
       const sessionsBefore = readTestSessionRegistrations(metadataPath());
       const rootsBefore = before.listReferencedTreeOids();
@@ -1664,7 +1917,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(pi.selections).toHaveLength(selectionsBefore);
       expect(pi.notifications.at(-1)?.message).toBe(messageFor("driftUsage"));
       expect(lastStatus(pi)).toBe("stale navigation notice");
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, leaf)).toEqual(
         stateBefore,
       );
@@ -1682,7 +1935,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const stateBefore = checkpointState(before, pi.manager.sessionId, leaf);
       const sessionsBefore = readTestSessionRegistrations(metadataPath());
       const rootsBefore = before.listReferencedTreeOids();
@@ -1698,7 +1951,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(pi.notifications.at(-1)?.message).toBe(
         messageFor("waitIdleRestore"),
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, leaf)).toEqual(
         stateBefore,
       );
@@ -1716,7 +1969,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const dbBefore = metadata();
+      const dbBefore = await metadata();
       const stateBefore = checkpointState(
         dbBefore,
         pi.manager.sessionId,
@@ -1738,7 +1991,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(
         pi.selections.at(-1)?.prompt.split("\n").length,
       ).toBeLessThanOrEqual(10);
-      const dbAfter = metadata();
+      const dbAfter = await metadata();
       expect(checkpointState(dbAfter, pi.manager.sessionId, leaf)).toEqual(
         stateBefore,
       );
@@ -1749,6 +2002,41 @@ describe("checkpoint authority lifecycle", () => {
         "still-current",
       );
       expect(pi.notifications.at(-1)?.message).toContain("/restore");
+    });
+
+    it("makes a version-only replay change stale after manual confirmation", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      await writeFile(join(workspace, "a.txt"), "current");
+      const original = runtime.scanCurrentWorkspaceForScope.bind(runtime);
+      let confirmed = false;
+      const scan = vi
+        .spyOn(runtime, "scanCurrentWorkspaceForScope")
+        .mockImplementation(async (...args) => {
+          const snapshot = await original(...args);
+          return confirmed
+            ? {
+                ...snapshot,
+                gitOracleVersion: "git version changed-after-confirmation",
+              }
+            : snapshot;
+        });
+      pi.selectHook = async () => {
+        confirmed = true;
+      };
+
+      try {
+        await pi.runCommand("restore");
+      } finally {
+        scan.mockRestore();
+      }
+
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
+      expect(notified(pi, "commandPreviewStale")).toBe(true);
     });
 
     it("does not apply a restore after its preparation lock cleanup fails", async () => {
@@ -1773,7 +2061,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
       expect(pi.selections).toHaveLength(selectionsBefore);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       db.close();
       expect(notified(pi, "workspaceLockCleanupFailed")).toBe(true);
@@ -1789,7 +2077,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const slotBefore = before.getCheckpointSlot(pi.manager.sessionId, leaf);
       before.close();
       expect(slotBefore.kind).toBe("open-checkpoint");
@@ -1811,7 +2099,7 @@ describe("checkpoint authority lifecycle", () => {
         notifiedWithDetail(pi, "restoreNotStarted", "metadata pin failed"),
       ).toBe(true);
       expect(notified(pi, "restorePostMutationControlProtected")).toBe(false);
-      const db = metadata();
+      const db = await metadata();
       expect(db.getCheckpointSlot(pi.manager.sessionId, leaf)).toEqual(
         slotBefore,
       );
@@ -1825,7 +2113,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const slotBefore = before.getCheckpointSlot(pi.manager.sessionId, leaf);
       before.close();
       if (slotBefore.kind !== "open-checkpoint") {
@@ -1833,28 +2121,28 @@ describe("checkpoint authority lifecycle", () => {
       }
       await writeFile(join(workspace, "a.txt"), "current");
 
-      const store = await openObjectStore(storeRoot);
-      const prototype = Object.getPrototypeOf(store) as Pick<
-        ObjectStore,
-        "readBlob"
-      >;
-      const original = prototype.readBlob;
-      const readBlob = vi
-        .spyOn(prototype, "readBlob")
-        .mockImplementation(async function (this: ObjectStore, oid: string) {
-          const content = await original.call(this, oid);
+      let staged = false;
+      const streamBlob = await interceptRepositoryContentStream({
+        storageRoot: await realpath(storeRoot),
+        contentId: contentIdForText("saved"),
+        occurrence: 2,
+        action: async () => {
+          staged = true;
           pi.idle = false;
-          return content;
-        });
+        },
+      });
 
       try {
         await pi.runCommand("restore");
       } finally {
-        readBlob.mockRestore();
+        streamBlob.spy.mockRestore();
         pi.idle = true;
       }
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current");
+      expect(staged).toBe(true);
+      expect(streamBlob.triggered()).toBe(true);
+      expect(streamBlob.matchingStreams()).toBe(2);
       expect(
         notifiedWithDetail(
           pi,
@@ -1863,7 +2151,7 @@ describe("checkpoint authority lifecycle", () => {
         ),
       ).toBe(true);
       expect(notified(pi, "restorePostMutationControlProtected")).toBe(false);
-      const after = metadata();
+      const after = await metadata();
       expect(after.getCheckpointSlot(pi.manager.sessionId, leaf)).toEqual(
         slotBefore,
       );
@@ -1874,7 +2162,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       before.close();
       pi.manager.setLeaf(first);
@@ -1900,7 +2188,7 @@ describe("checkpoint authority lifecycle", () => {
       ).toBe(true);
       expect(notified(pi, "restoreSuccessOne")).toBe(true);
       expect(notified(pi, "restoreExecutionFailed")).toBe(false);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         firstState,
       );
@@ -1934,7 +2222,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       const secondState = checkpointState(
         before,
@@ -1961,7 +2249,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
         expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
         expect(notified(pi, "commandLocationChanged")).toBe(false);
-        let db = metadata();
+        let db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -1985,7 +2273,7 @@ describe("checkpoint authority lifecycle", () => {
         db.close();
 
         await pi.endTurn(0);
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
           secondState,
         );
@@ -2006,7 +2294,7 @@ describe("checkpoint authority lifecycle", () => {
         pi.manager.setLeaf(second);
         await pi.runCommand("restore");
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
           secondState,
         );
@@ -2023,7 +2311,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       const secondState = checkpointState(
         before,
@@ -2081,7 +2369,7 @@ describe("checkpoint authority lifecycle", () => {
           ]),
         );
         expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
-        let db = metadata();
+        let db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -2102,7 +2390,7 @@ describe("checkpoint authority lifecycle", () => {
         db.close();
 
         await pi.endTurn(0);
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
           secondState,
         );
@@ -2127,7 +2415,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       before.close();
       pi.manager.setLeaf(first);
@@ -2155,7 +2443,7 @@ describe("checkpoint authority lifecycle", () => {
           ),
         ).toBe(true);
         expect(pi.notifications.at(-1)?.level).toBe("error");
-        const db = metadata();
+        const db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -2176,7 +2464,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       const secondState = checkpointState(
         before,
@@ -2202,7 +2490,7 @@ describe("checkpoint authority lifecycle", () => {
 
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
         expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
-        let db = metadata();
+        let db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -2221,7 +2509,7 @@ describe("checkpoint authority lifecycle", () => {
         pi.manager.setLeaf(second);
         await pi.endTurn(0);
 
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
           secondState,
         );
@@ -2248,7 +2536,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
       expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
-      let db = metadata();
+      let db = await metadata();
       expect(
         captureBarrier(db, pi.manager.sessionId, pi.manager.getSessionFile()!),
       ).toBe(true);
@@ -2256,7 +2544,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.submitInput("after-conflict")).toBe("handled");
       expect(pi.manager.getLeafId()).toBeNull();
-      db = metadata();
+      db = await metadata();
       expect(
         captureBarrier(db, pi.manager.sessionId, pi.manager.getSessionFile()!),
       ).toBe(true);
@@ -2269,7 +2557,7 @@ describe("checkpoint authority lifecycle", () => {
       await leavePendingNoNodeAfterRestore(pi);
 
       const custom = await pi.sendCustomMessage("after-conflict", true);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, custom)).toBeUndefined();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, custom)).toBe(true);
       expect(
@@ -2290,7 +2578,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.runCommand("drift");
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, child)).toBeUndefined();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, child)).toBe(true);
       expect(
@@ -2326,7 +2614,7 @@ describe("checkpoint authority lifecycle", () => {
           child = firstHost.manager.getLeafId()!;
         }
 
-        let db = metadata();
+        let db = await metadata();
         expect(
           checkpointState(db, firstHost.manager.sessionId, child),
         ).toBeUndefined();
@@ -2349,7 +2637,7 @@ describe("checkpoint authority lifecycle", () => {
         registerCyclotomy(restarted.api);
         await restarted.startSession("startup");
 
-        db = metadata();
+        db = await metadata();
         expect(
           checkpointState(db, restarted.manager.sessionId, child),
         ).toBeUndefined();
@@ -2384,7 +2672,7 @@ describe("checkpoint authority lifecycle", () => {
       registerCyclotomy(restarted.api);
       await restarted.startSession("startup");
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         captureBarrier(
           db,
@@ -2411,7 +2699,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
 
       expect(await restarted.navigate(selected.modelId)).toBe("done");
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, selected.modelId),
       ).toBeUndefined();
@@ -2443,7 +2731,7 @@ describe("checkpoint authority lifecycle", () => {
 
         await forkHost.startSession("fork", parentSessionFile);
 
-        const db = metadata();
+        const db = await metadata();
         if (leaf === undefined) {
           expect(
             captureBarrier(db, fork.sessionId, fork.getSessionFile()!),
@@ -2485,7 +2773,7 @@ describe("checkpoint authority lifecycle", () => {
         "cancelled",
       );
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         captureBarrier(
           db,
@@ -2499,7 +2787,7 @@ describe("checkpoint authority lifecycle", () => {
       // uncertain files acquired an owner. The durable barrier therefore
       // survives until a concrete public coordinate is reconciled.
       await restarted.replaceRuntime(registerCyclotomy, "reload");
-      db = metadata();
+      db = await metadata();
       expect(
         captureBarrier(
           db,
@@ -2519,7 +2807,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "v3");
       await pi.endTurn();
       const third = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       const thirdState = checkpointState(before, pi.manager.sessionId, third)!;
       before.close();
@@ -2554,7 +2842,7 @@ describe("checkpoint authority lifecycle", () => {
 
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
         expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
-        let db = metadata();
+        let db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -2577,7 +2865,7 @@ describe("checkpoint authority lifecycle", () => {
         pi.manager.setLeaf(third);
         await pi.endTurn(0);
 
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, third)).toEqual(
           thirdState,
         );
@@ -2619,7 +2907,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const savedOid = checkpointState(
         before,
         pi.manager.sessionId,
@@ -2630,7 +2918,7 @@ describe("checkpoint authority lifecycle", () => {
 
       pi.selectDestructive = false;
       await pi.replaceRuntime(registerCyclotomy, "resume");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       expect(checkpointState(db, pi.manager.sessionId, leaf)?.treeOid).toBe(
         savedOid,
@@ -2641,21 +2929,21 @@ describe("checkpoint authority lifecycle", () => {
       await pi.runCommand("drift");
       expect(notified(pi, "driftCleanProtected")).toBe(true);
       expect(pi.notifications.at(-1)?.message).toContain("Detached");
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       db.close();
       await writeFile(join(workspace, "a.txt"), "kept-current");
 
       pi.selectDestructive = true;
       await pi.runCommand("restore");
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(false);
       db.close();
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
 
       await writeFile(join(workspace, "a.txt"), "after-restore");
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf)?.treeOid).not.toBe(
         savedOid,
       );
@@ -2670,18 +2958,19 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn();
       await writeFile(join(workspace, "a.txt"), "current");
       const readTree = await spyOnReadTree();
-      const readTreeManifest = await spyOnReadTreeManifest();
+      const readTreeRoots = await spyOnReadTreeRoots();
 
       try {
         await pi.runCommand("restore");
 
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
         expect(readTree).toHaveBeenCalledOnce();
-        // One manifest-only restore read plus readTree's own manifest read.
-        expect(readTreeManifest).toHaveBeenCalledTimes(2);
+        // One manifest-only restore read plus readTree's own rooted structural
+        // read, both through the native operation-scoped repository boundary.
+        expect(rootStructuralReads(readTreeRoots)).toHaveLength(2);
       } finally {
         readTree.mockRestore();
-        readTreeManifest.mockRestore();
+        readTreeRoots.mockRestore();
       }
     });
 
@@ -2733,7 +3022,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const leaf = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const savedOid = checkpointState(
         before,
         pi.manager.sessionId,
@@ -2747,7 +3036,7 @@ describe("checkpoint authority lifecycle", () => {
 
       try {
         await pi.replaceRuntime(registerCyclotomy, "resume");
-        const unchanged = metadata();
+        const unchanged = await metadata();
         expect(
           checkpointState(unchanged, pi.manager.sessionId, leaf)?.treeOid,
         ).toBe(savedOid);
@@ -2761,7 +3050,7 @@ describe("checkpoint authority lifecycle", () => {
 
         expect(await pi.submitInput()).toBe("continued");
         const descendant = pi.manager.getLeafId()!;
-        let accepted = metadata();
+        let accepted = await metadata();
         expect(
           checkpointState(accepted, pi.manager.sessionId, leaf)?.treeOid,
         ).toBe(savedOid);
@@ -2774,7 +3063,7 @@ describe("checkpoint authority lifecycle", () => {
         accepted.close();
 
         await pi.endTurn(0);
-        accepted = metadata();
+        accepted = await metadata();
         expect(
           checkpointState(accepted, pi.manager.sessionId, descendant),
         ).toBeDefined();
@@ -2859,17 +3148,19 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.navigate(first)).toBe("done");
       const child = pi.manager.appendEntry();
       await writeFile(join(workspace, "a.txt"), "unsaved-child");
-      const db = metadata();
+      const db = await metadata();
       const alternate = checkpointState(db, pi.manager.sessionId, second)!;
       db.close();
       pi.selectHook = async () => {
-        const concurrent = metadata();
-        commitTestNodeState(
-          concurrent,
-          pi.manager.sessionId,
-          child.id,
-          alternate.treeOid,
-          pi.manager.getSessionFile(),
+        const concurrent = await metadata();
+        await mutateMetadata(concurrent, () =>
+          commitTestNodeState(
+            concurrent,
+            pi.manager.sessionId,
+            child.id,
+            alternate.treeOid,
+            pi.manager.getSessionFile(),
+          ),
         );
         concurrent.close();
       };
@@ -2905,7 +3196,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(pi.manager.getLeafId()).toBe(first);
       expect(runtime.activation).toEqual({ kind: "unavailable", cause });
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       db.close();
     });
@@ -2925,7 +3216,7 @@ describe("checkpoint authority lifecycle", () => {
           execution.mockResolvedValueOnce({
             kind: "action-failed",
             cause,
-            cleanup: { kind: "released" },
+            cleanup: { kind: "settled" },
           });
         }
 
@@ -2937,7 +3228,7 @@ describe("checkpoint authority lifecycle", () => {
 
         expect(pi.manager.getLeafId()).toBe(first);
         expect(runtime.activation).toEqual({ kind: "unavailable", cause });
-        const db = metadata();
+        const db = await metadata();
         expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(
           true,
         );
@@ -2968,7 +3259,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(pi.manager.getLeafId()).toBe(first);
       expect(runtime.activation.kind).toBe("unavailable");
       expect(notified(pi, "sourceCaptureFailed")).toBe(true);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       db.close();
     });
@@ -2977,7 +3268,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3000,7 +3291,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-current",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, second)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -3026,7 +3317,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn();
       const second = pi.manager.getLeafId()!;
 
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         checkpointState(db, pi.manager.sessionId, second),
       );
@@ -3034,7 +3325,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.navigate(first)).toBe("done");
 
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
       db.close();
       expect(notified(pi, "restorePostMutationTargetProtected")).toBe(false);
@@ -3042,7 +3333,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await writeFile(join(workspace, "same.txt"), "changed-after-no-op");
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
       expect(checkpointState(db, pi.manager.sessionId, first)).not.toEqual(
         checkpointState(db, pi.manager.sessionId, second),
@@ -3067,26 +3358,100 @@ describe("checkpoint authority lifecycle", () => {
       );
     });
 
+    it("cancels departure when the Git replay version changes after navigation confirmation", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first, second } = await twoStates(pi);
+      const original = runtime.scanCurrentWorkspaceForScope.bind(runtime);
+      let confirmed = false;
+      const scan = vi
+        .spyOn(runtime, "scanCurrentWorkspaceForScope")
+        .mockImplementation(async (...args) => {
+          const snapshot = await original(...args);
+          return confirmed
+            ? {
+                ...snapshot,
+                gitOracleVersion: "git version changed-after-confirmation",
+              }
+            : snapshot;
+        });
+      pi.selectHook = async () => {
+        confirmed = true;
+      };
+
+      try {
+        expect(await pi.navigate(first)).toBe("cancelled");
+      } finally {
+        scan.mockRestore();
+      }
+
+      expect(pi.manager.getLeafId()).toBe(second);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+      expect(notified(pi, "navigationChangedBeforeDeparture")).toBe(true);
+    });
+
+    it("protects an arrived node when the Git replay version changes after departure", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first } = await twoStates(pi);
+      const original = runtime.scanCurrentWorkspaceForScope.bind(runtime);
+      let arrived = false;
+      const scan = vi
+        .spyOn(runtime, "scanCurrentWorkspaceForScope")
+        .mockImplementation(async (...args) => {
+          const snapshot = await original(...args);
+          return arrived
+            ? {
+                ...snapshot,
+                gitOracleVersion: "git version changed-after-departure",
+              }
+            : snapshot;
+        });
+      pi.beforeTreeCommit = async () => {
+        arrived = true;
+      };
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+      } finally {
+        scan.mockRestore();
+        pi.beforeTreeCommit = undefined;
+      }
+
+      expect(pi.manager.getLeafId()).toBe(first);
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+      expect(notified(pi, "navigationChangedAfterPreview")).toBe(true);
+      const db = await metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
+      db.close();
+    });
+
     it("navigates with current files while protecting the exact destination", async () => {
       const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
       const { first, second } = await twoStates(pi);
-      let db = metadata();
+      let db = await metadata();
       const targetBefore = checkpointState(db, pi.manager.sessionId, first)!;
       const sourceBefore = checkpointState(db, pi.manager.sessionId, second)!;
       db.close();
       await writeFile(join(workspace, "a.txt"), "source-current");
       pi.selectionOverride = messageFor("choiceNavigationDetach");
       const readTree = await spyOnReadTree();
+      const scan = vi.spyOn(runtime, "scanCurrentWorkspaceForScope");
 
       try {
         expect(await pi.navigate(first)).toBe("done");
+        expect(scan).toHaveBeenCalledOnce();
         expect(readTree.mock.calls.map(([treeOid]) => treeOid)).toEqual([
           targetBefore.treeOid,
           targetBefore.treeOid,
           targetBefore.treeOid,
         ]);
       } finally {
+        scan.mockRestore();
         readTree.mockRestore();
       }
 
@@ -3098,7 +3463,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-current",
       );
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         targetBefore,
       );
@@ -3114,7 +3479,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.notifications.length = 0;
       await pi.runCommand("drift");
       expect(notified(pi, "driftTitleDetached")).toBe(true);
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
       db.close();
 
@@ -3123,7 +3488,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn(0);
       const child = pi.manager.appendEntry();
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         targetBefore,
       );
@@ -3140,7 +3505,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.selectionOverride = undefined;
       await pi.runCommand("restore");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         targetBefore,
       );
@@ -3160,7 +3525,7 @@ describe("checkpoint authority lifecycle", () => {
       const source = pi.manager.appendEntry();
       await writeFile(join(workspace, "a.txt"), "source");
       await pi.endTurn(0);
-      let db = metadata();
+      let db = await metadata();
       const ancestorState = checkpointState(
         db,
         pi.manager.sessionId,
@@ -3176,19 +3541,21 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.navigate(target.id)).toBe("done");
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("source");
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, target.id)).toEqual(
         ancestorState,
       );
       expect(checkpointIsBlocked(db, pi.manager.sessionId, target.id)).toBe(
         true,
       );
-      commitTestNodeState(
-        db,
-        pi.manager.sessionId,
-        ancestor,
-        sourceState.treeOid,
-        pi.manager.getSessionFile(),
+      await mutateMetadata(db, () =>
+        commitTestNodeState(
+          db,
+          pi.manager.sessionId,
+          ancestor,
+          sourceState.treeOid,
+          pi.manager.getSessionFile(),
+        ),
       );
       expect(checkpointState(db, pi.manager.sessionId, target.id)).toEqual(
         ancestorState,
@@ -3200,7 +3567,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      let db = metadata();
+      let db = await metadata();
       const sourceBefore = checkpointState(db, pi.manager.sessionId, second)!;
       db.close();
       await writeFile(join(workspace, "a.txt"), "protected-source");
@@ -3213,7 +3580,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "protected-source",
       );
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
       );
@@ -3255,7 +3622,7 @@ describe("checkpoint authority lifecycle", () => {
         "protected-source",
       );
       expect(runtime.activation.kind).toBe("unavailable");
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
       db.close();
@@ -3266,7 +3633,7 @@ describe("checkpoint authority lifecycle", () => {
       const runtime = await preparedRuntime();
       registerPreparedRuntime(pi.api, runtime);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3300,7 +3667,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(pi.manager.getLeafId()).toBe(second);
       expect(runtime.activation.kind).toBe("active");
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
       );
@@ -3314,7 +3681,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const db = metadata();
+      const db = await metadata();
       const targetTreeOid = checkpointState(
         db,
         pi.manager.sessionId,
@@ -3322,7 +3689,7 @@ describe("checkpoint authority lifecycle", () => {
       )!.treeOid;
       db.close();
       const readTree = await spyOnReadTree();
-      const readTreeManifest = await spyOnReadTreeManifest();
+      const readTreeRoots = await spyOnReadTreeRoots();
 
       try {
         expect(await pi.navigate(first)).toBe("done");
@@ -3333,13 +3700,14 @@ describe("checkpoint authority lifecycle", () => {
           targetTreeOid,
           targetTreeOid,
         ]);
-        // Two readTree phases each load the manifest; restore adds one
-        // manifest-only read without repeating closure verification.
-        expect(readTreeManifest).toHaveBeenCalledTimes(3);
-        expect(readTreeManifest).toHaveBeenCalledWith(targetTreeOid);
+        // Two readTree phases each load the rooted structure; restore adds one
+        // manifest-only rooted read without repeating closure verification.
+        expect(rootStructuralReads(readTreeRoots, targetTreeOid)).toHaveLength(
+          3,
+        );
       } finally {
         readTree.mockRestore();
-        readTreeManifest.mockRestore();
+        readTreeRoots.mockRestore();
       }
     });
 
@@ -3347,7 +3715,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const targetBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3375,7 +3743,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "declined-edit",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
       );
@@ -3419,13 +3787,15 @@ describe("checkpoint authority lifecycle", () => {
         ],
         gitScope({ globalExclude: "X\n" }),
       );
-      const db = metadata();
-      commitTestNodeState(
-        db,
-        pi.manager.sessionId,
-        targetNode.id,
-        treeOid,
-        pi.manager.getSessionFile(),
+      const db = await metadata();
+      await mutateMetadata(db, () =>
+        commitTestNodeState(
+          db,
+          pi.manager.sessionId,
+          targetNode.id,
+          treeOid,
+          pi.manager.getSessionFile(),
+        ),
       );
       db.close();
       const sourceNode = pi.manager.appendEntry();
@@ -3444,7 +3814,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "delete-me"), "utf8")).toBe(
         "must survive preview",
       );
-      const protectedSource = metadata();
+      const protectedSource = await metadata();
       expect(
         checkpointIsBlocked(
           protectedSource,
@@ -3467,7 +3837,7 @@ describe("checkpoint authority lifecycle", () => {
         message: { role: "user" },
       });
       pi.manager.setLeaf(source);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3482,7 +3852,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "editor-no-op",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -3501,7 +3871,7 @@ describe("checkpoint authority lifecycle", () => {
         message: { role: "user" },
       });
       pi.manager.setLeaf(source);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3513,7 +3883,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.prepareNavigation(childPrompt.id)).toBe("ready");
       await pi.commitPreparedSummary(childPrompt.id, true);
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -3536,7 +3906,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "still-current",
       );
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       db.close();
       expect(await pi.submitInput()).toBe("continued");
@@ -3566,7 +3936,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const concurrentState = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3575,13 +3945,15 @@ describe("checkpoint authority lifecycle", () => {
       before.close();
       await writeFile(join(workspace, "a.txt"), "previewed-source");
       pi.selectHook = async () => {
-        const concurrent = metadata();
-        commitTestNodeState(
-          concurrent,
-          pi.manager.sessionId,
-          second,
-          concurrentState.treeOid,
-          pi.manager.getSessionFile(),
+        const concurrent = await metadata();
+        await mutateMetadata(concurrent, () =>
+          commitTestNodeState(
+            concurrent,
+            pi.manager.sessionId,
+            second,
+            concurrentState.treeOid,
+            pi.manager.getSessionFile(),
+          ),
         );
         concurrent.close();
       };
@@ -3592,7 +3964,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "previewed-source",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         concurrentState,
       );
@@ -3608,7 +3980,7 @@ describe("checkpoint authority lifecycle", () => {
       const runtime = await preparedRuntime();
       registerPreparedRuntime(pi.api, runtime);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const concurrentState = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3622,10 +3994,14 @@ describe("checkpoint authority lifecycle", () => {
       const original = metadataStore.commitCapture.bind(metadataStore);
       const raced = vi
         .spyOn(metadataStore, "commitCapture")
-        .mockImplementation((input) => {
-          const result = original(input);
+        .mockImplementation((authority, input) => {
+          const result = original(authority, input);
           if (input.entryId === second && result === "committed") {
-            const concurrent = metadata();
+            const concurrent = createCurrentMetadataStore(
+              metadataPath(),
+              authority,
+            );
+            bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
             commitTestNodeState(
               concurrent,
               pi.manager.sessionId,
@@ -3644,7 +4020,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, first)).toEqual(
         concurrentState,
       );
@@ -3679,7 +4055,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3694,7 +4070,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "unowned-edit",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
       );
@@ -3793,7 +4169,7 @@ describe("checkpoint authority lifecycle", () => {
         "source-current",
       );
       expect(pi.selections).toHaveLength(selectionsBefore);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, source)).toBeDefined();
       expect(
         checkpointState(db, pi.manager.sessionId, child.id),
@@ -3811,7 +4187,7 @@ describe("checkpoint authority lifecycle", () => {
       const label = pi.manager.getLeafId()!;
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, summary)).toBeDefined();
       expect(checkpointState(db, pi.manager.sessionId, label)).toBeUndefined();
       db.close();
@@ -3829,7 +4205,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       }
 
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, summary)).toBeDefined();
       expect(checkpointState(db, pi.manager.sessionId, label)).toBeUndefined();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, summary)).toBe(
@@ -3842,7 +4218,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const targetBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -3856,7 +4232,7 @@ describe("checkpoint authority lifecycle", () => {
       const label = pi.manager.getLeafId()!;
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         targetBefore,
       );
@@ -3870,7 +4246,7 @@ describe("checkpoint authority lifecycle", () => {
 
       const child = pi.manager.appendEntry();
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, summary)).toEqual(
         targetBefore,
       );
@@ -3897,7 +4273,7 @@ describe("checkpoint authority lifecycle", () => {
       // blocked-missing, rather than a blocked slot pinning inherited state.
       await pi.landUnmanaged(target.id);
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, target.id),
       ).toBeUndefined();
@@ -3921,7 +4297,7 @@ describe("checkpoint authority lifecycle", () => {
       }
       const label = pi.manager.getLeafId()!;
 
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, target.id)).toBe(
         true,
       );
@@ -3939,7 +4315,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await writeFile(join(workspace, "a.txt"), "unassigned-summary-edit");
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, summary)).toEqual(
         protectedSummaryState,
       );
@@ -3958,7 +4334,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.submitInput()).toBe("continued");
 
-      let sourceDb = metadata();
+      let sourceDb = await metadata();
       expect(
         checkpointState(sourceDb, pi.manager.sessionId, oldLabel),
       ).toBeUndefined();
@@ -4015,7 +4391,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "edited-at-label",
       );
-      sourceDb = metadata();
+      sourceDb = await metadata();
       expect(checkpointState(sourceDb, fork.sessionId, summary)).toBeDefined();
       expect(
         checkpointState(sourceDb, fork.sessionId, newLabel.id),
@@ -4049,7 +4425,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-current",
       );
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, child.id),
       ).toBeUndefined();
@@ -4082,7 +4458,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
       db.close();
     });
@@ -4105,7 +4481,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
       db.close();
     });
@@ -4140,7 +4516,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(pi.manager.getLeafId()).toBeNull();
-      const db = metadata();
+      const db = await metadata();
       expect(
         captureBarrier(db, pi.manager.sessionId, pi.manager.getSessionFile()!),
       ).toBe(true);
@@ -4151,7 +4527,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -4164,7 +4540,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.navigate(first)).toBe("cancelled");
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, second)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -4178,7 +4554,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const targetBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -4200,7 +4576,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "event-gap",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         sourceBefore,
       );
@@ -4219,7 +4595,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const concurrentState = checkpointState(
         before,
         pi.manager.sessionId,
@@ -4228,13 +4604,15 @@ describe("checkpoint authority lifecycle", () => {
       before.close();
       pi.selectionOverride = messageFor("choiceNavigationDetach");
       pi.beforeTreeCommit = async () => {
-        const concurrent = metadata();
-        commitTestNodeState(
-          concurrent,
-          pi.manager.sessionId,
-          first,
-          concurrentState.treeOid,
-          pi.manager.getSessionFile(),
+        const concurrent = await metadata();
+        await mutateMetadata(concurrent, () =>
+          commitTestNodeState(
+            concurrent,
+            pi.manager.sessionId,
+            first,
+            concurrentState.treeOid,
+            pi.manager.getSessionFile(),
+          ),
         );
         concurrent.close();
       };
@@ -4242,7 +4620,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.navigate(first)).toBe("done");
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, first)).toEqual(
         concurrentState,
       );
@@ -4286,7 +4664,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn();
       const child = pi.manager.getLeafId()!;
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, child)).toBeDefined();
       expect(
         checkpointState(db, pi.manager.sessionId, child)?.treeOid,
@@ -4319,7 +4697,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn();
       const child = pi.manager.getLeafId()!;
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, child)).toBeDefined();
       expect(
         checkpointState(db, pi.manager.sessionId, child)?.treeOid,
@@ -4343,7 +4721,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       const secondState = checkpointState(
         before,
@@ -4369,7 +4747,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
         expect(notified(pi, "restorePostMutationLocationBarrier")).toBe(true);
         expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-        let db = metadata();
+        let db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
           firstState,
         );
@@ -4390,7 +4768,7 @@ describe("checkpoint authority lifecycle", () => {
         db.close();
 
         await pi.endTurn(0);
-        db = metadata();
+        db = await metadata();
         expect(checkpointState(db, pi.manager.sessionId, second)).toEqual(
           secondState,
         );
@@ -4448,7 +4826,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(rewritten).toBe(true);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(notified(pi, "commandLocationChanged")).toBe(true);
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
       db.close();
     });
@@ -4460,7 +4838,7 @@ describe("checkpoint authority lifecycle", () => {
       });
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
       before.close();
       if (firstSlot.kind !== "open-checkpoint") {
@@ -4477,7 +4855,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(notified(pi, "transitionInProgress")).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = metadata();
+      const db = await metadata();
       expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
         kind: "blocked-checkpoint",
         treeOid: firstSlot.treeOid,
@@ -4495,37 +4873,34 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
       before.close();
       if (firstSlot.kind !== "open-checkpoint") {
         throw new Error("two-state fixture did not capture its first node");
       }
 
-      const store = await openObjectStore(storeRoot);
-      const prototype = Object.getPrototypeOf(store) as Pick<
-        ObjectStore,
-        "readBlob"
-      >;
-      const original = prototype.readBlob;
       let staged = false;
-      const readBlob = vi
-        .spyOn(prototype, "readBlob")
-        .mockImplementation(async function (this: ObjectStore, oid: string) {
-          const content = await original.call(this, oid);
+      const streamBlob = await interceptRepositoryContentStream({
+        storageRoot: await realpath(storeRoot),
+        contentId: contentIdForText("v1"),
+        occurrence: 3,
+        action: async () => {
           staged = true;
           pi.idle = false;
-          return content;
-        });
+        },
+      });
 
       try {
         expect(await pi.navigate(first)).toBe("done");
       } finally {
-        readBlob.mockRestore();
+        streamBlob.spy.mockRestore();
         pi.idle = true;
       }
 
       expect(staged).toBe(true);
+      expect(streamBlob.triggered()).toBe(true);
+      expect(streamBlob.matchingStreams()).toBe(3);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(
         notifiedWithDetail(
@@ -4535,7 +4910,7 @@ describe("checkpoint authority lifecycle", () => {
         ),
       ).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = metadata();
+      const db = await metadata();
       expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
         kind: "blocked-checkpoint",
         treeOid: firstSlot.treeOid,
@@ -4543,76 +4918,63 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
     });
 
-    it("revalidates Pi after apply's asynchronous preflight and before its first write", async () => {
+    it("revalidates Pi after asynchronous staging and before its first write", async () => {
       const pi = new FakePi(workspace);
-      const probePath = join(workspace, ".file-handle-prototype-probe");
-      const probe = await open(probePath, "w");
-      const prototype = Object.getPrototypeOf(probe) as {
-        readFile(): Promise<Buffer>;
-      };
-      await probe.close();
-      await rm(probePath);
-      const originalReadFile = prototype.readFile;
-      let readCount = 0;
-      let releaseApplyRead: (() => void) | undefined;
-      const applyReadReleased = new Promise<void>((resolve) => {
-        releaseApplyRead = resolve;
-      });
-      let observeApplyRead: (() => void) | undefined;
-      let applyReadTimer: NodeJS.Timeout | undefined;
-      const applyReadObserved = new Promise<void>((resolve, reject) => {
-        applyReadTimer = setTimeout(
-          () => reject(new Error("apply did not reach its staged-blob read")),
-          30_000,
-        );
-        observeApplyRead = () => {
-          clearTimeout(applyReadTimer);
-          applyReadTimer = undefined;
-          resolve();
-        };
-      });
-      let readFileSpy: ReturnType<typeof vi.spyOn> | undefined;
-      // Install only after Pi has committed the tree arrival. Source capture
-      // and every pre-arrival phase are therefore outside the probe.
-      pi.api.on("session_tree", async () => {
-        readFileSpy = vi
-          .spyOn(prototype, "readFile")
-          .mockImplementation(async function (this: FileHandle) {
-            readCount += 1;
-            // Object-store authentication is bounded and no longer uses an
-            // unbounded FileHandle.readFile(). This first such read is apply
-            // consuming the private staged blob, after its asynchronous
-            // preflight and before any workspace mutation is possible.
-            if (readCount === 1) {
-              observeApplyRead?.();
-              await applyReadReleased;
-            }
-            return originalReadFile.call(this);
-          });
-      });
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
       before.close();
       if (firstSlot.kind !== "open-checkpoint") {
         throw new Error("two-state fixture did not capture its first node");
       }
 
+      let releaseStaging: (() => void) | undefined;
+      const stagingReleased = new Promise<void>((resolve) => {
+        releaseStaging = resolve;
+      });
+      let observeStaging: (() => void) | undefined;
+      let stagingTimer: NodeJS.Timeout | undefined;
+      const stagingObserved = new Promise<void>((resolve, reject) => {
+        stagingTimer = setTimeout(
+          () => reject(new Error("restore did not finish staging its blob")),
+          30_000,
+        );
+        observeStaging = () => {
+          clearTimeout(stagingTimer);
+          stagingTimer = undefined;
+          resolve();
+        };
+      });
+      let intercepted = false;
+      const streamBlob = await interceptRepositoryContentStream({
+        storageRoot: await realpath(storeRoot),
+        contentId: contentIdForText("v1"),
+        occurrence: 3,
+        action: async () => {
+          intercepted = true;
+          observeStaging?.();
+          await stagingReleased;
+        },
+      });
+
       const navigating = pi.navigate(first);
       try {
-        await applyReadObserved;
+        await stagingObserved;
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
         pi.idle = false;
-        releaseApplyRead?.();
+        releaseStaging?.();
         expect(await navigating).toBe("done");
       } finally {
-        if (applyReadTimer !== undefined) clearTimeout(applyReadTimer);
-        releaseApplyRead?.();
-        readFileSpy?.mockRestore();
+        if (stagingTimer !== undefined) clearTimeout(stagingTimer);
+        releaseStaging?.();
+        streamBlob.spy.mockRestore();
         pi.idle = true;
       }
 
+      expect(intercepted).toBe(true);
+      expect(streamBlob.triggered()).toBe(true);
+      expect(streamBlob.matchingStreams()).toBe(3);
       expect(pi.manager.getLeafId()).toBe(first);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(
@@ -4623,7 +4985,7 @@ describe("checkpoint authority lifecycle", () => {
         ),
       ).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = metadata();
+      const db = await metadata();
       expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
         kind: "blocked-checkpoint",
         treeOid: firstSlot.treeOid,
@@ -4636,7 +4998,7 @@ describe("checkpoint authority lifecycle", () => {
       const runtime = await preparedRuntime();
       registerPreparedRuntime(pi.api, runtime);
       const { first } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const firstState = checkpointState(before, pi.manager.sessionId, first)!;
       before.close();
 
@@ -4650,6 +5012,7 @@ describe("checkpoint authority lifecycle", () => {
         )
         .mockImplementation(function (
           this: WorkspaceMutationAuthority,
+          writeAuthority,
           view,
           resolution,
         ) {
@@ -4662,7 +5025,7 @@ describe("checkpoint authority lifecycle", () => {
             rejectTargetAdmission = false;
             throw new Error("post-restore admission failed");
           }
-          return original.call(this, view, resolution);
+          return original.call(this, writeAuthority, view, resolution);
         });
       const recoveryAdmissionFailure = vi
         .spyOn(runtime.admission, "admit")
@@ -4699,7 +5062,7 @@ describe("checkpoint authority lifecycle", () => {
       ).toBe(true);
       expect(notified(pi, "restoreSuccessOne")).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         firstState,
       );
@@ -4763,7 +5126,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("gap-edit");
       expect(notified(pi, "navigationChangedAfterPreview")).toBe(true);
       expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = metadata();
+      const db = await metadata();
       const secondAfter = checkpointState(db, pi.manager.sessionId, second)!;
       const firstState = checkpointState(db, pi.manager.sessionId, first)!;
       expect(secondAfter.treeOid).not.toBe(firstState.treeOid);
@@ -4800,7 +5163,10 @@ describe("checkpoint authority lifecycle", () => {
         .update(await realpath(firstRoot))
         .digest("hex");
       const firstStore = join(home, "cyclotomy", firstHash);
-      let db = createCurrentMetadataStore(join(firstStore, "state.db"));
+      let db = await createTestCurrentMetadataStore(
+        join(firstStore, "state.db"),
+        firstStore,
+      );
       const before = checkpointState(db, pi.manager.sessionId, source)!;
       db.close();
       await writeFile(join(firstRoot, "a.txt"), "prepared-source");
@@ -4818,7 +5184,10 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(secondRoot, "outside.txt"), "utf8")).toBe(
         "outside",
       );
-      db = createCurrentMetadataStore(join(firstStore, "state.db"));
+      db = await createTestCurrentMetadataStore(
+        join(firstStore, "state.db"),
+        firstStore,
+      );
       expect(
         checkpointState(db, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(before.treeOid);
@@ -4839,7 +5208,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const beforeDb = metadata();
+      const beforeDb = await metadata();
       const before = checkpointState(beforeDb, pi.manager.sessionId, second)!;
       beforeDb.close();
       await writeFile(join(workspace, "a.txt"), "prepared-before-scan-error");
@@ -4860,7 +5229,7 @@ describe("checkpoint authority lifecycle", () => {
       }
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      const afterDb = metadata();
+      const afterDb = await metadata();
       expect(
         checkpointState(afterDb, pi.manager.sessionId, second)?.treeOid,
       ).not.toBe(before.treeOid);
@@ -4876,7 +5245,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first } = await twoStates(pi);
-      const dbBefore = metadata();
+      const dbBefore = await metadata();
       const targetBefore = checkpointState(
         dbBefore,
         pi.manager.sessionId,
@@ -4887,7 +5256,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.landUnmanaged(first);
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      const dbAfter = metadata();
+      const dbAfter = await metadata();
       expect(checkpointState(dbAfter, pi.manager.sessionId, first)).toEqual(
         targetBefore,
       );
@@ -4924,7 +5293,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(await pi.navigate(first)).toBe("done");
         expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
 
-        const before = metadata();
+        const before = await metadata();
         const targetBefore = checkpointState(
           before,
           pi.manager.sessionId,
@@ -4983,7 +5352,7 @@ describe("checkpoint authority lifecycle", () => {
         // successful recovery closes it durably; unavailable recovery instead
         // retires the runtime so no later capture can rewrite the checkpoint.
         await pi.endTurn(0);
-        const after = metadata();
+        const after = await metadata();
         expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
           targetBefore,
         );
@@ -5018,7 +5387,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.landUnmanaged(ancestor.id);
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5035,7 +5404,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.manager.setLeaf(ancestor.id);
       expect(await pi.navigate(child.id)).toBe("done");
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5062,7 +5431,7 @@ describe("checkpoint authority lifecycle", () => {
       await firstHost.endTurn(0);
 
       await firstHost.landUnmanaged(ancestor.id);
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, firstHost.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5082,7 +5451,7 @@ describe("checkpoint authority lifecycle", () => {
       // rather than treating it as an unknown fresh node on the first event.
       await restarted.endTurn(0);
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5101,7 +5470,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await restarted.runCommand("drift");
       expect(notified(restarted, "driftMissingProtected")).toBe(true);
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5112,7 +5481,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await restarted.runCommand("restore");
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, ancestor.id),
       ).toBeDefined();
@@ -5137,21 +5506,25 @@ describe("checkpoint authority lifecycle", () => {
       const intended = pi.manager.appendEntry();
       await writeFile(join(workspace, "a.txt"), "intended-first-state");
 
-      let db = metadata();
+      let db = await metadata();
       const lateArrivalState = checkpointState(
         db,
         pi.manager.sessionId,
         lateArrival,
       )!;
       expect(
-        protectTestLocation(
+        await mutateMetadata(
           db,
-          {
-            sessionId: pi.manager.sessionId,
-            sessionFile: pi.manager.getSessionFile()!,
-          },
-          intended.id,
-        ).kind,
+          () =>
+            protectTestLocation(
+              db,
+              {
+                sessionId: pi.manager.sessionId,
+                sessionFile: pi.manager.getSessionFile()!,
+              },
+              intended.id,
+            ).kind,
+        ),
       ).toBe("protected");
       db.close();
 
@@ -5159,9 +5532,9 @@ describe("checkpoint authority lifecycle", () => {
       const original = metadataStore.adoptBlockedMissing.bind(metadataStore);
       const raced = vi
         .spyOn(metadataStore, "adoptBlockedMissing")
-        .mockImplementationOnce((input) => {
+        .mockImplementationOnce((authority, input) => {
           expect(input.entryId).toBe(intended.id);
-          const result = original(input);
+          const result = original(authority, input);
           pi.manager.setLeaf(lateArrival);
           return result;
         });
@@ -5172,7 +5545,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, intended.id),
       ).toBeDefined();
@@ -5187,7 +5560,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "restoreInitialized")).toBe(false);
 
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, lateArrival)).toEqual(
         lateArrivalState,
       );
@@ -5213,7 +5586,7 @@ describe("checkpoint authority lifecycle", () => {
       // Neither the target nor any of its ancestry owns a checkpoint when the
       // unplanned arrival makes the target fail-closed.
       await pi.landUnmanaged(target.id);
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, ancestor.id),
       ).toBeUndefined();
@@ -5234,7 +5607,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await writeFile(join(workspace, "a.txt"), "later-ancestor-state");
       expect(await pi.navigate(target.id)).toBe("done");
-      db = metadata();
+      db = await metadata();
       const ancestorState = checkpointState(
         db,
         pi.manager.sessionId,
@@ -5253,7 +5626,7 @@ describe("checkpoint authority lifecycle", () => {
       // workspace as this node's first exact state and retires its guard.
       await writeFile(join(workspace, "a.txt"), "target-current");
       await pi.runCommand("restore");
-      db = metadata();
+      db = await metadata();
       const targetState = checkpointState(db, pi.manager.sessionId, target.id);
       expect(targetState).toBeDefined();
       expect(targetState?.treeOid).not.toBe(ancestorState?.treeOid);
@@ -5273,7 +5646,7 @@ describe("checkpoint authority lifecycle", () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const db = metadata();
+      const db = await metadata();
       const target = checkpointState(db, pi.manager.sessionId, second)!;
       db.close();
       await rm(
@@ -5294,12 +5667,12 @@ describe("checkpoint authority lifecycle", () => {
         notifiedWithDetail(
           pi,
           "navigationPrepareFailed",
-          "tree object does not exist",
+          "structural object does not exist",
         ),
       ).toBe(true);
       // A readable older ancestor state exists, but corruption of the nearest
       // authoritative slot is never silently downgraded to inheriting it.
-      const readable = metadata();
+      const readable = await metadata();
       expect(
         checkpointState(readable, pi.manager.sessionId, first),
       ).toBeDefined();
@@ -5321,7 +5694,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "source-edit",
       );
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, ancestor.id),
       ).toBeDefined();
@@ -5350,7 +5723,7 @@ describe("checkpoint authority lifecycle", () => {
         "ancestor-edit",
       );
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, restarted.manager.sessionId, ancestor.id),
       ).toBeDefined();
@@ -5373,7 +5746,7 @@ describe("checkpoint authority lifecycle", () => {
       const summary = await pi.commitPreparedSummary(ancestor.id, true);
       const label = pi.manager.getLeafId()!;
 
-      const db = metadata();
+      const db = await metadata();
       expect(db.getCheckpointSlot(pi.manager.sessionId, ancestor.id).kind).toBe(
         "open-checkpoint",
       );
@@ -5403,7 +5776,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "source-state");
       await pi.endTurn();
       const lateArrival = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const lateArrivalState = checkpointState(
         before,
         pi.manager.sessionId,
@@ -5415,8 +5788,8 @@ describe("checkpoint authority lifecycle", () => {
       const original = metadataStore.commitCapture.bind(metadataStore);
       const raced = vi
         .spyOn(metadataStore, "commitCapture")
-        .mockImplementation((input) => {
-          const result = original(input);
+        .mockImplementation((authority, input) => {
+          const result = original(authority, input);
           if (input.entryId === intended.id && result === "committed") {
             pi.manager.setLeaf(lateArrival);
           }
@@ -5435,7 +5808,7 @@ describe("checkpoint authority lifecycle", () => {
         raced.mockRestore();
       }
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, intended.id),
       ).toBeDefined();
@@ -5513,7 +5886,7 @@ describe("checkpoint authority lifecycle", () => {
       const summary = await pi.commitPreparedSummary(rootPrompt.id, true);
       const label = pi.manager.getLeafId()!;
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, rootPrompt.id),
       ).toBeUndefined();
@@ -5544,7 +5917,7 @@ describe("checkpoint authority lifecycle", () => {
         .map((entry) => entry.id);
 
       expect(labels).toHaveLength(5);
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, rootPrompt.id),
       ).toBeUndefined();
@@ -5579,7 +5952,7 @@ describe("checkpoint authority lifecycle", () => {
       });
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
-      const before = metadata();
+      const before = await metadata();
       const secondState = checkpointState(
         before,
         pi.manager.sessionId,
@@ -5593,7 +5966,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, second)).toEqual(
         secondState,
       );
@@ -5623,7 +5996,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.manager.setLeaf(source);
       await pi.landUnmanaged(label.id);
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         captureBarrier(db, pi.manager.sessionId, pi.manager.getSessionFile()!),
       ).toBe(false);
@@ -5640,7 +6013,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "root-turn-state");
       await pi.endTurn();
       const child = pi.manager.getLeafId()!;
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, child)).toBeDefined();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, child)).toBe(false);
       db.close();
@@ -5660,7 +6033,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.navigate(label.id)).toBe("done");
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, stable.id),
       ).toBeDefined();
@@ -5734,7 +6107,7 @@ describe("checkpoint authority lifecycle", () => {
 
       pi.selectDestructive = false;
       await pi.replaceRuntime(registerCyclotomy, "resume");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, source)).toBe(true);
       db.close();
 
@@ -5749,7 +6122,7 @@ describe("checkpoint authority lifecycle", () => {
         "same inode",
       );
       expect(notified(pi, "navigationScanIncomplete")).toBe(false);
-      db = metadata();
+      db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, source)).toBe(true);
       expect(checkpointIsBlocked(db, pi.manager.sessionId, target)).toBe(false);
       db.close();
@@ -5785,7 +6158,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "baseline");
       await pi.endTurn();
       const firstStable = pi.manager.getLeafId()!;
-      let db = metadata();
+      let db = await metadata();
       const baselineOid = checkpointState(
         db,
         pi.manager.sessionId,
@@ -5798,7 +6171,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "labelled-edit");
       expect(await pi.submitInput()).toBe("continued");
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, firstStable)?.treeOid,
       ).not.toBe(baselineOid);
@@ -5816,7 +6189,7 @@ describe("checkpoint authority lifecycle", () => {
       await pi.endTurn(0);
       const secondLabel = pi.manager.appendEntry({ type: "label" });
       await pi.endTurn(0);
-      db = metadata();
+      db = await metadata();
       const labelledOid = checkpointState(
         db,
         pi.manager.sessionId,
@@ -5828,7 +6201,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.submitInput()).toBe("continued");
 
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, secondStable)?.treeOid,
       ).not.toBe(labelledOid);
@@ -5848,7 +6221,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "turn");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const beforeOid = checkpointState(
         before,
         pi.manager.sessionId,
@@ -5859,7 +6232,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.submitInput()).toBe("continued");
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)!.treeOid,
       ).not.toBe(beforeOid);
@@ -5892,7 +6265,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "later-custom-handler",
       );
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, custom)).toBeUndefined();
       db.close();
       pi.manager.setLeaf(source);
@@ -5934,7 +6307,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -5948,7 +6321,7 @@ describe("checkpoint authority lifecycle", () => {
       // No post-append/context work can change the already-owned source capture.
       await pi.emitContext();
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -5962,7 +6335,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -5974,7 +6347,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.submitInput()).toBe("handled");
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -6004,7 +6377,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.submitInput()).toBe("continued");
 
       const userLeaf = pi.manager.getLeafId()!;
-      const db = metadata();
+      const db = await metadata();
       expect(compactionLeaf).toBeDefined();
       expect(
         checkpointState(db, pi.manager.sessionId, compactionLeaf!),
@@ -6026,12 +6399,46 @@ describe("checkpoint authority lifecycle", () => {
       expect(await pi.compact()).toBe("done");
       expect(lastStatus(pi)).toBeUndefined();
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, source)).toBeDefined();
       expect(
         checkpointState(db, pi.manager.sessionId, pi.manager.getLeafId()!),
       ).toBeDefined();
       db.close();
+    });
+
+    it("explains cancellation when the session view drifts after compaction capture", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      await writeFile(join(workspace, "a.txt"), "before-compact");
+      const commitPreparedCapture =
+        CyclotomyRuntime.prototype.commitPreparedCapture;
+      let drifted = false;
+      const driftAfterCapture = vi
+        .spyOn(CyclotomyRuntime.prototype, "commitPreparedCapture")
+        .mockImplementation(function (
+          this: CyclotomyRuntime,
+          ...args: Parameters<CyclotomyRuntime["commitPreparedCapture"]>
+        ) {
+          const result = commitPreparedCapture.call(this, ...args);
+          if (!drifted) {
+            pi.manager.appendEntry();
+            drifted = true;
+          }
+          return result;
+        });
+
+      try {
+        expect(await pi.compact()).toBe("cancelled");
+      } finally {
+        driftAfterCapture.mockRestore();
+      }
+
+      expect(drifted).toBe(true);
+      expect(notified(pi, "commandLocationChanged")).toBe(true);
     });
 
     it("lets fire-and-forget metadata leaves inherit without parent backflow", async () => {
@@ -6041,7 +6448,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "turn");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6056,7 +6463,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "before-name");
       const sessionInfo = await pi.setSessionName("renamed");
 
-      const db = metadata();
+      const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, source)).toEqual(
         sourceBefore,
       );
@@ -6091,7 +6498,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.setSessionName("same");
 
-      const db = metadata();
+      const db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, firstInfo),
       ).toBeUndefined();
@@ -6108,7 +6515,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "turn");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6117,7 +6524,7 @@ describe("checkpoint authority lifecycle", () => {
       before.close();
 
       const metadataLeaf = await pi.setSessionName("concurrent");
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, source)).toEqual(
         sourceBefore,
       );
@@ -6127,7 +6534,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
 
       expect(await pi.submitInput()).toBe("continued");
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, metadataLeaf),
       ).toBeDefined();
@@ -6146,7 +6553,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6158,7 +6565,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.compact()).toBe("cancelled");
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -6213,7 +6620,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "turn");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6228,7 +6635,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(operationRan).toBe(false);
       const resultLeaf = pi.manager.getLeafId()!;
-      let db = metadata();
+      let db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, source)).toEqual(
         sourceBefore,
       );
@@ -6238,7 +6645,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
       // The next cancellable input assigns the inherited result location.
       expect(await pi.submitInput()).toBe("continued");
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, resultLeaf),
       ).toBeDefined();
@@ -6252,7 +6659,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6269,7 +6676,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(executed).toBe(true);
       expect(pi.manager.getLeafId()).not.toBe(source);
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
@@ -6307,7 +6714,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(pi.manager.getLeafId() === source).toBe(!persistResultEntry);
         await expect(stat(join(workspace, "ran"))).resolves.toBeDefined();
         expect(notified(pi, "sourceCaptureFailed")).toBe(true);
-        const after = metadata();
+        const after = await metadata();
         expect(checkpointIsBlocked(after, pi.manager.sessionId, source)).toBe(
           true,
         );
@@ -6322,7 +6729,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const sourceBefore = checkpointState(
         before,
         pi.manager.sessionId,
@@ -6339,7 +6746,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(executed).toBe(false);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, pi.manager.sessionId, source)).toEqual(
         sourceBefore,
       );
@@ -6392,7 +6799,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await pi.startSession("startup");
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, historical.id),
       ).toBeUndefined();
@@ -6411,7 +6818,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "state.txt"), "utf8")).toBe(
         "current workspace",
       );
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, historical.id),
       ).toBeUndefined();
@@ -6457,7 +6864,7 @@ describe("checkpoint authority lifecycle", () => {
         rendering.mockRestore();
       }
 
-      let db = metadata();
+      let db = await metadata();
       expect(
         readTestSessionRegistration(metadataPath(), pi.manager.sessionId),
       ).toBeDefined();
@@ -6473,13 +6880,13 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
       expect(pi.notifications).toContainEqual({
         message:
-          "Cyclotomy blocked this operation, but could not render its diagnostic message.",
+          "Cyclotomy could not complete this operation or show the reason.",
         level: "warning",
       });
 
       await pi.endTurn();
       const descendant = pi.manager.getLeafId()!;
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, descendant),
       ).toBeDefined();
@@ -6504,7 +6911,7 @@ describe("checkpoint authority lifecycle", () => {
 
         expect(notified(pi, "forkImportFailed")).toBe(false);
         expect(notified(pi, "forkInheritanceSkipped")).toBe(true);
-        let db = metadata();
+        let db = await metadata();
         expect(
           readTestSessionRegistration(metadataPath(), pi.manager.sessionId),
         ).toBeDefined();
@@ -6513,7 +6920,7 @@ describe("checkpoint authority lifecycle", () => {
         await writeFile(join(workspace, "state.txt"), "fresh child");
         await pi.endTurn();
         const quarantinedLeaf = pi.manager.getLeafId()!;
-        db = metadata();
+        db = await metadata();
         expect(
           checkpointState(db, pi.manager.sessionId, quarantinedLeaf),
         ).toBeUndefined();
@@ -6528,7 +6935,7 @@ describe("checkpoint authority lifecycle", () => {
         await writeFile(join(workspace, "state.txt"), "verified descendant");
         await pi.endTurn();
         const descendant = pi.manager.getLeafId()!;
-        db = metadata();
+        db = await metadata();
         expect(
           checkpointState(db, pi.manager.sessionId, descendant),
         ).toBeDefined();
@@ -6568,7 +6975,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(notified(pi, "forkImportFailed")).toBe(false);
       expect(notified(pi, "forkInheritanceSkipped")).toBe(true);
-      const db = metadata();
+      const db = await metadata();
       expect(
         readTestSessionRegistration(metadataPath(), child.sessionId),
       ).toBeDefined();
@@ -6615,7 +7022,7 @@ describe("checkpoint authority lifecycle", () => {
 
         await pi.replaceSession(child, registerCyclotomy, reason, sourceFile);
 
-        const db = metadata();
+        const db = await metadata();
         expect(
           checkpointState(db, child.sessionId, sourceLeaf),
         ).toBeUndefined();
@@ -6634,7 +7041,7 @@ describe("checkpoint authority lifecycle", () => {
       const sessionId = pi.manager.sessionId;
       const originalSessionFile = pi.manager.getSessionFile()!;
       const entryId = pi.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const original = checkpointState(before, sessionId, entryId)!;
       before.close();
 
@@ -6652,7 +7059,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
         "duplicate-workspace",
       );
-      const after = metadata();
+      const after = await metadata();
       expect(checkpointState(after, sessionId, entryId)).toEqual(original);
       expect(readTestSessionRegistrations(metadataPath())[0]?.sessionFile).toBe(
         originalSessionFile,
@@ -6685,16 +7092,20 @@ describe("checkpoint authority lifecycle", () => {
       await mkdir(storeRoot, { recursive: true });
       const originalOid = "a".repeat(64);
       const originalSessionFile = join(home, "original.jsonl");
-      let db = metadata();
-      registerTestSession(db, "shared-session", originalSessionFile, [leaf.id]);
-      commitTestNodeState(db, "shared-session", leaf.id, originalOid);
+      let db = await metadata();
+      await mutateMetadata(db, () => {
+        registerTestSession(db, "shared-session", originalSessionFile, [
+          leaf.id,
+        ]);
+        commitTestNodeState(db, "shared-session", leaf.id, originalOid);
+      });
       db.close();
       await writeFile(join(workspace, "a.txt"), "must-not-be-captured");
 
       await pi.endTurn(0);
       await pi.runCommand("restore");
 
-      db = metadata();
+      db = await metadata();
       expect(checkpointState(db, "shared-session", leaf.id)?.treeOid).toBe(
         originalOid,
       );
@@ -6996,7 +7407,7 @@ describe("checkpoint authority lifecycle", () => {
         process.platform === "win32",
         "Windows symlink creation is privilege-dependent",
       );
-      let targetWorkspace = await mkdtemp(
+      const alternateWorkspace = await mkdtemp(
         join(tmpdir(), "cyclotomy-pi-fork-rebound-target-"),
       );
       const storageA = join(home, "fork-storage-a");
@@ -7006,6 +7417,33 @@ describe("checkpoint authority lifecycle", () => {
       try {
         await Promise.all([mkdir(storageA), mkdir(storageB)]);
         const canonicalStorageA = await realpath(storageA);
+        const candidates = await Promise.all(
+          [workspace, alternateWorkspace].map(async (candidateWorkspace) => {
+            const hash = createHash("sha256")
+              .update(await realpath(candidateWorkspace))
+              .digest("hex");
+            const storeRoot = join(canonicalStorageA, hash);
+            await mkdir(storeRoot);
+            const identity = await lstat(storeRoot);
+            return {
+              workspace: candidateWorkspace,
+              storeRoot,
+              order: {
+                path: storeRoot,
+                device: identity.dev,
+                inode: identity.ino,
+              },
+            };
+          }),
+        );
+        candidates.sort((left, right) =>
+          compareWorkspaceLockPhysicalOrder(left.order, right.order),
+        );
+        const targetWorkspace = candidates[0]!.workspace;
+        const targetStoreRoot = candidates[0]!.storeRoot;
+        const sourceWorkspace = candidates[1]!.workspace;
+        const sourceStoreRoot = candidates[1]!.storeRoot;
+
         await symlink(storageA, storageAlias);
         await writeFile(
           join(home, "cyclotomy", "settings.json"),
@@ -7021,27 +7459,24 @@ describe("checkpoint authority lifecycle", () => {
           `${JSON.stringify({
             type: "session",
             id: "rebound-parent",
-            cwd: workspace,
+            cwd: sourceWorkspace,
           })}\n`,
         );
 
-        const parent = new FakePi(workspace);
+        const parent = new FakePi(sourceWorkspace);
         parent.manager = new FakeSessionManager(
           "rebound-parent",
           parentFile,
-          workspace,
+          sourceWorkspace,
         );
         registerCyclotomy(parent.api);
         await parent.startSession("startup");
-        await writeFile(join(workspace, "state.txt"), "parent state");
+        await writeFile(join(sourceWorkspace, "state.txt"), "parent state");
         await parent.endTurn();
         const retained = parent.manager.getLeafId()!;
-        const sourceHash = createHash("sha256")
-          .update(await realpath(workspace))
-          .digest("hex");
-        const sourceStoreRoot = join(canonicalStorageA, sourceHash);
-        const sourceMetadata = createCurrentMetadataStore(
+        const sourceMetadata = await createTestCurrentMetadataStore(
           join(sourceStoreRoot, "state.db"),
+          sourceStoreRoot,
         );
         const sourceOid = checkpointState(
           sourceMetadata,
@@ -7049,28 +7484,6 @@ describe("checkpoint authority lifecycle", () => {
           retained,
         )!.treeOid;
         sourceMetadata.close();
-
-        let targetHash = createHash("sha256")
-          .update(await realpath(targetWorkspace))
-          .digest("hex");
-        for (
-          let attempt = 0;
-          Buffer.from(targetHash).compare(Buffer.from(sourceHash)) >= 0 &&
-          attempt < 100;
-          attempt += 1
-        ) {
-          await rm(targetWorkspace, { recursive: true, force: true });
-          targetWorkspace = await mkdtemp(
-            join(tmpdir(), "cyclotomy-pi-fork-rebound-target-"),
-          );
-          targetHash = createHash("sha256")
-            .update(await realpath(targetWorkspace))
-            .digest("hex");
-        }
-        if (Buffer.from(targetHash).compare(Buffer.from(sourceHash)) >= 0) {
-          throw new Error("failed to choose a target ordered before source");
-        }
-        const targetStoreRoot = join(canonicalStorageA, targetHash);
 
         await writeFile(join(targetWorkspace, "state.txt"), "target state");
         const child = new FakePi(targetWorkspace);
@@ -7089,19 +7502,24 @@ describe("checkpoint authority lifecycle", () => {
           loadCyclotomyConfig(home),
           TEST_I18N,
         );
+        if (!(await runtime.ensureStore(targetWorkspace))) {
+          throw new Error(
+            "failed to prepare target store before ordered import",
+          );
+        }
         registerPreparedRuntime(child.api, runtime);
 
         const sourceLock = await acquireWorkspaceLock(
           sourceStoreRoot,
-          "hold-source-before-rebound",
+          "hold-second-ordered-root-before-rebound",
         );
         const starting = child.startSession("fork", parentFile);
         try {
-          const targetLockPath = join(targetStoreRoot, "workspace.lock");
+          const firstLockPath = join(targetStoreRoot, "workspace.lock");
           let importLockObserved = false;
           for (let attempt = 0; attempt < 800; attempt += 1) {
             try {
-              const names = await readdir(targetLockPath);
+              const names = await readdir(firstLockPath);
               for (const name of names) {
                 if (!name.startsWith("owner-") || !name.endsWith(".json")) {
                   continue;
@@ -7109,17 +7527,13 @@ describe("checkpoint authority lifecycle", () => {
                 let record: { operation?: unknown };
                 try {
                   record = JSON.parse(
-                    await readFile(join(targetLockPath, name), "utf8"),
+                    await readFile(join(firstLockPath, name), "utf8"),
                   ) as { operation?: unknown };
                 } catch (error) {
-                  const token = name.slice("owner-".length, -".json".length);
-                  if (
-                    error instanceof SyntaxError &&
-                    !names.includes(`heartbeat-${token}`)
-                  ) {
-                    // writeFile publishes the owner before its heartbeat. A
-                    // parse failure is transient only in that formation gap;
-                    // malformed records with a published heartbeat still fail.
+                  if (error instanceof SyntaxError) {
+                    // The owner pathname can be observed while its one bounded
+                    // write is still publishing. The polling deadline remains
+                    // the fail-closed bound for a persistently malformed owner.
                     continue;
                   }
                   throw error;
@@ -7145,7 +7559,10 @@ describe("checkpoint authority lifecycle", () => {
               setTimeout(resolveWait, 5),
             );
           }
-          expect(importLockObserved).toBe(true);
+          expect(
+            importLockObserved,
+            JSON.stringify({ notifications: child.notifications }),
+          ).toBe(true);
           await rm(storageAlias);
           await symlink(storageB, storageAlias);
         } finally {
@@ -7159,8 +7576,9 @@ describe("checkpoint authority lifecycle", () => {
           "target state",
         );
 
-        const targetMetadata = createCurrentMetadataStore(
+        const targetMetadata = await createTestCurrentMetadataStore(
           join(targetStoreRoot, "state.db"),
+          targetStoreRoot,
         );
         expect(
           readTestSessionRegistration(
@@ -7178,7 +7596,7 @@ describe("checkpoint authority lifecycle", () => {
         const targetStore = await openObjectStore(targetStoreRoot);
         await expect(targetStore.readTree(sourceOid)).rejects.toThrow();
       } finally {
-        await rm(targetWorkspace, { recursive: true, force: true });
+        await rm(alternateWorkspace, { recursive: true, force: true });
       }
     });
 
@@ -7230,8 +7648,9 @@ describe("checkpoint authority lifecycle", () => {
           .update(await realpath(workspace))
           .digest("hex");
         const sourceStoreRoot = join(canonicalStorageA, sourceHash);
-        const sourceMetadata = createCurrentMetadataStore(
+        const sourceMetadata = await createTestCurrentMetadataStore(
           join(sourceStoreRoot, "state.db"),
+          sourceStoreRoot,
         );
         const sourceOid = checkpointState(
           sourceMetadata,
@@ -7244,27 +7663,20 @@ describe("checkpoint authority lifecycle", () => {
           .update(await realpath(targetWorkspace))
           .digest("hex");
         const targetStoreRoot = join(canonicalStorageA, targetHash);
-        const prototypeStore = await openObjectStore(sourceStoreRoot);
-        const prototype = Object.getPrototypeOf(prototypeStore) as Pick<
-          ObjectStore,
-          "verifyBlobs"
-        >;
-        const originalVerifyBlobs = prototype.verifyBlobs;
         let rebound = false;
-        const verifyBlobs = vi
-          .spyOn(prototype, "verifyBlobs")
-          .mockImplementation(async function (
-            this: ObjectStore,
-            blobOids: readonly string[],
-          ) {
-            await originalVerifyBlobs.call(this, blobOids);
-            if (!rebound && this.storageRoot === targetStoreRoot) {
-              expect(blobOids.length).toBeGreaterThan(0);
-              await rm(storageAlias);
-              await symlink(storageB, storageAlias);
-              rebound = true;
-            }
-          });
+        const verifyBlobs = await interceptRepositoryContentStream({
+          storageRoot: targetStoreRoot,
+          contentId: contentIdForText("parent state"),
+          // Target publication authenticates through private repository
+          // primitives. Its first public scoped stream is the final collective
+          // closure proof, after CAS objects exist but before metadata commit.
+          occurrence: 1,
+          action: async () => {
+            rebound = true;
+            await rm(storageAlias);
+            await symlink(storageB, storageAlias);
+          },
+        });
         try {
           await writeFile(join(targetWorkspace, "state.txt"), "target state");
           const child = new FakePi(targetWorkspace);
@@ -7283,14 +7695,17 @@ describe("checkpoint authority lifecycle", () => {
           await child.startSession("fork", parentFile);
 
           expect(rebound).toBe(true);
+          expect(verifyBlobs.triggered()).toBe(true);
+          expect(verifyBlobs.matchingStreams()).toBe(1);
           expect(notified(child, "forkImportFailed")).toBe(true);
           expect(notified(child, "forkInheritanceSkipped")).toBe(false);
           expect(
             await readFile(join(targetWorkspace, "state.txt"), "utf8"),
           ).toBe("target state");
 
-          const targetMetadata = createCurrentMetadataStore(
+          const targetMetadata = await createTestCurrentMetadataStore(
             join(targetStoreRoot, "state.db"),
+            targetStoreRoot,
           );
           expect(
             readTestSessionRegistration(
@@ -7309,7 +7724,7 @@ describe("checkpoint authority lifecycle", () => {
           const targetStore = await openObjectStore(targetStoreRoot);
           await expect(targetStore.readTree(sourceOid)).resolves.toBeDefined();
         } finally {
-          verifyBlobs.mockRestore();
+          verifyBlobs.spy.mockRestore();
         }
       } finally {
         await rm(targetWorkspace, { recursive: true, force: true });
@@ -7337,7 +7752,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "state.txt"), "parent checkpoint");
       await parent.endTurn();
       const retained = parent.manager.getLeafId()!;
-      const before = metadata();
+      const before = await metadata();
       const parentOid = checkpointState(
         before,
         "missing-local-parent",
@@ -7361,7 +7776,7 @@ describe("checkpoint authority lifecycle", () => {
 
       await child.startSession("fork", parentFile);
 
-      const after = metadata();
+      const after = await metadata();
       expect(
         checkpointState(after, "missing-local-parent", retained)?.treeOid,
       ).toBe(parentOid);
@@ -7812,7 +8227,7 @@ describe("checkpoint authority lifecycle", () => {
           "Pi session contains a parent cycle",
         ),
       ).toBe(true);
-      const db = metadata();
+      const db = await metadata();
       expect(
         readTestSessionRegistration(metadataPath(), "malformed-fork"),
       ).toBeUndefined();
@@ -7853,7 +8268,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.endTurn();
       const source = pi.manager.getLeafId()!;
-      const initial = metadata();
+      const initial = await metadata();
       const initialOid = checkpointState(
         initial,
         pi.manager.sessionId,
@@ -7864,7 +8279,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.api.on("session_before_fork", async () => ({ cancel: true }));
 
       expect(await pi.fork(source)).toBe("cancelled");
-      let db = metadata();
+      let db = await metadata();
       const forkOid = checkpointState(
         db,
         pi.manager.sessionId,
@@ -7876,11 +8291,46 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "before-switch-veto");
       pi.api.on("session_before_switch", async () => ({ cancel: true }));
       expect(await pi.resumeTo(pi.newDetachedSession())).toBe("cancelled");
-      db = metadata();
+      db = await metadata();
       expect(
         checkpointState(db, pi.manager.sessionId, source)?.treeOid,
       ).not.toBe(forkOid);
       db.close();
+    });
+
+    it("explains cancellation when the session view drifts after switch capture", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.endTurn();
+      await writeFile(join(workspace, "a.txt"), "before-switch");
+      const target = pi.newDetachedSession();
+      const commitPreparedCapture =
+        CyclotomyRuntime.prototype.commitPreparedCapture;
+      let drifted = false;
+      const driftAfterCapture = vi
+        .spyOn(CyclotomyRuntime.prototype, "commitPreparedCapture")
+        .mockImplementation(function (
+          this: CyclotomyRuntime,
+          ...args: Parameters<CyclotomyRuntime["commitPreparedCapture"]>
+        ) {
+          const result = commitPreparedCapture.call(this, ...args);
+          if (!drifted) {
+            pi.manager.appendEntry();
+            drifted = true;
+          }
+          return result;
+        });
+
+      try {
+        expect(await pi.resumeTo(target)).toBe("cancelled");
+      } finally {
+        driftAfterCapture.mockRestore();
+      }
+
+      expect(drifted).toBe(true);
+      expect(notified(pi, "commandLocationChanged")).toBe(true);
     });
   });
 });

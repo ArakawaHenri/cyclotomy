@@ -10,6 +10,7 @@ import {
   type StableCoordinate,
 } from "./extension-boundary.ts";
 import { projectPublicSessionCoreIdentity } from "./session-view.ts";
+import { systemErrorCode } from "../infrastructure/system-error.ts";
 
 const COPY_CHUNK_BYTES = 64 * 1024;
 const MAX_COLD_PARENT_SESSION_BYTES = 64 * 1024 * 1024;
@@ -36,12 +37,6 @@ export class PiSessionSourceRejectedError extends Error {
     this.name = "PiSessionSourceRejectedError";
     this.kind = kind;
   }
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
 }
 
 async function runWithCleanup<T>(
@@ -185,7 +180,9 @@ export async function readPiSessionPublicObservation(
   try {
     before = await lstat(sessionFile, { bigint: true });
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return { kind: "source-missing" };
+    if (systemErrorCode(error) === "ENOENT") {
+      return { kind: "source-missing" };
+    }
     throw error;
   }
   requireRegularFile(before);
@@ -198,7 +195,7 @@ export async function readPiSessionPublicObservation(
   } catch (error) {
     // The path existed at the initial observation. Losing it before the fixed
     // descriptor is acquired is a race, not durable evidence of absence.
-    if (errorCode(error) === "ENOENT") {
+    if (systemErrorCode(error) === "ENOENT") {
       throw new Error("Pi parent session changed before it was copied", {
         cause: error,
       });

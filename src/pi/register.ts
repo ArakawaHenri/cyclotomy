@@ -26,9 +26,10 @@ import {
 import { CyclotomyEngineController } from "./engine-controller.ts";
 import { createCyclotomyI18n, type CyclotomyI18n } from "./i18n.ts";
 import {
-  notifyArrivalProtectionFailure,
+  notifyArrivalDispositionFailure,
   notifyWorkspaceLockCleanupFailure,
-} from "./restore-outcome.ts";
+} from "./restore-notifications.ts";
+import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
 import { messageOfUnknown } from "./unknown-error.ts";
 
 type CyclotomyRuntimeEvent = Exclude<
@@ -113,11 +114,8 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
       await engine.runtime.workspaceMutations.protectCurrentLocationForRetirement(
         context,
       );
-    notifyArrivalProtectionFailure(
-      engine.runtime,
-      context,
-      recovery.protection,
-    );
+    applyActiveArrivalSettlement(engine.runtime, recovery.arrival);
+    notifyArrivalDispositionFailure(engine.runtime, context, recovery.arrival);
     notifyWorkspaceLockCleanupFailure(
       engine.runtime,
       context,
@@ -168,10 +166,11 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
         context,
         failure,
       );
-      notifyArrivalProtectionFailure(
+      applyActiveArrivalSettlement(lease.engine.runtime, recovery.arrival);
+      notifyArrivalDispositionFailure(
         lease.engine.runtime,
         context,
-        recovery.protection,
+        recovery.arrival,
       );
       notifyWorkspaceLockCleanupFailure(
         lease.engine.runtime,
@@ -239,10 +238,11 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
         context,
         failure,
       );
-      notifyArrivalProtectionFailure(
+      applyActiveArrivalSettlement(lease.engine.runtime, recovery.arrival);
+      notifyArrivalDispositionFailure(
         lease.engine.runtime,
         context,
-        recovery.protection,
+        recovery.arrival,
       );
       notifyWorkspaceLockCleanupFailure(
         lease.engine.runtime,

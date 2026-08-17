@@ -99,26 +99,9 @@ export interface MetadataVersionNode {
   ) => MetadataSessionIdentityMatch;
 }
 
-interface MetadataVersionDefinition {
-  readonly version: number;
-  readonly treeFormat: string;
-  readonly schema: Readonly<MetadataSchemaSpec>;
-  readonly previous?: MetadataVersionNode;
-  readonly upgradeFromPrevious?: AdjacentMetadataUpgrade;
-  readonly initializeWithinTransaction: (db: DatabaseSync) => void;
-  readonly referencedTreeOids: (
-    db: DatabaseSync,
-    limit?: number,
-  ) => readonly TreeOid[];
-  readonly matchSessionIdentity: (
-    db: DatabaseSync,
-    sessionId: string,
-    sessionFile: string,
-  ) => MetadataSessionIdentityMatch;
-}
-
+/** Validate and freeze one caller-defined node before it joins the history. */
 export function defineMetadataVersion(
-  definition: MetadataVersionDefinition,
+  definition: MetadataVersionNode,
 ): MetadataVersionNode {
   if (
     !isDefinedMetadataSchema(definition.schema) ||

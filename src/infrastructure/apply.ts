@@ -19,13 +19,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   type FileRecreationMode,
   type TreeEntry,
-  type TreeManifest,
 } from "./tree-formats/manifest-codec.ts";
+import type { CurrentTreeManifest } from "./tree-formats/current.ts";
 import {
   prepareWorkspaceRestorePlan,
   type WorkspacePathAlias,
 } from "./restore-preparation.ts";
 import type { WorkspacePathRename } from "./restore-plan.ts";
+import { systemErrorCode } from "./system-error.ts";
 import {
   summarizeScanProblems,
   type WorkspaceEntry,
@@ -33,6 +34,15 @@ import {
 } from "./workspace-scan.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
 import { portableWorkspacePathKey } from "./workspace-scope.ts";
+import {
+  addWorkspacePathAncestors,
+  workspacePathIsAtOrBelow,
+  workspacePathSetHasAtOrAbove,
+} from "./workspace-path-relations.ts";
+import {
+  assertWorkspaceWriteAuthority,
+  type WorkspaceWriteAuthority,
+} from "./workspace-lock.ts";
 
 export type ApplyProblemKind =
   "write-failed" | "delete-failed" | "mkdir-failed" | "read-failed";
@@ -84,52 +94,69 @@ const UNOBSERVED_PATH_DETAIL =
 const BLOCKED_ANCESTOR_DETAIL =
   "refusing to mutate below an unsafe or unavailable target directory";
 
+interface WorkspaceWriteAccess {
+  readonly writeAuthority: WorkspaceWriteAuthority;
+  readonly storeRoot: string;
+}
+
+type WorkspaceMutationCutover = () => WorkspaceWriteAccess;
+
 /**
  * A restore may spend an arbitrary amount of time in asynchronous preflight.
- * Entering this gate is the single synchronous cutover from observation to
- * mutation. Every possible first workspace mutation enters it immediately
- * before issuing its syscall; subsequent entries are no-ops. A rejected
- * cutover stays rejected so per-path error collection can never let a later
- * path mutate without authority. A no-op apply never enters; a potentially
- * mutating syscall does even when the kernel ultimately rejects that syscall.
+ * The first entry is the synchronous business cutover from observation to
+ * mutation. Every entry also revalidates the continuing workspace authority
+ * immediately before its durable syscall. A rejected entry stays rejected so
+ * per-path error collection can never let a later path mutate without
+ * authority. A no-op apply never enters; a potentially mutating syscall does
+ * even when the kernel ultimately rejects that syscall.
  */
 class WorkspaceMutationGate {
-  #state: "pending" | "entered" | "rejected" = "pending";
-  #rejection: unknown;
-  readonly #beforeFirstMutation: () => void;
+  #state:
+    | { readonly kind: "ready" }
+    | { readonly kind: "authorized"; readonly access: WorkspaceWriteAccess }
+    | { readonly kind: "rejected"; readonly cause: unknown } = {
+    kind: "ready",
+  };
+  readonly #cutover: WorkspaceMutationCutover;
 
-  constructor(beforeFirstMutation: () => void) {
-    this.#beforeFirstMutation = beforeFirstMutation;
+  constructor(cutover: WorkspaceMutationCutover) {
+    this.#cutover = cutover;
   }
 
   enter(): void {
-    if (this.#state === "entered") return;
-    if (this.#state === "rejected") throw this.#rejection;
+    if (this.#state.kind === "rejected") throw this.#state.cause;
 
     try {
-      this.#beforeFirstMutation();
-      this.#state = "entered";
+      let access: WorkspaceWriteAccess;
+      if (this.#state.kind === "ready") {
+        const proposed: unknown = this.#cutover();
+        if (
+          typeof proposed !== "object" ||
+          proposed === null ||
+          typeof Reflect.get(proposed, "then") === "function" ||
+          typeof Reflect.get(proposed, "writeAuthority") !== "object" ||
+          Reflect.get(proposed, "writeAuthority") === null ||
+          typeof Reflect.get(proposed, "storeRoot") !== "string" ||
+          Reflect.get(proposed, "storeRoot") === ""
+        ) {
+          throw new Error(
+            "workspace mutation authorization must complete synchronously",
+          );
+        }
+        access = proposed as WorkspaceWriteAccess;
+        this.#state = { kind: "authorized", access };
+      } else {
+        access = this.#state.access;
+      }
+      assertWorkspaceWriteAuthority(access.writeAuthority, access.storeRoot);
     } catch (error) {
-      this.#state = "rejected";
-      this.#rejection = error;
+      this.#state = { kind: "rejected", cause: error };
       throw error;
     }
   }
 
   throwIfRejected(): void {
-    if (this.#state === "rejected") throw this.#rejection;
-  }
-}
-
-function errorCode(error: unknown): string | undefined {
-  try {
-    if (typeof error !== "object" || error === null) {
-      return undefined;
-    }
-    const value = Reflect.get(error, "code");
-    return typeof value === "string" ? value : undefined;
-  } catch {
-    return undefined;
+    if (this.#state.kind === "rejected") throw this.#state.cause;
   }
 }
 
@@ -157,19 +184,11 @@ function isGitInternalPath(relativePath: string): boolean {
     .some((component) => portableWorkspacePathKey(component) === ".git");
 }
 
-function ancestorDirectories(relativePath: string, into: Set<string>): void {
-  let separator = relativePath.lastIndexOf("/");
-  while (separator !== -1) {
-    const ancestor = relativePath.slice(0, separator);
-    into.add(ancestor);
-    separator = ancestor.lastIndexOf("/");
-  }
-}
-
 /** Publish a missing/recreated regular file through an atomic sibling rename. */
 async function writeRegularAtomically(
   absolute: string,
-  content: Uint8Array,
+  blobOid: string,
+  streamBlob: ApplyBlobStreamReader,
   recreationMode: FileRecreationMode,
   beforeCommit: () => Promise<void>,
   mutationGate: WorkspaceMutationGate,
@@ -192,14 +211,17 @@ async function writeRegularAtomically(
       0o600,
     );
     temporaryCreated = true;
-    await handle.writeFile(content);
+    await streamBlobIntoHandle(handle, blobOid, streamBlob, mutationGate);
     if (process.platform !== "win32" && recreationMode !== null) {
+      mutationGate.enter();
       await handle.chmod(recreationMode);
     }
+    mutationGate.enter();
     await handle.sync();
     await handle.close();
     handle = undefined;
     await beforeCommit();
+    mutationGate.enter();
     await rename(temporary, absolute);
   } catch (error) {
     if (handle !== undefined) {
@@ -211,9 +233,10 @@ async function writeRegularAtomically(
     }
     if (temporaryCreated) {
       try {
+        mutationGate.enter();
         await unlink(temporary);
       } catch (cleanupError) {
-        if (errorCode(cleanupError) !== "ENOENT") {
+        if (systemErrorCode(cleanupError) !== "ENOENT") {
           // Orphan temporary files are inert; preserve the original failure.
         }
       }
@@ -285,20 +308,47 @@ function assertStableRead(before: Stats, after: Stats): void {
 async function writeAll(
   handle: FileHandle,
   content: Uint8Array,
+  mutationGate: WorkspaceMutationGate,
+  position = 0,
 ): Promise<void> {
   let offset = 0;
   while (offset < content.byteLength) {
+    mutationGate.enter();
     const { bytesWritten } = await handle.write(
       content,
       offset,
       content.byteLength - offset,
-      offset,
+      position + offset,
     );
     if (bytesWritten === 0) {
       throw new Error("zero-byte write during in-place regular-file rewrite");
     }
     offset += bytesWritten;
   }
+}
+
+export type ApplyBlobStreamReader = (
+  oid: string,
+  sink: (chunk: Uint8Array) => Promise<void>,
+) => Promise<{ readonly decodedLength: number }>;
+
+async function streamBlobIntoHandle(
+  handle: FileHandle,
+  oid: string,
+  streamBlob: ApplyBlobStreamReader,
+  mutationGate: WorkspaceMutationGate,
+): Promise<number> {
+  const hash = createHash("sha256");
+  let byteLength = 0;
+  const streamed = await streamBlob(oid, async (chunk) => {
+    await writeAll(handle, chunk, mutationGate, byteLength);
+    hash.update(chunk);
+    byteLength += chunk.byteLength;
+  });
+  if (streamed.decodedLength !== byteLength || hash.digest("hex") !== oid) {
+    throw new Error("blob stream does not match its content id");
+  }
+  return byteLength;
 }
 
 /**
@@ -312,7 +362,8 @@ async function writeAll(
  */
 async function rewriteRegularInPlace(
   absolute: string,
-  content: Uint8Array,
+  blobOid: string,
+  streamBlob: ApplyBlobStreamReader,
   observed: Extract<WorkspaceEntry, { readonly kind: "regular" }>,
   validateAncestors: () => Promise<void>,
   mutationGate: WorkspaceMutationGate,
@@ -365,11 +416,17 @@ async function rewriteRegularInPlace(
 
     mutationGate.enter();
     await handle.truncate(0);
-    await writeAll(handle, content);
-    await handle.truncate(content.byteLength);
+    const decodedLength = await streamBlobIntoHandle(
+      handle,
+      blobOid,
+      streamBlob,
+      mutationGate,
+    );
+    mutationGate.enter();
+    await handle.truncate(decodedLength);
+    mutationGate.enter();
     await handle.sync();
 
-    const expectedSha256 = createHash("sha256").update(content).digest("hex");
     const beforeVerification = await handle.stat();
     assertSingleLinkRegular(
       beforeVerification,
@@ -378,17 +435,14 @@ async function rewriteRegularInPlace(
     if (!sameInode(opened, beforeVerification)) {
       throw new Error("opened regular-file identity changed during rewrite");
     }
-    const written = await hashOpenedRegular(handle, content.byteLength);
+    const written = await hashOpenedRegular(handle, decodedLength);
     const afterVerification = await handle.stat();
     assertSingleLinkRegular(
       afterVerification,
       "rewritten inode is no longer a single-link regular file",
     );
     assertStableRead(beforeVerification, afterVerification);
-    if (
-      written.byteLength !== content.byteLength ||
-      written.sha256 !== expectedSha256
-    ) {
+    if (written.byteLength !== decodedLength || written.sha256 !== blobOid) {
       throw new Error("rewritten regular-file content failed verification");
     }
     await validateAncestors();
@@ -431,10 +485,16 @@ async function writeSymlinkAtomically(
     }
     temporaryCreated = true;
     await beforeCommit();
+    mutationGate.enter();
     await rename(temporary, absolute);
   } catch (error) {
     if (temporaryCreated) {
-      await unlink(temporary).catch(() => {});
+      try {
+        mutationGate.enter();
+        await unlink(temporary);
+      } catch {
+        // A stale owner must leave its inert private temporary untouched.
+      }
     }
     throw error;
   }
@@ -445,7 +505,10 @@ function targetRecreationMode(entry: RegularTargetEntry): FileRecreationMode {
   return entry.recreationMode;
 }
 
-async function syncDirectory(absolute: string): Promise<void> {
+async function syncDirectory(
+  absolute: string,
+  mutationGate: WorkspaceMutationGate,
+): Promise<void> {
   // Windows does not expose a portable directory FlushFileBuffers contract.
   // File contents are still fsynced; directory-entry crash durability remains
   // best-effort on that platform instead of making capture/restore unusable.
@@ -461,6 +524,7 @@ async function syncDirectory(absolute: string): Promise<void> {
     if (!metadata.isDirectory()) {
       throw new Error("path is no longer a directory");
     }
+    mutationGate.enter();
     await handle.sync();
   } finally {
     await handle.close();
@@ -524,7 +588,8 @@ async function assertPreparedDirectoryAlias(
   } catch (error) {
     if (
       !alias.targetExisted &&
-      (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR")
+      (systemErrorCode(error) === "ENOENT" ||
+        systemErrorCode(error) === "ENOTDIR")
     ) {
       return;
     }
@@ -684,20 +749,6 @@ function physicalAliasAncestor(
   return undefined;
 }
 
-function isAtOrBelow(path: string, root: string): boolean {
-  return path === root || path.startsWith(`${root}/`);
-}
-
-function hasPathAtOrAbove(path: string, paths: ReadonlySet<string>): boolean {
-  let candidate = path;
-  while (true) {
-    if (paths.has(candidate)) return true;
-    const separator = candidate.lastIndexOf("/");
-    if (separator === -1) return false;
-    candidate = candidate.slice(0, separator);
-  }
-}
-
 async function assertUnobservedPathAbsent(
   workspaceRoot: string,
   relativePath: string,
@@ -707,7 +758,7 @@ async function assertUnobservedPathAbsent(
   try {
     await lstat(join(workspaceRoot, relativePath));
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return;
+    if (systemErrorCode(error) === "ENOENT") return;
     throw error;
   }
   throw new Error(UNOBSERVED_PATH_DETAIL);
@@ -738,7 +789,9 @@ async function assertReplacementDirectoryInventory(
   directories: ReadonlyMap<string, DirectoryObservation>,
 ): Promise<void> {
   const observedDirectories = [...directories.values()]
-    .filter((observation) => isAtOrBelow(observation.path, replacementRoot))
+    .filter((observation) =>
+      workspacePathIsAtOrBelow(observation.path, replacementRoot),
+    )
     .sort((left, right) => comparePaths(left.path, right.path));
   if (observedDirectories[0]?.path !== replacementRoot) {
     throw new Error(
@@ -762,7 +815,10 @@ async function assertReplacementDirectoryInventory(
 
   const expectedChildren = new Map<string, Set<string>>();
   const addKnownPath = (path: string): void => {
-    if (path === replacementRoot || !isAtOrBelow(path, replacementRoot)) {
+    if (
+      path === replacementRoot ||
+      !workspacePathIsAtOrBelow(path, replacementRoot)
+    ) {
       return;
     }
     const parentValue = dirname(path);
@@ -830,7 +886,7 @@ async function preflightReplacementNamespace(
       }
       await assertObservedDirectory(workspaceRoot, observation);
       const covered = [...inventoriedAliasDirectories].some((root) =>
-        isAtOrBelow(alias.from, root),
+        workspacePathIsAtOrBelow(alias.from, root),
       );
       if (!covered) {
         await assertReplacementDirectoryInventory(
@@ -1044,14 +1100,24 @@ async function assertWorkspaceEntryUnchanged(
  * unchanged. The caller owns scanning `current` beforehand and re-scanning
  * for verification afterwards.
  */
-export async function applyTreeToWorkspace(
+type ApplyBlobSource =
+  | {
+      readonly kind: "buffer";
+      readonly readBlob: (oid: string) => Promise<Uint8Array>;
+    }
+  | {
+      readonly kind: "stream";
+      readonly streamBlob: ApplyBlobStreamReader;
+    };
+
+async function applyTreeToWorkspaceFromSource(
   root: string,
-  target: TreeManifest,
-  readBlob: (oid: string) => Promise<Uint8Array>,
+  target: CurrentTreeManifest,
+  blobSource: ApplyBlobSource,
   current: WorkspaceSnapshot,
-  beforeFirstMutation: () => void,
+  cutover: WorkspaceMutationCutover,
 ): Promise<ApplyReport> {
-  const mutationGate = new WorkspaceMutationGate(beforeFirstMutation);
+  const mutationGate = new WorkspaceMutationGate(cutover);
   if (current.problems.length > 0) {
     throw new ApplyError(
       `refusing to apply from an incomplete current workspace scan: ${summarizeScanProblems(
@@ -1165,7 +1231,7 @@ export async function applyTreeToWorkspace(
       continue;
     }
     currentByPath.set(entry.path, entry);
-    ancestorDirectories(entry.path, currentDirectories);
+    addWorkspacePathAncestors(entry.path, currentDirectories);
   }
   for (const directory of currentDirectories) {
     if (!directoryObservations.has(directory)) {
@@ -1219,7 +1285,7 @@ export async function applyTreeToWorkspace(
   // directories are deliberately outside the checkpoint model.
   const targetKeptDirectories = new Set<string>();
   for (const entry of targetByPath.values()) {
-    ancestorDirectories(entry.path, targetKeptDirectories);
+    addWorkspacePathAncestors(entry.path, targetKeptDirectories);
   }
   await preflightReplacementNamespace(
     workspaceRoot,
@@ -1251,7 +1317,7 @@ export async function applyTreeToWorkspace(
     try {
       await lstat(join(workspaceRoot, relativePath));
     } catch (error) {
-      if (errorCode(error) === "ENOENT") return;
+      if (systemErrorCode(error) === "ENOENT") return;
       throw error;
     }
     throw new Error(UNOBSERVED_PATH_DETAIL);
@@ -1273,7 +1339,7 @@ export async function applyTreeToWorkspace(
   const pathAfterCommittedRecases = (path: string): string => {
     let current = path;
     for (const recase of committedDirectoryRecases) {
-      if (isAtOrBelow(current, recase.from)) {
+      if (workspacePathIsAtOrBelow(current, recase.from)) {
         current = `${recase.to}${current.slice(recase.from.length)}`;
       }
     }
@@ -1281,7 +1347,7 @@ export async function applyTreeToWorkspace(
   };
   const copyDirectoryObservations = (from: string, to: string): void => {
     for (const observation of [...directoryObservations.values()]) {
-      if (!isAtOrBelow(observation.path, from)) continue;
+      if (!workspacePathIsAtOrBelow(observation.path, from)) continue;
       const suffix = observation.path.slice(from.length);
       const targetPath = `${to}${suffix}`;
       directoryObservations.set(targetPath, {
@@ -1299,7 +1365,7 @@ export async function applyTreeToWorkspace(
   // managed entries still use their scanned spelling for later validation.
   for (const alias of directoryRecases) {
     const failedAncestor = [...failedDirectoryAliasSources].some((source) =>
-      isAtOrBelow(alias.from, source),
+      workspacePathIsAtOrBelow(alias.from, source),
     );
     if (failedAncestor) {
       failedDirectoryAliasSources.add(alias.from);
@@ -1392,7 +1458,7 @@ export async function applyTreeToWorkspace(
     const relativePath = currentEntry.path;
     if (
       [...failedDirectoryAliasSources].some((source) =>
-        isAtOrBelow(relativePath, source),
+        workspacePathIsAtOrBelow(relativePath, source),
       )
     ) {
       continue;
@@ -1437,7 +1503,7 @@ export async function applyTreeToWorkspace(
       (relativePath) =>
         !targetKeptDirectories.has(relativePath) &&
         !directoryAliases.some((alias) =>
-          isAtOrBelow(relativePath, alias.from),
+          workspacePathIsAtOrBelow(relativePath, alias.from),
         ),
     )
     .sort(
@@ -1463,7 +1529,7 @@ export async function applyTreeToWorkspace(
       dirtiedDirectories.delete(relativePath);
       markDirty(relativePath);
     } catch (error) {
-      const code = errorCode(error);
+      const code = systemErrorCode(error);
       if (code === "ENOTEMPTY" || code === "ENOTDIR" || code === "EEXIST") {
         continue;
       }
@@ -1494,7 +1560,10 @@ export async function applyTreeToWorkspace(
     if (directoryReplacementRootsByTarget.has(targetPath)) return;
     const effectiveObservedRoot = pathAfterCommittedRecases(observedRoot);
     if (
-      hasPathAtOrAbove(effectiveObservedRoot, directoryReplacementObservedRoots)
+      workspacePathSetHasAtOrAbove(
+        effectiveObservedRoot,
+        directoryReplacementObservedRoots,
+      )
     ) {
       return;
     }
@@ -1579,7 +1648,7 @@ export async function applyTreeToWorkspace(
     try {
       existing = await lstat(absolute);
     } catch (error) {
-      if (errorCode(error) !== "ENOENT") {
+      if (systemErrorCode(error) !== "ENOENT") {
         problems.push({
           path: relativePath,
           kind: "read-failed",
@@ -1754,7 +1823,7 @@ export async function applyTreeToWorkspace(
         });
         continue;
       } catch (error) {
-        if (errorCode(error) !== "ENOENT") {
+        if (systemErrorCode(error) !== "ENOENT") {
           problems.push({
             path: entry.path,
             kind: "read-failed",
@@ -1764,23 +1833,33 @@ export async function applyTreeToWorkspace(
         }
       }
     }
-    let content: Uint8Array;
-    try {
-      content = await readBlob(entry.blobOid);
-    } catch (error) {
-      problems.push({
-        path: entry.path,
-        kind: "write-failed",
-        detail: errorDetail(`read blob ${entry.blobOid}`, error),
-      });
-      continue;
+    let streamBlob: ApplyBlobStreamReader;
+    if (blobSource.kind === "buffer") {
+      let content: Uint8Array;
+      try {
+        content = await blobSource.readBlob(entry.blobOid);
+      } catch (error) {
+        problems.push({
+          path: entry.path,
+          kind: "write-failed",
+          detail: errorDetail(`read blob ${entry.blobOid}`, error),
+        });
+        continue;
+      }
+      streamBlob = async (_oid, sink) => {
+        await sink(content);
+        return { decodedLength: content.byteLength };
+      };
+    } else {
+      streamBlob = blobSource.streamBlob;
     }
     try {
       const absolute = join(workspaceRoot, entry.path);
       if (existingRegular !== undefined) {
         await rewriteRegularInPlace(
           absolute,
-          content,
+          entry.blobOid,
+          streamBlob,
           existingRegular,
           () =>
             assertObservedAncestors(
@@ -1797,7 +1876,8 @@ export async function applyTreeToWorkspace(
         await validateDestination();
         await writeRegularAtomically(
           absolute,
-          content,
+          entry.blobOid,
+          streamBlob,
           targetRecreationMode(entry),
           validateDestination,
           mutationGate,
@@ -1847,7 +1927,7 @@ export async function applyTreeToWorkspace(
           });
           continue;
         } catch (error) {
-          if (errorCode(error) !== "ENOENT") {
+          if (systemErrorCode(error) !== "ENOENT") {
             throw error;
           }
         }
@@ -1894,9 +1974,10 @@ export async function applyTreeToWorkspace(
       );
       await syncDirectory(
         relativePath === "" ? workspaceRoot : join(workspaceRoot, relativePath),
+        mutationGate,
       );
     } catch (error) {
-      if (errorCode(error) === "ENOENT") {
+      if (systemErrorCode(error) === "ENOENT") {
         // The directory was removed after it was dirtied (e.g. a pruned
         // parent took it away); the removal is the parent's fsync concern.
         continue;
@@ -1915,4 +1996,38 @@ export async function applyTreeToWorkspace(
   renamed.sort((left, right) => comparePaths(left.to, right.to));
   mutationGate.throwIfRejected();
   return { created, updated, deleted, renamed, unchangedCount, problems };
+}
+
+/** Compatibility convenience for callers that already materialize a blob. */
+export function applyTreeToWorkspace(
+  root: string,
+  target: CurrentTreeManifest,
+  readBlob: (oid: string) => Promise<Uint8Array>,
+  current: WorkspaceSnapshot,
+  cutover: WorkspaceMutationCutover,
+): Promise<ApplyReport> {
+  return applyTreeToWorkspaceFromSource(
+    root,
+    target,
+    { kind: "buffer", readBlob },
+    current,
+    cutover,
+  );
+}
+
+/** Apply already-staged logical content without materializing whole blobs. */
+export function applyTreeToWorkspaceFromStream(
+  root: string,
+  target: CurrentTreeManifest,
+  streamBlob: ApplyBlobStreamReader,
+  current: WorkspaceSnapshot,
+  cutover: WorkspaceMutationCutover,
+): Promise<ApplyReport> {
+  return applyTreeToWorkspaceFromSource(
+    root,
+    target,
+    { kind: "stream", streamBlob },
+    current,
+    cutover,
+  );
 }

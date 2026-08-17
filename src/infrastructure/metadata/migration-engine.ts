@@ -2,6 +2,10 @@ import { type DatabaseSync } from "node:sqlite";
 
 import { isTreeOid, type TreeOid } from "../../domain/model.ts";
 import { MetadataError } from "../metadata-error.ts";
+import {
+  assertWorkspaceWriteAuthority,
+  type WorkspaceWriteAuthority,
+} from "../workspace-lock.ts";
 import { CURRENT_METADATA_VERSION } from "./current.ts";
 import {
   dropWriterFences,
@@ -250,6 +254,8 @@ async function captureAndPrepareNextUpgrade(
 function applyPreparedUpgrade(
   db: DatabaseSync,
   current: MetadataVersionNode,
+  authority: WorkspaceWriteAuthority,
+  storeRoot: string,
   prepared: Extract<
     Awaited<ReturnType<typeof captureAndPrepareNextUpgrade>>,
     { readonly kind: "prepared" }
@@ -282,6 +288,7 @@ function applyPreparedUpgrade(
       return "tree-roots-changed";
     }
 
+    assertWorkspaceWriteAuthority(authority, storeRoot);
     dropWriterFences(db, upgrade.source.schema);
     if (upgrade.kind === "tree-format") {
       upgrade.edge.applyWithinTransaction(db, upgrade.prepared);
@@ -316,6 +323,8 @@ function applyPreparedUpgrade(
 export async function migrateMetadataToCurrent(
   db: DatabaseSync,
   dependencies: MetadataMigrationDependencies,
+  authority: WorkspaceWriteAuthority,
+  storeRoot: string,
   current: MetadataVersionNode = CURRENT_METADATA_VERSION,
 ): Promise<void> {
   let consecutiveTreeRootDriftRetries = 0;
@@ -324,6 +333,7 @@ export async function migrateMetadataToCurrent(
       db.exec("BEGIN IMMEDIATE");
       try {
         if (metadataSchemaVersion(db) === 0) {
+          assertWorkspaceWriteAuthority(authority, storeRoot);
           initializeMetadataVersionWithinTransaction(db, current);
           db.exec("COMMIT");
           return;
@@ -338,7 +348,13 @@ export async function migrateMetadataToCurrent(
 
     const next = await captureAndPrepareNextUpgrade(db, current, dependencies);
     if (next.kind === "current") return;
-    const result = applyPreparedUpgrade(db, current, next);
+    const result = applyPreparedUpgrade(
+      db,
+      current,
+      authority,
+      storeRoot,
+      next,
+    );
     if (result === "tree-roots-changed") {
       consecutiveTreeRootDriftRetries += 1;
       if (
