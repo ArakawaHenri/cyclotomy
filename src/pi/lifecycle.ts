@@ -437,9 +437,9 @@ async function reconcileLoadedConcreteSession(
       );
       return;
     case "outcome":
-      notifyArrivalDispositionFailure(runtime, context, settledResult!.arrival);
       notifyRestoreProtocolOutcome(runtime, context, {
         execution,
+        arrival: settledResult!.arrival,
         workspaceLockCleanup: settledResult!.workspaceLockCleanup,
       });
       return;

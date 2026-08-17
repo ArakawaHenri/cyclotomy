@@ -1,29 +1,9 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import type { CaptureSuccess } from "../application/capture.ts";
-import type { ResolvedNodeState } from "../application/resolve.ts";
 import type { NodeKey } from "../domain/model.ts";
+import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
+import { gitReplayRisk } from "../infrastructure/git-replay-risk.ts";
 import {
-  checkpointSlotsEqual,
-  checkpointSlotTreeOid,
-  type CheckpointSlot,
-} from "../domain/checkpoint-slot.ts";
-import {
-  planWorkspaceRestore,
-  restorePlanHasChanges,
-  workspaceSnapshotAsManifest,
-} from "../infrastructure/restore-plan.ts";
-import { prepareWorkspaceRestorePlan } from "../infrastructure/restore-preparation.ts";
-import {
-  gitReplayRisk,
-  sameGitOracleVersion,
-} from "../infrastructure/git-replay-risk.ts";
-import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
-import {
-  checkpointInitializationDispositionConflict,
   finalizeArrivalAfterWorkspaceExecution,
   isLockedArrivalOutcome,
   protectCurrentArrivalAfterWorkspaceFailure,
@@ -32,7 +12,6 @@ import {
 } from "./post-mutation.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
-import { settleCheckpointInitialization } from "./checkpoint-initialization-protocol.ts";
 import {
   requestNavigationChoice,
   type NavigationChoice,
@@ -46,18 +25,21 @@ import {
 } from "./restore-notifications.ts";
 import { CyclotomyRuntime } from "./runtime.ts";
 import {
-  isExactUsableSessionView,
   SessionViewTracker,
   type AuthenticatedTreeArrival,
   type SessionView,
 } from "./session-view.ts";
 import {
-  lockedTreeArrivalOutcome,
   type LockedTreeArrivalOutcome,
   type TreeArrivalExecution,
   type TreeArrivalResult,
 } from "./tree-arrival-outcome.ts";
-import type { NavigationTargetPlan } from "./navigation-plan.ts";
+import { executeTreeArrivalInWorkspaceLock } from "./tree-arrival-protocol.ts";
+import {
+  commitNavigationDepartureInWorkspaceLock,
+  prepareNavigationDepartureInWorkspaceLock,
+  type SourceBlockReason,
+} from "./navigation-departure-protocol.ts";
 import {
   WorkspaceMutationProtocol,
   type RestoreProtocolOutcome,
@@ -66,20 +48,15 @@ import { assertNever } from "./assert-never.ts";
 import { formatCaptureFailure } from "./capture-failure.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { PiHostAdapter } from "./pi-host-adapter.ts";
-import type { WorkspaceReceipt } from "./workspace-receipt.ts";
-
-type ClassifiedNavigationTargetKind = Exclude<
-  NavigationTargetPlan["kind"],
-  "detach"
->;
-
-type NavigationSourceKind = "capture" | "write-protected" | "no-coordinate";
+import type { ArrivalReceipt } from "./workspace-receipt.ts";
+import {
+  revalidateNavigationLocation as readExactLocation,
+  sameNavigationNode as sameNode,
+} from "./navigation-authentication.ts";
 
 function withDetail(message: string, detail: string): string {
   return `${message} ${detail}`;
 }
-
-type SourceBlockReason = "not-admitted" | "changed-before-publication";
 
 function sourceBlockDetail(reason: SourceBlockReason): string {
   switch (reason) {
@@ -92,120 +69,10 @@ function sourceBlockDetail(reason: SourceBlockReason): string {
   }
 }
 
-function readExactLocation(
-  runtime: CyclotomyRuntime,
-  views: SessionViewTracker,
-  context: ExtensionContext,
-  expected: SessionView,
-): SessionView | undefined {
-  const current = views.revalidate(context);
-  return isExactUsableSessionView(current, expected, (candidate) =>
-    runtime.registrations.sessionIsUsable(candidate),
-  )
-    ? current
-    : undefined;
-}
-
-/** Whether capturing source will become target's nearest exact slot. */
-function targetWillInheritSource(
-  runtime: CyclotomyRuntime,
-  view: SessionView,
-  source: NodeKey | undefined,
-  target: NodeKey | undefined,
-): boolean {
-  if (
-    source === undefined ||
-    target === undefined ||
-    source.sessionId !== target.sessionId
-  ) {
-    return false;
-  }
-  const ancestry = runtime.checkpoints.ancestryEntryIds(view, target.entryId);
-  const sourceIndex = ancestry.lastIndexOf(source.entryId);
-  if (sourceIndex < 0) return false;
-  return ancestry.slice(sourceIndex + 1).every(
-    (entryId) =>
-      runtime.checkpoints.checkpointSlot({
-        sessionId: target.sessionId,
-        entryId,
-      }).kind === "open-missing",
-  );
-}
-
-function sameNode(
-  left: NodeKey | undefined,
-  right: NodeKey | undefined,
-): boolean {
-  return (
-    left !== undefined &&
-    right !== undefined &&
-    left.sessionId === right.sessionId &&
-    left.entryId === right.entryId
-  );
-}
-
 function isLockedTreeArrivalOutcome(
   value: TreeArrivalExecution | LockedTreeArrivalOutcome,
 ): value is LockedTreeArrivalOutcome {
   return isLockedArrivalOutcome(value);
-}
-
-function classifyTarget(
-  runtime: CyclotomyRuntime,
-  view: SessionView,
-  source: NodeKey | undefined,
-  target: NodeKey | undefined,
-  sourceKind: NavigationSourceKind,
-  hasResolution: boolean,
-): ClassifiedNavigationTargetKind {
-  if (target === undefined) return "no-node";
-  if (sameNode(source, target)) return "same-location";
-  if (runtime.checkpoints.locationIsBlocked(target)) {
-    return hasResolution ? "restore" : "protected-missing";
-  }
-  if (
-    sourceKind === "capture" &&
-    targetWillInheritSource(runtime, view, source, target)
-  ) {
-    return "inherit-source";
-  }
-  if (hasResolution) return "restore";
-  if (sourceKind === "write-protected") {
-    return "protected-missing";
-  }
-  return "materialize-missing";
-}
-
-function preparedTargetStillMatches(
-  runtime: CyclotomyRuntime,
-  view: SessionView,
-  source: NodeKey | undefined,
-  target: NodeKey | undefined,
-  sourceKind: NavigationSourceKind,
-  expectedKind: ClassifiedNavigationTargetKind,
-  resolution: ResolvedNodeState | undefined,
-): boolean {
-  const currentKind = classifyTarget(
-    runtime,
-    view,
-    source,
-    target,
-    sourceKind,
-    resolution !== undefined,
-  );
-  if (currentKind !== expectedKind) return false;
-  return (
-    target === undefined ||
-    currentKind === "inherit-source" ||
-    currentKind === "same-location" ||
-    (resolution === undefined
-      ? runtime.workspaceMutations.locationIsUnresolved(view, target)
-      : runtime.workspaceMutations.resolutionStillAuthoritative(
-          view,
-          target,
-          resolution,
-        ))
-  );
 }
 
 /** Register the two-phase Pi tree-navigation protocol. */
@@ -332,155 +199,16 @@ export function registerNavigationLifecycle(
               }
 
               const preparationExecution = await runtime
-                .enqueueWorkspaceExecution(
-                  "tree-prepare",
-                  async (writeAuthority) => {
-                    const current = readExactLocation(
-                      runtime,
-                      views,
-                      context,
-                      view,
-                    );
-                    if (current === undefined) {
-                      return { kind: "location-changed" as const };
-                    }
-                    const sourceAdmission =
-                      runtime.workspaceMutations.captureAdmission(
-                        writeAuthority,
-                        current,
-                        source,
-                      );
-                    if (sourceAdmission.kind === "not-admitted") {
-                      return {
-                        kind: "source-blocked" as const,
-                        reason: "not-admitted" as const,
-                      };
-                    }
-                    let sourceSnapshot: WorkspaceSnapshot | undefined;
-                    let sourceExpectedSlot: CheckpointSlot | undefined;
-                    let preparedView = current;
-                    if (sourceAdmission.kind === "capture") {
-                      if (source !== undefined) {
-                        sourceExpectedSlot =
-                          runtime.checkpoints.checkpointSlot(source);
-                      }
-                      sourceSnapshot = await runtime.scanCurrentWorkspace(
-                        view.cwd,
-                      );
-                      if (sourceSnapshot.problems.length > 0) {
-                        return {
-                          kind: "scan-incomplete" as const,
-                          problems: sourceSnapshot.problems,
-                        };
-                      }
-                      const observed = readExactLocation(
-                        runtime,
-                        views,
-                        context,
-                        view,
-                      );
-                      if (observed === undefined) {
-                        return { kind: "location-changed" as const };
-                      }
-                      preparedView = observed;
-                    }
-
-                    const targetKind = classifyTarget(
-                      runtime,
-                      preparedView,
-                      source,
-                      target,
-                      sourceAdmission.kind,
-                      false,
-                    );
-                    if (
-                      targetKind === "no-node" ||
-                      targetKind === "same-location" ||
-                      targetKind === "inherit-source"
-                    ) {
-                      return {
-                        kind: "ready" as const,
-                        sourceKind: sourceAdmission.kind,
-                        sourceSnapshot,
-                        sourceExpectedSlot,
-                        restoreSnapshot: undefined,
-                        resolution: undefined,
-                        targetKind,
-                      };
-                    }
-                    if (target === undefined) {
-                      throw new Error(
-                        "classified navigation target is missing",
-                      );
-                    }
-                    const readable = await runtime.resolveReadableTreeIn(
-                      preparedView,
-                      target,
-                    );
-                    if (readable === undefined) {
-                      const missingKind = classifyTarget(
-                        runtime,
-                        preparedView,
-                        source,
-                        target,
-                        sourceAdmission.kind,
-                        false,
-                      );
-                      return {
-                        kind: "ready" as const,
-                        sourceKind: sourceAdmission.kind,
-                        sourceSnapshot,
-                        sourceExpectedSlot,
-                        restoreSnapshot: undefined,
-                        resolution: undefined,
-                        targetKind: missingKind,
-                      };
-                    }
-                    const { resolution, manifest, scopeValidation } = readable;
-                    const restoreSnapshot =
-                      await runtime.scanCurrentWorkspaceForScope(
-                        view.cwd,
-                        manifest.scope,
-                      );
-                    if (restoreSnapshot.problems.length > 0) {
-                      return {
-                        kind: "scan-incomplete" as const,
-                        problems: restoreSnapshot.problems,
-                      };
-                    }
-                    if (
-                      !sameGitOracleVersion(
-                        scopeValidation.gitVersion,
-                        restoreSnapshot.gitOracleVersion,
-                      )
-                    ) {
-                      throw new Error(
-                        "Git evaluator changed while preparing navigation",
-                      );
-                    }
-                    const drift = (
-                      await prepareWorkspaceRestorePlan(
-                        restoreSnapshot,
-                        manifest,
-                      )
-                    ).plan;
-                    if (drift.problems.length > 0) {
-                      return {
-                        kind: "scan-incomplete" as const,
-                        problems: drift.problems,
-                      };
-                    }
-                    return {
-                      kind: "ready" as const,
-                      sourceKind: sourceAdmission.kind,
-                      sourceSnapshot,
-                      sourceExpectedSlot,
-                      restoreSnapshot,
-                      resolution,
-                      targetKind: "restore" as const,
-                      drift,
-                    };
-                  },
+                .enqueueWorkspaceExecution("tree-prepare", (writeAuthority) =>
+                  prepareNavigationDepartureInWorkspaceLock(
+                    runtime,
+                    views,
+                    context,
+                    writeAuthority,
+                    view,
+                    source,
+                    target,
+                  ),
                 )
                 .catch((cause: unknown) => ({
                   kind: "acquisition-failed" as const,
@@ -596,358 +324,18 @@ export function registerNavigationLifecycle(
                 runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
               }
               const commitExecution = await runtime
-                .enqueueWorkspaceExecution(
-                  "tree-commit",
-                  async (writeAuthority) => {
-                    // `isIdle` is used only for its public product meaning: never begin
-                    // or publish transition work while Pi is streaming. It is not a
-                    // transition mutex and says nothing about whether an older proposal
-                    // completed.
-                    if (!context.isIdle()) {
-                      return { kind: "busy" as const };
-                    }
-                    const commitView = readExactLocation(
-                      runtime,
-                      views,
-                      context,
-                      view,
-                    );
-                    if (commitView === undefined) {
-                      return { kind: "location-changed" as const };
-                    }
-                    const sourceAdmission =
-                      runtime.workspaceMutations.captureAdmission(
-                        writeAuthority,
-                        commitView,
-                        source,
-                      );
-                    if (sourceAdmission.kind === "not-admitted") {
-                      return {
-                        kind: "source-blocked" as const,
-                        reason: "not-admitted" as const,
-                      };
-                    }
-                    if (sourceAdmission.kind !== prepared.sourceKind) {
-                      return { kind: "target-changed" as const };
-                    }
-                    let sourceCurrent: WorkspaceSnapshot | undefined;
-                    if (sourceAdmission.kind === "capture") {
-                      if (prepared.sourceSnapshot === undefined) {
-                        return { kind: "target-changed" as const };
-                      }
-                      if (
-                        source === undefined ||
-                        prepared.sourceExpectedSlot === undefined
-                      ) {
-                        return { kind: "target-changed" as const };
-                      }
-                      if (
-                        !checkpointSlotsEqual(
-                          runtime.checkpoints.checkpointSlot(source),
-                          prepared.sourceExpectedSlot,
-                        )
-                      ) {
-                        return { kind: "target-changed" as const };
-                      }
-                      sourceCurrent = await runtime.scanCurrentWorkspace(
-                        view.cwd,
-                      );
-                      if (sourceCurrent.problems.length > 0) {
-                        return {
-                          kind: "scan-incomplete" as const,
-                          problems: sourceCurrent.problems,
-                        };
-                      }
-                      if (
-                        sourceCurrent.rootPath !==
-                        prepared.sourceSnapshot.rootPath
-                      ) {
-                        return { kind: "location-changed" as const };
-                      }
-                      const sourceGap = planWorkspaceRestore(
-                        sourceCurrent,
-                        workspaceSnapshotAsManifest(prepared.sourceSnapshot),
-                      );
-                      if (
-                        sourceGap.problems.length > 0 ||
-                        restorePlanHasChanges(sourceGap)
-                      ) {
-                        return { kind: "preview-stale" as const };
-                      }
-                    }
-                    if (
-                      !preparedTargetStillMatches(
-                        runtime,
-                        commitView,
-                        source,
-                        target,
-                        sourceAdmission.kind,
-                        prepared.targetKind,
-                        prepared.resolution,
-                      )
-                    ) {
-                      return { kind: "target-changed" as const };
-                    }
-                    // The preview phase may have crossed an interactive confirmation.
-                    // Authenticate the unchanged target closure once more before Pi is
-                    // allowed to leave the source location.
-                    if (
-                      prepared.resolution !== undefined &&
-                      prepared.targetKind === "restore"
-                    ) {
-                      await runtime.store.readTree(prepared.resolution.treeOid);
-                    }
-                    let restoreCurrent: WorkspaceSnapshot | undefined;
-                    if (
-                      prepared.targetKind === "restore" &&
-                      navigationChoice === "restore"
-                    ) {
-                      if (prepared.restoreSnapshot === undefined) {
-                        return { kind: "target-changed" as const };
-                      }
-                      restoreCurrent =
-                        await runtime.scanCurrentWorkspaceForScope(
-                          view.cwd,
-                          prepared.restoreSnapshot.scope,
-                        );
-                      if (restoreCurrent.problems.length > 0) {
-                        return {
-                          kind: "scan-incomplete" as const,
-                          problems: restoreCurrent.problems,
-                        };
-                      }
-                      if (
-                        restoreCurrent.rootPath !==
-                        prepared.restoreSnapshot.rootPath
-                      ) {
-                        return { kind: "location-changed" as const };
-                      }
-                      if (
-                        !sameGitOracleVersion(
-                          restoreCurrent.gitOracleVersion,
-                          prepared.restoreSnapshot.gitOracleVersion,
-                        )
-                      ) {
-                        return { kind: "preview-stale" as const };
-                      }
-                      const restoreGap = planWorkspaceRestore(
-                        restoreCurrent,
-                        workspaceSnapshotAsManifest(prepared.restoreSnapshot),
-                      );
-                      if (
-                        restoreGap.problems.length > 0 ||
-                        restorePlanHasChanges(restoreGap)
-                      ) {
-                        return { kind: "preview-stale" as const };
-                      }
-                    } else if (prepared.targetKind === "inherit-source") {
-                      if (sourceCurrent === undefined) {
-                        return { kind: "target-changed" as const };
-                      }
-                      restoreCurrent = sourceCurrent;
-                    }
-                    let preparedSource: CaptureSuccess | undefined;
-                    if (
-                      sourceAdmission.kind === "capture" &&
-                      source !== undefined
-                    ) {
-                      if (sourceCurrent === undefined) {
-                        return { kind: "target-changed" as const };
-                      }
-                      const currentView = readExactLocation(
-                        runtime,
-                        views,
-                        context,
-                        view,
-                      );
-                      if (
-                        currentView === undefined ||
-                        !runtime.workspaceMutations.captureLeaseIsCurrent(
-                          sourceAdmission.lease,
-                          currentView,
-                          source,
-                        )
-                      ) {
-                        return {
-                          kind: "source-blocked" as const,
-                          reason: "changed-before-publication" as const,
-                        };
-                      }
-                      const published =
-                        await runtime.checkpoints.prepareObserved(
-                          sourceCurrent,
-                        );
-                      if (!published.ok) {
-                        return {
-                          kind: "capture-failed" as const,
-                          failure: published.error,
-                        };
-                      }
-                      preparedSource = published.value;
-                      if (
-                        !(await runtime.registrations.workspaceStillBound(
-                          view.cwd,
-                        ))
-                      ) {
-                        return { kind: "workspace-binding-lost" as const };
-                      }
-                      if (!context.isIdle()) return { kind: "busy" as const };
-                      const validatedView = readExactLocation(
-                        runtime,
-                        views,
-                        context,
-                        view,
-                      );
-                      if (
-                        validatedView === undefined ||
-                        !runtime.workspaceMutations.captureLeaseIsCurrent(
-                          sourceAdmission.lease,
-                          validatedView,
-                          source,
-                        )
-                      ) {
-                        return { kind: "location-changed" as const };
-                      }
-                      if (!context.isIdle()) return { kind: "busy" as const };
-                      const sourceExpectedSlot = prepared.sourceExpectedSlot;
-                      if (sourceExpectedSlot === undefined) {
-                        return { kind: "target-changed" as const };
-                      }
-                      const sourceCommitted = runtime.commitPreparedCapture(
-                        writeAuthority,
-                        validatedView,
-                        source,
-                        preparedSource,
-                        sourceExpectedSlot,
-                      );
-                      if (!sourceCommitted.ok) {
-                        if (sourceCommitted.error.kind === "write-protected") {
-                          runtime.workspaceMutations.protectCurrentNode(
-                            writeAuthority,
-                            validatedView,
-                            source,
-                          );
-                        }
-                        return {
-                          kind: "capture-failed" as const,
-                          failure: sourceCommitted.error,
-                        };
-                      }
-                    }
-                    if (
-                      !(await runtime.registrations.workspaceStillBound(
-                        view.cwd,
-                      ))
-                    ) {
-                      return { kind: "workspace-binding-lost" as const };
-                    }
-                    if (!context.isIdle()) return { kind: "busy" as const };
-                    const departureView = readExactLocation(
-                      runtime,
-                      views,
-                      context,
-                      view,
-                    );
-                    if (departureView === undefined) {
-                      return { kind: "location-changed" as const };
-                    }
-                    if (
-                      sourceAdmission.kind === "capture" &&
-                      (source === undefined ||
-                        !runtime.workspaceMutations.captureLeaseIsCurrent(
-                          sourceAdmission.lease,
-                          departureView,
-                          source,
-                        ))
-                    ) {
-                      return { kind: "location-changed" as const };
-                    }
-                    if (
-                      !preparedTargetStillMatches(
-                        runtime,
-                        departureView,
-                        source,
-                        target,
-                        sourceAdmission.kind,
-                        prepared.targetKind,
-                        prepared.resolution,
-                      )
-                    ) {
-                      return { kind: "target-changed" as const };
-                    }
-                    let targetPlan: NavigationTargetPlan;
-                    switch (prepared.targetKind) {
-                      case "no-node":
-                        targetPlan = { kind: "no-node" };
-                        break;
-                      case "materialize-missing":
-                        if (target === undefined) {
-                          return { kind: "target-changed" as const };
-                        }
-                        targetPlan = {
-                          kind: "materialize-missing",
-                          node: target,
-                        };
-                        break;
-                      case "protected-missing":
-                        if (target === undefined) {
-                          return { kind: "target-changed" as const };
-                        }
-                        targetPlan = {
-                          kind: "protected-missing",
-                          node: target,
-                        };
-                        break;
-                      case "same-location":
-                        if (target === undefined) {
-                          return { kind: "target-changed" as const };
-                        }
-                        targetPlan = { kind: "same-location", node: target };
-                        break;
-                      case "inherit-source":
-                        if (
-                          source === undefined ||
-                          target === undefined ||
-                          preparedSource === undefined
-                        ) {
-                          return { kind: "target-changed" as const };
-                        }
-                        targetPlan = {
-                          kind: "inherit-source",
-                          node: target,
-                          resolution: {
-                            treeOid: preparedSource.treeOid,
-                            foundAt: source,
-                          },
-                        };
-                        break;
-                      case "restore":
-                        if (
-                          target === undefined ||
-                          prepared.resolution === undefined
-                        ) {
-                          return { kind: "target-changed" as const };
-                        }
-                        targetPlan =
-                          navigationChoice === "detach"
-                            ? {
-                                kind: "detach",
-                                node: target,
-                                resolution: prepared.resolution,
-                              }
-                            : {
-                                kind: "restore",
-                                node: target,
-                                resolution: prepared.resolution,
-                              };
-                        break;
-                    }
-                    return {
-                      kind: "ready" as const,
-                      snapshot: restoreCurrent,
-                      target: targetPlan,
-                    };
-                  },
+                .enqueueWorkspaceExecution("tree-commit", (writeAuthority) =>
+                  commitNavigationDepartureInWorkspaceLock(
+                    runtime,
+                    views,
+                    context,
+                    writeAuthority,
+                    view,
+                    source,
+                    target,
+                    prepared,
+                    navigationChoice,
+                  ),
                 )
                 .catch((cause: unknown) => ({
                   kind: "acquisition-failed" as const,
@@ -1262,437 +650,20 @@ export function registerNavigationLifecycle(
       try {
         const locked = await runtime.enqueueWorkspaceExecution(
           "tree-arrival",
-          async (
-            writeAuthority,
-          ): Promise<TreeArrivalExecution | LockedTreeArrivalOutcome> => {
-            if (!(await runtime.registrations.workspaceStillBound(view.cwd))) {
-              return { kind: "location-changed" as const };
-            }
-            const arrivalView = readExactLocation(
+          (writeAuthority) =>
+            executeTreeArrivalInWorkspaceLock(
               runtime,
               views,
               context,
-              view,
-            );
-            if (arrivalView === undefined) {
-              return { kind: "location-changed" as const };
-            }
-            if (
-              !runtime.admission.arrivalCanProceed(
-                arrival,
-                arrivalView,
-                runtime.checkpoints.captureAnchor(arrivalView),
-              )
-            ) {
-              return { kind: "target-changed" as const };
-            }
-            if (!context.isIdle()) return { kind: "busy" as const };
-
-            switch (plan.target.kind) {
-              case "protected-missing": {
-                const disposition =
-                  runtime.workspaceMutations.protectCurrentTreeArrival(
-                    writeAuthority,
-                    arrival,
-                    arrivalView,
-                  );
-                return disposition.kind === "protected" &&
-                  runtime.checkpoints.locationIsBlocked(plan.target.node)
-                  ? lockedTreeArrivalOutcome({ kind: "protected" }, disposition)
-                  : lockedTreeArrivalOutcome(
-                      { kind: "target-changed" },
-                      disposition,
-                    );
-              }
-              case "detach": {
-                const authenticatedAnchor =
-                  runtime.checkpoints.captureAnchor(arrivalView);
-                if (
-                  actualAnchor === undefined ||
-                  authenticatedAnchor === undefined ||
-                  !sameNode(authenticatedAnchor, actualAnchor)
-                ) {
-                  return { kind: "target-changed" as const };
-                }
-                const readable = await runtime.resolveReadableTreeIn(
-                  arrivalView,
-                  authenticatedAnchor,
-                );
-                if (
-                  readable === undefined ||
-                  readable.resolution.treeOid !==
-                    plan.target.resolution.treeOid ||
-                  !sameNode(
-                    readable.resolution.foundAt,
-                    plan.target.resolution.foundAt,
-                  )
-                ) {
-                  return { kind: "target-changed" as const };
-                }
-                if (
-                  !(await runtime.registrations.workspaceStillBound(view.cwd))
-                ) {
-                  return { kind: "location-changed" as const };
-                }
-                const current = readExactLocation(
-                  runtime,
-                  views,
-                  context,
-                  view,
-                );
-                if (current === undefined) {
-                  return { kind: "location-changed" as const };
-                }
-                if (!context.isIdle()) return { kind: "busy" as const };
-                const currentAnchor =
-                  runtime.checkpoints.captureAnchor(current);
-                if (!sameNode(currentAnchor, actualAnchor)) {
-                  return { kind: "location-changed" as const };
-                }
-                if (
-                  currentAnchor === undefined ||
-                  !runtime.workspaceMutations.resolutionStillAuthoritative(
-                    current,
-                    currentAnchor,
-                    readable.resolution,
-                  )
-                ) {
-                  return { kind: "target-changed" as const };
-                }
-                const disposition =
-                  runtime.workspaceMutations.protectTreeArrivalIfResolution(
-                    writeAuthority,
-                    arrival,
-                    current,
-                    readable.resolution,
-                  );
-                if (disposition.kind !== "protected") {
-                  return lockedTreeArrivalOutcome(
-                    { kind: "target-changed" },
-                    disposition,
-                  );
-                }
-                if (
-                  checkpointSlotTreeOid(
-                    runtime.checkpoints.checkpointSlot(currentAnchor),
-                  ) !== readable.resolution.treeOid ||
-                  !runtime.checkpoints.locationIsBlocked(currentAnchor)
-                ) {
-                  return { kind: "target-changed" as const };
-                }
-                return lockedTreeArrivalOutcome(
-                  { kind: "detached" },
-                  disposition,
-                );
-              }
-              case "no-node":
-              case "materialize-missing":
-              case "same-location":
-              case "inherit-source":
-              case "restore":
-                break;
-              default:
-                return assertNever(
-                  plan.target,
-                  "unhandled tree-arrival target",
-                );
-            }
-
-            const authenticatedRootSummary =
-              plan.target.kind === "no-node" &&
-              plan.expectedDestinationId === null &&
-              authenticatedArrival.kind === "summary" &&
-              authenticatedArrival.summaryParentLandingId === null
-                ? {
-                    sessionId: plan.sessionId,
-                    entryId: authenticatedArrival.summaryEntryId,
-                  }
-                : undefined;
-            const sameLocationSummary =
-              plan.target.kind === "same-location" &&
-              actualAnchor !== undefined &&
-              runtime.checkpoints
-                .ancestryEntryIds(arrivalView, actualAnchor.entryId)
-                .includes(plan.target.node.entryId)
-                ? actualAnchor
-                : undefined;
-            const missingTarget =
-              plan.target.kind === "materialize-missing"
-                ? plan.target.node
-                : (authenticatedRootSummary ?? sameLocationSummary);
-
-            if (plan.target.kind === "no-node" && missingTarget === undefined) {
-              const disposition =
-                runtime.workspaceMutations.admitCurrentTreeArrival(
-                  writeAuthority,
-                  arrival,
-                  arrivalView,
-                );
-              return disposition.kind === "admitted"
-                ? lockedTreeArrivalOutcome({ kind: "no-node" }, disposition)
-                : lockedTreeArrivalOutcome(
-                    { kind: "target-changed" },
-                    disposition,
-                  );
-            }
-
-            if (missingTarget !== undefined) {
-              // A normal missing destination was authenticated in before_tree.
-              // The sole late-bound exception is Pi's explicit summary entry for
-              // a null logical destination; a wrapping label never owns state.
-              const targetNode = missingTarget;
-              if (runtime.checkpoints.locationIsBlocked(targetNode)) {
-                const disposition =
-                  runtime.workspaceMutations.protectCurrentTreeArrival(
-                    writeAuthority,
-                    arrival,
-                    arrivalView,
-                  );
-                return disposition.kind === "protected"
-                  ? lockedTreeArrivalOutcome({ kind: "protected" }, disposition)
-                  : lockedTreeArrivalOutcome(
-                      { kind: "target-changed" },
-                      disposition,
-                    );
-              }
-              if (
-                sameLocationSummary === undefined &&
-                !runtime.workspaceMutations.locationIsUnresolved(
-                  arrivalView,
-                  targetNode,
-                )
-              ) {
-                return { kind: "target-changed" as const };
-              }
-
-              let targetCurrent: WorkspaceSnapshot;
-              try {
-                // This is deliberately a fresh current-policy observation. Host
-                // work between before_tree and session_tree belongs to the newly
-                // arrived, previously unknown location.
-                targetCurrent = await runtime.scanCurrentWorkspace(view.cwd);
-              } catch (error) {
-                return {
-                  kind: "scan-failed" as const,
-                  cause: error,
-                };
-              }
-              if (targetCurrent.problems.length > 0) {
-                return {
-                  kind: "scan-incomplete" as const,
-                  problems: targetCurrent.problems,
-                };
-              }
-              const preparedTarget =
-                await runtime.checkpoints.prepareObserved(targetCurrent);
-              if (!preparedTarget.ok) {
-                return {
-                  kind: "capture-failed" as const,
-                  failure: preparedTarget.error,
-                };
-              }
-              if (
-                !(await runtime.registrations.workspaceStillBound(view.cwd))
-              ) {
-                return { kind: "location-changed" as const };
-              }
-              const current = readExactLocation(runtime, views, context, view);
-              if (current === undefined) {
-                return { kind: "location-changed" as const };
-              }
-              if (
-                runtime.checkpoints.locationIsBlocked(targetNode) ||
-                (sameLocationSummary === undefined &&
-                  !runtime.workspaceMutations.locationIsUnresolved(
-                    current,
-                    targetNode,
-                  ))
-              ) {
-                return { kind: "target-changed" as const };
-              }
-              if (!context.isIdle()) return { kind: "busy" as const };
-              const committedTarget = runtime.commitTreeArrivalCapture(
-                writeAuthority,
-                arrival,
-                current,
-                targetNode,
-                preparedTarget.value,
-                runtime.checkpoints.checkpointSlot(targetNode),
-              );
-              if (!committedTarget.ok) {
-                if (committedTarget.error.kind === "write-protected") {
-                  const disposition =
-                    runtime.workspaceMutations.protectCurrentTreeArrival(
-                      writeAuthority,
-                      arrival,
-                      current,
-                    );
-                  return disposition.kind === "protected"
-                    ? lockedTreeArrivalOutcome(
-                        { kind: "protected" },
-                        disposition,
-                      )
-                    : lockedTreeArrivalOutcome(
-                        { kind: "target-changed" },
-                        disposition,
-                      );
-                }
-                return {
-                  kind: "capture-failed" as const,
-                  failure: committedTarget.error,
-                };
-              }
-              const resolution = {
-                treeOid: preparedTarget.value.treeOid,
-                foundAt: targetNode,
-              };
-              const arrivalDisposition = await settleCheckpointInitialization(
-                {
-                  readCurrentView: () => views.revalidate(context),
-                  sessionIsUsable: (candidate) =>
-                    runtime.registrations.sessionIsUsable(candidate),
-                  captureAnchor: (candidate) =>
-                    runtime.checkpoints.captureAnchor(candidate),
-                  protectCommittedArrival: () =>
-                    runtime.workspaceMutations.recoverUncertainLocationInWorkspaceLock(
-                      writeAuthority,
-                      context,
-                    ),
-                },
-                {
-                  expected: view,
-                  node: targetNode,
-                  resolution,
-                  locationMatches: (committedView, node) =>
-                    runtime.workspaceMutations.treeArrivalCanProceed(
-                      arrival,
-                      committedView,
-                      node,
-                    ),
-                  admit: (committedView) =>
-                    runtime.workspaceMutations.admitTreeArrivalIfResolution(
-                      writeAuthority,
-                      arrival,
-                      committedView,
-                      resolution,
-                    ),
-                },
-              );
-              return arrivalDisposition.kind === "admitted"
-                ? lockedTreeArrivalOutcome(
-                    { kind: "materialized" },
-                    arrivalDisposition,
-                  )
-                : checkpointInitializationDispositionConflict(
-                    arrivalDisposition.kind === "unsettled"
-                      ? arrivalDisposition.cause
-                      : new Error(
-                          "checkpoint initialization protected a changed arrival",
-                        ),
-                    arrivalDisposition,
-                  );
-            }
-
-            if (
-              plan.target.kind === "no-node" ||
-              plan.target.kind === "materialize-missing" ||
-              plan.target.kind === "same-location"
-            ) {
-              return { kind: "target-changed" as const };
-            }
-            const previewSnapshot = plan.previewSnapshot;
-            if (previewSnapshot === undefined) {
-              return { kind: "target-changed" as const };
-            }
-
-            let restoreCurrent: WorkspaceSnapshot;
-            try {
-              restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
-                view.cwd,
-                previewSnapshot.scope,
-              );
-            } catch (error) {
-              return {
-                kind: "scan-failed" as const,
-                cause: error,
-              };
-            }
-            if (restoreCurrent.problems.length > 0) {
-              return {
-                kind: "scan-incomplete" as const,
-                problems: restoreCurrent.problems,
-              };
-            }
-            if (restoreCurrent.rootPath !== previewSnapshot.rootPath) {
-              return {
-                kind: "location-changed" as const,
-              };
-            }
-            if (
-              !sameGitOracleVersion(
-                restoreCurrent.gitOracleVersion,
-                previewSnapshot.gitOracleVersion,
-              )
-            ) {
-              return { kind: "preview-stale" as const };
-            }
-            const gap = planWorkspaceRestore(
-              restoreCurrent,
-              workspaceSnapshotAsManifest(previewSnapshot),
-            );
-            if (gap.problems.length > 0 || restorePlanHasChanges(gap)) {
-              return { kind: "preview-stale" as const };
-            }
-            const restoredView = readExactLocation(
-              runtime,
-              views,
-              context,
-              view,
-            );
-            if (restoredView === undefined) {
-              return { kind: "location-changed" as const };
-            }
-            if (
-              !runtime.workspaceMutations.resolutionStillAuthoritative(
-                restoredView,
-                plan.target.node,
-                plan.target.resolution,
-              )
-            ) {
-              return { kind: "target-changed" as const };
-            }
-            if (plan.target.kind === "inherit-source") {
-              if (!context.isIdle()) return { kind: "busy" as const };
-              const disposition =
-                runtime.workspaceMutations.admitTreeArrivalIfResolution(
-                  writeAuthority,
-                  arrival,
-                  restoredView,
-                  plan.target.resolution,
-                );
-              return disposition.kind === "admitted"
-                ? lockedTreeArrivalOutcome({ kind: "inherited" }, disposition)
-                : lockedTreeArrivalOutcome(
-                    { kind: "target-changed" },
-                    disposition,
-                  );
-            }
-            const restoreResolution = plan.target.resolution;
-            if (actualAnchor === undefined) {
-              return { kind: "target-changed" as const };
-            }
-            const restored = await mutationProtocol.restoreTreeArrival(
+              mutationProtocol,
+              writeAuthority,
               {
                 arrival,
-                expected: restoredView,
-                node: actualAnchor,
-                resolution: restoreResolution,
-                current: restoreCurrent,
+                expectedView: view,
+                authenticatedArrival,
+                actualAnchor,
               },
-              writeAuthority,
-            );
-            return restored;
-          },
+            ),
         );
         if (locked.kind === "completed") {
           if (isLockedTreeArrivalOutcome(locked.value)) {
@@ -1757,7 +728,8 @@ export function registerNavigationLifecycle(
       applyActiveArrivalSettlement(runtime, result.arrival);
       if (
         result.execution.kind !== "initialization-conflict" &&
-        result.execution.kind !== "post-mutation-conflict"
+        result.execution.kind !== "post-mutation-conflict" &&
+        result.execution.kind !== "outcome"
       ) {
         notifyArrivalDispositionFailure(runtime, context, result.arrival);
       }
@@ -1866,7 +838,7 @@ export function registerNavigationLifecycle(
             notifyRestoreProtocolOutcome(
               runtime,
               context,
-              result as WorkspaceReceipt<RestoreProtocolOutcome>,
+              result as ArrivalReceipt<RestoreProtocolOutcome>,
               { announceSuccess: false },
             );
             break;

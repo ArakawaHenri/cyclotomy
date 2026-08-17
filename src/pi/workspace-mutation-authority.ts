@@ -21,6 +21,7 @@ import type {
 import {
   type ArrivalAdmissionSettlement,
   type ArrivalDisposition,
+  type ArrivalProtectionEvidence,
   type LocationProtectionDisposition,
   type NonAdmittedArrivalDisposition,
   unsettledArrival,
@@ -49,6 +50,28 @@ type LocationExpectation =
       readonly kind: "exact-resolution";
       readonly resolution: ResolvedNodeState;
     };
+
+type RegisteredLocationInput = Omit<
+  Parameters<CurrentMetadataStore["protectLocation"]>[1],
+  "expectation"
+>;
+
+type ExactSlotProtectionEvidence = Extract<
+  ArrivalProtectionEvidence,
+  { readonly kind: "exact-slot" }
+>;
+
+function exactSlotProtectionEvidence(
+  protection: ProtectLocationResult,
+  admission: ArrivalAdmissionSettlement,
+): ExactSlotProtectionEvidence {
+  return {
+    kind: "exact-slot",
+    slot: protection.protectedSlot,
+    expectation: protection.kind === "protected" ? "matched" : "stale",
+    admission,
+  };
+}
 
 type RegistrationAuthority = Pick<
   SessionRegistrationService,
@@ -393,12 +416,9 @@ export class WorkspaceMutationAuthority {
       if (!restoreAdmission || !this.#options.participationIsActive()) {
         return {
           kind: "protected",
-          evidence: {
-            kind: "exact-slot",
-            slot: protection.protectedSlot,
-            expectation: protection.kind === "protected" ? "matched" : "stale",
-            admission: { kind: "settled" },
-          },
+          evidence: exactSlotProtectionEvidence(protection, {
+            kind: "settled",
+          }),
         };
       }
       // The slot is now durably closed against capture. Recovery keeps the
@@ -408,12 +428,9 @@ export class WorkspaceMutationAuthority {
         this.#options.admission.admit(current, node);
         return {
           kind: "protected",
-          evidence: {
-            kind: "exact-slot",
-            slot: protection.protectedSlot,
-            expectation: protection.kind === "protected" ? "matched" : "stale",
-            admission: { kind: "settled" },
-          },
+          evidence: exactSlotProtectionEvidence(protection, {
+            kind: "settled",
+          }),
         };
       } catch (secondaryFailure) {
         // The metadata transaction is authoritative even when rebuilding the
@@ -421,12 +438,10 @@ export class WorkspaceMutationAuthority {
         // exact durable fact to a weaker barrier or unavailable settlement.
         return {
           kind: "protected",
-          evidence: {
-            kind: "exact-slot",
-            slot: protection.protectedSlot,
-            expectation: protection.kind === "protected" ? "matched" : "stale",
-            admission: { kind: "failed", cause: secondaryFailure },
-          },
+          evidence: exactSlotProtectionEvidence(protection, {
+            kind: "failed",
+            cause: secondaryFailure,
+          }),
         };
       }
     } catch (primary) {
@@ -713,28 +728,43 @@ export class WorkspaceMutationAuthority {
     );
   }
 
+  /**
+   * Build one terminal metadata input after synchronously revalidating the
+   * registered workspace binding. Callers consume it immediately and never
+   * retain it or cross an asynchronous boundary before the metadata command.
+   */
+  #registeredLocationInput(
+    view: SessionView,
+    node: NodeKey,
+  ): RegisteredLocationInput | undefined {
+    const identity = persistedSessionIdentityOf(view);
+    if (identity === undefined) return undefined;
+    try {
+      this.#options.registrations.assertActiveWorkspaceAuthority(identity);
+    } catch {
+      return undefined;
+    }
+    return {
+      identity: {
+        sessionId: node.sessionId,
+        sessionFile: identity.sessionFile,
+      },
+      entryId: node.entryId,
+      activeAncestryEntryIds: this.#ancestryIds(view, node.entryId),
+    };
+  }
+
   #admitResolvedLocation(
     writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey,
     resolution: ResolvedNodeState,
   ): boolean {
-    const identity = persistedSessionIdentityOf(view);
-    if (identity === undefined) return false;
-    try {
-      this.#options.registrations.assertActiveWorkspaceAuthority(identity);
-    } catch {
-      return false;
-    }
-    const metadata = this.#options.metadata();
+    const location = this.#registeredLocationInput(view, node);
+    if (location === undefined) return false;
     const input: Parameters<CurrentMetadataStore["admitResolvedLocation"]>[1] =
       {
-        identity: {
-          sessionId: node.sessionId,
-          sessionFile: identity.sessionFile,
-        },
-        entryId: node.entryId,
-        activeAncestryEntryIds: this.#ancestryIds(view, node.entryId),
+        ...location,
         expectedResolution: {
           kind: "checkpoint" as const,
           entryId: resolution.foundAt.entryId,
@@ -742,7 +772,8 @@ export class WorkspaceMutationAuthority {
         },
       };
     return (
-      metadata.admitResolvedLocation(writeAuthority, input) !== "slot-changed"
+      this.#options.metadata().admitResolvedLocation(writeAuthority, input) !==
+      "slot-changed"
     );
   }
 
@@ -809,12 +840,10 @@ export class WorkspaceMutationAuthority {
     const settlement = this.#settleProtectedArrival(attempt, view, node);
     return {
       kind: "protected",
-      evidence: {
-        kind: "exact-slot",
-        slot: protection.protectedSlot,
-        expectation: protection.kind === "protected" ? "matched" : "stale",
-        admission: this.#arrivalAdmissionSettlement(settlement),
-      },
+      evidence: exactSlotProtectionEvidence(
+        protection,
+        this.#arrivalAdmissionSettlement(settlement),
+      ),
     };
   }
 
@@ -850,12 +879,7 @@ export class WorkspaceMutationAuthority {
     }
     return {
       kind: "protected",
-      evidence: {
-        kind: "exact-slot",
-        slot: protection.protectedSlot,
-        expectation: protection.kind === "protected" ? "matched" : "stale",
-        admission,
-      },
+      evidence: exactSlotProtectionEvidence(protection, admission),
     };
   }
 
@@ -924,23 +948,10 @@ export class WorkspaceMutationAuthority {
     node: NodeKey,
     expectation: LocationExpectation,
   ): ProtectLocationResult | { readonly kind: "unregistered" } {
-    const identity = persistedSessionIdentityOf(view);
-    if (identity === undefined) return { kind: "unregistered" };
-    try {
-      // This re-observes cwd + session cwd against the registered dev/ino
-      // binding synchronously, immediately before metadata's transaction.
-      this.#options.registrations.assertActiveWorkspaceAuthority(identity);
-    } catch {
-      return { kind: "unregistered" };
-    }
-    const metadata = this.#options.metadata();
+    const location = this.#registeredLocationInput(view, node);
+    if (location === undefined) return { kind: "unregistered" };
     const input: Parameters<CurrentMetadataStore["protectLocation"]>[1] = {
-      identity: {
-        sessionId: node.sessionId,
-        sessionFile: identity.sessionFile,
-      },
-      entryId: node.entryId,
-      activeAncestryEntryIds: this.#ancestryIds(view, node.entryId),
+      ...location,
       expectation:
         expectation.kind === "any-current"
           ? expectation
@@ -953,6 +964,6 @@ export class WorkspaceMutationAuthority {
               },
             },
     };
-    return metadata.protectLocation(writeAuthority, input);
+    return this.#options.metadata().protectLocation(writeAuthority, input);
   }
 }

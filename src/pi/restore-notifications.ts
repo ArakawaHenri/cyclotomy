@@ -13,7 +13,7 @@ import { formatUiDetail } from "./restore-presentation.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { RestoreProtocolOutcome } from "./workspace-mutation-protocol.ts";
-import type { WorkspaceReceipt } from "./workspace-receipt.ts";
+import type { ArrivalReceipt } from "./workspace-receipt.ts";
 
 /** Critical notification presenter for the safety fact beside a protocol result. */
 export function notifyArrivalDispositionFailure(
@@ -143,13 +143,14 @@ export function notifyRestoreOutcome(
   });
 }
 
-/** Present a restore without mistaking a refused cutover for file mutation. */
+/** Present every UI fact owned by one restore receipt exactly once. */
 export function notifyRestoreProtocolOutcome(
   runtime: CyclotomyRuntime,
   context: ExtensionContext,
-  receipt: WorkspaceReceipt<RestoreProtocolOutcome>,
+  receipt: ArrivalReceipt<RestoreProtocolOutcome>,
   options: { readonly announceSuccess?: boolean } = {},
 ): void {
+  notifyArrivalDispositionFailure(runtime, context, receipt.arrival);
   const execution = receipt.execution;
   if (execution.cutover.kind !== "rejected") {
     notifyRestoreOutcome(runtime, context, execution.outcome, options);

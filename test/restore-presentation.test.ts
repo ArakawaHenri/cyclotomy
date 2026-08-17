@@ -218,6 +218,7 @@ describe("restore presentation", () => {
         cutover: { kind: "rejected", cause: new Error("Pi became busy") },
         preparationCleanup: { kind: "settled" },
       },
+      arrival: exactArrival,
       workspaceLockCleanup: { kind: "settled" },
     });
 
@@ -260,6 +261,7 @@ describe("restore presentation", () => {
           cause: new Error("scratch remained"),
         },
       },
+      arrival: exactArrival,
       workspaceLockCleanup: {
         kind: "failed",
         cause: new Error("lock remained"),
@@ -279,6 +281,53 @@ describe("restore presentation", () => {
       level: "error",
       message: expect.stringContaining("lock remained"),
     });
+  });
+
+  it("presents every restore receipt fact exactly once", () => {
+    const notifications: string[] = [];
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
+      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyRestoreProtocolOutcome(runtime, {} as never, {
+      execution: {
+        kind: "outcome",
+        outcome: {
+          kind: "failed",
+          stage: "apply",
+          cause: new Error("restore failed"),
+        },
+        cutover: { kind: "not-requested" },
+        preparationCleanup: {
+          kind: "failed",
+          cause: new Error("staging cleanup failed"),
+        },
+      },
+      arrival: {
+        ...exactArrival,
+        evidence: {
+          ...exactArrival.evidence,
+          admission: {
+            kind: "failed",
+            cause: new Error("admission failed"),
+          },
+        },
+      },
+      workspaceLockCleanup: {
+        kind: "failed",
+        cause: new Error("lock cleanup failed"),
+      },
+    });
+
+    expect(notifications).toHaveLength(4);
+    expect(notifications[0]).toContain("admission failed");
+    expect(notifications[1]).toContain("restore failed");
+    expect(notifications[2]).toContain("staging cleanup failed");
+    expect(notifications[3]).toContain("lock cleanup failed");
   });
 
   it("reports preparation cleanup once beside a post-mutation lock failure", () => {

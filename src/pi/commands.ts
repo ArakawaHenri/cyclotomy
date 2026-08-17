@@ -61,9 +61,9 @@ function finishRestore(
       );
       return;
     case "outcome":
-      notifyArrivalDispositionFailure(runtime, context, receipt.arrival);
       notifyRestoreProtocolOutcome(runtime, context, {
         execution,
+        arrival: receipt.arrival,
         workspaceLockCleanup: receipt.workspaceLockCleanup,
       });
       return;
