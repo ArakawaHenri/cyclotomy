@@ -930,7 +930,9 @@ describe("pure workspace restore", () => {
       (name) => name.startsWith(".cyclotomy-") && name.endsWith(".tmp"),
     );
     expect(temporaries).toHaveLength(1);
-    expect(await readFile(join(root, temporaries[0]!), "utf8")).toBe("target");
+    // The source fragment was still buffered when ownership changed, so no
+    // payload byte crossed the next authenticated write boundary.
+    expect(await readFile(join(root, temporaries[0]!), "utf8")).toBe("");
     setup.metadata.close();
   });
 

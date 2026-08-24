@@ -93,6 +93,7 @@ const UNOBSERVED_PATH_DETAIL =
   "refusing to replace a path that exists but was absent from the current inventory";
 const BLOCKED_ANCESTOR_DETAIL =
   "refusing to mutate below an unsafe or unavailable target directory";
+const APPLY_WRITE_WINDOW_BYTES = 1024 * 1024;
 
 interface WorkspaceWriteAccess {
   readonly writeAuthority: WorkspaceWriteAuthority;
@@ -189,6 +190,7 @@ async function writeRegularAtomically(
   absolute: string,
   blobOid: string,
   streamBlob: ApplyBlobStreamReader,
+  writeWindow: Uint8Array,
   recreationMode: FileRecreationMode,
   beforeCommit: () => Promise<void>,
   mutationGate: WorkspaceMutationGate,
@@ -211,7 +213,13 @@ async function writeRegularAtomically(
       0o600,
     );
     temporaryCreated = true;
-    await streamBlobIntoHandle(handle, blobOid, streamBlob, mutationGate);
+    await streamBlobIntoHandle(
+      handle,
+      blobOid,
+      streamBlob,
+      writeWindow,
+      mutationGate,
+    );
     if (process.platform !== "win32" && recreationMode !== null) {
       mutationGate.enter();
       await handle.chmod(recreationMode);
@@ -336,15 +344,46 @@ async function streamBlobIntoHandle(
   handle: FileHandle,
   oid: string,
   streamBlob: ApplyBlobStreamReader,
+  writeWindow: Uint8Array,
   mutationGate: WorkspaceMutationGate,
 ): Promise<number> {
   const hash = createHash("sha256");
   let byteLength = 0;
+  let writtenLength = 0;
+  let bufferedLength = 0;
+
+  const write = async (content: Uint8Array): Promise<void> => {
+    await writeAll(handle, content, mutationGate, writtenLength);
+    writtenLength += content.byteLength;
+  };
+  const flush = async (): Promise<void> => {
+    if (bufferedLength === 0) return;
+    await write(writeWindow.subarray(0, bufferedLength));
+    bufferedLength = 0;
+  };
+
   const streamed = await streamBlob(oid, async (chunk) => {
-    await writeAll(handle, chunk, mutationGate, byteLength);
+    let offset = 0;
+    while (offset < chunk.byteLength) {
+      const remaining = chunk.byteLength - offset;
+      if (bufferedLength === 0 && remaining >= writeWindow.byteLength) {
+        await write(chunk.subarray(offset, offset + writeWindow.byteLength));
+        offset += writeWindow.byteLength;
+        continue;
+      }
+      const copied = Math.min(
+        remaining,
+        writeWindow.byteLength - bufferedLength,
+      );
+      writeWindow.set(chunk.subarray(offset, offset + copied), bufferedLength);
+      bufferedLength += copied;
+      offset += copied;
+      if (bufferedLength === writeWindow.byteLength) await flush();
+    }
     hash.update(chunk);
     byteLength += chunk.byteLength;
   });
+  await flush();
   if (streamed.decodedLength !== byteLength || hash.digest("hex") !== oid) {
     throw new Error("blob stream does not match its content id");
   }
@@ -364,6 +403,7 @@ async function rewriteRegularInPlace(
   absolute: string,
   blobOid: string,
   streamBlob: ApplyBlobStreamReader,
+  writeWindow: Uint8Array,
   observed: Extract<WorkspaceEntry, { readonly kind: "regular" }>,
   validateAncestors: () => Promise<void>,
   mutationGate: WorkspaceMutationGate,
@@ -420,6 +460,7 @@ async function rewriteRegularInPlace(
       handle,
       blobOid,
       streamBlob,
+      writeWindow,
       mutationGate,
     );
     mutationGate.enter();
@@ -1801,6 +1842,7 @@ async function applyTreeToWorkspaceFromSource(
   }
 
   // Step 4: write new and changed regular files.
+  let writeWindow: Uint8Array | undefined;
   for (const { entry, createdPath, existingRegular } of regularWrites) {
     if (blockedDirectoryReplacements.has(entry.path)) {
       continue;
@@ -1855,11 +1897,13 @@ async function applyTreeToWorkspaceFromSource(
     }
     try {
       const absolute = join(workspaceRoot, entry.path);
+      writeWindow ??= Buffer.allocUnsafe(APPLY_WRITE_WINDOW_BYTES);
       if (existingRegular !== undefined) {
         await rewriteRegularInPlace(
           absolute,
           entry.blobOid,
           streamBlob,
+          writeWindow,
           existingRegular,
           () =>
             assertObservedAncestors(
@@ -1878,6 +1922,7 @@ async function applyTreeToWorkspaceFromSource(
           absolute,
           entry.blobOid,
           streamBlob,
+          writeWindow,
           targetRecreationMode(entry),
           validateDestination,
           mutationGate,

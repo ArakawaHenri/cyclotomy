@@ -25,6 +25,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApplyError,
   applyTreeToWorkspace as applyTreeToWorkspaceWithMutationAuthority,
+  applyTreeToWorkspaceFromStream,
 } from "../src/infrastructure/apply.ts";
 import {
   type FileRecreationMode,
@@ -350,6 +351,150 @@ describe("applyTreeToWorkspace", () => {
     expect(cutovers).toBe(1);
     expect(await readFile(join(root, "a.txt"), "utf8")).toBe("target a");
     expect(await readFile(join(root, "b.txt"), "utf8")).toBe("target b");
+  });
+
+  it("coalesces fragmented blob streams into bounded writes", async () => {
+    const sourceChunkBytes = 64 * 1024;
+    const writeWindowBytes = 1024 * 1024;
+    const content = Buffer.alloc(sourceChunkBytes * 17, 0x5a);
+    const oid = sha256Hex(content);
+    const probePath = join(root, ".write-window-probe");
+    const probe = await open(probePath, "w");
+    type PositionalWrite = (
+      this: FileHandle,
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ) => Promise<{
+      readonly bytesWritten: number;
+      readonly buffer: Uint8Array;
+    }>;
+    const prototype = Object.getPrototypeOf(probe) as {
+      write: PositionalWrite;
+    };
+    await probe.close();
+    await unlink(probePath);
+    const originalWrite = prototype.write;
+    const requestedLengths: number[] = [];
+    const writeSpy = vi
+      .spyOn(prototype, "write")
+      .mockImplementation(async function (
+        this: FileHandle,
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+        position: number,
+      ) {
+        requestedLengths.push(length);
+        return await originalWrite.call(this, buffer, offset, length, position);
+      });
+
+    try {
+      const report = await applyTreeToWorkspaceFromStream(
+        root,
+        manifest([
+          {
+            path: "large.bin",
+            type: "regular",
+            blobOid: oid,
+            recreationMode: process.platform === "win32" ? null : 0o644,
+          },
+        ]),
+        async (requestedOid, sink) => {
+          expect(requestedOid).toBe(oid);
+          for (let offset = 0; offset < content.byteLength;) {
+            const end = Math.min(offset + sourceChunkBytes, content.byteLength);
+            await sink(content.subarray(offset, end));
+            offset = end;
+          }
+          return { decodedLength: content.byteLength };
+        },
+        snapshot([]),
+        () => ({ writeAuthority, storeRoot: authorityRoot }),
+      );
+      expect(report.problems).toEqual([]);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(await readFile(join(root, "large.bin"))).toEqual(content);
+    expect(requestedLengths[0]).toBe(writeWindowBytes);
+    expect(requestedLengths.every((length) => length <= writeWindowBytes)).toBe(
+      true,
+    );
+  });
+
+  it("revalidates mutation authority before retrying a short write", async () => {
+    const content = Buffer.alloc(2 * 1024 * 1024, 0x41);
+    const oid = sha256Hex(content);
+    await writeFile(join(root, "large.bin"), "old");
+    const current = await scanRealWorkspace(root);
+    const probePath = join(root, ".short-write-probe");
+    const probe = await open(probePath, "w");
+    type PositionalWrite = (
+      this: FileHandle,
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ) => Promise<{
+      readonly bytesWritten: number;
+      readonly buffer: Uint8Array;
+    }>;
+    const prototype = Object.getPrototypeOf(probe) as {
+      write: PositionalWrite;
+    };
+    await probe.close();
+    await unlink(probePath);
+    const originalWrite = prototype.write;
+    let writes = 0;
+    const writeSpy = vi
+      .spyOn(prototype, "write")
+      .mockImplementation(async function (
+        this: FileHandle,
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+        position: number,
+      ) {
+        writes += 1;
+        const result = await originalWrite.call(
+          this,
+          buffer,
+          offset,
+          Math.min(length, 128 * 1024),
+          position,
+        );
+        await releaseTestWorkspaceWriteAuthorities();
+        return result;
+      });
+
+    try {
+      await expect(
+        applyTreeToWorkspaceFromStream(
+          root,
+          manifest([
+            {
+              path: "large.bin",
+              type: "regular",
+              blobOid: oid,
+              recreationMode: process.platform === "win32" ? null : 0o644,
+            },
+          ]),
+          async (requestedOid, sink) => {
+            expect(requestedOid).toBe(oid);
+            await sink(content);
+            return { decodedLength: content.byteLength };
+          },
+          current,
+          () => ({ writeAuthority, storeRoot: authorityRoot }),
+        ),
+      ).rejects.toThrow(/authority|owner/u);
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect(writes).toBe(1);
   });
 
   it("refuses to delete an unmanaged descendant for an ancestor type replacement", async () => {
