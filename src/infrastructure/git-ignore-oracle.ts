@@ -3,15 +3,12 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
-import { constants as fsConstants, type Stats } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   mkdir,
-  mkdtemp,
   open,
   realpath,
-  rmdir,
-  rm,
   stat,
   writeFile,
   type FileHandle,
@@ -37,7 +34,11 @@ import {
   SyntheticGitDirectoryShape,
   type SyntheticGitShapePath,
 } from "./synthetic-git-directory-shape.ts";
-import { systemErrorCode } from "./system-error.ts";
+import {
+  createPrivateScratchRoot,
+  PrivateScratchRootError,
+  type PrivateScratchRoot,
+} from "./private-scratch-root.ts";
 
 const GIT_COMMAND_TIMEOUT_MS = 5_000;
 const MAX_GIT_COMMAND_OUTPUT_BYTES = 1024 * 1024;
@@ -869,188 +870,73 @@ class AllManagedOracle implements GitIgnoreOracle {
   }
 }
 
-interface SyntheticScratchRoot {
-  readonly path: string;
-  readonly observation: Stats;
-  readonly parent: string;
-  readonly parentObservation: Stats;
-}
+type SyntheticScratchRoot = PrivateScratchRoot;
 
-function sameDirectoryIdentity(expected: Stats, actual: Stats): boolean {
-  return (
-    actual.isDirectory() &&
-    !actual.isSymbolicLink() &&
-    expected.dev === actual.dev &&
-    expected.ino === actual.ino
-  );
-}
-
-function pathIsWithin(root: string, candidate: string): boolean {
-  const fromRoot = relative(root, candidate);
-  return (
-    fromRoot === "" ||
-    (!isAbsolute(fromRoot) &&
-      fromRoot !== ".." &&
-      !fromRoot.startsWith(`..${sep}`))
-  );
-}
-
-async function realDirectory(
-  path: string,
-  label: string,
-): Promise<{
-  readonly path: string;
-  readonly observation: Stats;
-}> {
-  const canonical = await realpath(path);
-  const observation = await lstat(canonical);
-  if (!observation.isDirectory() || observation.isSymbolicLink()) {
-    throw new GitIgnoreOracleError(`${label} is not a real directory`);
-  }
-  return { path: canonical, observation };
-}
-
-async function selectSyntheticScratchParent(
-  options: SyntheticGitIgnoreScratchOptions,
-): Promise<{
-  readonly parent: string;
-  readonly parentObservation: Stats;
-  readonly forbiddenRoots: readonly string[];
-}> {
-  const forbiddenRoots = await Promise.all(
-    (options.forbiddenRoots ?? []).map(
-      async (path) =>
-        (await realDirectory(path, "synthetic Git scratch forbidden root"))
-          .path,
-    ),
-  );
-  const preferred = await realDirectory(
-    options.scratchParent ?? tmpdir(),
-    "synthetic Git scratch parent",
-  );
-  let candidate = preferred;
-  while (forbiddenRoots.some((root) => pathIsWithin(root, candidate.path))) {
-    if (options.scratchParent !== undefined) {
-      throw new GitIgnoreOracleError(
-        "synthetic Git scratch parent is inside a forbidden root",
-      );
+function syntheticScratchCreationError(error: unknown): GitIgnoreOracleError {
+  if (error instanceof PrivateScratchRootError) {
+    switch (error.code) {
+      case "parent-forbidden":
+        return new GitIgnoreOracleError(
+          "synthetic Git scratch parent is inside a forbidden root",
+          { cause: error },
+        );
+      case "no-safe-parent":
+        return new GitIgnoreOracleError(
+          "cannot select synthetic Git scratch space outside forbidden roots",
+          { cause: error },
+        );
+      case "creation-invalid":
+        return new GitIgnoreOracleError(
+          "synthetic Git scratch root was not created in the selected private parent",
+          { cause: error },
+        );
+      case "cleanup-replaced":
+      case "operation-failed":
+        break;
     }
-    const ancestor = dirname(candidate.path);
-    if (ancestor === candidate.path) {
-      throw new GitIgnoreOracleError(
-        "cannot select synthetic Git scratch space outside forbidden roots",
-      );
-    }
-    candidate = await realDirectory(
-      ancestor,
-      "synthetic Git scratch fallback parent",
-    );
   }
-  return {
-    parent: candidate.path,
-    parentObservation: candidate.observation,
-    forbiddenRoots,
-  };
-}
-
-async function removeSyntheticScratchRoot(
-  scratch: SyntheticScratchRoot,
-): Promise<void> {
-  let current: Stats;
-  try {
-    current = await lstat(scratch.path);
-  } catch (error) {
-    if (systemErrorCode(error) === "ENOENT") return;
-    throw new GitIgnoreOracleError(
-      "cannot inspect synthetic Git scratch root before cleanup",
-      { cause: error },
-    );
-  }
-  const parentNow = await lstat(scratch.parent);
-  if (
-    !sameDirectoryIdentity(scratch.observation, current) ||
-    !sameDirectoryIdentity(scratch.parentObservation, parentNow)
-  ) {
-    throw new GitIgnoreOracleError(
-      "refusing to clean a replaced synthetic Git scratch directory",
-    );
-  }
-
-  // Node exposes neither openat/unlinkat nor an fd-relative recursive remove.
-  // Recheck both identities immediately before removing the original path and
-  // never rename owned content through another replaceable pathname. rm does
-  // not follow a root symlink. A process with the same uid can still win the
-  // final pathname race; same-uid adversarial mutation is not a trust boundary.
-  const [rootBeforeRemove, parentBeforeRemove] = await Promise.all([
-    lstat(scratch.path),
-    lstat(scratch.parent),
-  ]);
-  if (
-    !sameDirectoryIdentity(scratch.observation, rootBeforeRemove) ||
-    !sameDirectoryIdentity(scratch.parentObservation, parentBeforeRemove)
-  ) {
-    throw new GitIgnoreOracleError(
-      "refusing to clean a changed synthetic Git scratch directory",
-    );
-  }
-  try {
-    await rm(scratch.path, { recursive: true, force: false });
-  } catch (error) {
-    throw new GitIgnoreOracleError("cannot clean synthetic Git scratch root", {
-      cause: error,
-    });
-  }
+  return new GitIgnoreOracleError("cannot create synthetic Git scratch root", {
+    cause: error,
+  });
 }
 
 async function createSyntheticScratchRoot(
   options: SyntheticGitIgnoreScratchOptions,
 ): Promise<SyntheticScratchRoot> {
-  const selected = await selectSyntheticScratchParent(options);
-  const path = await mkdtemp(join(selected.parent, "cyclotomy-ignore-"));
-  let created: Stats | undefined;
-  let observation: Stats;
   try {
-    created = await lstat(path);
-    const [canonical, parentNow] = await Promise.all([
-      realpath(path),
-      lstat(selected.parent),
-    ]);
+    return await createPrivateScratchRoot({
+      parent: options.scratchParent ?? tmpdir(),
+      parentPolicy:
+        options.scratchParent === undefined ? "nearest-safe-ancestor" : "exact",
+      ...(options.forbiddenRoots === undefined
+        ? {}
+        : { forbiddenRoots: options.forbiddenRoots }),
+      prefix: "cyclotomy-ignore-",
+    });
+  } catch (error) {
+    throw syntheticScratchCreationError(error);
+  }
+}
+
+async function removeSyntheticScratchRoot(
+  scratch: SyntheticScratchRoot,
+): Promise<void> {
+  try {
+    await scratch.dispose();
+  } catch (error) {
     if (
-      canonical !== path ||
-      !created.isDirectory() ||
-      created.isSymbolicLink() ||
-      !sameDirectoryIdentity(selected.parentObservation, parentNow) ||
-      selected.forbiddenRoots.some((root) => pathIsWithin(root, canonical))
+      error instanceof PrivateScratchRootError &&
+      error.code === "cleanup-replaced"
     ) {
       throw new GitIgnoreOracleError(
-        "synthetic Git scratch root was not created in the selected private parent",
+        "refusing to clean a replaced synthetic Git scratch directory",
+        { cause: error },
       );
     }
-    observation = created;
-  } catch (error) {
-    // Never recurse when creation could not be authenticated. Remove only an
-    // empty directory that still has the identity observed immediately after
-    // mkdtemp; otherwise preserve it for inspection.
-    const current = await lstat(path).catch(() => undefined);
-    if (
-      created !== undefined &&
-      current !== undefined &&
-      sameDirectoryIdentity(created, current)
-    ) {
-      await rmdir(path).catch(() => {});
-    }
-    if (error instanceof GitIgnoreOracleError) throw error;
-    throw new GitIgnoreOracleError(
-      "cannot validate synthetic Git scratch root",
-      { cause: error },
-    );
+    throw new GitIgnoreOracleError("cannot clean synthetic Git scratch root", {
+      cause: error,
+    });
   }
-  return {
-    path,
-    observation,
-    parent: selected.parent,
-    parentObservation: selected.parentObservation,
-  };
 }
 
 interface PendingQuery {

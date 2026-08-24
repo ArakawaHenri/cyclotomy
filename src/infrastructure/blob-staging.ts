@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { mkdtemp, open, realpath, rm, type FileHandle } from "node:fs/promises";
+import { open, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { join } from "node:path";
+
+import {
+  createPrivateScratchRoot,
+  PrivateScratchRootError,
+  type PrivateScratchRoot,
+} from "./private-scratch-root.ts";
 
 /**
  * Operation-local, already-authenticated blob bytes. The private staging
@@ -149,16 +155,6 @@ function sameObservation(left: Stats, right: Stats): boolean {
   );
 }
 
-function isWithin(root: string, candidate: string): boolean {
-  const pathFromRoot = relative(root, candidate);
-  return (
-    pathFromRoot === "" ||
-    (!isAbsolute(pathFromRoot) &&
-      pathFromRoot !== ".." &&
-      !pathFromRoot.startsWith(`..${sep}`))
-  );
-}
-
 async function streamStagedFile(
   path: string,
   oid: string,
@@ -229,6 +225,37 @@ async function readStagedFile(
   return Buffer.concat(chunks, decodedLength);
 }
 
+function stagingCreationDetail(error: unknown): string {
+  if (
+    error instanceof PrivateScratchRootError &&
+    error.code === "parent-forbidden"
+  ) {
+    return `restore staging directory must be outside managed roots: ${error.path}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function stagingCleanupError(error: unknown): BlobStagingError {
+  if (
+    error instanceof PrivateScratchRootError &&
+    error.code === "cleanup-replaced"
+  ) {
+    return new BlobStagingError(
+      "refusing to clean a replaced private restore staging directory",
+      error,
+    );
+  }
+  return new BlobStagingError("cannot clean private restore staging", error);
+}
+
+async function disposeStagingRoot(root: PrivateScratchRoot): Promise<void> {
+  try {
+    await root.dispose();
+  } catch (error) {
+    throw stagingCleanupError(error);
+  }
+}
+
 /**
  * Authenticate and spool each distinct oid before apply. `readBlob` is the
  * object-store trust boundary: its contract requires a digest-checked result.
@@ -285,32 +312,26 @@ export async function stageBlobStreams(
   }
 
   // TMPDIR is process-controlled and may itself point into the managed
-  // workspace. Resolve and reject that topology before mkdir: preparation
-  // must not mutate the workspace it promises to leave untouched on failure.
-  let root: string;
+  // workspace. Authenticate and reject that topology before mkdir:
+  // preparation must not mutate the workspace it promises to leave untouched.
+  let scratch: PrivateScratchRoot;
   try {
-    const [controlledRoots, stagingParent] = await Promise.all([
-      Promise.all(
-        [options.workspaceRoot, ...(options.forbiddenRoots ?? [])].map((path) =>
-          realpath(path),
-        ),
-      ),
-      realpath(options.stagingParent ?? tmpdir()),
-    ]);
-    if (controlledRoots.some((path) => isWithin(path, stagingParent))) {
-      throw new Error(
-        `restore staging directory must be outside managed roots: ${stagingParent}`,
-      );
-    }
-    root = await mkdtemp(join(stagingParent, "cyclotomy-restore-blobs-"));
+    scratch = await createPrivateScratchRoot({
+      parent: options.stagingParent ?? tmpdir(),
+      parentPolicy: "exact",
+      forbiddenRoots: [
+        options.workspaceRoot,
+        ...(options.forbiddenRoots ?? []),
+      ],
+      prefix: "cyclotomy-restore-blobs-",
+    });
   } catch (error) {
     throw new BlobStagingError(
-      `cannot prepare private restore staging: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `cannot prepare private restore staging: ${stagingCreationDetail(error)}`,
       error,
     );
   }
+  const root = scratch.path;
   const staged = new Map<
     string,
     { readonly path: string; readonly observation: Stats }
@@ -335,7 +356,7 @@ export async function stageBlobStreams(
     }
   } catch (error) {
     try {
-      await rm(root, { recursive: true, force: true });
+      await disposeStagingRoot(scratch);
     } catch (cleanup) {
       throw new BlobStagingCleanupError(error, cleanup);
     }
@@ -364,11 +385,8 @@ export async function stageBlobStreams(
       return streamStagedFile(prepared.path, oid, prepared.observation, sink);
     },
     dispose: async () => {
-      if (disposed) {
-        return;
-      }
       disposed = true;
-      await rm(root, { recursive: true, force: true });
+      await disposeStagingRoot(scratch);
     },
   };
 }
