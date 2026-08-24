@@ -66,6 +66,8 @@ function notify(
 
 /** Assemble Cyclotomy behind one permanent, pass-through Pi boundary. */
 export function registerCyclotomy(pi: ExtensionAPI): void {
+  const automaticStartupEnabled = process.env.CYCLOTOMY_ENABLED !== "0";
+  let sessionStartObserved = false;
   const agentDir = getAgentDir();
   let i18n = startupI18n(agentDir);
   const controller = new CyclotomyEngineController<
@@ -121,6 +123,28 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
       context,
       recovery.workspaceLockCleanup,
     );
+  }
+
+  async function retireCurrentParticipation(
+    context: ExtensionContext,
+    cause?: unknown,
+  ): Promise<void> {
+    const lease = controller.acquire();
+    if (lease === undefined) {
+      await controller.stop(cause);
+      return;
+    }
+
+    const stopping = controller.stopIfCurrent(lease.generation, cause);
+    try {
+      await settleBeforeRetirement(lease.engine, context);
+    } catch {
+      // Participation is already revoked. Failed durable protection cannot
+      // make the retired engine authoritative again.
+    } finally {
+      lease.release();
+    }
+    await stopping.catch(() => {});
   }
 
   async function stopGeneration(
@@ -267,12 +291,19 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (event, context) => {
-    if (controller.current !== undefined) {
-      await controller.stop(
+    if (sessionStartObserved) {
+      await retireCurrentParticipation(
+        context,
         new Error(
           "Pi delivered more than one session_start to an extension runtime",
         ),
-      );
+      ).catch(() => {});
+      return;
+    }
+    sessionStartObserved = true;
+    if (!automaticStartupEnabled) {
+      await controller.stop();
+      return;
     }
     await controller.resume({ event, context });
   });
@@ -343,23 +374,7 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           return;
         case "stop":
           try {
-            const lease = controller.acquire();
-            if (lease === undefined) {
-              await controller.stop();
-            } else {
-              const stopping = controller.stopIfCurrent(
-                lease.generation,
-                undefined,
-              );
-              try {
-                await settleBeforeRetirement(lease.engine, context);
-              } catch {
-                // The user stop is already linearized; failure to improve the
-                // durable settlement cannot make Cyclotomy participate again.
-              }
-              lease.release();
-              await stopping.catch(() => {});
-            }
+            await retireCurrentParticipation(context);
             notify(context, i18n.t("cyclotomyStopSucceeded"));
           } catch {
             showStatus(context);

@@ -10,9 +10,10 @@ import {
   workspaceMutationLeaseState,
 } from "../src/application/mutation-lease.ts";
 import type { ResolvedNodeState } from "../src/application/resolve.ts";
-import type {
+import {
   CheckpointAdmission,
-  EphemeralArrivalSettlement,
+  type EphemeralArrivalSettlement,
+  type OrdinaryMutationClaim,
 } from "../src/pi/checkpoint-admission.ts";
 import { readSessionView } from "../src/pi/session-view.ts";
 import type { SessionRegistrationService } from "../src/pi/session-registration-service.ts";
@@ -65,6 +66,7 @@ function context(
 
 function authority(options: {
   readonly events?: string[];
+  readonly checkpointAdmission?: CheckpointAdmission;
   readonly captureAnchor?: () => typeof node | undefined;
   readonly locationIsBlocked?: () => boolean;
   readonly sessionHasBarrier?: () => boolean | undefined;
@@ -74,38 +76,67 @@ function authority(options: {
     writeAuthority: WorkspaceWriteAuthority,
   ) => "admitted" | "slot-changed";
   readonly admit?: () => void;
+  readonly ordinaryClaim?: () => OrdinaryMutationClaim;
   readonly admitArrival?: () => boolean;
   readonly arrivalCanProceed?: () => boolean;
+  readonly arrivalCanCommitPlannedTarget?: () => boolean;
   readonly arrivalIsCurrent?: () => boolean;
   readonly closeArrival?: () => boolean;
   readonly cutoverMutation?: () => boolean;
   readonly cutoverArrivalMutation?: () => boolean;
   readonly arrivalSettlement?: () => EphemeralArrivalSettlement;
+  readonly carryArrival?: () => boolean;
+  readonly decideCapture?: () =>
+    | {
+        readonly kind: "capture";
+        readonly lease: { readonly __admissionLease: true };
+      }
+    | { readonly kind: "no-coordinate" | "write-protected" | "not-admitted" };
+  readonly leaseIsCurrent?: () => boolean;
+  readonly reconcileSessionBarrier?: () =>
+    "reconciled" | "absent" | "unregistered";
   readonly workspaceCleanupFailure?: unknown;
   readonly participationIsActive?: () => boolean;
   readonly storeRoot?: string;
   readonly writeAuthority?: WorkspaceWriteAuthority;
 }) {
   const events = options.events ?? [];
-  const admission = {
-    admit: vi.fn(options.admit),
-    admitArrival: vi.fn(options.admitArrival ?? (() => true)),
-    arrivalCanProceed: vi.fn(options.arrivalCanProceed ?? (() => true)),
-    cutoverMutation: vi.fn(() => {
-      events.push("cutover");
-      return options.cutoverMutation?.() ?? true;
-    }),
-    cutoverArrivalMutation: vi.fn(() => {
-      events.push("arrival-cutover");
-      return options.cutoverArrivalMutation?.() ?? true;
-    }),
-    arrivalIsCurrent: vi.fn(options.arrivalIsCurrent ?? (() => true)),
-    closeArrival: vi.fn(options.closeArrival ?? (() => true)),
-    settleProtectedArrival: vi.fn(
-      options.arrivalSettlement ?? (() => ({ kind: "settled" })),
-    ),
-    reset: vi.fn(() => events.push("quarantine")),
-  } as unknown as CheckpointAdmission;
+  const admit = vi.fn(options.admit);
+  const admission =
+    options.checkpointAdmission ??
+    ({
+      admit,
+      claimOrdinaryMutation: vi.fn(() => {
+        const claim =
+          options.ordinaryClaim?.() ?? ({ kind: "claimed" } as const);
+        if (claim.kind === "claimed") admit();
+        return claim;
+      }),
+      admitArrival: vi.fn(options.admitArrival ?? (() => true)),
+      arrivalCanProceed: vi.fn(options.arrivalCanProceed ?? (() => true)),
+      arrivalCanCommitPlannedTarget: vi.fn(
+        options.arrivalCanCommitPlannedTarget ?? (() => false),
+      ),
+      cutoverMutation: vi.fn(() => {
+        events.push("cutover");
+        return options.cutoverMutation?.() ?? true;
+      }),
+      cutoverArrivalMutation: vi.fn(() => {
+        events.push("arrival-cutover");
+        return options.cutoverArrivalMutation?.() ?? true;
+      }),
+      arrivalIsCurrent: vi.fn(options.arrivalIsCurrent ?? (() => true)),
+      closeArrival: vi.fn(options.closeArrival ?? (() => true)),
+      carryArrival: vi.fn(options.carryArrival ?? (() => true)),
+      decideCapture: vi.fn(
+        options.decideCapture ?? (() => ({ kind: "not-admitted" })),
+      ),
+      leaseIsCurrent: vi.fn(options.leaseIsCurrent ?? (() => true)),
+      settleProtectedArrival: vi.fn(
+        options.arrivalSettlement ?? (() => ({ kind: "settled" })),
+      ),
+      reset: vi.fn(() => events.push("quarantine")),
+    } as unknown as CheckpointAdmission);
   const registrations = {
     registeredAuthority: {
       sessionId: node.sessionId,
@@ -136,6 +167,9 @@ function authority(options: {
       events.push("barrier");
       return options.raiseSessionBarrier?.() ?? true;
     }),
+    reconcileSessionBarrier: vi.fn(
+      options.reconcileSessionBarrier ?? (() => "absent"),
+    ),
     hasSessionBarrier: vi.fn(options.sessionHasBarrier ?? (() => false)),
   } as unknown as CurrentMetadataStore;
   return {
@@ -319,6 +353,119 @@ describe("workspace mutation authority", () => {
     });
   });
 
+  it("does not mint a workspace mutation lease after participation is withdrawn", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => false,
+        storeRoot,
+      });
+      const host = context();
+
+      expect(
+        service.prepareLocationMutation(
+          writeAuthority,
+          host,
+          readSessionView(host),
+          node,
+          resolution,
+        ),
+      ).toBeUndefined();
+      expect(
+        service.prepareTreeArrivalMutation(
+          writeAuthority,
+          host,
+          {} as ReturnType<CheckpointAdmission["beginTreeArrival"]>,
+          readSessionView(host),
+          node,
+          resolution,
+        ),
+      ).toBeUndefined();
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
+      expect(admission.arrivalCanProceed).not.toHaveBeenCalled();
+      expect(metadata.protectLocation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects a pre-write lease locally but preserves terminal claim failures", async () => {
+    const failure = new Error("admission snapshot unavailable");
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, metadata } = authority({
+        ordinaryClaim: () => {
+          throw failure;
+        },
+        storeRoot,
+      });
+      const host = context();
+      const current = readSessionView(host);
+
+      expect(
+        service.prepareLocationMutation(
+          writeAuthority,
+          host,
+          current,
+          node,
+          resolution,
+        ),
+      ).toBeUndefined();
+      expect(() => service.admitCurrentLocation(current)).toThrow(failure);
+      expect(metadata.protectLocation).not.toHaveBeenCalled();
+      expect(metadata.admitResolvedLocation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects an ordinary mutation lease retired before its first write", async () => {
+    let active = true;
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => active,
+        storeRoot,
+      });
+      const host = context();
+      const lease = service.prepareLocationMutation(
+        writeAuthority,
+        host,
+        readSessionView(host),
+        node,
+        resolution,
+      );
+      active = false;
+
+      expect(lease).toBeDefined();
+      expect(() => consumeWorkspaceMutationLease(lease!)).toThrow(
+        "workspace mutation authority was retired",
+      );
+      expect(metadata.protectLocation).not.toHaveBeenCalled();
+      expect(admission.cutoverMutation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects a tree mutation lease retired before its first write", async () => {
+    let active = true;
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => active,
+        storeRoot,
+      });
+      const host = context();
+      const lease = service.prepareTreeArrivalMutation(
+        writeAuthority,
+        host,
+        {} as ReturnType<CheckpointAdmission["beginTreeArrival"]>,
+        readSessionView(host),
+        node,
+        resolution,
+      );
+      active = false;
+
+      expect(lease).toBeDefined();
+      expect(() => consumeWorkspaceMutationLease(lease!)).toThrow(
+        "tree mutation authority was retired",
+      );
+      expect(metadata.protectLocation).not.toHaveBeenCalled();
+      expect(admission.cutoverArrivalMutation).not.toHaveBeenCalled();
+    });
+  });
+
   it("rejects the first-write cutover after workspace lock ownership is lost", async () => {
     const storeRoot = await mkdtemp(join(tmpdir(), "cyclotomy-mutation-loss-"));
     try {
@@ -463,7 +610,7 @@ describe("workspace mutation authority", () => {
     }
   });
 
-  it("keeps current admission local and authenticates exact admission durably first", async () => {
+  it("claims transition authority before reopening an exact durable location", async () => {
     await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
       const currentEvents: string[] = [];
       const current = authority({
@@ -497,10 +644,43 @@ describe("workspace mutation authority", () => {
         ),
       ).toBe(true);
       expect(exactEvents).toEqual([
+        "ephemeral-admit",
         "binding",
         "durable-admit",
-        "ephemeral-admit",
       ]);
+    });
+  });
+
+  it("does not durably admit an ordinary location while a transition owns authority", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        ordinaryClaim: () => ({ kind: "transition-conflict" }),
+        storeRoot,
+      });
+      const current = readSessionView(context());
+
+      expect(
+        service.admitLocationIfResolution(writeAuthority, current, resolution),
+      ).toBe(false);
+      expect(admission.claimOrdinaryMutation).toHaveBeenCalledOnce();
+      expect(metadata.admitResolvedLocation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not admit an ordinary location through either terminal while inactive", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => false,
+        storeRoot,
+      });
+      const current = readSessionView(context());
+
+      expect(service.admitCurrentLocation(current)).toBe(false);
+      expect(
+        service.admitLocationIfResolution(writeAuthority, current, resolution),
+      ).toBe(false);
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
+      expect(metadata.admitResolvedLocation).not.toHaveBeenCalled();
     });
   });
 
@@ -547,6 +727,33 @@ describe("workspace mutation authority", () => {
       });
       expect(blockedEvents).toEqual(["binding", "pin", "arrival-settlement"]);
       expect(blocked.admission.admitArrival).not.toHaveBeenCalled();
+    });
+  });
+
+  it("protects rather than admits a tree arrival after participation is withdrawn", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => false,
+        storeRoot,
+      });
+      const current = readSessionView(context());
+      const attempt = {} as ReturnType<CheckpointAdmission["beginTreeArrival"]>;
+
+      expect(
+        service.admitCurrentTreeArrival(writeAuthority, attempt, current),
+      ).toEqual({
+        kind: "protected",
+        evidence: {
+          kind: "exact-slot",
+          slot: protectedLocation.protectedSlot,
+          expectation: "matched",
+          admission: { kind: "settled" },
+        },
+      });
+      expect(metadata.protectLocation).toHaveBeenCalledOnce();
+      expect(admission.admitArrival).not.toHaveBeenCalled();
+      expect(admission.settleProtectedArrival).not.toHaveBeenCalled();
+      expect(admission.reset).toHaveBeenCalled();
     });
   });
 
@@ -681,6 +888,135 @@ describe("workspace mutation authority", () => {
       });
       expect(events).toEqual(["binding", "barrier", "arrival-settlement"]);
     });
+  });
+
+  it("protects a capture conflict without consuming its active arrival", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const checkpointAdmission = new CheckpointAdmission();
+      const current = readSessionView(context());
+      checkpointAdmission.admit(current, node);
+      const attempt = checkpointAdmission.beginTreeArrival();
+      const { service, metadata } = authority({
+        checkpointAdmission,
+        storeRoot,
+      });
+
+      expect(
+        service.settleCaptureBoundary(writeAuthority, current, node),
+      ).toEqual({ kind: "not-admitted" });
+      expect(metadata.protectLocation).toHaveBeenCalledOnce();
+      expect(checkpointAdmission.arrivalIsCurrent(attempt)).toBe(true);
+    });
+  });
+
+  it("reports failure to protect a capture conflict", async () => {
+    const failure = new Error("metadata unavailable");
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service } = authority({
+        protectLocation: () => {
+          throw failure;
+        },
+        storeRoot,
+      });
+
+      expect(
+        service.settleCaptureBoundary(
+          writeAuthority,
+          readSessionView(context()),
+          node,
+        ),
+      ).toEqual({ kind: "settlement-failed", cause: failure });
+    });
+  });
+
+  it("rebuilds ordinary authority after projecting a durable session barrier", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        reconcileSessionBarrier: () => "reconciled",
+        storeRoot,
+      });
+
+      expect(
+        service.settleCaptureBoundary(
+          writeAuthority,
+          readSessionView(context()),
+          node,
+        ),
+      ).toEqual({ kind: "write-protected" });
+      expect(metadata.reconcileSessionBarrier).toHaveBeenCalledOnce();
+      expect(admission.claimOrdinaryMutation).toHaveBeenCalledOnce();
+      expect(admission.decideCapture).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not consume an arrival while projecting its durable session barrier", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const checkpointAdmission = new CheckpointAdmission();
+      const current = readSessionView(context());
+      checkpointAdmission.admit(current, node);
+      const attempt = checkpointAdmission.beginTreeArrival();
+      const { service } = authority({
+        checkpointAdmission,
+        reconcileSessionBarrier: () => "reconciled",
+        storeRoot,
+      });
+
+      expect(
+        service.settleCaptureBoundary(writeAuthority, current, node),
+      ).toEqual({ kind: "not-admitted" });
+      expect(checkpointAdmission.arrivalIsCurrent(attempt)).toBe(true);
+    });
+  });
+
+  it("closes inactive capture boundaries with durable protection only", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const exact = authority({
+        participationIsActive: () => false,
+        storeRoot,
+      });
+      const current = readSessionView(context());
+
+      expect(
+        exact.service.settleCaptureBoundary(writeAuthority, current, node),
+      ).toEqual({ kind: "write-protected" });
+      expect(exact.metadata.protectLocation).toHaveBeenCalledOnce();
+      expect(exact.admission.decideCapture).not.toHaveBeenCalled();
+      expect(exact.admission.claimOrdinaryMutation).not.toHaveBeenCalled();
+      expect(exact.admission.reset).toHaveBeenCalled();
+
+      const nodeFree = authority({
+        captureAnchor: () => undefined,
+        participationIsActive: () => false,
+        storeRoot,
+      });
+      expect(
+        nodeFree.service.settleCaptureBoundary(
+          writeAuthority,
+          current,
+          undefined,
+        ),
+      ).toEqual({ kind: "write-protected" });
+      expect(nodeFree.metadata.raiseSessionBarrier).toHaveBeenCalledOnce();
+      expect(nodeFree.admission.decideCapture).not.toHaveBeenCalled();
+      expect(nodeFree.admission.claimOrdinaryMutation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("fences capture leases and tree-arrival capabilities while inactive", () => {
+    const { service, admission } = authority({
+      participationIsActive: () => false,
+    });
+    const current = readSessionView(context());
+    const lease = { __admissionLease: true } as const;
+    const attempt = {} as ReturnType<CheckpointAdmission["beginTreeArrival"]>;
+
+    expect(service.captureLeaseIsCurrent(lease, current, node)).toBe(false);
+    expect(service.carryCurrentTreeArrival(attempt, current, node)).toBe(false);
+    expect(service.treeArrivalCanProceed(attempt, current, node)).toBe(false);
+    expect(admission.leaseIsCurrent).not.toHaveBeenCalled();
+    expect(admission.carryArrival).not.toHaveBeenCalled();
+    expect(admission.arrivalCanProceed).not.toHaveBeenCalled();
+    expect(admission.arrivalCanCommitPlannedTarget).not.toHaveBeenCalled();
   });
 
   it("falls back to an authenticated session barrier when the tree snapshot is unreadable", async () => {
@@ -899,6 +1235,55 @@ describe("workspace mutation authority", () => {
           admission: { kind: "failed", cause: settlementFailure },
         },
       });
+    });
+  });
+
+  it("keeps durable protection without misreporting a preserved transition", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        ordinaryClaim: () => ({ kind: "transition-conflict" }),
+        storeRoot,
+      });
+
+      expect(
+        service.protectCurrentNode(
+          writeAuthority,
+          readSessionView(context()),
+          node,
+        ),
+      ).toMatchObject({
+        kind: "protected",
+        evidence: {
+          kind: "exact-slot",
+          slot: protectedLocation.protectedSlot,
+          admission: { kind: "settled" },
+        },
+      });
+      expect(metadata.protectLocation).toHaveBeenCalledOnce();
+      expect(admission.claimOrdinaryMutation).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("never reopens ephemeral node authority after inactive protection", async () => {
+    await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
+      const { service, admission, metadata } = authority({
+        participationIsActive: () => false,
+        storeRoot,
+      });
+
+      expect(
+        service.protectCurrentNode(
+          writeAuthority,
+          readSessionView(context()),
+          node,
+        ),
+      ).toMatchObject({
+        kind: "protected",
+        evidence: { admission: { kind: "settled" } },
+      });
+      expect(metadata.protectLocation).toHaveBeenCalledOnce();
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
+      expect(admission.reset).toHaveBeenCalled();
     });
   });
 

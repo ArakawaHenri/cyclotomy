@@ -32,7 +32,7 @@ function deps(expected: SessionView): CaptureProtocolDeps {
     readCurrentView: () => expected,
     sessionIsUsable: () => true,
     captureAnchor: () => node,
-    captureAdmission: () => ({ kind: "capture", lease }),
+    settleCaptureBoundary: () => ({ kind: "capture", lease }),
     checkpointSlot: () => ({ kind: "open-missing" }),
     prepareCurrent: async () => ({ ok: true, value: capture }),
     workspaceStillBound: async () => true,
@@ -70,7 +70,7 @@ describe("capture protocol", () => {
         {
           ...options,
           prepareCurrent,
-          captureAdmission: () => ({ kind: "not-admitted" }),
+          settleCaptureBoundary: () => ({ kind: "not-admitted" }),
         },
         { expected },
       ),
@@ -81,7 +81,7 @@ describe("capture protocol", () => {
   it("stops before admission when the public view has already changed", async () => {
     const expected = view();
     const options = deps(expected);
-    const captureAdmission = vi.fn(options.captureAdmission);
+    const settleCaptureBoundary = vi.fn(options.settleCaptureBoundary);
     const prepareCurrent = vi.fn(options.prepareCurrent);
 
     await expect(
@@ -89,7 +89,7 @@ describe("capture protocol", () => {
         {
           ...options,
           readCurrentView: () => view(),
-          captureAdmission,
+          settleCaptureBoundary,
           prepareCurrent,
         },
         { expected },
@@ -98,7 +98,7 @@ describe("capture protocol", () => {
       kind: "location-changed",
       phase: "before-capture",
     });
-    expect(captureAdmission).not.toHaveBeenCalled();
+    expect(settleCaptureBoundary).not.toHaveBeenCalled();
     expect(prepareCurrent).not.toHaveBeenCalled();
   });
 
@@ -112,7 +112,7 @@ describe("capture protocol", () => {
         {
           ...options,
           captureAnchor: () => undefined,
-          captureAdmission: () => ({ kind: "no-coordinate" }),
+          settleCaptureBoundary: () => ({ kind: "no-coordinate" }),
           prepareCurrent,
         },
         { expected },
@@ -128,11 +128,33 @@ describe("capture protocol", () => {
       runCaptureProtocol(
         {
           ...deps(expected),
-          captureAdmission: () => ({ kind: "write-protected" }),
+          settleCaptureBoundary: () => ({ kind: "write-protected" }),
         },
         { expected },
       ),
     ).resolves.toEqual({ kind: "write-protected" });
+  });
+
+  it("preserves capture-boundary protection failure without scanning", async () => {
+    const expected = view();
+    const cause = new Error("protection unavailable");
+    const options = deps(expected);
+    const prepareCurrent = vi.fn(options.prepareCurrent);
+
+    await expect(
+      runCaptureProtocol(
+        {
+          ...options,
+          prepareCurrent,
+          settleCaptureBoundary: () => ({
+            kind: "settlement-failed",
+            cause,
+          }),
+        },
+        { expected },
+      ),
+    ).resolves.toEqual({ kind: "failed", cause });
+    expect(prepareCurrent).not.toHaveBeenCalled();
   });
 
   it("reauthenticates the capture lease after asynchronous preparation", async () => {

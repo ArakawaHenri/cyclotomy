@@ -1011,6 +1011,7 @@ describe("Cyclotomy runtime", () => {
       kind: "active",
       disposition: { kind: "quarantined" },
     });
+    runtime.markSessionActive();
 
     await rename(workspace, displaced);
     await mkdir(workspace);
@@ -1052,6 +1053,7 @@ describe("Cyclotomy runtime", () => {
     await expect(
       runtime.registrations.register(current, () => current, preparation),
     ).resolves.toEqual(activeRegistration("fresh"));
+    runtime.markSessionActive();
     const commitCapture = vi.spyOn(runtime.metadata, "commitCapture");
     const storeRoot = runtime.storeRoot;
 
@@ -1087,6 +1089,44 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
+  it("rejects a prepared capture at the metadata terminal after participation retires", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const current = registrationView({
+      cwd: workspace,
+      sessionId: "capture-retired",
+      sessionFile: join(home, "capture-retired.jsonl"),
+      retainedEntryIds: ["retained"],
+    });
+    const preparation = await runtime.registrations.prepare(current, {
+      kind: "independent",
+    });
+    await expect(
+      runtime.registrations.register(current, () => current, preparation),
+    ).resolves.toEqual(activeRegistration("fresh"));
+    runtime.markSessionActive();
+    runtime.retire();
+
+    const committed = runtime.commitPreparedCapture(
+      {} as WorkspaceWriteAuthority,
+      current,
+      { sessionId: current.sessionId, entryId: "retained" },
+      { treeOid: "a".repeat(64), snapshot: {} as never },
+      { kind: "open-missing" },
+    );
+
+    expect(committed).toMatchObject({
+      ok: false,
+      error: {
+        kind: "metadata-failed",
+        cause: { message: "capture commit authority was retired" },
+      },
+    });
+    expect(
+      checkpointState(runtime.metadata, current.sessionId, "retained"),
+    ).toBeUndefined();
+    runtime.close();
+  });
+
   it("revokes active authority when the workspace store path is recreated", async (context) => {
     context.skip(
       process.platform === "win32",
@@ -1105,6 +1145,7 @@ describe("Cyclotomy runtime", () => {
     await expect(
       runtime.registrations.register(current, () => current, preparation),
     ).resolves.toEqual(activeRegistration("fresh"));
+    runtime.markSessionActive();
     const storeRoot = runtime.storeRoot;
     const displaced = `${storeRoot}.displaced`;
 
@@ -1738,6 +1779,7 @@ describe("Cyclotomy runtime", () => {
     await expect(
       runtime.registrations.register(current, () => current, preparation),
     ).resolves.toEqual(activeRegistration("fresh"));
+    runtime.markSessionActive();
 
     const treeOid = "a".repeat(64);
     await mutateRuntimeMetadata(runtime, () =>
@@ -1813,6 +1855,7 @@ describe("Cyclotomy runtime", () => {
     await expect(
       runtime.registrations.register(rootView, () => rootView, preparation),
     ).resolves.toEqual(activeRegistration("fresh"));
+    runtime.markSessionActive();
 
     const before = "a".repeat(64);
     const after = "b".repeat(64);

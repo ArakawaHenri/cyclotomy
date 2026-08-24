@@ -22,8 +22,10 @@ executable on `PATH`.
 pi install npm:cyclotomy
 ```
 
-Cyclotomy starts automatically in saved Pi sessions. `--no-session` and
-in-memory sessions are not supported.
+Cyclotomy starts automatically in saved Pi sessions. Set
+`CYCLOTOMY_ENABLED=0` to keep it stopped at startup. `/cyclotomy resume` starts
+it manually; the setting is applied again when the session changes or the
+extension reloads. `--no-session` and in-memory sessions are not supported.
 
 ```bash
 pi update npm:cyclotomy

@@ -181,11 +181,14 @@ export async function prepareNavigationDepartureInWorkspaceLock(
   if (current === undefined) {
     return { kind: "location-changed" };
   }
-  const sourceAdmission = runtime.workspaceMutations.captureAdmission(
+  const sourceAdmission = runtime.workspaceMutations.settleCaptureBoundary(
     writeAuthority,
     current,
     source,
   );
+  if (sourceAdmission.kind === "settlement-failed") {
+    throw sourceAdmission.cause;
+  }
   if (sourceAdmission.kind === "not-admitted") {
     return { kind: "source-blocked", reason: "not-admitted" };
   }
@@ -317,11 +320,14 @@ export async function commitNavigationDepartureInWorkspaceLock(
   if (commitView === undefined) {
     return { kind: "location-changed" };
   }
-  const sourceAdmission = runtime.workspaceMutations.captureAdmission(
+  const sourceAdmission = runtime.workspaceMutations.settleCaptureBoundary(
     writeAuthority,
     commitView,
     source,
   );
+  if (sourceAdmission.kind === "settlement-failed") {
+    throw sourceAdmission.cause;
+  }
   if (sourceAdmission.kind === "not-admitted") {
     return { kind: "source-blocked", reason: "not-admitted" };
   }

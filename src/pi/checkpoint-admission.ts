@@ -38,6 +38,11 @@ export type AdmissionDecision =
   | { readonly kind: "write-protected" }
   | { readonly kind: "not-admitted" };
 
+export type OrdinaryMutationClaim =
+  | { readonly kind: "claimed" }
+  | { readonly kind: "transition-conflict" }
+  | { readonly kind: "invalid-location" };
+
 export type EphemeralArrivalSettlement =
   | { readonly kind: "settled" }
   | { readonly kind: "unsettled"; readonly cause: unknown };
@@ -206,9 +211,36 @@ export class CheckpointAdmission {
     }
   }
 
-  /** Reject one cancellable boundary while preparation or a stale proposal exists. */
+  /** Reject one cancellable boundary while another transition owns authority. */
   rejectTransitionConflict(): boolean {
-    return this.#preparing !== undefined || this.#authority.retireProposal();
+    return (
+      this.#preparing !== undefined ||
+      this.#authority.snapshot().kind === "arrival" ||
+      this.#authority.retireProposal()
+    );
+  }
+
+  /**
+   * Atomically replace ordinary live authority only when no transition owns it.
+   * A pending proposal is retired, but the conflicting mutation is rejected
+   * once; preparation and arrival authority are observed without consumption.
+   */
+  claimOrdinaryMutation(
+    view: SessionView,
+    node: NodeKey | undefined,
+  ): OrdinaryMutationClaim {
+    if (
+      this.#preparing !== undefined ||
+      this.#authority.snapshot().kind === "arrival"
+    ) {
+      return { kind: "transition-conflict" };
+    }
+    if (this.#authority.retireProposal()) {
+      return { kind: "transition-conflict" };
+    }
+    return this.#setLive(view, node)
+      ? { kind: "claimed" }
+      : { kind: "invalid-location" };
   }
 
   admit(view: SessionView, node: NodeKey | undefined): void {
@@ -547,15 +579,15 @@ export class CheckpointAdmission {
         };
   }
 
-  #setLive(view: SessionView, node: NodeKey | undefined): void {
+  #setLive(view: SessionView, node: NodeKey | undefined): boolean {
     // Invalidate before reading the new snapshot. An exceptional accessor can
     // never leave the preceding live authority or one of its leases usable.
     this.#invalidateLifecycle();
     this.#authority.close();
     const location = locationOf(view, node);
-    if (location !== undefined) {
-      this.#authority.open(view, location);
-    }
+    if (location === undefined) return false;
+    this.#authority.open(view, location);
+    return true;
   }
 
   #advanceLive(view: SessionView, node: NodeKey | undefined): boolean {

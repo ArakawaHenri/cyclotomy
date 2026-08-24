@@ -573,6 +573,9 @@ export class CyclotomyRuntime {
       writeAuthority,
       expectedSessionFile: authority.sessionFile,
       assertWorkspaceAuthority: () => {
+        if (!this.isActive) {
+          throw new Error("capture commit authority was retired");
+        }
         this.#registrations.assertActiveWorkspaceAuthority(authority);
         return undefined;
       },

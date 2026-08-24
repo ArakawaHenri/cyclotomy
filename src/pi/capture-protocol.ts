@@ -1,11 +1,9 @@
 import type { CaptureFailure, CaptureSuccess } from "../application/capture.ts";
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { NodeKey, Result } from "../domain/model.ts";
-import type {
-  AdmissionDecision,
-  AdmissionLease,
-} from "./checkpoint-admission.ts";
+import type { AdmissionLease } from "./checkpoint-admission.ts";
 import { isExactUsableSessionView, type SessionView } from "./session-view.ts";
+import type { CaptureBoundaryResult } from "./workspace-mutation-authority.ts";
 
 export type CaptureProtocolFailure =
   | {
@@ -31,10 +29,10 @@ export interface CaptureProtocolDeps {
     view: SessionView,
     leafId?: string | null,
   ) => NodeKey | undefined;
-  readonly captureAdmission: (
+  readonly settleCaptureBoundary: (
     view: SessionView,
     node: NodeKey | undefined,
-  ) => AdmissionDecision;
+  ) => CaptureBoundaryResult;
   readonly checkpointSlot: (node: NodeKey) => CheckpointSlot;
   readonly prepareCurrent: (
     view: SessionView,
@@ -88,7 +86,7 @@ export async function runCaptureProtocol(
       return { kind: "location-changed", phase: "before-capture" };
     }
 
-    const admission = deps.captureAdmission(admittedView, node);
+    const admission = deps.settleCaptureBoundary(admittedView, node);
     switch (admission.kind) {
       case "no-coordinate":
         return { kind: "no-coordinate" };
@@ -96,6 +94,8 @@ export async function runCaptureProtocol(
         return { kind: "write-protected" };
       case "not-admitted":
         return { kind: "not-admitted" };
+      case "settlement-failed":
+        return { kind: "failed", cause: admission.cause };
       case "capture":
         break;
     }

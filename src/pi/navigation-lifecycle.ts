@@ -569,7 +569,13 @@ export function registerNavigationLifecycle(
         view: SessionView,
         node: NodeKey | undefined,
       ): Promise<ArrivalDisposition> => {
-        if (runtime.admission.carryArrival(arrival, view, node)) {
+        if (
+          runtime.workspaceMutations.carryCurrentTreeArrival(
+            arrival,
+            view,
+            node,
+          )
+        ) {
           runtime.setStatus(context, undefined);
           return { kind: "admitted" };
         }

@@ -19,7 +19,10 @@ Cyclotomy 让两者同行。它安静地记录对话推进时的工作区，并�
 pi install npm:cyclotomy
 ```
 
-Cyclotomy 会在已保存的 Pi 会话中自动启动。`--no-session` 和内存会话不受支持。
+Cyclotomy 会在已保存的 Pi 会话中自动启动。
+设置 `CYCLOTOMY_ENABLED=0` 可关闭自动启动；仍可用 `/cyclotomy resume` 手动启动。
+切换会话或重新加载扩展后会再次应用该设置。
+`--no-session` 和内存会话不受支持。
 
 ```bash
 pi update npm:cyclotomy

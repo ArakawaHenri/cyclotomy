@@ -234,6 +234,105 @@ describe("checkpoint admission", () => {
     expect(admission.closeArrival(arrival)).toBe(true);
   });
 
+  it("rejects an ordinary mutation without consuming an active preparation", async () => {
+    const admission = new CheckpointAdmission();
+    const current = view({ leafId: "parent", entries: [parentEntry] });
+    const parent = node("parent");
+    admission.admit(current, parent);
+
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const preparation = admission.runPreparation(async () => {
+      await blocked;
+      return "prepared";
+    });
+
+    expect(admission.claimOrdinaryMutation(current, parent)).toEqual({
+      kind: "transition-conflict",
+    });
+    release();
+    await expect(preparation).resolves.toEqual({
+      kind: "completed",
+      value: "prepared",
+    });
+  });
+
+  it("rejects an ordinary mutation without consuming an active arrival", () => {
+    const admission = new CheckpointAdmission();
+    const current = view({ leafId: "parent", entries: [parentEntry] });
+    const parent = node("parent");
+    admission.admit(current, parent);
+    const arrival = admission.beginTreeArrival();
+
+    expect(admission.claimOrdinaryMutation(current, parent)).toEqual({
+      kind: "transition-conflict",
+    });
+    expect(admission.rejectTransitionConflict()).toBe(true);
+    expect(admission.arrivalIsCurrent(arrival)).toBe(true);
+    expect(admission.settleProtectedArrival(arrival, current, parent)).toEqual({
+      kind: "settled",
+    });
+  });
+
+  it("retires a pending proposal but rejects the conflicting ordinary mutation once", async () => {
+    const admission = new CheckpointAdmission();
+    const current = view({ leafId: "parent", entries: [parentEntry] });
+    const parent = node("parent");
+    admission.admit(current, parent);
+    const plan: PendingNavigation = {
+      sessionId: "session",
+      cwd: "/workspace",
+      expectedOldLeafId: "parent",
+      expectedDestinationId: null,
+      previewSnapshot: undefined,
+      target: { kind: "no-node" },
+    };
+    await expect(
+      admission.runTreePreparation(async () => plan),
+    ).resolves.toEqual({ kind: "accepted" });
+
+    expect(admission.claimOrdinaryMutation(current, parent)).toEqual({
+      kind: "transition-conflict",
+    });
+    expect(admission.claimOrdinaryMutation(current, parent)).toEqual({
+      kind: "claimed",
+    });
+    expect(
+      admission.decideCapture({
+        view: current,
+        node: parent,
+        writeProtected: false,
+      }).kind,
+    ).toBe("capture");
+  });
+
+  it("closes preceding authority when an ordinary location is invalid", () => {
+    const admission = new CheckpointAdmission();
+    const current = view({ leafId: "parent", entries: [parentEntry] });
+    const parent = node("parent");
+    admission.admit(current, parent);
+
+    expect(
+      admission.claimOrdinaryMutation(
+        view({
+          leafId: "parent",
+          entries: [parentEntry],
+          sessionFile: null,
+        }),
+        parent,
+      ),
+    ).toEqual({ kind: "invalid-location" });
+    expect(
+      admission.decideCapture({
+        view: current,
+        node: parent,
+        writeProtected: false,
+      }),
+    ).toEqual({ kind: "not-admitted" });
+  });
+
   it("makes a hanging preparation stale across an equal-looking admission replacement", async () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });

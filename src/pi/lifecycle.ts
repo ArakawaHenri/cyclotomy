@@ -209,8 +209,8 @@ async function captureSourceOrCancel(
               runtime.registrations.sessionIsUsable(current),
             captureAnchor: (current, leafId) =>
               runtime.checkpoints.captureAnchor(current, leafId),
-            captureAdmission: (current, node) =>
-              runtime.workspaceMutations.captureAdmission(
+            settleCaptureBoundary: (current, node) =>
+              runtime.workspaceMutations.settleCaptureBoundary(
                 writeAuthority,
                 current,
                 node,
@@ -1180,6 +1180,84 @@ export function registerCyclotomyLifecycle(
     return true;
   };
 
+  const prepareIdleSessionTransition = async (
+    context: ExtensionContext,
+  ): Promise<{ readonly cancel: true } | undefined> => {
+    try {
+      const view = views.observe(context);
+      runtime.assertSessionUsable(view);
+      if (!context.isIdle()) {
+        runtime.notify(
+          context,
+          runtime.i18n.t("transitionInProgress"),
+          "warning",
+        );
+        return { cancel: true };
+      }
+      const preparation = await runtime.admission.runPreparation(async () => {
+        if (!(await runtime.ensureStore(view.cwd))) {
+          runtime.notifyInitFailure(context);
+          return undefined;
+        }
+        const capture = await captureSourceOrCancel(
+          runtime,
+          views,
+          context,
+          view,
+          view.leafId,
+        );
+        if (capture.kind === "failed") {
+          return (await withdrawAfterSourceCaptureFailure(
+            context,
+            capture.failure,
+          ))
+            ? undefined
+            : ({ cancel: true } as const);
+        }
+        if (
+          readExactRegisteredView(runtime, views, context, view) === undefined
+        ) {
+          runtime.notifyBestEffort(
+            context,
+            () => runtime.i18n.t("commandLocationChanged"),
+            "warning",
+          );
+          return { cancel: true } as const;
+        }
+        if (!context.isIdle()) {
+          runtime.notify(
+            context,
+            runtime.i18n.t("transitionInProgress"),
+            "warning",
+          );
+          return { cancel: true } as const;
+        }
+        return undefined;
+      });
+      if (preparation.kind !== "completed") {
+        if (runtime.activation.kind !== "active") return undefined;
+        runtime.notify(
+          context,
+          runtime.i18n.t("transitionInProgress"),
+          "warning",
+        );
+        return { cancel: true };
+      }
+      return preparation.value;
+    } catch (error) {
+      await withdrawAfterPreparationFailure(context, error);
+      runtime.notifyBestEffort(
+        context,
+        () =>
+          runtime.i18n.t("navigationPrepareFailed", {
+            message: messageOf(error),
+          }),
+        "warning",
+      );
+      return undefined;
+    }
+  };
+
   const host = new PiHostAdapter({
     activation: () => runtime.activation,
     reportFailure: async (failure, context) => {
@@ -1397,11 +1475,14 @@ export function registerCyclotomyLifecycle(
             ) {
               return;
             }
-            runtime.workspaceMutations.captureAdmission(
+            const settlement = runtime.workspaceMutations.settleCaptureBoundary(
               writeAuthority,
               current,
               currentNode,
             );
+            if (settlement.kind === "settlement-failed") {
+              throw settlement.cause;
+            }
             if (!runtime.checkpoints.locationIsBlocked(currentNode)) {
               throw new Error(
                 "session capture barrier was not projected onto the current location",
@@ -1737,65 +1818,7 @@ export function registerCyclotomyLifecycle(
     "session_before_fork",
     host.guard<SessionBeforeForkEvent>({
       pass: undefined,
-      active: async (_event, context) => {
-        try {
-          const view = views.observe(context);
-          runtime.assertSessionUsable(view);
-          if (!context.isIdle()) {
-            runtime.notify(
-              context,
-              runtime.i18n.t("transitionInProgress"),
-              "warning",
-            );
-            return { cancel: true };
-          }
-          const preparation = await runtime.admission.runPreparation(
-            async () => {
-              if (!(await runtime.ensureStore(view.cwd))) {
-                runtime.notifyInitFailure(context);
-                return undefined;
-              }
-              const capture = await captureSourceOrCancel(
-                runtime,
-                views,
-                context,
-                view,
-                view.leafId,
-              );
-              if (capture.kind === "failed") {
-                return (await withdrawAfterSourceCaptureFailure(
-                  context,
-                  capture.failure,
-                ))
-                  ? undefined
-                  : ({ cancel: true } as const);
-              }
-              return undefined;
-            },
-          );
-          if (preparation.kind !== "completed") {
-            if (runtime.activation.kind !== "active") return undefined;
-            runtime.notify(
-              context,
-              runtime.i18n.t("transitionInProgress"),
-              "warning",
-            );
-            return { cancel: true };
-          }
-          return preparation.value;
-        } catch (error) {
-          await withdrawAfterPreparationFailure(context, error);
-          runtime.notifyBestEffort(
-            context,
-            () =>
-              runtime.i18n.t("navigationPrepareFailed", {
-                message: messageOf(error),
-              }),
-            "warning",
-          );
-          return undefined;
-        }
-      },
+      active: (_event, context) => prepareIdleSessionTransition(context),
     }),
   );
 
@@ -1803,76 +1826,7 @@ export function registerCyclotomyLifecycle(
     "session_before_switch",
     host.guard<SessionBeforeSwitchEvent>({
       pass: undefined,
-      active: async (_event, context) => {
-        try {
-          const view = views.observe(context);
-          runtime.assertSessionUsable(view);
-          if (!context.isIdle()) {
-            runtime.notify(
-              context,
-              runtime.i18n.t("transitionInProgress"),
-              "warning",
-            );
-            return { cancel: true };
-          }
-          const preparation = await runtime.admission.runPreparation(
-            async () => {
-              if (!(await runtime.ensureStore(view.cwd))) {
-                runtime.notifyInitFailure(context);
-                return undefined;
-              }
-              const capture = await captureSourceOrCancel(
-                runtime,
-                views,
-                context,
-                view,
-                view.leafId,
-              );
-              if (capture.kind === "failed") {
-                return (await withdrawAfterSourceCaptureFailure(
-                  context,
-                  capture.failure,
-                ))
-                  ? undefined
-                  : ({ cancel: true } as const);
-              }
-              if (
-                readExactRegisteredView(runtime, views, context, view) ===
-                undefined
-              ) {
-                runtime.notifyBestEffort(
-                  context,
-                  () => runtime.i18n.t("commandLocationChanged"),
-                  "warning",
-                );
-                return { cancel: true } as const;
-              }
-              return undefined;
-            },
-          );
-          if (preparation.kind !== "completed") {
-            if (runtime.activation.kind !== "active") return undefined;
-            runtime.notify(
-              context,
-              runtime.i18n.t("transitionInProgress"),
-              "warning",
-            );
-            return { cancel: true };
-          }
-          return preparation.value;
-        } catch (error) {
-          await withdrawAfterPreparationFailure(context, error);
-          runtime.notifyBestEffort(
-            context,
-            () =>
-              runtime.i18n.t("navigationPrepareFailed", {
-                message: messageOf(error),
-              }),
-            "warning",
-          );
-          return undefined;
-        }
-      },
+      active: (_event, context) => prepareIdleSessionTransition(context),
     }),
   );
 }

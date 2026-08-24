@@ -80,11 +80,12 @@ type RegistrationAuthority = Pick<
 
 type MutationAdmission = Pick<
   CheckpointAdmission,
-  | "admit"
   | "admitArrival"
   | "arrivalCanProceed"
   | "arrivalCanCommitPlannedTarget"
   | "arrivalIsCurrent"
+  | "carryArrival"
+  | "claimOrdinaryMutation"
   | "closeArrival"
   | "cutoverArrivalMutation"
   | "cutoverMutation"
@@ -93,6 +94,10 @@ type MutationAdmission = Pick<
   | "settleProtectedArrival"
   | "reset"
 >;
+
+export type CaptureBoundaryResult =
+  | AdmissionDecision
+  | { readonly kind: "settlement-failed"; readonly cause: unknown };
 
 export interface WorkspaceMutationAuthorityOptions {
   readonly admission: MutationAdmission;
@@ -180,6 +185,7 @@ export class WorkspaceMutationAuthority {
     node: NodeKey,
     resolution: ResolvedNodeState,
   ): WorkspaceMutationLease<ResolvedNodeState> | undefined {
+    if (!this.#options.participationIsActive()) return undefined;
     let current: SessionView;
     try {
       current = readSessionView(context);
@@ -192,9 +198,11 @@ export class WorkspaceMutationAuthority {
         return undefined;
       }
       // Explicit restore authenticates this complete public snapshot at the
-      // command boundary. Rebase ephemeral authority to that exact fact; the
-      // durable slot is checked and pinned again in the callback below.
-      this.#options.admission.admit(current, node);
+      // command boundary. Claim that exact fact without consuming a concurrent
+      // preparation, proposal conflict, or active tree arrival.
+      if (this.#claimOrdinaryMutation(current, node)?.kind !== "claimed") {
+        return undefined;
+      }
     } catch {
       return undefined;
     }
@@ -211,6 +219,9 @@ export class WorkspaceMutationAuthority {
       }
       if (!context.isIdle()) {
         throw new Error("Pi became busy before workspace mutation");
+      }
+      if (!this.#options.participationIsActive()) {
+        throw new Error("workspace mutation authority was retired");
       }
       const protection = this.#protectLocation(
         writeAuthority,
@@ -251,6 +262,7 @@ export class WorkspaceMutationAuthority {
     node: NodeKey,
     resolution: ResolvedNodeState,
   ): WorkspaceMutationLease<ResolvedNodeState> | undefined {
+    if (!this.#options.participationIsActive()) return undefined;
     if (!this.#options.admission.arrivalCanProceed(attempt, expected, node)) {
       return undefined;
     }
@@ -267,6 +279,9 @@ export class WorkspaceMutationAuthority {
       }
       if (!context.isIdle()) {
         throw new Error("Pi became busy before tree workspace mutation");
+      }
+      if (!this.#options.participationIsActive()) {
+        throw new Error("tree mutation authority was retired");
       }
       const protection = this.#protectLocation(
         writeAuthority,
@@ -425,7 +440,21 @@ export class WorkspaceMutationAuthority {
       // authenticated snapshot live so a still-running engine may leave it or
       // append a genuine descendant. Retirement deliberately skips this step.
       try {
-        this.#options.admission.admit(current, node);
+        const claim = this.#claimOrdinaryMutation(current, node);
+        if (claim === undefined) {
+          this.quarantineAdmission();
+          return {
+            kind: "protected",
+            evidence: exactSlotProtectionEvidence(protection, {
+              kind: "settled",
+            }),
+          };
+        }
+        if (claim.kind !== "claimed") {
+          throw new Error(
+            `arrival recovery could not claim ordinary authority (${claim.kind})`,
+          );
+        }
         return {
           kind: "protected",
           evidence: exactSlotProtectionEvidence(protection, {
@@ -541,6 +570,7 @@ export class WorkspaceMutationAuthority {
   }
 
   admitCurrentLocation(view: SessionView): boolean {
+    if (!this.#options.participationIsActive()) return false;
     const node = this.captureAnchor(view);
     if (
       (node !== undefined && this.#locationIsBlocked(node)) ||
@@ -548,8 +578,7 @@ export class WorkspaceMutationAuthority {
     ) {
       return false;
     }
-    this.#options.admission.admit(view, node);
-    return true;
+    return this.#claimOrdinaryMutation(view, node)?.kind === "claimed";
   }
 
   admitLocationIfResolution(
@@ -557,15 +586,23 @@ export class WorkspaceMutationAuthority {
     view: SessionView,
     resolution: ResolvedNodeState,
   ): boolean {
+    if (!this.#options.participationIsActive()) return false;
     const node = this.captureAnchor(view);
-    if (
-      node === undefined ||
-      !this.#admitResolvedLocation(writeAuthority, view, node, resolution)
-    ) {
-      return false;
+    if (node === undefined) return false;
+    const claim = this.#claimOrdinaryMutation(view, node);
+    if (claim?.kind !== "claimed") return false;
+    try {
+      if (
+        !this.#admitResolvedLocation(writeAuthority, view, node, resolution)
+      ) {
+        this.quarantineAdmission();
+        return false;
+      }
+      return true;
+    } catch (cause) {
+      this.quarantineAdmission();
+      throw cause;
     }
-    this.#options.admission.admit(view, node);
-    return true;
   }
 
   admitCurrentTreeArrival(
@@ -573,6 +610,11 @@ export class WorkspaceMutationAuthority {
     attempt: ArrivalAttempt,
     view: SessionView,
   ): ArrivalDisposition {
+    if (!this.#options.participationIsActive()) {
+      return this.#protectTreeArrival(writeAuthority, attempt, view, {
+        kind: "any-current",
+      });
+    }
     const node = this.captureAnchor(view);
     if (!this.#options.admission.arrivalCanProceed(attempt, view, node)) {
       this.#options.admission.closeArrival(attempt);
@@ -603,6 +645,12 @@ export class WorkspaceMutationAuthority {
     view: SessionView,
     resolution: ResolvedNodeState,
   ): ArrivalDisposition {
+    if (!this.#options.participationIsActive()) {
+      return this.#protectTreeArrival(writeAuthority, attempt, view, {
+        kind: "exact-resolution",
+        resolution,
+      });
+    }
     const node = this.captureAnchor(view);
     if (
       node === undefined ||
@@ -677,11 +725,11 @@ export class WorkspaceMutationAuthority {
     });
   }
 
-  captureAdmission(
+  settleCaptureBoundary(
     writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
     node: NodeKey | undefined,
-  ): AdmissionDecision {
+  ): CaptureBoundaryResult {
     if (node !== undefined) {
       const reconciled = this.reconcileSessionBarrier(
         writeAuthority,
@@ -689,10 +737,43 @@ export class WorkspaceMutationAuthority {
         node,
       );
       if (reconciled === "reconciled") {
-        this.#options.admission.admit(view, node);
-        return { kind: "write-protected" };
+        if (!this.#options.participationIsActive()) {
+          this.quarantineAdmission();
+          return { kind: "write-protected" };
+        }
+        try {
+          const claim = this.#claimOrdinaryMutation(view, node);
+          if (claim === undefined) {
+            this.quarantineAdmission();
+            return { kind: "write-protected" };
+          }
+          return claim.kind === "claimed"
+            ? { kind: "write-protected" }
+            : { kind: "not-admitted" };
+        } catch (cause) {
+          return { kind: "settlement-failed", cause };
+        }
       }
       if (reconciled === "unregistered") return { kind: "not-admitted" };
+    }
+    if (!this.#options.participationIsActive()) {
+      this.quarantineAdmission();
+      if (node === undefined) {
+        try {
+          return this.#raiseSessionBarrier(writeAuthority, view)
+            ? { kind: "write-protected" }
+            : {
+                kind: "settlement-failed",
+                cause: new Error("session capture barrier could not be raised"),
+              };
+        } catch (cause) {
+          return { kind: "settlement-failed", cause };
+        }
+      }
+      const protection = this.protectCurrentNode(writeAuthority, view, node);
+      return protection.kind === "protected"
+        ? { kind: "write-protected" }
+        : { kind: "settlement-failed", cause: protection.cause };
     }
     const writeProtected = node !== undefined && this.#locationIsBlocked(node);
     const decision = this.#options.admission.decideCapture({
@@ -701,7 +782,14 @@ export class WorkspaceMutationAuthority {
       writeProtected,
     });
     if (decision.kind === "not-admitted" && node !== undefined) {
-      this.protectCurrentNode(writeAuthority, view, node);
+      const protection = this.protectCurrentNode(writeAuthority, view, node);
+      // Durable protection closes the uncertain coordinate, but it does not
+      // grant this caller transition authority. Preserve `not-admitted` so a
+      // concurrent preparation or arrival still cancels the departure that
+      // observed it; only failure to establish the safety fact is escalated.
+      return protection.kind === "protected"
+        ? decision
+        : { kind: "settlement-failed", cause: protection.cause };
     }
     return decision;
   }
@@ -712,8 +800,20 @@ export class WorkspaceMutationAuthority {
     node: NodeKey,
   ): boolean {
     return (
+      this.#options.participationIsActive() &&
       this.#options.admission.leaseIsCurrent(lease, view, node) &&
       !this.#locationIsBlocked(node)
+    );
+  }
+
+  carryCurrentTreeArrival(
+    attempt: ArrivalAttempt,
+    view: SessionView,
+    node: NodeKey | undefined,
+  ): boolean {
+    return (
+      this.#options.participationIsActive() &&
+      this.#options.admission.carryArrival(attempt, view, node)
     );
   }
 
@@ -723,8 +823,13 @@ export class WorkspaceMutationAuthority {
     node: NodeKey,
   ): boolean {
     return (
-      this.#options.admission.arrivalCanProceed(attempt, view, node) ||
-      this.#options.admission.arrivalCanCommitPlannedTarget(attempt, view, node)
+      this.#options.participationIsActive() &&
+      (this.#options.admission.arrivalCanProceed(attempt, view, node) ||
+        this.#options.admission.arrivalCanCommitPlannedTarget(
+          attempt,
+          view,
+          node,
+        ))
     );
   }
 
@@ -754,6 +859,16 @@ export class WorkspaceMutationAuthority {
     };
   }
 
+  /** Participation-gated owner of every ordinary ephemeral authority mint. */
+  #claimOrdinaryMutation(
+    view: SessionView,
+    node: NodeKey | undefined,
+  ): ReturnType<CheckpointAdmission["claimOrdinaryMutation"]> | undefined {
+    return this.#options.participationIsActive()
+      ? this.#options.admission.claimOrdinaryMutation(view, node)
+      : undefined;
+  }
+
   #admitResolvedLocation(
     writeAuthority: WorkspaceWriteAuthority,
     view: SessionView,
@@ -771,6 +886,7 @@ export class WorkspaceMutationAuthority {
           treeOid: resolution.treeOid,
         },
       };
+    if (!this.#options.participationIsActive()) return false;
     return (
       this.#options.metadata().admitResolvedLocation(writeAuthority, input) !==
       "slot-changed"
@@ -785,7 +901,10 @@ export class WorkspaceMutationAuthority {
   ): ArrivalDisposition {
     let node: NodeKey | undefined;
     try {
-      if (!this.#options.admission.arrivalIsCurrent(attempt)) {
+      if (
+        this.#options.participationIsActive() &&
+        !this.#options.admission.arrivalIsCurrent(attempt)
+      ) {
         return {
           kind: "unsettled",
           cause: new Error("tree arrival authority is stale"),
@@ -871,11 +990,32 @@ export class WorkspaceMutationAuthority {
       };
     }
     let admission: ArrivalAdmissionSettlement;
-    try {
-      this.#options.admission.admit(view, node);
+    if (!this.#options.participationIsActive()) {
+      this.quarantineAdmission();
       admission = { kind: "settled" };
-    } catch (cause) {
-      admission = { kind: "failed", cause };
+    } else {
+      try {
+        const claim = this.#claimOrdinaryMutation(view, node);
+        if (claim === undefined) {
+          this.quarantineAdmission();
+          admission = { kind: "settled" };
+        } else {
+          // A preparation or arrival remains the legitimate owner; a proposal
+          // conflict retires only the proposal and retains its live source.
+          // Either outcome is expected contention, not an admission failure.
+          admission =
+            claim.kind === "claimed" || claim.kind === "transition-conflict"
+              ? { kind: "settled" }
+              : {
+                  kind: "failed",
+                  cause: new Error(
+                    `protected location could not claim ordinary authority (${claim.kind})`,
+                  ),
+                };
+        }
+      } catch (cause) {
+        admission = { kind: "failed", cause };
+      }
     }
     return {
       kind: "protected",
@@ -931,6 +1071,10 @@ export class WorkspaceMutationAuthority {
     view: SessionView,
     node: NodeKey | undefined,
   ): EphemeralArrivalSettlement {
+    if (!this.#options.participationIsActive()) {
+      this.quarantineAdmission();
+      return { kind: "settled" };
+    }
     try {
       return this.#options.admission.settleProtectedArrival(
         attempt,

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  access,
   mkdir,
   mkdtemp,
   readFile,
@@ -26,12 +27,15 @@ let workspace: string;
 let agentDir: string;
 let storeRoot: string;
 let previousAgentDir: string | undefined;
+let previousCyclotomyEnabled: string | undefined;
 
 beforeEach(async () => {
   workspace = await mkdtemp(join(tmpdir(), "cyclotomy-participation-ws-"));
   agentDir = await mkdtemp(join(tmpdir(), "cyclotomy-participation-home-"));
   previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  previousCyclotomyEnabled = process.env.CYCLOTOMY_ENABLED;
   process.env.PI_CODING_AGENT_DIR = agentDir;
+  delete process.env.CYCLOTOMY_ENABLED;
   await mkdir(join(agentDir, "cyclotomy"));
   await writeSettings({ locale: "en", gc: { intervalMs: 0 } });
   storeRoot = join(
@@ -50,6 +54,11 @@ afterEach(async () => {
     delete process.env.PI_CODING_AGENT_DIR;
   } else {
     process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+  if (previousCyclotomyEnabled === undefined) {
+    delete process.env.CYCLOTOMY_ENABLED;
+  } else {
+    process.env.CYCLOTOMY_ENABLED = previousCyclotomyEnabled;
   }
   await Promise.all([
     rm(workspace, { recursive: true, force: true }),
@@ -93,6 +102,90 @@ async function startTwoNodeSession(pi: FakePi): Promise<string> {
 }
 
 describe("Cyclotomy participation boundary", () => {
+  it("starts stopped when CYCLOTOMY_ENABLED is zero and resumes explicitly", async () => {
+    process.env.CYCLOTOMY_ENABLED = "0";
+    const pi = new FakePi(workspace, registerCyclotomy);
+    pi.manager.appendEntry();
+
+    await pi.startSession("startup");
+    await pi.runCommand("cyclotomy");
+    expect(pi.notifications.at(-1)).toEqual({
+      message: "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
+      level: "info",
+    });
+    await expectPiPreparationPasses(pi);
+    await expect(access(storeRoot)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await pi.runCommand("cyclotomy", "resume");
+    expect(pi.notifications.at(-1)).toEqual({
+      message: "Cyclotomy resumed.",
+      level: "info",
+    });
+    await pi.endTurn();
+    const target = pi.manager.getLeafId();
+    expect(target).not.toBeNull();
+    const db = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
+    expect(checkpointState(db, pi.manager.sessionId, target!)).toBeDefined();
+    db.close();
+  });
+
+  it.each([
+    { state: "stopped", resume: false },
+    { state: "explicitly resumed", resume: true },
+  ])(
+    "retires $state participation when Pi repeats session_start",
+    async ({ resume }) => {
+      process.env.CYCLOTOMY_ENABLED = "0";
+      const pi = new FakePi(workspace, registerCyclotomy);
+      pi.manager.appendEntry();
+      await pi.startSession("startup");
+      if (resume) await pi.runCommand("cyclotomy", "resume");
+
+      pi.notifications.length = 0;
+      await pi.emitMalformedSessionStart("reload");
+      await pi.runCommand("cyclotomy");
+
+      expect(pi.notifications.at(-1)?.message).toContain(
+        "Pi delivered more than one session_start to an extension runtime",
+      );
+      await expectPiPreparationPasses(pi);
+    },
+  );
+
+  it("retires and protects active participation when Pi repeats session_start", async () => {
+    const pi = new FakePi(workspace, registerCyclotomy);
+    const target = pi.manager.appendEntry().id;
+    await writeFile(join(workspace, "state.txt"), "checkpoint");
+    await pi.startSession("startup");
+    await pi.endTurn(0);
+    const before = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
+    expect(checkpointState(before, pi.manager.sessionId, target)).toBeDefined();
+    expect(checkpointIsBlocked(before, pi.manager.sessionId, target)).toBe(
+      false,
+    );
+    before.close();
+
+    await pi.emitMalformedSessionStart("reload");
+    await pi.runCommand("cyclotomy");
+
+    expect(pi.notifications.at(-1)?.message).toContain(
+      "Pi delivered more than one session_start to an extension runtime",
+    );
+    const after = await createTestCurrentMetadataStore(
+      join(storeRoot, "state.db"),
+      storeRoot,
+    );
+    expect(checkpointIsBlocked(after, pi.manager.sessionId, target)).toBe(true);
+    after.close();
+    await expectPiPreparationPasses(pi);
+  });
+
   it.each([
     {
       name: "configuration parsing fails",

@@ -5028,7 +5028,7 @@ describe("checkpoint authority lifecycle", () => {
           return original.call(this, writeAuthority, view, resolution);
         });
       const recoveryAdmissionFailure = vi
-        .spyOn(runtime.admission, "admit")
+        .spyOn(runtime.admission, "claimOrdinaryMutation")
         .mockImplementationOnce(() => {
           throw new Error("recovery admission failed");
         });
@@ -5796,7 +5796,7 @@ describe("checkpoint authority lifecycle", () => {
           return result;
         });
       const recoveryAdmissionFailure = vi
-        .spyOn(runtime.admission, "admit")
+        .spyOn(runtime.admission, "claimOrdinaryMutation")
         .mockImplementationOnce(() => {
           throw new Error("initialization recovery admission failed");
         });
@@ -8298,39 +8298,85 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
     });
 
-    it("explains cancellation when the session view drifts after switch capture", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      await pi.startSession("startup");
-      await writeFile(join(workspace, "a.txt"), "saved");
-      await pi.endTurn();
-      await writeFile(join(workspace, "a.txt"), "before-switch");
-      const target = pi.newDetachedSession();
-      const commitPreparedCapture =
-        CyclotomyRuntime.prototype.commitPreparedCapture;
-      let drifted = false;
-      const driftAfterCapture = vi
-        .spyOn(CyclotomyRuntime.prototype, "commitPreparedCapture")
-        .mockImplementation(function (
-          this: CyclotomyRuntime,
-          ...args: Parameters<CyclotomyRuntime["commitPreparedCapture"]>
-        ) {
-          const result = commitPreparedCapture.call(this, ...args);
-          if (!drifted) {
-            pi.manager.appendEntry();
-            drifted = true;
-          }
-          return result;
-        });
+    it.each(["fork", "switch"] as const)(
+      "explains cancellation when the session view drifts after %s capture",
+      async (transition) => {
+        const pi = new FakePi(workspace, registerCyclotomy);
+        await pi.startSession("startup");
+        await writeFile(join(workspace, "a.txt"), "saved");
+        await pi.endTurn();
+        const source = pi.manager.getLeafId()!;
+        await writeFile(join(workspace, "a.txt"), `before-${transition}`);
+        const commitPreparedCapture =
+          CyclotomyRuntime.prototype.commitPreparedCapture;
+        let drifted = false;
+        const driftAfterCapture = vi
+          .spyOn(CyclotomyRuntime.prototype, "commitPreparedCapture")
+          .mockImplementation(function (
+            this: CyclotomyRuntime,
+            ...args: Parameters<CyclotomyRuntime["commitPreparedCapture"]>
+          ) {
+            const result = commitPreparedCapture.call(this, ...args);
+            if (!drifted) {
+              pi.manager.appendEntry();
+              drifted = true;
+            }
+            return result;
+          });
 
-      try {
-        expect(await pi.resumeTo(target)).toBe("cancelled");
-      } finally {
-        driftAfterCapture.mockRestore();
-      }
+        try {
+          const result =
+            transition === "fork"
+              ? await pi.fork(source)
+              : await pi.resumeTo(pi.newDetachedSession());
+          expect(result).toBe("cancelled");
+        } finally {
+          driftAfterCapture.mockRestore();
+        }
 
-      expect(drifted).toBe(true);
-      expect(notified(pi, "commandLocationChanged")).toBe(true);
-    });
+        expect(drifted).toBe(true);
+        expect(notified(pi, "commandLocationChanged")).toBe(true);
+      },
+    );
+
+    it.each(["fork", "switch"] as const)(
+      "cancels when Pi becomes busy after %s capture",
+      async (transition) => {
+        const pi = new FakePi(workspace, registerCyclotomy);
+        await pi.startSession("startup");
+        await writeFile(join(workspace, "a.txt"), "saved");
+        await pi.endTurn();
+        const source = pi.manager.getLeafId()!;
+        await writeFile(join(workspace, "a.txt"), `before-${transition}`);
+        const commitPreparedCapture =
+          CyclotomyRuntime.prototype.commitPreparedCapture;
+        let becameBusy = false;
+        const busyAfterCapture = vi
+          .spyOn(CyclotomyRuntime.prototype, "commitPreparedCapture")
+          .mockImplementation(function (
+            this: CyclotomyRuntime,
+            ...args: Parameters<CyclotomyRuntime["commitPreparedCapture"]>
+          ) {
+            const result = commitPreparedCapture.call(this, ...args);
+            pi.idle = false;
+            becameBusy = true;
+            return result;
+          });
+
+        try {
+          const result =
+            transition === "fork"
+              ? await pi.fork(source)
+              : await pi.resumeTo(pi.newDetachedSession());
+          expect(result).toBe("cancelled");
+        } finally {
+          pi.idle = true;
+          busyAfterCapture.mockRestore();
+        }
+
+        expect(becameBusy).toBe(true);
+        expect(notified(pi, "transitionInProgress")).toBe(true);
+      },
+    );
   });
 });
