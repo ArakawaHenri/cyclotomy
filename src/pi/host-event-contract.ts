@@ -12,6 +12,15 @@ type PublicSessionEvent = Extract<
 type SessionEventPolicy =
   "bootstrap" | "prepare" | "settle" | "close" | "ignore-nonstructural";
 
+/** Require every installed event while retaining policies for newer Pi versions. */
+function defineSessionEventPolicies<
+  const Policies extends Record<string, SessionEventPolicy>,
+>(
+  policies: Policies & Record<PublicSessionEvent["type"], SessionEventPolicy>,
+): Readonly<Policies> {
+  return Object.freeze(policies);
+}
+
 /**
  * Compile-time inventory of Pi's public session lifecycle.
  *
@@ -20,17 +29,18 @@ type SessionEventPolicy =
  * public session event makes both the locked and latest-host type checks ask
  * for an explicit Cyclotomy policy.
  */
-Object.freeze({
+defineSessionEventPolicies({
   session_start: "bootstrap",
   session_info_changed: "ignore-nonstructural",
   session_before_switch: "prepare",
   session_before_fork: "prepare",
   session_before_compact: "prepare",
   session_compact: "settle",
+  session_compact_failed: "ignore-nonstructural",
   session_shutdown: "close",
   session_before_tree: "prepare",
   session_tree: "settle",
-} as const satisfies Record<PublicSessionEvent["type"], SessionEventPolicy>);
+});
 
 export interface SessionStartPolicy {
   readonly registration: "independent" | "fork";

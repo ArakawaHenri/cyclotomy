@@ -22,10 +22,9 @@ executable on `PATH`.
 pi install npm:cyclotomy
 ```
 
-Cyclotomy starts automatically in saved Pi sessions. Set
-`CYCLOTOMY_ENABLED=0` to keep it stopped at startup. `/cyclotomy resume` starts
-it manually; the setting is applied again when the session changes or the
-extension reloads. `--no-session` and in-memory sessions are not supported.
+Cyclotomy starts automatically in saved Pi sessions unless
+`CYCLOTOMY_ENABLED=0` is set. `--no-session` and in-memory sessions are not
+supported.
 
 ```bash
 pi update npm:cyclotomy
@@ -45,8 +44,7 @@ pi remove npm:cyclotomy
 | `/restore`                  | Reapply the current node's exact or inherited checkpoint.                                                  |
 | `/cyclotomy [stop\|resume]` | Show status, stop Cyclotomy, or resume it.                                                                 |
 
-`/tree` belongs to Pi. A stop is temporary: use `/cyclotomy resume` to start
-Cyclotomy again, or reopen a saved session.
+`/tree` belongs to Pi.
 
 Before a restore changes files, Cyclotomy shows the same preview:
 
