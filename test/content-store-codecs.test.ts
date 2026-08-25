@@ -83,6 +83,27 @@ describe("zstd-v1 codec", () => {
     }
   });
 
+  it("emits one complete frame when output fills the host chunk", async () => {
+    const input = deterministicBytes(16_370);
+    const encoded = await encodeZstdV1(input);
+    expect(encoded.byteLength).toBe(16 * 1024);
+    expect(Buffer.from(await decodeZstdV1(encoded, input.byteLength))).toEqual(
+      Buffer.from(input),
+    );
+  });
+
+  it("authenticates a production-selected zstd record beyond the host chunk", async () => {
+    const input = deterministicBytes(20_000);
+    input.fill(0, 0, 3_000);
+
+    const record = await createContentRecord(input);
+    expect(record.encoding).toBe("zstd-v1");
+    expect(record.payload.byteLength).toBeGreaterThan(16 * 1024);
+    expect(Buffer.from(await authenticateFullRecordPayload(record))).toEqual(
+      Buffer.from(input),
+    );
+  });
+
   it("rejects ignored suffixes and concatenated frames", async () => {
     const input = Buffer.alloc(10_000, 0x61);
     const encoded = await encodeZstdV1(input);

@@ -52,6 +52,32 @@ jobs:
       - name: Verify installed package loads through Pi
         run: npm run test:package
 
+  zstd-host-regression:
+    if: github.event_name != 'schedule'
+    name: Node 26.7 · Deno 2.9.5 · zstd regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26.7.0
+
+      - name: Verify Node zstd regression
+        run: node scripts/verify-zstd-host.mjs
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+
+      - name: Verify Deno zstd regression
+        run: deno run scripts/verify-zstd-host.mjs
+
   minimum-pi:
     if: github.event_name != 'schedule'
     name: Minimum Pi 0.84.0 compatibility

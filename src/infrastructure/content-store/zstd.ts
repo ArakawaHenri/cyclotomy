@@ -45,8 +45,22 @@ type ZstdDecompressWithInfo = (
   callback: (error: Error | null, result: ZstdInfoResult) => void,
 ) => void;
 
+/**
+ * Mirrors zstd's one-shot worst-case compression bound and leaves one output
+ * byte spare. Some node:zlib implementations can otherwise continue after a
+ * full output slab and append an empty frame.
+ */
+function oneShotOutputChunkSize(inputLength: number): number {
+  const smallInputMargin =
+    inputLength < 128 * 1024
+      ? Math.floor((128 * 1024 - inputLength) / 2048)
+      : 0;
+  return inputLength + Math.floor(inputLength / 256) + smallInputMargin + 1;
+}
+
 function encoderOptions(inputLength: number): ZstdEncoderOptions {
   return {
+    chunkSize: oneShotOutputChunkSize(inputLength),
     pledgedSrcSize: inputLength,
     params: {
       [constants.ZSTD_c_compressionLevel]: ZSTD_V1_COMPRESSION_LEVEL,
