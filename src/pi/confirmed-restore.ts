@@ -190,9 +190,7 @@ export async function runConfirmedRestore(
       recovery,
     );
   };
-  runtime.setStatusBestEffort(context, () =>
-    runtime.i18n.t("checkingWorkspace"),
-  );
+  runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
   try {
     const execution = await runtime.enqueueWorkspaceExecution(
       `${mode}-restore-prepare`,
@@ -534,9 +532,7 @@ export async function runConfirmedRestore(
   }
   if (!confirmed) return finalizePendingArrival({ kind: "cancelled" });
 
-  runtime.setStatusBestEffort(context, () =>
-    runtime.i18n.t("restoringWorkspace"),
-  );
+  runtime.setStatus(context, runtime.i18n.t("restoringWorkspace"));
   const mutationProtocol = new WorkspaceMutationProtocol(
     runtime.workspaceMutations,
     context,

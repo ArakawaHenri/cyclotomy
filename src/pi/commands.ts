@@ -25,9 +25,11 @@ import {
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
   notifyWorkspaceLockCleanupFailure,
+  participationMessage,
 } from "./restore-notifications.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
+import { withdrawAfterStoreBindingFailure } from "./store-binding-failure.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { ArrivalReceipt } from "./workspace-receipt.ts";
 
@@ -81,12 +83,24 @@ function finishRestore(
     case "target-changed":
       runtime.notify(
         context,
-        runtime.i18n.t("commandTargetChanged"),
+        participationMessage(
+          runtime,
+          "commandTargetChanged",
+          "commandTargetChangedFact",
+        ),
         "warning",
       );
       break;
     case "preview-stale":
-      runtime.notify(context, runtime.i18n.t("commandPreviewStale"), "warning");
+      runtime.notify(
+        context,
+        participationMessage(
+          runtime,
+          "commandPreviewStale",
+          "commandPreviewStaleFact",
+        ),
+        "warning",
+      );
       break;
     case "scan-incomplete":
       runtime.notify(
@@ -103,7 +117,11 @@ function finishRestore(
     case "protected-missing":
       runtime.notify(
         context,
-        runtime.i18n.t("sessionMissingProtected"),
+        participationMessage(
+          runtime,
+          "sessionMissingProtected",
+          "sessionMissingFact",
+        ),
         "warning",
       );
       break;
@@ -117,7 +135,7 @@ function finishRestore(
       runtime.notify(
         context,
         [
-          runtime.i18n.t("restoreNeedsUi"),
+          participationMessage(runtime, "restoreNeedsUi", "restoreNeedsUiFact"),
           runtime.i18n.formatGitReplayRisk(execution.replayRisk),
         ]
           .filter((part): part is string => part !== undefined)
@@ -134,7 +152,12 @@ function finishRestore(
           execution.phase === "prepare"
             ? "restorePrepareFailed"
             : "restoreFailed",
-          { message: messageOf(execution.cause) },
+          {
+            message: messageOf(execution.cause),
+            continuation: runtime.i18n.t(
+              runtime.isActive ? "continueWithDrift" : "continueAfterResume",
+            ),
+          },
         ),
         "error",
       );
@@ -258,9 +281,13 @@ async function driftCommand(
   if (prepared.kind === "missing") {
     runtime.notify(
       context,
-      runtime.i18n.t(
-        prepared.writeProtected ? "driftMissingProtected" : "driftMissing",
-      ),
+      prepared.writeProtected
+        ? participationMessage(
+            runtime,
+            "driftMissingProtected",
+            "sessionMissingFact",
+          )
+        : runtime.i18n.t("driftMissing"),
       "info",
     );
     return;
@@ -276,13 +303,13 @@ async function driftCommand(
     runtime.notify(
       context,
       [
-        runtime.i18n.t(
-          prepared.writeProtected
-            ? "driftCleanProtected"
-            : inherited
-              ? "driftCleanInherited"
-              : "driftClean",
-        ),
+        prepared.writeProtected
+          ? participationMessage(
+              runtime,
+              "driftCleanProtected",
+              "driftCleanProtectedFact",
+            )
+          : runtime.i18n.t(inherited ? "driftCleanInherited" : "driftClean"),
         riskNotice,
       ]
         .filter((part): part is string => part !== undefined)
@@ -345,7 +372,7 @@ async function runCommand(
     // the closer root cause. Explicit user commands always re-report it, so an
     // already-notified failure cannot make /drift or /restore look silent.
     if (!(await runtime.ensureStore(view.cwd))) {
-      runtime.notifyInitFailure(context, { force: true });
+      await withdrawAfterStoreBindingFailure(runtime, context);
       return;
     }
     if (!runtime.registrations.sessionIsUsable(view)) {
@@ -358,14 +385,6 @@ async function runCommand(
     }
     await action(runtime, context, view);
   } catch (error) {
-    const recovery = await runtime.withdrawFromParticipation(context, error);
-    applyActiveArrivalSettlement(runtime, recovery.arrival);
-    notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
-    notifyWorkspaceLockCleanupFailure(
-      runtime,
-      context,
-      recovery.workspaceLockCleanup,
-    );
     runtime.notify(
       context,
       runtime.i18n.t("commandFailed", { message: messageOf(error) }),

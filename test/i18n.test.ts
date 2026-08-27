@@ -81,12 +81,18 @@ describe("Cyclotomy Pi localization", () => {
   it("states post-application uncertainty without leaving placeholders", () => {
     const en = new CyclotomyI18n("en");
     const zh = new CyclotomyI18n("zh-CN");
-    expect(en.t("restoreExecutionFailed", { message: "failure" })).toContain(
-      "Some files may have changed",
-    );
-    expect(zh.t("restoreExecutionFailed", { message: "失败" })).toContain(
-      "部分文件可能已改动",
-    );
+    expect(
+      en.t("restoreExecutionFailed", {
+        message: "failure",
+        continuation: en.t("continueWithDrift"),
+      }),
+    ).toContain("Some files may have changed");
+    expect(
+      zh.t("restoreExecutionFailed", {
+        message: "失败",
+        continuation: zh.t("continueWithDrift"),
+      }),
+    ).toContain("部分文件可能已改动");
     for (const i18n of [en, zh]) {
       const message = i18n.t("restorePostMutationControlUnavailable", {
         message: "post-check",
@@ -138,18 +144,36 @@ describe("Cyclotomy Pi localization", () => {
     const english = new CyclotomyI18n("en");
     const chinese = new CyclotomyI18n("zh-CN");
     const en = [
-      english.t("restorePostMutationLocationBarrier"),
-      english.t("restorePostMutationTargetBarrier"),
-      english.t("restorePostMutationControlBarrier", { message: "failure" }),
+      english.t("restorePostMutationLocationBarrier", {
+        continuation: english.t("continueWithDrift"),
+      }),
+      english.t("restorePostMutationTargetBarrier", {
+        continuation: english.t("continueWithDrift"),
+      }),
+      english.t("restorePostMutationControlBarrier", {
+        message: "failure",
+        continuation: english.t("continueWithDrift"),
+      }),
       english.t("checkpointInitializedConflictBarrier", {
         message: "conflict",
+        continuation: english.t("continueWithDrift"),
       }),
     ];
     const zh = [
-      chinese.t("restorePostMutationLocationBarrier"),
-      chinese.t("restorePostMutationTargetBarrier"),
-      chinese.t("restorePostMutationControlBarrier", { message: "失败" }),
-      chinese.t("checkpointInitializedConflictBarrier", { message: "冲突" }),
+      chinese.t("restorePostMutationLocationBarrier", {
+        continuation: chinese.t("continueWithDrift"),
+      }),
+      chinese.t("restorePostMutationTargetBarrier", {
+        continuation: chinese.t("continueWithDrift"),
+      }),
+      chinese.t("restorePostMutationControlBarrier", {
+        message: "失败",
+        continuation: chinese.t("continueWithDrift"),
+      }),
+      chinese.t("checkpointInitializedConflictBarrier", {
+        message: "冲突",
+        continuation: chinese.t("continueWithDrift"),
+      }),
     ];
 
     for (const message of en) {

@@ -178,46 +178,27 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
       return pass;
     }
     let result: unknown;
-    let failure: unknown;
-    let failed = false;
     try {
       result = await lease.engine.dispatch(event, context);
     } catch (cause) {
-      failed = true;
-      failure =
-        cause ?? new Error("Cyclotomy handler failed without an error value");
-      const recovery = await lease.engine.runtime.withdrawFromParticipation(
-        context,
-        failure,
-      );
-      applyActiveArrivalSettlement(lease.engine.runtime, recovery.arrival);
-      notifyArrivalDispositionFailure(
-        lease.engine.runtime,
-        context,
-        recovery.arrival,
-      );
-      notifyWorkspaceLockCleanupFailure(
-        lease.engine.runtime,
-        context,
-        recovery.workspaceLockCleanup,
-      );
+      lease.release();
+      throw cause;
     }
 
     const activation = lease.engine.runtime.activation;
     const generationIsCurrent = controller.generation === lease.generation;
-    if (!generationIsCurrent || failed || activation.kind !== "active") {
+    if (!generationIsCurrent) {
+      lease.release();
+      return pass;
+    }
+    if (activation.kind !== "active") {
       const cause =
-        failure ??
-        (activation.kind === "unavailable"
+        activation.kind === "unavailable"
           ? activation.cause
-          : new Error("Cyclotomy stopped participating"));
-      if (generationIsCurrent) {
-        const retirement = stopGeneration(lease.generation, cause);
-        lease.release();
-        await retirement;
-      } else {
-        lease.release();
-      }
+          : new Error("Cyclotomy stopped participating");
+      const retirement = stopGeneration(lease.generation, cause);
+      lease.release();
+      await retirement;
       return pass;
     }
     lease.release();
@@ -246,8 +227,6 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
       showStatus(context);
       return;
     }
-    let failure: unknown;
-    let failed = false;
     try {
       const handler =
         command === "drift"
@@ -255,33 +234,16 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           : createRestoreCommandHandler(lease.engine.runtime);
       await handler(args, context);
     } catch (cause) {
-      failed = true;
-      failure =
-        cause ?? new Error("Cyclotomy command failed without an error value");
-      const recovery = await lease.engine.runtime.withdrawFromParticipation(
-        context,
-        failure,
-      );
-      applyActiveArrivalSettlement(lease.engine.runtime, recovery.arrival);
-      notifyArrivalDispositionFailure(
-        lease.engine.runtime,
-        context,
-        recovery.arrival,
-      );
-      notifyWorkspaceLockCleanupFailure(
-        lease.engine.runtime,
-        context,
-        recovery.workspaceLockCleanup,
-      );
+      lease.release();
+      throw cause;
     }
     const activation = lease.engine.runtime.activation;
     const generationIsCurrent = controller.generation === lease.generation;
-    if (generationIsCurrent && (failed || activation.kind !== "active")) {
+    if (generationIsCurrent && activation.kind !== "active") {
       const cause =
-        failure ??
-        (activation.kind === "unavailable"
+        activation.kind === "unavailable"
           ? activation.cause
-          : new Error("Cyclotomy stopped participating"));
+          : new Error("Cyclotomy stopped participating");
       const retirement = stopGeneration(lease.generation, cause);
       lease.release();
       await retirement;

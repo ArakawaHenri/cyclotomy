@@ -6,6 +6,7 @@ import {
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
   notifyArrivalDispositionFailure,
+  notifyRestoreOutcome,
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
 } from "../src/pi/restore-notifications.ts";
@@ -49,8 +50,6 @@ describe("restore presentation", () => {
     const cleanup = new Error("initialization lock remained");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -78,8 +77,6 @@ describe("restore presentation", () => {
     const notifications: string[] = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -105,8 +102,6 @@ describe("restore presentation", () => {
     const shared = new Error("shared initialization failure");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -123,13 +118,99 @@ describe("restore presentation", () => {
     ).toHaveLength(1);
   });
 
+  it("does not repeat one arrival and lock cleanup cause", () => {
+    const notifications: string[] = [];
+    const shared = new Error("shared arrival cleanup failure");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyCheckpointInitializationConflict(runtime, {} as never, {
+      execution: {
+        kind: "initialization-conflict",
+        cause: new Error("arrival changed"),
+      },
+      arrival: {
+        ...exactArrival,
+        evidence: {
+          ...exactArrival.evidence,
+          admission: { kind: "failed", cause: shared },
+        },
+      },
+      workspaceLockCleanup: { kind: "failed", cause: shared },
+    });
+
+    expect(
+      notifications.join("\n").match(/shared arrival cleanup failure/gu),
+    ).toHaveLength(1);
+  });
+
+  it("does not repeat one post-mutation control and protection cause", () => {
+    const notifications: string[] = [];
+    const shared = new Error("shared post-mutation failure");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyPostMutationConflict(runtime, {} as never, {
+      execution: {
+        kind: "post-mutation-conflict",
+        reason: "control-failed",
+        outcome: {
+          kind: "restored",
+          treeOid: "a".repeat(64),
+          report: {
+            created: [],
+            updated: [],
+            deleted: [],
+            renamed: [],
+            unchangedCount: 1,
+            problems: [],
+          },
+        },
+        cause: shared,
+        preparationCleanup: { kind: "settled" },
+      },
+      arrival: { kind: "unsettled", cause: shared },
+      workspaceLockCleanup: { kind: "failed", cause: shared },
+    });
+
+    expect(notifications).toHaveLength(1);
+    expect(
+      notifications[0]?.match(/shared post-mutation failure/gu),
+    ).toHaveLength(1);
+  });
+
+  it("does not repeat one preparation and protection cause", () => {
+    const notifications: string[] = [];
+    const shared = new Error("shared preparation failure");
+    const runtime = {
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+
+    notifyRestorePreparationConflict(runtime, {} as never, {
+      execution: { kind: "preparation-conflict", cause: shared },
+      arrival: { kind: "unsettled", cause: shared },
+      workspaceLockCleanup: { kind: "settled" },
+    });
+
+    expect(notifications).toHaveLength(1);
+    expect(
+      notifications[0]?.match(/shared preparation failure/gu),
+    ).toHaveLength(1);
+  });
+
   it("does not present a cleanup-only preparation failure twice", () => {
     const notifications: string[] = [];
     const cleanup = new Error("preparation lock remained");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -152,8 +233,6 @@ describe("restore presentation", () => {
     const protection = new Error("durable protection failed");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -175,8 +254,6 @@ describe("restore presentation", () => {
     const cleanup = new Error("preparation release failed");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -199,7 +276,6 @@ describe("restore presentation", () => {
     }> = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -238,8 +314,6 @@ describe("restore presentation", () => {
     }> = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -287,8 +361,6 @@ describe("restore presentation", () => {
     const notifications: string[] = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -336,8 +408,6 @@ describe("restore presentation", () => {
     const lockCleanup = new Error("restore action lock remained");
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -386,9 +456,8 @@ describe("restore presentation", () => {
       readonly level: "info" | "warning" | "error";
     }> = [];
     const runtime = {
+      isActive: false,
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -405,6 +474,49 @@ describe("restore presentation", () => {
       expect.objectContaining({ level: "error" }),
     ]);
     expect(notifications[0]?.message).toContain("protect\\n\\u001b[31mfailed");
+    expect(notifications[0]?.message).toContain("/cyclotomy resume");
+    expect(notifications[0]?.message).not.toContain("/drift");
+  });
+
+  it("never recommends drift for a restore result after participation stops", () => {
+    const notifications: string[] = [];
+    const runtime = {
+      isActive: false,
+      i18n: new CyclotomyI18n("en"),
+      notify: (_context: unknown, message: string) =>
+        notifications.push(message),
+    } as unknown as CyclotomyRuntime;
+    const report = {
+      created: [],
+      updated: ["changed.txt"],
+      deleted: [],
+      renamed: [],
+      unchangedCount: 0,
+      problems: [],
+    };
+
+    notifyRestoreOutcome(runtime, {} as never, {
+      kind: "apply-incomplete",
+      treeOid: "a".repeat(64),
+      report,
+    });
+    notifyRestoreOutcome(runtime, {} as never, {
+      kind: "verify-failed",
+      reason: "mismatch",
+      treeOid: "a".repeat(64),
+      report,
+    });
+    notifyRestoreOutcome(runtime, {} as never, {
+      kind: "failed",
+      stage: "apply",
+      cause: new Error("apply stopped"),
+    });
+
+    expect(notifications).toHaveLength(3);
+    expect(
+      notifications.every((message) => message.includes("/cyclotomy resume")),
+    ).toBe(true);
+    expect(notifications.join("\n")).not.toContain("/drift");
   });
 
   it("reports a failed checkpoint admission by user-visible impact", () => {
@@ -413,8 +525,8 @@ describe("restore presentation", () => {
       readonly level: "info" | "warning" | "error";
     }> = [];
     const runtime = {
+      isActive: true,
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -438,6 +550,8 @@ describe("restore presentation", () => {
         ),
       }),
     ]);
+    expect(notifications[0]?.message).toContain("/drift");
+    expect(notifications[0]?.message).not.toContain("/cyclotomy resume");
   });
 
   it("shows every action by default with deletions and overwrites first", () => {
@@ -551,9 +665,8 @@ describe("restore presentation", () => {
       readonly level: "info" | "warning" | "error";
     }> = [];
     const runtime = {
+      isActive: true,
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (
         _context: unknown,
         message: string,
@@ -604,8 +717,6 @@ describe("restore presentation", () => {
     const notifications: string[] = [];
     const runtime = {
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;
@@ -639,9 +750,8 @@ describe("restore presentation", () => {
   it("reports an unassigned restore without exposing the history barrier", () => {
     const notifications: string[] = [];
     const runtime = {
+      isActive: true,
       i18n: new CyclotomyI18n("en"),
-      notifyBestEffort: CyclotomyRuntime.prototype.notifyBestEffort,
-      presentBestEffort: CyclotomyRuntime.prototype.presentBestEffort,
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
     } as unknown as CyclotomyRuntime;

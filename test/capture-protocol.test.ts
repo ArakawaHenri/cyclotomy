@@ -9,6 +9,11 @@ import {
 } from "../src/pi/capture-protocol.ts";
 import type { AdmissionLease } from "../src/pi/checkpoint-admission.ts";
 import type { SessionView } from "../src/pi/session-view.ts";
+import {
+  sourceCaptureFailureImpact,
+  type SourceCaptureFailure,
+  type SourceCaptureFailureImpact,
+} from "../src/pi/source-capture-failure.ts";
 
 const node: NodeKey = { sessionId: "session", entryId: "entry" };
 const lease = { __admissionLease: true } as const satisfies AdmissionLease;
@@ -247,5 +252,67 @@ describe("capture protocol", () => {
         { expected },
       ),
     ).resolves.toEqual({ kind: "failed", cause });
+  });
+});
+
+describe("source capture failure impact", () => {
+  const cause = new Error("injected failure");
+  const cases: readonly [SourceCaptureFailure, SourceCaptureFailureImpact][] = [
+    [{ kind: "location-changed", phase: "before" }, "cancel-operation"],
+    [{ kind: "location-changed", phase: "during" }, "cancel-operation"],
+    [{ kind: "not-admitted", subject: "source" }, "cancel-operation"],
+    [{ kind: "workspace-unavailable" }, "withdraw-participation"],
+    [{ kind: "exception", cause }, "withdraw-participation"],
+    [
+      {
+        kind: "capture",
+        value: { kind: "scan-incomplete", phase: "capture", problems: [] },
+      },
+      "withdraw-participation",
+    ],
+    [
+      {
+        kind: "capture",
+        value: { kind: "scan-failed", phase: "validation", cause },
+      },
+      "withdraw-participation",
+    ],
+    [
+      { kind: "capture", value: { kind: "publish-failed", cause } },
+      "withdraw-participation",
+    ],
+    [
+      { kind: "capture", value: { kind: "metadata-failed", cause } },
+      "withdraw-participation",
+    ],
+    [
+      {
+        kind: "capture",
+        value: { kind: "workspace-changed", reason: "root" },
+      },
+      "withdraw-participation",
+    ],
+    [
+      {
+        kind: "capture",
+        value: { kind: "workspace-changed", reason: "contents" },
+      },
+      "cancel-operation",
+    ],
+    [
+      {
+        kind: "capture",
+        value: { kind: "state-changed", reason: "checkpoint" },
+      },
+      "cancel-operation",
+    ],
+    [
+      { kind: "capture", value: { kind: "write-protected" } },
+      "cancel-operation",
+    ],
+  ];
+
+  it.each(cases)("classifies $0 as $1", (failure, impact) => {
+    expect(sourceCaptureFailureImpact(failure)).toBe(impact);
   });
 });

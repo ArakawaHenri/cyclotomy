@@ -70,7 +70,12 @@ describe("PiHostAdapter", () => {
       cancel: false,
     });
     expect(reportFailure).toHaveBeenCalledWith(
-      { stage: "activation", event: switchEvent, cause: unavailable },
+      {
+        boundary: "guard",
+        stage: "activation",
+        event: switchEvent,
+        cause: unavailable,
+      },
       context,
     );
   });
@@ -116,7 +121,7 @@ describe("PiHostAdapter", () => {
 
     await expect(observer(startEvent, context)).resolves.toBeUndefined();
     expect(reportFailure).toHaveBeenCalledWith(
-      { stage: "handler", event: startEvent, cause },
+      { boundary: "observe", stage: "handler", event: startEvent, cause },
       context,
     );
   });

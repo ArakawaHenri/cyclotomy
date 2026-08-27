@@ -47,6 +47,7 @@ export type GuardedPiEventResult<Event extends GuardedPiEvent> =
                 : never;
 
 export interface PiHostFailure<Event extends ExtensionEvent = ExtensionEvent> {
+  readonly boundary: "guard" | "observe";
   readonly stage: "activation" | "handler";
   readonly event: Event;
   readonly cause: unknown;
@@ -102,7 +103,10 @@ export class PiHostAdapter {
       try {
         activation = this.#options.activation();
       } catch (cause) {
-        await this.#report({ stage: "activation", event, cause }, context);
+        await this.#report(
+          { boundary: "guard", stage: "activation", event, cause },
+          context,
+        );
         return options.pass;
       }
       switch (activation.kind) {
@@ -111,7 +115,12 @@ export class PiHostAdapter {
           return options.pass;
         case "unavailable":
           await this.#report(
-            { stage: "activation", event, cause: activation.cause },
+            {
+              boundary: "guard",
+              stage: "activation",
+              event,
+              cause: activation.cause,
+            },
             context,
           );
           return options.pass;
@@ -119,7 +128,10 @@ export class PiHostAdapter {
           try {
             return await options.active(event, context);
           } catch (cause) {
-            await this.#report({ stage: "handler", event, cause }, context);
+            await this.#report(
+              { boundary: "guard", stage: "handler", event, cause },
+              context,
+            );
             return options.pass;
           }
       }
@@ -134,12 +146,20 @@ export class PiHostAdapter {
       try {
         activation = this.#options.activation();
       } catch (cause) {
-        await this.#report({ stage: "activation", event, cause }, context);
+        await this.#report(
+          { boundary: "observe", stage: "activation", event, cause },
+          context,
+        );
         return;
       }
       if (activation.kind === "unavailable") {
         await this.#report(
-          { stage: "activation", event, cause: activation.cause },
+          {
+            boundary: "observe",
+            stage: "activation",
+            event,
+            cause: activation.cause,
+          },
           context,
         );
         return;
@@ -148,7 +168,10 @@ export class PiHostAdapter {
       try {
         await active(event, context);
       } catch (cause) {
-        await this.#report({ stage: "handler", event, cause }, context);
+        await this.#report(
+          { boundary: "observe", stage: "handler", event, cause },
+          context,
+        );
       }
     };
   }

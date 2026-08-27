@@ -55,9 +55,6 @@ import { WorkspaceMutationAuthority } from "./workspace-mutation-authority.ts";
 
 const GC_STATE_FILE = "gc-state.json";
 const GC_OBJECT_GRACE_MS = 3_600_000;
-const PRESENTATION_FAILURE_MESSAGE =
-  "Cyclotomy could not complete this operation or show the reason.";
-const PRESENTATION_STATUS_FALLBACK = "Cyclotomy · working…";
 
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
@@ -264,56 +261,6 @@ export class CyclotomyRuntime {
     }
   }
 
-  /**
-   * Render advisory text behind a total boundary. Pi intentionally continues
-   * after extension-handler exceptions, so presentation must never decide
-   * whether a safety-critical handler reaches its veto or durable settlement.
-   */
-  notifyBestEffort(
-    context: ExtensionContext,
-    render: () => string,
-    level: "info" | "warning" | "error" = "info",
-    fallback: string = PRESENTATION_FAILURE_MESSAGE,
-  ): void {
-    let message = fallback;
-    try {
-      message = render();
-    } catch {
-      // The bounded fallback remains visible even when localization fails.
-    }
-    this.notify(context, message, level);
-  }
-
-  setStatusBestEffort(context: ExtensionContext, render: () => string): void {
-    let message = PRESENTATION_STATUS_FALLBACK;
-    try {
-      message = render();
-    } catch {
-      // Status is advisory; retain a generic non-empty safety status.
-    }
-    this.setStatus(context, message);
-  }
-
-  renderBestEffort(render: () => string, fallback: string): string {
-    try {
-      return render();
-    } catch {
-      return fallback;
-    }
-  }
-
-  presentBestEffort(
-    context: ExtensionContext,
-    present: () => void,
-    fallbackLevel: "warning" | "error" = "error",
-  ): void {
-    try {
-      present();
-    } catch {
-      this.notify(context, PRESENTATION_FAILURE_MESSAGE, fallbackLevel);
-    }
-  }
-
   setStatus(context: ExtensionContext, message: string | undefined): void {
     try {
       if (context.hasUI) context.ui.setStatus("cyclotomy", message);
@@ -334,17 +281,15 @@ export class CyclotomyRuntime {
   ): void {
     if (this.#initFailureNotified && options.force !== true) return;
     this.#initFailureNotified = true;
-    this.notifyBestEffort(
+    this.notify(
       context,
-      () => {
-        const detail =
-          this.#initFailureDetail === undefined
-            ? ""
-            : ` ${this.i18n.t("captureFailureDetail", {
-                message: this.#initFailureDetail,
-              })}`;
-        return `${this.i18n.t("initFailure")}${detail}`;
-      },
+      `${this.i18n.t("initFailure")}${
+        this.#initFailureDetail === undefined
+          ? ""
+          : ` ${this.i18n.t("captureFailureDetail", {
+              message: this.#initFailureDetail,
+            })}`
+      }`,
       "error",
     );
   }
@@ -356,17 +301,15 @@ export class CyclotomyRuntime {
   ): void {
     if (!captured && !this.#captureFailureNotified) {
       this.#captureFailureNotified = true;
-      this.notifyBestEffort(
+      this.notify(
         context,
-        () => {
-          const detail =
-            failureMessage === undefined
-              ? ""
-              : ` ${this.i18n.t("captureFailureDetail", {
-                  message: failureMessage,
-                })}`;
-          return `${this.i18n.t("captureLaterFailed")}${detail}`;
-        },
+        `${this.i18n.t("captureLaterFailed")}${
+          failureMessage === undefined
+            ? ""
+            : ` ${this.i18n.t("captureFailureDetail", {
+                message: failureMessage,
+              })}`
+        }`,
         "warning",
       );
     } else if (captured) {

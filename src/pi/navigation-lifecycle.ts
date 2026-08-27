@@ -1,6 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 import type { NodeKey } from "../domain/model.ts";
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
 import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
 import { gitReplayRisk } from "../infrastructure/git-replay-risk.ts";
 import {
@@ -19,9 +23,11 @@ import {
 import {
   notifyCheckpointInitializationConflict,
   notifyArrivalDispositionFailure,
+  notifyArrivalRecovery,
   notifyPostMutationConflict,
   notifyRestoreProtocolOutcome,
   notifyWorkspaceLockCleanupFailure,
+  participationMessage,
 } from "./restore-notifications.ts";
 import { CyclotomyRuntime } from "./runtime.ts";
 import {
@@ -46,9 +52,14 @@ import {
 } from "./workspace-mutation-protocol.ts";
 import { assertNever } from "./assert-never.ts";
 import { formatCaptureFailure } from "./capture-failure.ts";
+import { sourceCaptureFailureImpact } from "./source-capture-failure.ts";
+import { withdrawAfterStoreBindingFailure } from "./store-binding-failure.ts";
 import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { PiHostAdapter } from "./pi-host-adapter.ts";
-import type { ArrivalReceipt } from "./workspace-receipt.ts";
+import type {
+  ArrivalReceipt,
+  ArrivalRecoverySettlement,
+} from "./workspace-receipt.ts";
 import {
   revalidateNavigationLocation as readExactLocation,
   sameNavigationNode as sameNode,
@@ -75,6 +86,64 @@ function isLockedTreeArrivalOutcome(
   return isLockedArrivalOutcome(value);
 }
 
+type NavigationDisposition =
+  "plan-mismatch" | "preview-stale" | "detached" | "protected";
+
+function notifyNavigationDisposition(
+  runtime: CyclotomyRuntime,
+  context: ExtensionContext,
+  disposition: NavigationDisposition,
+): void {
+  switch (disposition) {
+    case "plan-mismatch":
+      runtime.notify(
+        context,
+        participationMessage(
+          runtime,
+          "navigationPlanMismatch",
+          "navigationPlanMismatchFact",
+        ),
+        "warning",
+      );
+      return;
+    case "preview-stale":
+      runtime.notify(
+        context,
+        participationMessage(
+          runtime,
+          "navigationChangedAfterPreview",
+          "navigationChangedAfterPreviewFact",
+        ),
+        "warning",
+      );
+      return;
+    case "detached":
+      runtime.notify(
+        context,
+        participationMessage(
+          runtime,
+          "navigationDetached",
+          "navigationDetachedFact",
+        ),
+        "info",
+      );
+      return;
+    case "protected":
+      runtime.notify(
+        context,
+        participationMessage(
+          runtime,
+          "sessionMissingProtected",
+          "sessionMissingFact",
+        ),
+        "warning",
+      );
+      return;
+    default:
+      return assertNever(disposition, "unhandled navigation disposition");
+  }
+}
+
 /** Register the two-phase Pi tree-navigation protocol. */
 export function registerNavigationLifecycle(
   pi: Pick<ExtensionAPI, "on">,
@@ -90,33 +159,52 @@ export function registerNavigationLifecycle(
         runtime.setStatus(context, undefined);
         const recoverPreparationFailure = async (
           cause: unknown,
-        ): Promise<void> => {
+        ): Promise<ArrivalRecoverySettlement> => {
           const recovery = await runtime.withdrawFromParticipation(
             context,
             cause,
           );
           applyActiveArrivalSettlement(runtime, recovery.arrival);
-          notifyArrivalDispositionFailure(runtime, context, recovery.arrival);
-          notifyWorkspaceLockCleanupFailure(
-            runtime,
-            context,
-            recovery.workspaceLockCleanup,
-          );
+          return recovery;
         };
-        const notifyPreparationFailure = (cause: unknown): void => {
-          runtime.notifyBestEffort(
+        const withdrawAndPresentPreparationFailure = async (
+          cause: unknown,
+          cleanup: CleanupSettlement = { kind: "settled" },
+        ): Promise<void> => {
+          const recovery = await recoverPreparationFailure(
+            cleanup.kind === "failed" ? cleanup.cause : cause,
+          );
+          const presentedCauses = new Set<unknown>([cause]);
+          runtime.notify(
             context,
-            () =>
-              runtime.i18n.t("navigationPrepareFailed", {
+            withDetail(
+              runtime.i18n.t("sourceCaptureStopped"),
+              runtime.i18n.t("captureFailureDetail", {
                 message: messageOf(cause),
               }),
-            "warning",
+            ),
+            "error",
           );
+          if (
+            cleanup.kind === "failed" &&
+            !presentedCauses.has(cleanup.cause)
+          ) {
+            notifyWorkspaceLockCleanupFailure(runtime, context, cleanup);
+            presentedCauses.add(cleanup.cause);
+          }
+          notifyArrivalRecovery(runtime, context, recovery, presentedCauses);
         };
         let view: SessionView;
         try {
           view = views.revalidate(context);
-          runtime.assertSessionUsable(view);
+          if (!runtime.registrations.sessionIsUsable(view)) {
+            runtime.notify(
+              context,
+              runtime.i18n.t("commandLocationChanged"),
+              "warning",
+            );
+            return { cancel: true };
+          }
           if (!context.isIdle()) {
             runtime.notify(
               context,
@@ -126,8 +214,7 @@ export function registerNavigationLifecycle(
             return { cancel: true };
           }
         } catch (error) {
-          await recoverPreparationFailure(error);
-          notifyPreparationFailure(error);
+          await withdrawAndPresentPreparationFailure(error);
           return undefined;
         }
         const preparation = await runtime.admission.runTreePreparation(
@@ -135,13 +222,7 @@ export function registerNavigationLifecycle(
             try {
               runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
               if (!(await runtime.ensureStore(view.cwd))) {
-                runtime.notifyInitFailure(context);
-                const activation = runtime.activation;
-                await recoverPreparationFailure(
-                  activation.kind === "unavailable"
-                    ? activation.cause
-                    : new Error("Cyclotomy store is unavailable"),
-                );
+                await withdrawAfterStoreBindingFailure(runtime, context);
                 return undefined;
               }
               const authenticated = readExactLocation(
@@ -215,26 +296,24 @@ export function registerNavigationLifecycle(
                   cause,
                 }));
               if (preparationExecution.kind === "acquisition-failed") {
-                await recoverPreparationFailure(preparationExecution.cause);
-                notifyPreparationFailure(preparationExecution.cause);
+                await withdrawAndPresentPreparationFailure(
+                  preparationExecution.cause,
+                );
                 return undefined;
               }
               if (preparationExecution.cleanup.kind === "failed") {
-                if (preparationExecution.kind === "action-failed") {
-                  notifyPreparationFailure(preparationExecution.cause);
-                }
-                notifyWorkspaceLockCleanupFailure(runtime, context, {
-                  kind: "failed",
-                  cause: preparationExecution.cleanup.cause,
-                });
-                await recoverPreparationFailure(
-                  preparationExecution.cleanup.cause,
+                await withdrawAndPresentPreparationFailure(
+                  preparationExecution.kind === "action-failed"
+                    ? preparationExecution.cause
+                    : preparationExecution.cleanup.cause,
+                  preparationExecution.cleanup,
                 );
                 return undefined;
               }
               if (preparationExecution.kind === "action-failed") {
-                await recoverPreparationFailure(preparationExecution.cause);
-                notifyPreparationFailure(preparationExecution.cause);
+                await withdrawAndPresentPreparationFailure(
+                  preparationExecution.cause,
+                );
                 return undefined;
               }
               const prepared = preparationExecution.value;
@@ -243,18 +322,10 @@ export function registerNavigationLifecycle(
                 const detail = runtime.i18n.formatScanProblems(
                   prepared.problems,
                 );
-                runtime.notify(
-                  context,
-                  runtime.i18n.t("navigationScanIncomplete", {
-                    message: detail,
-                  }),
-                  "warning",
+                const cause = new Error(
+                  `tree preparation workspace scan was incomplete: ${detail}`,
                 );
-                await recoverPreparationFailure(
-                  new Error(
-                    `tree preparation workspace scan was incomplete: ${detail}`,
-                  ),
-                );
+                await withdrawAndPresentPreparationFailure(cause);
                 return undefined;
               }
               if (prepared.kind === "location-changed") {
@@ -314,8 +385,15 @@ export function registerNavigationLifecycle(
                     event.signal,
                   );
                 } catch (error) {
-                  await recoverPreparationFailure(error);
-                  notifyPreparationFailure(error);
+                  if (event.signal.aborted) {
+                    runtime.notify(
+                      context,
+                      runtime.i18n.t("commandLocationChanged"),
+                      "warning",
+                    );
+                    return undefined;
+                  }
+                  await withdrawAndPresentPreparationFailure(error);
                   return undefined;
                 }
                 if (navigationChoice === "stay") {
@@ -354,26 +432,12 @@ export function registerNavigationLifecycle(
                       } as const)
                     : commitExecution.value;
               if (commitExecution.kind !== "acquisition-failed") {
-                notifyWorkspaceLockCleanupFailure(
-                  runtime,
-                  context,
-                  commitExecution.cleanup,
-                );
                 if (commitExecution.cleanup.kind === "failed") {
-                  if (commitExecution.kind === "action-failed") {
-                    notifyPreparationFailure(commitExecution.cause);
-                  }
-                  if (
-                    commitExecution.kind === "completed" &&
-                    commitExecution.value.kind === "ready"
-                  ) {
-                    // Source capture and the departure plan are already
-                    // authoritative. Retire without rewriting that completed
-                    // checkpoint as a protection failure.
-                    return undefined;
-                  }
-                  await recoverPreparationFailure(
-                    commitExecution.cleanup.cause,
+                  await withdrawAndPresentPreparationFailure(
+                    commitExecution.kind === "action-failed"
+                      ? commitExecution.cause
+                      : commitExecution.cleanup.cause,
+                    commitExecution.cleanup,
                   );
                   return undefined;
                 }
@@ -392,18 +456,10 @@ export function registerNavigationLifecycle(
                       const detail = runtime.i18n.formatScanProblems(
                         committed.problems,
                       );
-                      runtime.notify(
-                        context,
-                        runtime.i18n.t("navigationScanIncomplete", {
-                          message: detail,
-                        }),
-                        "warning",
+                      const cause = new Error(
+                        `tree commit workspace scan was incomplete: ${detail}`,
                       );
-                      await recoverPreparationFailure(
-                        new Error(
-                          `tree commit workspace scan was incomplete: ${detail}`,
-                        ),
-                      );
+                      await withdrawAndPresentPreparationFailure(cause);
                     }
                     break;
                   case "preview-stale":
@@ -426,17 +482,27 @@ export function registerNavigationLifecycle(
                         runtime.i18n,
                         committed.failure,
                       );
-                      runtime.notify(
-                        context,
-                        withDetail(
-                          runtime.i18n.t("sourceCaptureFailed"),
-                          runtime.i18n.t("captureFailureDetail", {
-                            message: detail,
-                          }),
-                        ),
-                        "error",
-                      );
-                      await recoverPreparationFailure(new Error(detail));
+                      const withdrawn =
+                        sourceCaptureFailureImpact({
+                          kind: "capture",
+                          value: committed.failure,
+                        }) === "withdraw-participation";
+                      if (withdrawn) {
+                        await withdrawAndPresentPreparationFailure(
+                          new Error(detail),
+                        );
+                      } else {
+                        runtime.notify(
+                          context,
+                          withDetail(
+                            runtime.i18n.t("sourceCaptureFailed"),
+                            runtime.i18n.t("captureFailureDetail", {
+                              message: detail,
+                            }),
+                          ),
+                          "error",
+                        );
+                      }
                     }
                     break;
                   case "workspace-binding-lost":
@@ -444,8 +510,7 @@ export function registerNavigationLifecycle(
                       const cause = new Error(
                         "registered workspace binding was lost during tree preparation",
                       );
-                      await recoverPreparationFailure(cause);
-                      notifyPreparationFailure(cause);
+                      await withdrawAndPresentPreparationFailure(cause);
                     }
                     break;
                   case "source-blocked":
@@ -468,8 +533,7 @@ export function registerNavigationLifecycle(
                     );
                     break;
                   case "failed":
-                    await recoverPreparationFailure(committed.cause);
-                    notifyPreparationFailure(committed.cause);
+                    await withdrawAndPresentPreparationFailure(committed.cause);
                     break;
                 }
                 return undefined;
@@ -494,8 +558,7 @@ export function registerNavigationLifecycle(
                 target: committed.target,
               };
             } catch (error) {
-              await recoverPreparationFailure(error);
-              notifyPreparationFailure(error);
+              await withdrawAndPresentPreparationFailure(error);
               return undefined;
             } finally {
               runtime.setStatus(context, undefined);
@@ -512,9 +575,9 @@ export function registerNavigationLifecycle(
           case "busy":
           case "retired-conflict":
           case "closed":
-            runtime.notifyBestEffort(
+            runtime.notify(
               context,
-              () => runtime.i18n.t("transitionInProgress"),
+              runtime.i18n.t("transitionInProgress"),
               "warning",
             );
             return { cancel: true };
@@ -534,9 +597,26 @@ export function registerNavigationLifecycle(
       const arrival = runtime.admission.beginTreeArrival();
       const plan = arrival.plan;
       const attentionStatus = () =>
-        runtime.setStatusBestEffort(context, () =>
-          runtime.i18n.t("navigationAttentionStatus"),
+        runtime.setStatus(
+          context,
+          runtime.isActive
+            ? runtime.i18n.t("navigationAttentionStatus")
+            : undefined,
         );
+      const presentCaptureFailure = (detail: string): void => {
+        runtime.notify(
+          context,
+          withDetail(
+            runtime.i18n.t(
+              runtime.activation.kind === "active"
+                ? "sourceCaptureProtected"
+                : "sourceCaptureStopped",
+            ),
+            runtime.i18n.t("captureFailureDetail", { message: detail }),
+          ),
+          "error",
+        );
+      };
 
       const recoverCurrentArrival = () =>
         protectCurrentArrivalAfterWorkspaceFailure(
@@ -560,7 +640,7 @@ export function registerNavigationLifecycle(
       ): Promise<ArrivalDisposition> => {
         const disposition = await protectCurrentArrival();
         notifyArrivalDispositionFailure(runtime, context, disposition);
-        runtime.presentBestEffort(context, notify);
+        notify();
         attentionStatus();
         return disposition;
       };
@@ -594,11 +674,7 @@ export function registerNavigationLifecycle(
             : view.authenticateTreeArrival(event, plan);
         if (plan === undefined || authenticated === undefined) {
           await protectAndAttend(() =>
-            runtime.notify(
-              context,
-              runtime.i18n.t("navigationPlanMismatch"),
-              "warning",
-            ),
+            notifyNavigationDisposition(runtime, context, "plan-mismatch"),
           );
           return;
         }
@@ -628,19 +704,12 @@ export function registerNavigationLifecycle(
           return;
         }
       } catch (error) {
-        await protectAndAttend(() =>
-          runtime.notify(
-            context,
-            runtime.i18n.t("navigationPrepareFailed", {
-              message: messageOf(error),
-            }),
-            "warning",
-          ),
-        );
+        await protectAndAttend(() => presentCaptureFailure(messageOf(error)));
         return;
       }
 
-      runtime.setStatusBestEffort(context, () =>
+      runtime.setStatus(
+        context,
         runtime.i18n.t(
           plan.target.kind === "restore"
             ? "restoringWorkspace"
@@ -739,119 +808,90 @@ export function registerNavigationLifecycle(
       ) {
         notifyArrivalDispositionFailure(runtime, context, result.arrival);
       }
-      runtime.presentBestEffort(context, () => {
-        switch (result.execution.kind) {
-          case "initialization-conflict":
-            notifyCheckpointInitializationConflict(
+      switch (result.execution.kind) {
+        case "initialization-conflict":
+          notifyCheckpointInitializationConflict(
+            runtime,
+            context,
+            result as CheckpointInitializationConflict,
+          );
+          break;
+        case "post-mutation-conflict":
+          notifyPostMutationConflict(
+            runtime,
+            context,
+            result as PostMutationConflict,
+          );
+          break;
+        case "location-changed":
+          if (runtime.activation.kind === "active") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("navigationPlanMismatch"),
+              "warning",
+            );
+          } else {
+            presentCaptureFailure("active location changed during navigation");
+          }
+          break;
+        case "scan-incomplete":
+          presentCaptureFailure(
+            runtime.i18n.formatScanProblems(result.execution.problems),
+          );
+          break;
+        case "scan-failed":
+          presentCaptureFailure(messageOf(result.execution.cause));
+          break;
+        case "preview-stale":
+          notifyNavigationDisposition(runtime, context, result.execution.kind);
+          break;
+        case "no-node":
+        case "inherited":
+        case "materialized":
+          break;
+        case "detached":
+          notifyNavigationDisposition(runtime, context, result.execution.kind);
+          break;
+        case "protected":
+          notifyNavigationDisposition(runtime, context, result.execution.kind);
+          break;
+        case "capture-failed":
+          presentCaptureFailure(
+            formatCaptureFailure(runtime.i18n, result.execution.failure),
+          );
+          break;
+        case "target-changed":
+          runtime.notify(
+            context,
+            participationMessage(
               runtime,
-              context,
-              result as CheckpointInitializationConflict,
-            );
-            break;
-          case "post-mutation-conflict":
-            notifyPostMutationConflict(
-              runtime,
-              context,
-              result as PostMutationConflict,
-            );
-            break;
-          case "location-changed":
-            runtime.notify(
-              context,
-              runtime.i18n.t("commandLocationChanged"),
-              "warning",
-            );
-            break;
-          case "scan-incomplete":
-            runtime.notify(
-              context,
-              runtime.i18n.t("navigationScanIncomplete", {
-                message: runtime.i18n.formatScanProblems(
-                  result.execution.problems,
-                ),
-              }),
-              "warning",
-            );
-            break;
-          case "scan-failed":
-            runtime.notify(
-              context,
-              runtime.i18n.t("navigationScanIncomplete", {
-                message: messageOf(result.execution.cause),
-              }),
-              "warning",
-            );
-            break;
-          case "preview-stale":
-            runtime.notify(
-              context,
-              runtime.i18n.t("navigationChangedAfterPreview"),
-              "warning",
-            );
-            break;
-          case "no-node":
-          case "inherited":
-          case "materialized":
-            break;
-          case "detached":
-            runtime.notify(
-              context,
-              runtime.i18n.t("navigationDetached"),
-              "info",
-            );
-            break;
-          case "protected":
-            runtime.notify(
-              context,
-              runtime.i18n.t("sessionMissingProtected"),
-              "warning",
-            );
-            break;
-          case "capture-failed":
-            runtime.notifyCaptureResult(
-              context,
-              false,
-              formatCaptureFailure(runtime.i18n, result.execution.failure),
-            );
-            break;
-          case "target-changed":
-            runtime.notify(
-              context,
-              runtime.i18n.t("commandTargetChanged"),
-              "warning",
-            );
-            break;
-          case "busy":
-            runtime.notify(
-              context,
-              runtime.i18n.t("transitionInProgress"),
-              "warning",
-            );
-            break;
-          case "failed":
-            runtime.notify(
-              context,
-              runtime.i18n.t(
-                plan.target.kind === "detach"
-                  ? "navigationDetachFailed"
-                  : "restoreFailed",
-                { message: messageOf(result.execution.cause) },
-              ),
-              "error",
-            );
-            break;
-          case "outcome":
-            notifyRestoreProtocolOutcome(
-              runtime,
-              context,
-              result as ArrivalReceipt<RestoreProtocolOutcome>,
-              { announceSuccess: false },
-            );
-            break;
-          default:
-            assertNever(result.execution, "unhandled tree-arrival result");
-        }
-      });
+              "commandTargetChanged",
+              "commandTargetChangedFact",
+            ),
+            "warning",
+          );
+          break;
+        case "busy":
+          runtime.notify(
+            context,
+            runtime.i18n.t("transitionInProgress"),
+            "warning",
+          );
+          break;
+        case "failed":
+          presentCaptureFailure(messageOf(result.execution.cause));
+          break;
+        case "outcome":
+          notifyRestoreProtocolOutcome(
+            runtime,
+            context,
+            result as ArrivalReceipt<RestoreProtocolOutcome>,
+            { announceSuccess: false },
+          );
+          break;
+        default:
+          assertNever(result.execution, "unhandled tree-arrival result");
+      }
       if (
         result.execution.kind !== "initialization-conflict" &&
         result.execution.kind !== "post-mutation-conflict" &&

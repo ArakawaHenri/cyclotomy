@@ -13,7 +13,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { CyclotomyEngine } from "../src/pi/cyclotomy-engine.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { FakePi, FakeSessionManager } from "./fake-pi.ts";
@@ -219,26 +218,6 @@ describe("Cyclotomy participation boundary", () => {
         message.includes("test session context failure"),
       ),
     ).toBe(true);
-  });
-
-  it("normalizes an undefined handler failure before retiring", async () => {
-    const pi = new FakePi(workspace, registerCyclotomy);
-    await startTwoNodeSession(pi);
-    const dispatch = vi
-      .spyOn(CyclotomyEngine.prototype, "dispatch")
-      .mockRejectedValueOnce(undefined);
-
-    try {
-      await expect(pi.preflightInput("continue normally")).resolves.toBe(
-        "continued",
-      );
-    } finally {
-      dispatch.mockRestore();
-    }
-    await pi.runCommand("cyclotomy");
-    expect(pi.notifications.at(-1)?.message).toContain(
-      "handler failed without an error value",
-    );
   });
 
   it("stop detaches immediately, drains admitted work, then closes", async () => {

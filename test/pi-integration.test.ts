@@ -173,6 +173,7 @@ function messageFor(key: MessageKey): string {
     applied: SENTINEL,
     captured: SENTINEL,
     count: SENTINEL,
+    continuation: SENTINEL,
     current: SENTINEL,
     message: SENTINEL,
     mutations: SENTINEL,
@@ -193,7 +194,10 @@ function notifiedWithDetail(
   key: MessageKey,
   detail: string,
 ): boolean {
-  const rendered = TEST_I18N.t(key, { message: detail });
+  const rendered = TEST_I18N.t(key, {
+    continuation: SENTINEL,
+    message: detail,
+  }).split(SENTINEL)[0]!;
   return pi.notifications.some(({ message }) => message.includes(rendered));
 }
 
@@ -236,22 +240,6 @@ function failWorkspaceLockCleanup(
 
 function lastStatus(pi: FakePi): string | undefined {
   return pi.statuses.get("cyclotomy");
-}
-
-/** Inject a renderer failure without disturbing unrelated lifecycle copy. */
-function throwTranslations(...keys: MessageKey[]) {
-  const original = CyclotomyI18n.prototype.t;
-  const selected = new Set(keys);
-  return vi.spyOn(CyclotomyI18n.prototype, "t").mockImplementation(function (
-    this: CyclotomyI18n,
-    key: MessageKey,
-    variables?: Parameters<CyclotomyI18n["t"]>[1],
-  ) {
-    if (selected.has(key)) {
-      throw new Error(`injected ${key} translation failure`);
-    }
-    return original.call(this, key, variables);
-  });
 }
 
 async function workspaceAliasesCase(): Promise<boolean> {
@@ -415,31 +403,6 @@ describe("checkpoint authority lifecycle", () => {
       }
     });
 
-    it("keeps automatic GC failure presentation total", async () => {
-      const maybeRunAutomaticGc = vi
-        .spyOn(CyclotomyRuntime.prototype, "maybeRunAutomaticGc")
-        .mockRejectedValue(new Error("injected automatic GC failure"));
-      const rendering = throwTranslations("automaticGcFailed");
-      try {
-        const pi = new FakePi(workspace);
-        registerCyclotomy(pi.api);
-        pi.manager.appendEntry();
-
-        await expect(pi.startSession("startup")).resolves.toBeUndefined();
-        await expect(pi.endTurn(0)).resolves.toBeUndefined();
-
-        expect(maybeRunAutomaticGc).toHaveBeenCalledTimes(2);
-        expect(pi.notifications).toContainEqual({
-          message:
-            "Cyclotomy could not complete this operation or show the reason.",
-          level: "warning",
-        });
-      } finally {
-        rendering.mockRestore();
-        maybeRunAutomaticGc.mockRestore();
-      }
-    });
-
     it("reports automatic-GC lock cleanup without rewriting the completed run", async () => {
       await writeFile(
         join(home, "cyclotomy", "settings.json"),
@@ -463,7 +426,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "automaticGcFailed")).toBe(false);
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes(messageFor("workspaceLockCleanupStopped")),
         ),
       ).toHaveLength(1);
     });
@@ -657,11 +620,48 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "captureLaterFailed")).toBe(false);
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes(messageFor("workspaceLockCleanupStopped")),
         ),
       ).toHaveLength(1);
       expect(automaticGc).not.toHaveBeenCalled();
       expect(await pi.submitInput("after-cleanup-failure")).toBe("continued");
+    });
+
+    it("does not recommend restore after protected reload cleanup stops participation", async () => {
+      const pi = new FakePi(workspace);
+      registerCyclotomy(pi.api);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.startSession("startup");
+      await writeFile(join(workspace, "a.txt"), "external");
+      pi.notifications.length = 0;
+      const replacement = await preparedRuntime();
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "reload-reconcile",
+        new Error("protected reload lock remained"),
+      );
+
+      try {
+        await pi.replaceRuntime(
+          (api) => registerPreparedRuntime(api, replacement),
+          "reload",
+        );
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+
+      expect(replacement.activation.kind).toBe("unavailable");
+      expect(notified(pi, "reloadProtectedFact")).toBe(true);
+      expect(notified(pi, "reloadProtected")).toBe(false);
+      expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
+      expect(
+        pi.notifications.some(({ message }) =>
+          /\/(?:drift|restore)\b/u.test(message),
+        ),
+      ).toBe(false);
+      const db = await metadata();
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf.id)).toBe(true);
+      db.close();
     });
 
     it("keeps a completed barrier projection when only lock cleanup fails", async () => {
@@ -707,7 +707,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "captureLaterFailed")).toBe(false);
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes(messageFor("workspaceLockCleanupStopped")),
         ),
       ).toHaveLength(1);
     });
@@ -1242,9 +1242,9 @@ describe("checkpoint authority lifecycle", () => {
         capture.mockRestore();
       }
 
-      expect(notified(pi, "captureLaterFailed")).toBe(true);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
       const unavailable = pi.notifications.find(({ message }) =>
-        message.includes(messageFor("arrivalProtectionUnavailable")),
+        message.includes(messageFor("arrivalProtectionStopped")),
       );
       expect(unavailable?.level).toBe("error");
     });
@@ -1274,8 +1274,86 @@ describe("checkpoint authority lifecycle", () => {
         true,
       );
       db.close();
-      expect(notified(pi, "initFailure")).toBe(true);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
     });
+
+    it.each([
+      {
+        boundary: "input",
+        run: async (pi: FakePi, _leaf: string) => {
+          expect(await pi.preflightInput()).toBe("continued");
+        },
+      },
+      {
+        boundary: "bash",
+        run: async (pi: FakePi, _leaf: string) => {
+          let executed = false;
+          await pi.executeUserBash(
+            "true",
+            async () => {
+              executed = true;
+            },
+            false,
+          );
+          expect(executed).toBe(true);
+        },
+      },
+      {
+        boundary: "before compact",
+        run: async (pi: FakePi, _leaf: string) => {
+          expect(await pi.compact()).toBe("done");
+        },
+      },
+      {
+        boundary: "before fork",
+        run: async (pi: FakePi, leaf: string) => {
+          expect(await pi.beginFork(leaf, "at")).not.toBe("cancelled");
+        },
+      },
+      {
+        boundary: "before switch",
+        run: async (pi: FakePi, _leaf: string) => {
+          expect(await pi.prepareSwitch()).toBe("ready");
+        },
+      },
+      {
+        boundary: "command",
+        run: async (pi: FakePi, _leaf: string) => {
+          await pi.runCommand("drift");
+        },
+      },
+    ])(
+      "protects the current coordinate and passes $boundary when the store binding fails",
+      async ({ run }) => {
+        const runtime = await preparedRuntime();
+        const pi = new FakePi(workspace);
+        registerPreparedRuntime(pi.api, runtime);
+        const leaf = pi.manager.appendEntry().id;
+        await pi.startSession("startup");
+        const cause = new Error("injected store binding failure");
+        const ensureStore = vi
+          .spyOn(runtime, "ensureStore")
+          .mockImplementationOnce(async () => {
+            runtime.markSessionUnavailable(cause);
+            return false;
+          });
+
+        try {
+          await run(pi, leaf);
+        } finally {
+          ensureStore.mockRestore();
+        }
+
+        expect(runtime.activation).toEqual({ kind: "unavailable", cause });
+        const db = await metadata();
+        expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
+        db.close();
+        expect(notified(pi, "sourceCaptureStopped")).toBe(true);
+        expect(
+          pi.notifications.some(({ message }) => message.includes("/drift")),
+        ).toBe(false);
+      },
+    );
 
     it("anchors a missing active label at its stable parent", async () => {
       const pi = new FakePi(workspace);
@@ -1387,33 +1465,6 @@ describe("checkpoint authority lifecycle", () => {
       pi.selectDestructive = true;
       await pi.replaceRuntime(registerCyclotomy, "startup");
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("saved");
-    });
-
-    it("settles a declined loaded arrival when checking status rendering throws", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      await pi.startSession("startup");
-      await writeFile(join(workspace, "a.txt"), "saved");
-      await pi.endTurn();
-      const loaded = pi.manager.getLeafId()!;
-      await writeFile(join(workspace, "a.txt"), "kept-current");
-      pi.selectDestructive = false;
-      const rendering = throwTranslations("checkingWorkspace");
-
-      try {
-        await expect(
-          pi.replaceRuntime(registerCyclotomy, "resume"),
-        ).resolves.toBeUndefined();
-      } finally {
-        rendering.mockRestore();
-      }
-
-      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe(
-        "kept-current",
-      );
-      const db = await metadata();
-      expect(checkpointIsBlocked(db, pi.manager.sessionId, loaded)).toBe(true);
-      db.close();
     });
 
     it("preserves a declined loaded node while checkpointing new work", async () => {
@@ -1534,7 +1585,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(second.treeOid).not.toBe(first.treeOid);
     });
 
-    it("keeps a completed turn checkpoint open when only lock cleanup fails", async () => {
+    it("protects a completed turn checkpoint when lock cleanup fails", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       await pi.startSession("startup");
@@ -1553,14 +1604,56 @@ describe("checkpoint authority lifecycle", () => {
       const leaf = pi.manager.getLeafId()!;
       const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, leaf)).toBeDefined();
-      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(false);
+      expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       db.close();
-      expect(notified(pi, "captureLaterFailed")).toBe(false);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes("capture lock release failed"),
         ),
       ).toHaveLength(1);
+    });
+
+    it("presents each shared source recovery cause once", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      await pi.startSession("startup");
+      pi.notifications.length = 0;
+      const captureCause = new Error("capture publication failed once");
+      const recoveryCause = new Error("shared cleanup failure once");
+      const capture = vi
+        .spyOn(runtime.checkpoints, "prepareCurrent")
+        .mockResolvedValueOnce({
+          ok: false,
+          error: { kind: "publish-failed", cause: captureCause },
+        });
+      const recovery = vi
+        .spyOn(
+          runtime.workspaceMutations,
+          "protectCurrentLocationForRetirement",
+        )
+        .mockResolvedValueOnce({
+          arrival: { kind: "unsettled", cause: recoveryCause },
+          workspaceLockCleanup: { kind: "failed", cause: recoveryCause },
+        });
+      const cleanup = failWorkspaceLockCleanup("capture-turn", recoveryCause);
+
+      try {
+        await pi.endTurn();
+      } finally {
+        cleanup.mockRestore();
+        recovery.mockRestore();
+        capture.mockRestore();
+      }
+
+      const messages = pi.notifications
+        .map(({ message }) => message)
+        .join("\n");
+      expect(messages.match(/capture publication failed once/gu)).toHaveLength(
+        1,
+      );
+      expect(messages.match(/shared cleanup failure once/gu)).toHaveLength(1);
     });
 
     it("observes ordinary turn appends without rescanning the full Pi graph", async () => {
@@ -1632,7 +1725,7 @@ describe("checkpoint authority lifecycle", () => {
         treeOid: original.treeOid,
       });
       db.close();
-      expect(notified(pi, "captureLaterFailed")).toBe(true);
+      expect(notified(pi, "sourceCaptureProtected")).toBe(true);
     });
   });
 
@@ -1687,13 +1780,6 @@ describe("checkpoint authority lifecycle", () => {
         ),
       ).toBe(true);
 
-      // The first operational failure retires Cyclotomy. Exercise the restore
-      // presenter with a fresh runtime so both commands prove their own boundary.
-      const restoreRuntime = await preparedRuntime();
-      await pi.replaceRuntime(
-        (api) => registerPreparedRuntime(api, restoreRuntime),
-        "reload",
-      );
       await pi.runCommand("restore");
       expect(
         notifiedWithDetail(
@@ -1739,6 +1825,46 @@ describe("checkpoint authority lifecycle", () => {
       );
       expect(after.listReferencedTreeOids()).toEqual(rootsBefore);
       after.close();
+    });
+
+    it("reports only drift facts after lock cleanup stops participation", async () => {
+      const runtime = await preparedRuntime();
+      const pi = new FakePi(workspace);
+      registerPreparedRuntime(pi.api, runtime);
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(workspace, "a.txt"), "saved");
+      await pi.startSession("startup");
+      const db = await metadata();
+      await mutateMetadata(db, () =>
+        protectTestLocation(
+          db,
+          {
+            sessionId: pi.manager.sessionId,
+            sessionFile: pi.manager.getSessionFile()!,
+          },
+          leaf.id,
+        ),
+      );
+      db.close();
+      pi.notifications.length = 0;
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "drift",
+        new Error("drift lock remained"),
+      );
+
+      try {
+        await pi.runCommand("drift");
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+
+      expect(runtime.activation.kind).toBe("unavailable");
+      expect(notified(pi, "driftCleanProtectedFact")).toBe(true);
+      expect(notified(pi, "driftCleanProtected")).toBe(false);
+      expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
+      expect(
+        pi.notifications.some(({ message }) => message.includes("/restore")),
+      ).toBe(false);
     });
 
     it("shows archived Git evaluator drift in /drift and the restore confirmation", async () => {
@@ -2064,7 +2190,7 @@ describe("checkpoint authority lifecycle", () => {
       const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       db.close();
-      expect(notified(pi, "workspaceLockCleanupFailed")).toBe(true);
+      expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
       await pi.runCommand("cyclotomy");
       expect(notified(pi, "cyclotomyStoppedWithError")).toBe(true);
     });
@@ -2188,6 +2314,12 @@ describe("checkpoint authority lifecycle", () => {
       ).toBe(true);
       expect(notified(pi, "restoreSuccessOne")).toBe(true);
       expect(notified(pi, "restoreExecutionFailed")).toBe(false);
+      const guidance = pi.notifications.find(({ message }) =>
+        message.includes("workspace lock release failed"),
+      );
+      expect(guidance).toMatchObject({ level: "error" });
+      expect(guidance?.message).toContain("/cyclotomy resume");
+      expect(guidance?.message).not.toContain("/drift");
       const db = await metadata();
       expect(checkpointState(db, pi.manager.sessionId, first)).toEqual(
         firstState,
@@ -3258,13 +3390,13 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(pi.manager.getLeafId()).toBe(first);
       expect(runtime.activation.kind).toBe("unavailable");
-      expect(notified(pi, "sourceCaptureFailed")).toBe(true);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
       const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, second)).toBe(true);
       db.close();
     });
 
-    it("preserves source capture and lets Pi depart when commit lock cleanup fails", async () => {
+    it("protects source capture and lets Pi depart when commit lock cleanup fails", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
@@ -3296,13 +3428,13 @@ describe("checkpoint authority lifecycle", () => {
         checkpointState(after, pi.manager.sessionId, second)?.treeOid,
       ).not.toBe(sourceBefore.treeOid);
       expect(checkpointIsBlocked(after, pi.manager.sessionId, second)).toBe(
-        false,
+        true,
       );
       after.close();
-      expect(notified(pi, "sourceCaptureFailed")).toBe(false);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes("tree commit lock release failed"),
         ),
       ).toHaveLength(1);
     });
@@ -3511,6 +3643,32 @@ describe("checkpoint authority lifecycle", () => {
       );
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
       db.close();
+    });
+
+    it("does not recommend reconciliation after Detached cleanup stops participation", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first } = await twoStates(pi);
+      pi.selectionOverride = messageFor("choiceNavigationDetach");
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "tree-arrival",
+        new Error("detached arrival lock remained"),
+      );
+
+      try {
+        expect(await pi.navigate(first)).toBe("done");
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+
+      expect(runtime.activation.kind).toBe("unavailable");
+      expect(notified(pi, "navigationDetachedFact")).toBe(true);
+      expect(notified(pi, "navigationDetached")).toBe(false);
+      expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
+      expect(
+        pi.notifications.some(({ message }) => message.includes("/drift")),
+      ).toBe(false);
     });
 
     it("pins an inherited destination before keeping the current workspace", async () => {
@@ -3807,7 +3965,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(pi.manager.getLeafId()).toBe(targetNode.id);
       expect(pi.selections).toHaveLength(selectionsBefore);
-      expect(notified(pi, "navigationScanIncomplete")).toBe(true);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
       expect(await readFile(join(workspace, "X"), "utf8")).toBe(
         "ignored current",
       );
@@ -4097,28 +4255,19 @@ describe("checkpoint authority lifecycle", () => {
       );
     });
 
-    it("retires Cyclotomy and leaves Pi usable when session context and diagnostics throw", async () => {
+    it("retires Cyclotomy and leaves Pi usable when session context access throws", async () => {
       const pi = new FakePi(workspace, registerCyclotomy);
       const { first } = await twoStates(pi);
       pi.sessionContextThrows = true;
       let bashRan = false;
-      const rendering = throwTranslations(
-        "navigationPrepareFailed",
-        "inputCaptureFailed",
-        "sourceCaptureFailed",
-      );
 
-      try {
-        expect(await pi.navigate(first)).toBe("done");
-        expect(await pi.compact()).toBe("done");
-        expect(await pi.fork(first)).toBe("done");
-        expect(await pi.submitInput()).toBe("continued");
-        await pi.executeUserBash("must-not-run", async () => {
-          bashRan = true;
-        });
-      } finally {
-        rendering.mockRestore();
-      }
+      expect(await pi.navigate(first)).toBe("done");
+      expect(await pi.compact()).toBe("done");
+      expect(await pi.fork(first)).toBe("done");
+      expect(await pi.submitInput()).toBe("continued");
+      await pi.executeUserBash("must-not-run", async () => {
+        bashRan = true;
+      });
       expect(bashRan).toBe(true);
     });
 
@@ -4436,91 +4585,9 @@ describe("checkpoint authority lifecycle", () => {
       expect(lastStatus(pi)).toBeUndefined();
       expect(
         pi.notifications.filter(({ message }) =>
-          message.includes(messageFor("workspaceLockCleanupFailed")),
+          message.includes(messageFor("workspaceLockCleanupStopped")),
         ),
       ).toHaveLength(1);
-    });
-
-    it("settles a restored arrival when restoring status rendering throws", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      const { first } = await twoStates(pi);
-      let rendering: ReturnType<typeof throwTranslations> | undefined;
-      pi.beforeTreeCommit = async () => {
-        rendering = throwTranslations("restoringWorkspace");
-      };
-
-      try {
-        expect(await pi.navigate(first)).toBe("done");
-      } finally {
-        rendering?.mockRestore();
-        pi.beforeTreeCommit = undefined;
-      }
-
-      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
-      const db = await metadata();
-      expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(false);
-      db.close();
-    });
-
-    it("settles an exact detached arrival when checking status rendering throws", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      const { first } = await twoStates(pi);
-      pi.selectionOverride = messageFor("choiceNavigationDetach");
-      let rendering: ReturnType<typeof throwTranslations> | undefined;
-      pi.beforeTreeCommit = async () => {
-        rendering = throwTranslations("checkingWorkspace");
-      };
-
-      try {
-        expect(await pi.navigate(first)).toBe("done");
-      } finally {
-        rendering?.mockRestore();
-        pi.beforeTreeCommit = undefined;
-      }
-
-      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      const db = await metadata();
-      expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
-      db.close();
-    });
-
-    it("settles a node-free arrival with a barrier when checking status rendering throws", async () => {
-      const pi = new FakePi(workspace);
-      const runtime = await preparedRuntime();
-      registerPreparedRuntime(pi.api, runtime);
-      await pi.startSession("startup");
-      const rootPrompt = pi.manager.appendEntry({
-        type: "message",
-        message: { role: "user" },
-      });
-      await writeFile(join(workspace, "a.txt"), "source-state");
-      await pi.endTurn();
-
-      let rendering: ReturnType<typeof throwTranslations> | undefined;
-      let arrivalCheck: ReturnType<typeof vi.spyOn> | undefined;
-      pi.beforeTreeCommit = async () => {
-        rendering = throwTranslations("checkingWorkspace");
-        arrivalCheck = vi
-          .spyOn(runtime.admission, "arrivalCanProceed")
-          .mockReturnValueOnce(false);
-      };
-
-      try {
-        expect(await pi.navigate(rootPrompt.id)).toBe("done");
-      } finally {
-        arrivalCheck?.mockRestore();
-        rendering?.mockRestore();
-        pi.beforeTreeCommit = undefined;
-      }
-
-      expect(pi.manager.getLeafId()).toBeNull();
-      const db = await metadata();
-      expect(
-        captureBarrier(db, pi.manager.sessionId, pi.manager.getSessionFile()!),
-      ).toBe(true);
-      db.close();
     });
 
     it("leaves a harmless source capture when a later tree hook cancels", async () => {
@@ -4825,7 +4892,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(rewritten).toBe(true);
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      expect(notified(pi, "commandLocationChanged")).toBe(true);
+      expect(notified(pi, "navigationPlanMismatch")).toBe(true);
       const db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, first)).toBe(true);
       db.close();
@@ -5264,6 +5331,31 @@ describe("checkpoint authority lifecycle", () => {
       expect(notified(pi, "navigationPlanMismatch")).toBe(true);
     });
 
+    it("reports only arrival facts after protection cleanup stops participation", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      const { first } = await twoStates(pi);
+      const cleanupFailure = failWorkspaceLockCleanup(
+        "recover-uncertain-location",
+        new Error("arrival protection lock remained"),
+      );
+
+      try {
+        await pi.landUnmanaged(first);
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+
+      expect(runtime.activation.kind).toBe("unavailable");
+      expect(notified(pi, "navigationPlanMismatchFact")).toBe(true);
+      expect(notified(pi, "navigationPlanMismatch")).toBe(false);
+      expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
+      expect(
+        pi.notifications.some(({ message }) => message.includes("/drift")),
+      ).toBe(false);
+    });
+
     it.each([
       "view-read",
       "temporarily-unusable",
@@ -5371,7 +5463,7 @@ describe("checkpoint authority lifecycle", () => {
           );
           expect(unavailable?.level).toBe("error");
         } else if (fault === "protection-cleanup") {
-          expect(notified(pi, "workspaceLockCleanupFailed")).toBe(true);
+          expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true);
         }
       },
     );
@@ -5666,7 +5758,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(
         notifiedWithDetail(
           pi,
-          "navigationPrepareFailed",
+          "sourceCaptureStopped",
           "structural object does not exist",
         ),
       ).toBe(true);
@@ -6019,7 +6111,6 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
       expect(notified(pi, "captureLaterFailed")).toBe(false);
       expect(notified(pi, "sourceCaptureFailed")).toBe(false);
-      expect(notified(pi, "inputCaptureFailed")).toBe(false);
     });
 
     it("never materializes a selected label id", async () => {
@@ -6121,7 +6212,6 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "outside", "hard-b"), "utf8")).toBe(
         "same inode",
       );
-      expect(notified(pi, "navigationScanIncomplete")).toBe(false);
       db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, source)).toBe(true);
       expect(checkpointIsBlocked(db, pi.manager.sessionId, target)).toBe(false);
@@ -6146,7 +6236,7 @@ describe("checkpoint authority lifecycle", () => {
 
       expect(await pi.navigate(first)).toBe("done");
       expect(pi.manager.getLeafId()).toBe(first);
-      expect(notified(pi, "navigationScanIncomplete")).toBe(true);
+      expect(notified(pi, "sourceCaptureStopped")).toBe(true);
     });
   });
 
@@ -6713,7 +6803,7 @@ describe("checkpoint authority lifecycle", () => {
         expect(executed).toBe(true);
         expect(pi.manager.getLeafId() === source).toBe(!persistResultEntry);
         await expect(stat(join(workspace, "ran"))).resolves.toBeDefined();
-        expect(notified(pi, "sourceCaptureFailed")).toBe(true);
+        expect(notified(pi, "sourceCaptureStopped")).toBe(true);
         const after = await metadata();
         expect(checkpointIsBlocked(after, pi.manager.sessionId, source)).toBe(
           true,
@@ -6759,7 +6849,7 @@ describe("checkpoint authority lifecycle", () => {
       ["busy", false, undefined],
       ["streaming", true, "steer"],
     ] as const)(
-      "allows %s input after protecting an identity-mismatched runtime",
+      "cancels %s input when the registered view no longer matches",
       async (_case, idle, streamingBehavior) => {
         const pi = new FakePi(workspace);
         const runtime = await preparedRuntime();
@@ -6773,20 +6863,15 @@ describe("checkpoint authority lifecycle", () => {
 
         try {
           expect(await pi.preflightInput("untrusted", streamingBehavior)).toBe(
-            "continued",
+            "handled",
           );
         } finally {
           mismatch.mockRestore();
           pi.idle = true;
         }
 
-        expect(notified(pi, "inputCaptureFailed")).toBe(true);
-        expect(
-          notifiedVerbatim(
-            pi,
-            "current persisted session identity is unavailable",
-          ),
-        ).toBe(true);
+        expect(notified(pi, "commandLocationChanged")).toBe(true);
+        expect(runtime.activation.kind).toBe("active");
       },
     );
 
@@ -6847,7 +6932,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(lastStatus(pi)).toBeUndefined();
     });
 
-    it("reconciles quarantined registration before rendering its warning", async () => {
+    it("reconciles a quarantined registration before continuing", async () => {
       const pi = new FakePi(workspace);
       const header = pi.manager.getHeader();
       vi.spyOn(pi.manager, "getHeader").mockReturnValue({
@@ -6856,13 +6941,7 @@ describe("checkpoint authority lifecycle", () => {
       } as never);
       const quarantined = pi.manager.appendEntry();
       registerCyclotomy(pi.api);
-      const rendering = throwTranslations("forkInheritanceSkipped");
-
-      try {
-        await expect(pi.startSession("fork")).resolves.toBeUndefined();
-      } finally {
-        rendering.mockRestore();
-      }
+      await pi.startSession("fork");
 
       let db = await metadata();
       expect(
@@ -6878,11 +6957,7 @@ describe("checkpoint authority lifecycle", () => {
         checkpointIsBlocked(db, pi.manager.sessionId, quarantined.id),
       ).toBe(true);
       db.close();
-      expect(pi.notifications).toContainEqual({
-        message:
-          "Cyclotomy could not complete this operation or show the reason.",
-        level: "warning",
-      });
+      expect(notified(pi, "forkInheritanceSkipped")).toBe(true);
 
       await pi.endTurn();
       const descendant = pi.manager.getLeafId()!;
