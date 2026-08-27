@@ -704,6 +704,52 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
+  it("keeps restore comparison independent of capture byte limits", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-limits-"));
+    roots.push(parent);
+    const workspace = join(parent, "workspace");
+    const home = join(parent, "home");
+    await Promise.all([
+      mkdir(workspace),
+      mkdir(join(home, "cyclotomy"), { recursive: true }),
+    ]);
+    await writeFile(
+      join(home, "cyclotomy", "settings.json"),
+      JSON.stringify({ maxFileMiB: 1 }),
+    );
+    await writeFile(
+      join(workspace, "saved.bin"),
+      new Uint8Array(1024 * 1024 + 1),
+    );
+    const runtime = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+
+    expect(await runtime.ensureStore(workspace)).toBe(true);
+    const capture = await runtime.scanCurrentWorkspace(workspace);
+    expect(capture.problems).toContainEqual(
+      expect.objectContaining({
+        path: "saved.bin",
+        kind: "too-large",
+      }),
+    );
+
+    const comparison = await runtime.scanCurrentWorkspaceForScope(
+      workspace,
+      TEST_SCOPE,
+    );
+    expect(comparison.problems).toEqual([]);
+    expect(comparison.entries).toContainEqual(
+      expect.objectContaining({
+        path: "saved.bin",
+        kind: "regular",
+        byteLength: 1024 * 1024 + 1,
+      }),
+    );
+    runtime.close();
+  });
+
   it("reloads workspace configuration in a new runtime after close", async () => {
     const parent = await mkdtemp(join(tmpdir(), "cyclotomy-runtime-reload-"));
     roots.push(parent);

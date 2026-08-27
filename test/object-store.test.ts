@@ -428,6 +428,8 @@ describe("object store", () => {
     const legacyTreeOid = await installTreeObject(root, legacyBytes);
     const limitedStore = await openObjectStore(root, { maxFileBytes: 1 });
 
+    await expect(limitedStore.readBlob(blobOid)).resolves.toEqual(content);
+    await expect(limitedStore.verifyBlobs([blobOid])).resolves.toBeUndefined();
     await expect(limitedStore.readTree(legacyTreeOid)).rejects.toMatchObject({
       code: "object-integrity",
     });
@@ -444,9 +446,9 @@ describe("object store", () => {
     await expect(
       limitedStore.readTreeManifest(upgraded.treeOid),
     ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
-    await expect(limitedStore.readTree(upgraded.treeOid)).rejects.toMatchObject(
-      { code: "object-integrity" },
-    );
+    await expect(
+      limitedStore.readTree(upgraded.treeOid),
+    ).resolves.toMatchObject({ format: CURRENT_TREE_MANIFEST_FORMAT });
     await expect(
       upgradeStoredTree(
         limitedStore,
@@ -1241,54 +1243,6 @@ describe("object store", () => {
     });
   });
 
-  it.each(["ordinary", "sparse"] as const)(
-    "rejects an oversized %s blob from its opened-handle stat before reading or hashing",
-    async (fixture) => {
-      const maxFileBytes = 4;
-      const limited = await openObjectStore(root, { maxFileBytes });
-      const oid = fixture === "ordinary" ? "1".repeat(64) : "2".repeat(64);
-      const path = physicalObjectPath(root, "blobs", oid);
-      await mkdir(join(root, "objects", "blobs", oid.slice(0, 2)), {
-        recursive: true,
-      });
-      if (fixture === "ordinary") {
-        // Deliberately does not match `oid`: the size gate must win before the
-        // digest can inspect any bytes.
-        await writeFile(path, Buffer.alloc(maxFileBytes + 1, 0x61));
-      } else {
-        await writeFile(path, "");
-        await truncate(path, maxFileBytes + 1);
-      }
-
-      const prototype = await fileHandlePrototype();
-      const readablePrototype = prototype as typeof prototype & {
-        read(...args: unknown[]): Promise<unknown>;
-      };
-      const originalRead = readablePrototype.read;
-      let reads = 0;
-      const spy = vi
-        .spyOn(readablePrototype, "read")
-        .mockImplementation(async function (
-          this: FileHandle,
-          ...args: unknown[]
-        ): Promise<unknown> {
-          reads += 1;
-          return Reflect.apply(originalRead, this, args);
-        });
-
-      await expect(limited.readBlob(oid)).rejects.toMatchObject({
-        code: "object-integrity",
-        message: expect.stringContaining(`${maxFileBytes}-byte limit`),
-      });
-      await expect(limited.verifyBlobs([oid])).rejects.toMatchObject({
-        code: "object-integrity",
-        message: expect.stringContaining(`${maxFileBytes}-byte limit`),
-      });
-      spy.mockRestore();
-      expect(reads).toBe(0);
-    },
-  );
-
   it("keeps the tree read bounded when the file grows after the initial stat", async () => {
     const content = Buffer.from(
       `${JSON.stringify({
@@ -1667,9 +1621,7 @@ describe("cross-store tree import", () => {
         maxFileBytes: content.byteLength,
       });
 
-      await expect(limitedSource.readTree(treeOid)).rejects.toMatchObject({
-        code: "object-integrity",
-      });
+      await expect(limitedSource.readTree(treeOid)).resolves.toBeDefined();
       await expect(
         target.importTreesFrom(
           limitedSource,

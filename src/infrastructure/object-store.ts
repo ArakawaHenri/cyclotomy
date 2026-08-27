@@ -188,8 +188,8 @@ export interface ObjectStore {
    * Read and authenticate only the tree object itself (digest and canonical
    * manifest), without verifying the blob closure. Suitable for diagnostics
    * such as diff. Anything that will apply content must authenticate every
-   * blob it may write (for example by staging readBlob results) before the
-   * first workspace mutation.
+   * blob it may write (for example by streaming it into private staging)
+   * before the first workspace mutation.
    */
   readTreeManifest(treeOid: string): Promise<CurrentTreeManifest>;
   /** Authenticate exactly the supplied blob ids with bounded concurrency. */
@@ -199,7 +199,6 @@ export interface ObjectStore {
 /** Internal operation-scoped reader; fake stores receive a delegating shim. */
 export interface ObjectStoreReadScope {
   readTreeManifest(treeOid: string): Promise<CurrentTreeManifest>;
-  readBlob(oid: string): Promise<Uint8Array>;
   streamBlob(
     oid: string,
     sink: (chunk: Uint8Array) => Promise<void>,
@@ -412,7 +411,6 @@ export function openObjectStoreReadScope(
   if (native !== undefined) return native.access.openReadScope();
   return Object.freeze({
     readTreeManifest: (treeOid: string) => store.readTreeManifest(treeOid),
-    readBlob: (oid: string) => store.readBlob(oid),
     streamBlob: (oid: string, sink: (chunk: Uint8Array) => Promise<void>) =>
       store.streamBlob(oid, sink),
     verifyBlobs: (blobOids: readonly string[]) => store.verifyBlobs(blobOids),
@@ -703,7 +701,7 @@ class FileObjectStore implements NativeObjectStore {
   declare readonly [NATIVE_OBJECT_STORE]: true;
   declare readonly storageRoot: string;
   readonly #manifestLimits: TreeManifestLimits;
-  readonly #maxFileBytes: number;
+  readonly #admissionMaxFileBytes: number;
   readonly #repository: ContentRepository;
   readonly #contentProofOwner = Object.freeze({});
 
@@ -720,11 +718,10 @@ class FileObjectStore implements NativeObjectStore {
     });
     const layout = nativeObjectLayout(root);
     this.#manifestLimits = manifestLimits;
-    this.#maxFileBytes = maxFileBytes;
+    this.#admissionMaxFileBytes = maxFileBytes;
     this.#repository = new ContentRepository(layout, {
       // The repository is a durable-format decoder, not an admission policy.
-      // Call sites always provide their exact operation limit; schema upgrade
-      // must remain able to authenticate objects captured under older config.
+      // Publication and import enforce admission limits before reaching it.
       maxDecodedBytes: DURABLE_BLOB_VERIFICATION_CEILING,
     });
     nativeObjectRecords.set(
@@ -763,20 +760,13 @@ class FileObjectStore implements NativeObjectStore {
         ),
       readTreeManifest: (treeOid: string) =>
         this.#readTreeManifest(treeOid, scope),
-      readBlob: async (oid: string) => {
-        const chunks: Buffer[] = [];
-        const { decodedLength } = await this.#streamContent(
-          oid,
-          this.#maxFileBytes,
-          async (chunk) => {
-            chunks.push(Buffer.from(chunk));
-          },
-          scope,
-        );
-        return Buffer.concat(chunks, decodedLength);
-      },
       streamBlob: (oid: string, sink: (chunk: Uint8Array) => Promise<void>) =>
-        this.#streamContent(oid, this.#maxFileBytes, sink, scope),
+        this.#streamContent(
+          oid,
+          DURABLE_BLOB_VERIFICATION_CEILING,
+          sink,
+          scope,
+        ),
       verifyBlobs: (blobOids: readonly string[]) =>
         this.#verifyBlobs(blobOids, undefined, scope),
       verifyContent: (oid: string, maximumBytes: number) =>
@@ -869,10 +859,10 @@ class FileObjectStore implements NativeObjectStore {
         "streamed blob source must be absolute with a valid expected length",
       );
     }
-    if (expectedByteLength > this.#maxFileBytes) {
+    if (expectedByteLength > this.#admissionMaxFileBytes) {
       throw new ObjectStoreError(
         "invalid-blob",
-        `streamed blob exceeds the ${this.#maxFileBytes}-byte file limit`,
+        `streamed blob exceeds the ${this.#admissionMaxFileBytes}-byte file limit`,
       );
     }
     try {
@@ -883,7 +873,7 @@ class FileObjectStore implements NativeObjectStore {
           const observed = await streamWorkspaceSourceFile(
             sourcePath,
             async (chunk) => sink(chunk),
-            Math.min(this.#maxFileBytes, expectedByteLength),
+            Math.min(this.#admissionMaxFileBytes, expectedByteLength),
           );
           if (
             observed.byteLength !== expectedByteLength ||
@@ -928,7 +918,7 @@ class FileObjectStore implements NativeObjectStore {
     sink: (chunk: Uint8Array) => Promise<void>,
   ): Promise<{ readonly decodedLength: number }> {
     assertOid(oid);
-    return this.#streamContent(oid, this.#maxFileBytes, sink);
+    return this.#streamContent(oid, DURABLE_BLOB_VERIFICATION_CEILING, sink);
   }
 
   async #streamContent(
@@ -1115,7 +1105,7 @@ class FileObjectStore implements NativeObjectStore {
             (proof) =>
               this.#repository.revalidatePublishedContent(
                 proof,
-                this.#maxFileBytes,
+                this.#admissionMaxFileBytes,
                 resolutionScope,
               ),
             VERIFICATION_CONCURRENCY,
@@ -1429,25 +1419,25 @@ class FileObjectStore implements NativeObjectStore {
         let proof: NativeContentProof;
         try {
           proof = await preflightSourceAccess(() =>
-            source.verifyContent(blobOid, this.#maxFileBytes),
+            source.verifyContent(blobOid, this.#admissionMaxFileBytes),
           );
         } catch (error) {
           if (
             error instanceof ObjectSizeLimitError &&
-            error.maxBytes === this.#maxFileBytes
+            error.maxBytes === this.#admissionMaxFileBytes
           ) {
             throw new ObjectStoreError(
               "invalid-tree-manifest",
-              `imported blob ${blobOid} exceeds the ${this.#maxFileBytes}-byte target file limit`,
+              `imported blob ${blobOid} exceeds the ${this.#admissionMaxFileBytes}-byte target file limit`,
               error,
             );
           }
           throw error;
         }
-        if (proof.decodedLength > this.#maxFileBytes) {
+        if (proof.decodedLength > this.#admissionMaxFileBytes) {
           throw new ObjectStoreError(
             "invalid-tree-manifest",
-            `imported blob ${blobOid} exceeds the ${this.#maxFileBytes}-byte target file limit`,
+            `imported blob ${blobOid} exceeds the ${this.#admissionMaxFileBytes}-byte target file limit`,
           );
         }
         blobProofs.set(blobOid, proof);
@@ -1488,7 +1478,7 @@ class FileObjectStore implements NativeObjectStore {
       treeOids,
       blobOids: uniqueBlobOids,
       blobProofs,
-      maxFileBytes: this.#maxFileBytes,
+      maxFileBytes: this.#admissionMaxFileBytes,
     };
   }
 
@@ -1600,7 +1590,7 @@ class FileObjectStore implements NativeObjectStore {
         async (oid) => {
           await this.#verifyContent(
             oid,
-            maxBlobBytes ?? this.#maxFileBytes,
+            maxBlobBytes ?? DURABLE_BLOB_VERIFICATION_CEILING,
             scope,
           );
         },

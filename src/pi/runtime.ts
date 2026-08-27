@@ -31,7 +31,7 @@ import {
 } from "../infrastructure/workspace-lock.ts";
 import {
   scanWorkspace,
-  scanWorkspaceForScope,
+  scanWorkspaceForRestoreComparison,
   type ScanOptions,
   type WorkspaceSnapshot,
 } from "../infrastructure/workspace-scan.ts";
@@ -103,7 +103,6 @@ export class CyclotomyRuntime {
       workspaceStoreRoot: () => this.storeRoot,
       restoreDeps: () => ({
         store: this.store,
-        scanOptions: this.#scanOptions(),
         validateManifestScope: (manifest) =>
           this.#validateManifestScope(manifest),
       }),
@@ -457,11 +456,9 @@ export class CyclotomyRuntime {
     cwd: string,
     targetScope: WorkspaceScope,
   ): Promise<WorkspaceSnapshot> {
-    const snapshot = await scanWorkspaceForScope(
-      cwd,
-      targetScope,
-      this.#scanOptions(),
-    );
+    const snapshot = await scanWorkspaceForRestoreComparison(cwd, targetScope, {
+      gitIgnoreScratchParent: this.store.storageRoot,
+    });
     if (snapshot.rootPath !== this.workspaceRoot) {
       throw new Error(
         "workspace root changed after the checkpoint store was selected",

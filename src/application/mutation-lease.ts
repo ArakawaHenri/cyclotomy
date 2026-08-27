@@ -64,30 +64,13 @@ export function consumeWorkspaceMutationLease<Resolution>(
     throw new Error("workspace mutation authority is unavailable");
   }
 
-  // Reject first. A callback that throws, returns a thenable, or returns an
-  // invalid decision permanently consumes this one-shot capability.
+  // Reject first so a throwing cutover permanently consumes this capability.
   const unavailable = new Error("workspace mutation cutover was rejected");
   record.state = { kind: "rejected", cause: unavailable };
   try {
-    const authorization: unknown = record.cutover();
-    if (
-      typeof authorization !== "object" ||
-      authorization === null ||
-      Reflect.get(authorization, "kind") !== "authorized" ||
-      typeof Reflect.get(authorization, "then") === "function" ||
-      !Reflect.has(authorization, "pinnedResolution") ||
-      typeof Reflect.get(authorization, "writeAuthority") !== "object" ||
-      Reflect.get(authorization, "writeAuthority") === null ||
-      typeof Reflect.get(authorization, "storeRoot") !== "string" ||
-      Reflect.get(authorization, "storeRoot") === ""
-    ) {
-      throw new Error(
-        "workspace mutation authority must complete synchronously",
-      );
-    }
-    const typed = authorization as WorkspaceMutationAuthorization<Resolution>;
-    record.state = { kind: "authorized", authorization: typed };
-    return typed;
+    const authorization = record.cutover();
+    record.state = { kind: "authorized", authorization };
+    return authorization;
   } catch (cause) {
     record.state = { kind: "rejected", cause };
     throw cause;

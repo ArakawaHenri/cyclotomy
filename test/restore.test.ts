@@ -5,9 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  readdir,
   realpath,
-  rename,
   rm,
   stat,
   unlink,
@@ -48,9 +46,6 @@ import {
 } from "../src/infrastructure/object-store.ts";
 import { validateTreeEntriesAgainstScope } from "../src/infrastructure/tree-scope-validation.ts";
 import {
-  assertWorkspaceWriteAuthority,
-  runWithWorkspaceLock,
-  type WorkspaceLockExecution,
   type WorkspaceWriteAuthority,
   withWorkspaceLock,
 } from "../src/infrastructure/workspace-lock.ts";
@@ -68,6 +63,8 @@ import {
   holdTestWorkspaceWriteAuthority,
   releaseTestWorkspaceWriteAuthorities,
 } from "./workspace-write-authority-fixture.ts";
+
+vi.mock("../src/infrastructure/blob-staging.ts", { spy: true });
 
 const execFileAsync = promisify(execFile);
 
@@ -88,7 +85,7 @@ function contentRecordPath(oid: string): string {
 }
 
 function testMutationLease(
-  cutover: () => unknown = () => undefined,
+  cutover: () => void = () => undefined,
   access: {
     readonly writeAuthority: WorkspaceWriteAuthority;
     readonly storeRoot: string;
@@ -98,11 +95,7 @@ function testMutationLease(
   },
 ) {
   return prepareWorkspaceMutationLease<ResolvedNodeState>(() => {
-    const returned = cutover();
-    if (returned !== undefined) {
-      // Deliberately exercise the runtime guard with a hostile JS caller.
-      return returned as never;
-    }
+    cutover();
     return {
       kind: "authorized",
       pinnedResolution: {
@@ -144,6 +137,7 @@ async function restoreWorkspace(
 }
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   root = await mkdtemp(join(tmpdir(), "cyclotomy-restore-ws-"));
   storeRoot = await mkdtemp(join(tmpdir(), "cyclotomy-restore-store-"));
   mutationAuthorityRoot = await mkdtemp(
@@ -211,7 +205,7 @@ describe("pure workspace restore", () => {
     const lease = testMutationLease(() => {
       throw new Error("mutation authority must remain pending");
     });
-    const stage = vi.fn<typeof stageBlobs>();
+    const stage = vi.mocked(stageBlobs);
     const current = await scanWorkspace(root);
 
     const execution = await executeWorkspaceRestore(
@@ -220,7 +214,6 @@ describe("pure workspace restore", () => {
         validateManifestScope: async () => ({
           gitVersion: "git version changed-after-preview",
         }),
-        stageBlobs: stage,
       },
       root,
       setup.resolution,
@@ -542,7 +535,7 @@ describe("pure workspace restore", () => {
     setup.metadata.close();
   });
 
-  it("authenticates required and unused blobs exactly once before mutation", async () => {
+  it("verifies required and unused blobs exactly once before mutation", async () => {
     await writeFile(join(root, "a.txt"), "target a");
     await writeFile(join(root, "b.txt"), "target b");
     const setup = await setupTarget();
@@ -655,6 +648,19 @@ describe("pure workspace restore", () => {
     const lease = testMutationLease(() => {
       mutationAttempted = true;
     });
+    const nativeStaging = await vi.importActual<
+      typeof import("../src/infrastructure/blob-staging.ts")
+    >("../src/infrastructure/blob-staging.ts");
+    vi.mocked(stageBlobs).mockImplementationOnce(async (...args) => {
+      const staged = await nativeStaging.stageBlobs(...args);
+      return {
+        ...staged,
+        dispose: async () => {
+          dispose();
+          await staged.dispose();
+        },
+      };
+    });
 
     const execution = await executeWorkspaceRestore(
       {
@@ -664,16 +670,6 @@ describe("pure workspace restore", () => {
             scratchParent: setup.store.storageRoot,
             forbiddenRoots: [root],
           }),
-        stageBlobs: async (...args) => {
-          const staged = await stageBlobs(...args);
-          return {
-            ...staged,
-            dispose: async () => {
-              dispose();
-              await staged.dispose();
-            },
-          };
-        },
       },
       root,
       setup.resolution,
@@ -719,15 +715,15 @@ describe("pure workspace restore", () => {
         await originalClose.call(this, scope);
         throw readCleanup;
       });
+    vi.mocked(stageBlobs).mockRejectedValueOnce(
+      new BlobStagingCleanupError(stagingFailure, stagingCleanup),
+    );
     const lease = testMutationLease();
 
     const execution = await executeWorkspaceRestore(
       {
         store: setup.store,
         validateManifestScope: async () => ({ gitVersion: null }),
-        stageBlobs: async () => {
-          throw new BlobStagingCleanupError(stagingFailure, stagingCleanup);
-        },
       },
       root,
       setup.resolution,
@@ -822,126 +818,25 @@ describe("pure workspace restore", () => {
     setup.metadata.close();
   });
 
-  it("stops streamed publication after the exact workspace lease is replaced", async () => {
-    const targetPath = join(root, "target.txt");
-    await writeFile(targetPath, "target bytes");
-    const setup = await setupTarget();
-    await unlink(targetPath);
-    const current = await scanWorkspace(root);
-    const displacedLock = join(storeRoot, "displaced-workspace.lock");
-    let businessCutovers = 0;
-    let successorAcquired = false;
-    let successorExecution: WorkspaceLockExecution<void> | undefined;
-
-    const locked = await runWithWorkspaceLock(
-      storeRoot,
-      "restore-lease-revalidation-test",
-      async (writeAuthority) =>
-        executeWorkspaceRestore(
-          {
-            store: setup.store,
-            validateManifestScope: async (manifest) =>
-              validateTreeEntriesAgainstScope(manifest, {
-                scratchParent: setup.store.storageRoot,
-                forbiddenRoots: [root],
-              }),
-            stageBlobs: async (oids, readBlob) => {
-              const contents = new Map<string, Uint8Array>();
-              for (const oid of oids) contents.set(oid, await readBlob(oid));
-              return {
-                readBlob: async (oid: string) => contents.get(oid)!,
-                streamBlob: async (oid: string, sink) => {
-                  const content = contents.get(oid)!;
-                  const split = Math.max(1, Math.floor(content.byteLength / 2));
-                  await sink(content.subarray(0, split));
-                  await rename(
-                    join(storeRoot, "workspace.lock"),
-                    displacedLock,
-                  );
-                  let releaseSuccessor: (() => void) | undefined;
-                  const successorMayRelease = new Promise<void>((resolve) => {
-                    releaseSuccessor = resolve;
-                  });
-                  let observeSuccessor: (() => void) | undefined;
-                  const successorIsAcquired = new Promise<void>((resolve) => {
-                    observeSuccessor = resolve;
-                  });
-                  const successor = runWithWorkspaceLock(
-                    storeRoot,
-                    "restore-successor-test",
-                    async (successorLease) => {
-                      assertWorkspaceWriteAuthority(successorLease, storeRoot);
-                      successorAcquired = true;
-                      observeSuccessor?.();
-                      await successorMayRelease;
-                    },
-                  );
-                  await successorIsAcquired;
-                  try {
-                    await sink(content.subarray(split));
-                  } finally {
-                    releaseSuccessor?.();
-                    successorExecution = await successor;
-                  }
-                  return { decodedLength: content.byteLength };
-                },
-                dispose: async () => {},
-              };
-            },
-          },
-          root,
-          setup.resolution,
-          {
-            current,
-            mutationLease: prepareWorkspaceMutationLease(() => {
-              businessCutovers += 1;
-              return {
-                kind: "authorized",
-                pinnedResolution: setup.resolution,
-                writeAuthority,
-                storeRoot,
-              };
-            }),
-          },
-        ),
-    );
-
-    expect(locked.kind).toBe("completed");
-    if (locked.kind !== "completed") {
-      throw new Error("restore action unexpectedly escaped its typed receipt");
-    }
-    expect(locked.value.cutover.kind).toBe("authorized");
-    expect(businessCutovers).toBe(1);
-    expect(successorAcquired).toBe(true);
-    expect(successorExecution).toMatchObject({
-      kind: "completed",
-      cleanup: { kind: "settled" },
-    });
-    expect(locked.value.outcome).toMatchObject({
-      kind: "failed",
-      stage: "apply",
-      cause: { name: "WorkspaceLockOwnershipLostError" },
-    });
-    expect(locked.cleanup.kind).toBe("failed");
-    await expect(readFile(targetPath, "utf8")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    const temporaries = (await readdir(root)).filter(
-      (name) => name.startsWith(".cyclotomy-") && name.endsWith(".tmp"),
-    );
-    expect(temporaries).toHaveLength(1);
-    // The source fragment was still buffered when ownership changed, so no
-    // payload byte crossed the next authenticated write boundary.
-    expect(await readFile(join(root, temporaries[0]!), "utf8")).toBe("");
-    setup.metadata.close();
-  });
-
   it("preserves a rejected no-write cutover separately from staging cleanup failure", async () => {
     await writeFile(join(root, "target.txt"), "target bytes");
     const setup = await setupTarget();
     await writeFile(join(root, "target.txt"), "current bytes");
     const rejection = new Error("Pi became busy");
     const cleanup = new Error("staging cleanup failed");
+    const nativeStaging = await vi.importActual<
+      typeof import("../src/infrastructure/blob-staging.ts")
+    >("../src/infrastructure/blob-staging.ts");
+    vi.mocked(stageBlobs).mockImplementationOnce(async (...args) => {
+      const staged = await nativeStaging.stageBlobs(...args);
+      return {
+        ...staged,
+        dispose: async () => {
+          await staged.dispose();
+          throw cleanup;
+        },
+      };
+    });
 
     const execution = await executeWorkspaceRestore(
       {
@@ -951,16 +846,6 @@ describe("pure workspace restore", () => {
             scratchParent: setup.store.storageRoot,
             forbiddenRoots: [root],
           }),
-        stageBlobs: async (...args) => {
-          const staged = await stageBlobs(...args);
-          return {
-            readBlob: (oid) => staged.readBlob(oid),
-            dispose: async () => {
-              await staged.dispose();
-              throw cleanup;
-            },
-          };
-        },
       },
       root,
       setup.resolution,
@@ -994,14 +879,14 @@ describe("pure workspace restore", () => {
     await writeFile(join(root, "target.txt"), "current bytes");
     const primary = new BlobStagingError("scratch unavailable");
     const cleanup = new Error("partial scratch could not be removed");
+    vi.mocked(stageBlobs).mockRejectedValueOnce(
+      new BlobStagingCleanupError(primary, cleanup),
+    );
 
     const execution = await executeWorkspaceRestore(
       {
         store: setup.store,
         validateManifestScope: async () => ({ gitVersion: null }),
-        stageBlobs: async () => {
-          throw new BlobStagingCleanupError(primary, cleanup);
-        },
       },
       root,
       setup.resolution,
@@ -1032,6 +917,19 @@ describe("pure workspace restore", () => {
     const setup = await setupTarget();
     await writeFile(join(root, "target.txt"), "current bytes");
     const cleanup = new Error("staging cleanup failed");
+    const nativeStaging = await vi.importActual<
+      typeof import("../src/infrastructure/blob-staging.ts")
+    >("../src/infrastructure/blob-staging.ts");
+    vi.mocked(stageBlobs).mockImplementationOnce(async (...args) => {
+      const staged = await nativeStaging.stageBlobs(...args);
+      return {
+        ...staged,
+        dispose: async () => {
+          await staged.dispose();
+          throw cleanup;
+        },
+      };
+    });
 
     const execution = await executeWorkspaceRestore(
       {
@@ -1041,16 +939,6 @@ describe("pure workspace restore", () => {
             scratchParent: setup.store.storageRoot,
             forbiddenRoots: [root],
           }),
-        stageBlobs: async (...args) => {
-          const staged = await stageBlobs(...args);
-          return {
-            readBlob: (oid) => staged.readBlob(oid),
-            dispose: async () => {
-              await staged.dispose();
-              throw cleanup;
-            },
-          };
-        },
       },
       root,
       setup.resolution,
@@ -1108,7 +996,7 @@ describe("pure workspace restore", () => {
     setup.metadata.close();
   });
 
-  it("leaves mutation authority and the workspace untouched when a checkpoint blob exceeds the store limit", async () => {
+  it("restores a saved checkpoint after the capture file limit is lowered", async () => {
     await writeFile(join(root, "target.txt"), "target bytes");
     const setup = await setupTarget();
     await writeFile(join(root, "target.txt"), "current bytes");
@@ -1137,50 +1025,12 @@ describe("pure workspace restore", () => {
       },
     );
 
-    expect(execution.cutover).toEqual({ kind: "not-requested" });
-    expect(execution.outcome).toMatchObject({
-      kind: "checkpoint-unreadable",
-      treeOid: setup.resolution.treeOid,
-      cause: { code: "object-integrity" },
-    });
-    expect(workspaceMutationLeaseState(lease)).toEqual({ kind: "pending" });
-    expect(cutovers).toBe(0);
+    expect(execution.cutover.kind).toBe("authorized");
+    expect(execution.outcome).toMatchObject({ kind: "restored" });
+    expect(workspaceMutationLeaseState(lease).kind).toBe("authorized");
+    expect(cutovers).toBe(1);
     expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
-      "current bytes",
-    );
-    setup.metadata.close();
-  });
-
-  it("rejects a non-synchronous mutation cutover without awaiting it", async () => {
-    await writeFile(join(root, "target.txt"), "target bytes");
-    const setup = await setupTarget();
-    await writeFile(join(root, "target.txt"), "current bytes");
-    let callbackReturnObserved = false;
-
-    const outcome = await restoreWorkspace(
-      { store: setup.store },
-      root,
-      setup.resolution,
-      {
-        current: await scanWorkspace(root),
-        mutationLease: testMutationLease(() => ({
-          then: () => {
-            callbackReturnObserved = true;
-            throw new Error("before-mutation return value was awaited");
-          },
-        })),
-      },
-    );
-
-    expect(callbackReturnObserved).toBe(false);
-    expect(outcome).toMatchObject({
-      kind: "cutover-rejected",
-      cause: {
-        message: "workspace mutation authority must complete synchronously",
-      },
-    });
-    expect(await readFile(join(root, "target.txt"), "utf8")).toBe(
-      "current bytes",
+      "target bytes",
     );
     setup.metadata.close();
   });

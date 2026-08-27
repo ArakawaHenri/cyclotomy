@@ -16,8 +16,7 @@ import {
  * blob to be read and hashed exactly once before workspace mutation begins.
  */
 export interface StagedBlobs {
-  readBlob(oid: string): Promise<Uint8Array>;
-  readonly streamBlob?: (
+  readonly streamBlob: (
     oid: string,
     sink: (chunk: Uint8Array) => Promise<void>,
   ) => Promise<{ readonly decodedLength: number }>;
@@ -30,6 +29,12 @@ export type BlobStreamReader = (
 ) => Promise<{ readonly decodedLength: number }>;
 
 const CONTENT_ID = /^[0-9a-f]{64}$/u;
+
+function assertContentId(oid: string): void {
+  if (!CONTENT_ID.test(oid)) {
+    throw new Error("restore blob id is not a canonical SHA-256 digest");
+  }
+}
 
 class BlobStreamSourceError extends Error {
   declare readonly cause: unknown;
@@ -116,10 +121,7 @@ async function writeStagedFile(
       throw new BlobStreamSourceError(cause);
     }
     const digest = hash.digest("hex");
-    if (
-      streamed.decodedLength !== byteLength ||
-      (CONTENT_ID.test(oid) && digest !== oid)
-    ) {
+    if (streamed.decodedLength !== byteLength || digest !== oid) {
       throw new BlobStreamSourceError(
         new Error("staged blob bytes do not match their content id"),
       );
@@ -157,7 +159,6 @@ function sameObservation(left: Stats, right: Stats): boolean {
 
 async function streamStagedFile(
   path: string,
-  oid: string,
   expected: Stats,
   sink: (chunk: Uint8Array) => Promise<void>,
 ): Promise<{ readonly decodedLength: number }> {
@@ -174,7 +175,6 @@ async function streamStagedFile(
     ) {
       throw new Error("staged blob is no longer a private regular file");
     }
-    const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let decodedLength = 0;
     while (true) {
@@ -190,39 +190,16 @@ async function streamStagedFile(
       if (decodedLength > expected.size) {
         throw new Error("staged blob grew while it was being streamed");
       }
-      hash.update(chunk);
       await sink(chunk);
     }
     const after = await handle.stat();
-    const digest = hash.digest("hex");
-    if (
-      !sameObservation(before, after) ||
-      decodedLength !== expected.size ||
-      (CONTENT_ID.test(oid) && digest !== oid)
-    ) {
+    if (!sameObservation(before, after) || decodedLength !== expected.size) {
       throw new Error("staged blob changed while it was being read");
     }
     return { decodedLength };
   } finally {
     await handle.close();
   }
-}
-
-async function readStagedFile(
-  path: string,
-  oid: string,
-  expected: Stats,
-): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  const { decodedLength } = await streamStagedFile(
-    path,
-    oid,
-    expected,
-    async (chunk) => {
-      chunks.push(Buffer.from(chunk));
-    },
-  );
-  return Buffer.concat(chunks, decodedLength);
 }
 
 function stagingCreationDetail(error: unknown): string {
@@ -257,36 +234,11 @@ async function disposeStagingRoot(root: PrivateScratchRoot): Promise<void> {
 }
 
 /**
- * Authenticate and spool each distinct oid before apply. `readBlob` is the
- * object-store trust boundary: its contract requires a digest-checked result.
- * Staging is deliberately sequential so peak memory is one blob, not the
- * whole changed closure (snapshots may be as large as 2 GiB).
+ * Authenticate and spool each distinct blob before apply. Staging is
+ * sequential so memory stays bounded while the full changed closure is made
+ * available before workspace mutation begins.
  */
 export async function stageBlobs(
-  oids: readonly string[],
-  readBlob: (oid: string) => Promise<Uint8Array>,
-  options: {
-    /** Canonicalized before any staging directory is created. */
-    readonly workspaceRoot: string;
-    /** Other controlled roots (for example the object store) to exclude. */
-    readonly forbiddenRoots?: readonly string[];
-    /** Test/embedding override; defaults to the process temporary directory. */
-    readonly stagingParent?: string;
-  },
-): Promise<StagedBlobs> {
-  return stageBlobStreams(
-    oids,
-    async (oid, sink) => {
-      const content = await readBlob(oid);
-      await sink(content);
-      return { decodedLength: content.byteLength };
-    },
-    options,
-  );
-}
-
-/** Stream authenticated logical content into private restore staging files. */
-export async function stageBlobStreams(
   oids: readonly string[],
   streamBlob: BlobStreamReader,
   options: {
@@ -299,11 +251,9 @@ export async function stageBlobStreams(
   },
 ): Promise<StagedBlobs> {
   const unique = [...new Set(oids)];
+  for (const oid of unique) assertContentId(oid);
   if (unique.length === 0) {
     return {
-      readBlob: async (oid) => {
-        throw new Error(`blob ${oid} was not prepared for this apply`);
-      },
       streamBlob: async (oid) => {
         throw new Error(`blob ${oid} was not prepared for this apply`);
       },
@@ -364,16 +314,6 @@ export async function stageBlobStreams(
   }
 
   return {
-    readBlob: async (oid) => {
-      if (disposed) {
-        throw new Error("prepared blobs have already been disposed");
-      }
-      const prepared = staged.get(oid);
-      if (prepared === undefined) {
-        throw new Error(`blob ${oid} was not prepared for this apply`);
-      }
-      return readStagedFile(prepared.path, oid, prepared.observation);
-    },
     streamBlob: async (oid, sink) => {
       if (disposed) {
         throw new Error("prepared blobs have already been disposed");
@@ -382,7 +322,7 @@ export async function stageBlobStreams(
       if (prepared === undefined) {
         throw new Error(`blob ${oid} was not prepared for this apply`);
       }
-      return streamStagedFile(prepared.path, oid, prepared.observation, sink);
+      return streamStagedFile(prepared.path, prepared.observation, sink);
     },
     dispose: async () => {
       disposed = true;

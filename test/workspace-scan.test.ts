@@ -28,6 +28,7 @@ import {
 import {
   ScanError,
   scanWorkspace,
+  scanWorkspaceForRestoreComparison,
   workspaceSnapshotsEqual,
   type WorkspaceSnapshot,
 } from "../src/infrastructure/workspace-scan.ts";
@@ -372,6 +373,18 @@ describe("workspace scanner", () => {
     await expect(scanWorkspace(root, { maxSnapshotBytes: 5 })).rejects.toThrow(
       /5-byte limit/,
     );
+  });
+
+  it("compares durable history without applying capture byte quotas", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "entry"), "saved checkpoint bytes");
+
+    const comparison = await scanWorkspaceForRestoreComparison(root, {
+      kind: "all-managed",
+    });
+
+    expect(comparison.problems).toEqual([]);
+    expect(pathsOf(comparison)).toEqual(["entry"]);
   });
 
   it.each([

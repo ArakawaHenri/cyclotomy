@@ -1,11 +1,10 @@
 import {
-  applyTreeToWorkspaceFromStream,
+  applyTreeToWorkspace,
   type ApplyReport,
 } from "../infrastructure/apply.ts";
 import {
   BlobStagingCleanupError,
   BlobStagingError,
-  stageBlobStreams,
   stageBlobs,
   type StagedBlobs,
 } from "../infrastructure/blob-staging.ts";
@@ -20,8 +19,7 @@ import {
   restorePlanHasChanges,
 } from "../infrastructure/restore-plan.ts";
 import {
-  scanWorkspaceForScope,
-  type ScanOptions,
+  scanWorkspaceForRestoreComparison,
   type ScanProblem,
   type WorkspaceSnapshot,
 } from "../infrastructure/workspace-scan.ts";
@@ -45,13 +43,10 @@ import type { ResolvedNodeState } from "./resolve.ts";
 
 export interface RestoreDeps {
   readonly store: ObjectStore;
-  readonly scanOptions?: ScanOptions;
   /** Runtime-scoped validation may reuse a prior attestation for this tree. */
   readonly validateManifestScope: (
     manifest: CurrentTreeManifest,
   ) => Promise<GitReplayAttestation>;
-  /** Test/embedding seam; production uses the native private staging protocol. */
-  readonly stageBlobs?: typeof stageBlobs;
 }
 
 export interface RestoreOptions {
@@ -59,14 +54,6 @@ export interface RestoreOptions {
   readonly current: WorkspaceSnapshot;
   /** Required one-shot authority consumed immediately before workspace writes. */
   readonly mutationLease: WorkspaceMutationLease<ResolvedNodeState>;
-}
-
-function effectiveScanOptions(deps: RestoreDeps): ScanOptions {
-  return {
-    ...deps.scanOptions,
-    gitIgnoreScratchParent:
-      deps.scanOptions?.gitIgnoreScratchParent ?? deps.store.storageRoot,
-  };
 }
 
 export type RestoreOutcome =
@@ -237,24 +224,14 @@ async function restoreWorkspaceOutcomeWithReads(
 
   let staged;
   try {
-    staged =
-      deps.stageBlobs === undefined
-        ? await stageBlobStreams(
-            restorePlan.requiredBlobOids,
-            (oid, sink) => reads.streamBlob(oid, sink),
-            {
-              workspaceRoot: operationRoot,
-              forbiddenRoots: [deps.store.storageRoot],
-            },
-          )
-        : await deps.stageBlobs(
-            restorePlan.requiredBlobOids,
-            (oid) => reads.readBlob(oid),
-            {
-              workspaceRoot: operationRoot,
-              forbiddenRoots: [deps.store.storageRoot],
-            },
-          );
+    staged = await stageBlobs(
+      restorePlan.requiredBlobOids,
+      (oid, sink) => reads.streamBlob(oid, sink),
+      {
+        workspaceRoot: operationRoot,
+        forbiddenRoots: [deps.store.storageRoot],
+      },
+    );
   } catch (error) {
     const primary =
       error instanceof BlobStagingCleanupError ? error.primary : error;
@@ -305,8 +282,8 @@ async function restoreWorkspaceOutcomeWithReads(
     );
   }
 
-  // No object-store reads remain beyond this point. Release authenticated
-  // pack handles before workspace mutation; the outer owner records that the
+  // No object-store reads remain beyond this point. Release pack handles
+  // before workspace mutation; the outer owner records that the
   // close was attempted so a rejection is not awaited and reported twice.
   try {
     await reads.close();
@@ -323,15 +300,10 @@ async function restoreWorkspaceOutcomeWithReads(
 
   let report: ApplyReport;
   try {
-    report = await applyTreeToWorkspaceFromStream(
+    report = await applyTreeToWorkspace(
       root,
       manifest,
-      staged.streamBlob ??
-        (async (oid, sink) => {
-          const content = await staged.readBlob(oid);
-          await sink(content);
-          return { decodedLength: content.byteLength };
-        }),
+      staged.streamBlob,
       current,
       () => consumeWorkspaceMutationLease(options.mutationLease),
     );
@@ -346,10 +318,10 @@ async function restoreWorkspaceOutcomeWithReads(
 
   let actual: WorkspaceSnapshot;
   try {
-    actual = await scanWorkspaceForScope(
+    actual = await scanWorkspaceForRestoreComparison(
       operationRoot,
       manifest.scope,
-      effectiveScanOptions(deps),
+      { gitIgnoreScratchParent: deps.store.storageRoot },
     );
   } catch (error) {
     return restoreAttempt(

@@ -24,8 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApplyError,
-  applyTreeToWorkspace as applyTreeToWorkspaceWithMutationAuthority,
-  applyTreeToWorkspaceFromStream,
+  applyTreeToWorkspace as applyStreamedTreeToWorkspace,
 } from "../src/infrastructure/apply.ts";
 import {
   type FileRecreationMode,
@@ -41,7 +40,13 @@ import {
 } from "../src/infrastructure/workspace-scan.ts";
 import { planWorkspaceRestore } from "../src/infrastructure/restore-plan.ts";
 import { prepareWorkspaceRestorePlan } from "../src/infrastructure/restore-preparation.ts";
-import type { WorkspaceWriteAuthority } from "../src/infrastructure/workspace-lock.ts";
+import {
+  acquireWorkspaceLock,
+  runWithWorkspaceLock,
+  WorkspaceLockOwnershipLostError,
+  type WorkspaceLock,
+  type WorkspaceWriteAuthority,
+} from "../src/infrastructure/workspace-lock.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
 import {
   holdTestWorkspaceWriteAuthority,
@@ -147,10 +152,14 @@ function applyTreeToWorkspace(
     readonly storeRoot: string;
   } = () => ({ writeAuthority, storeRoot: authorityRoot }),
 ) {
-  return applyTreeToWorkspaceWithMutationAuthority(
+  return applyStreamedTreeToWorkspace(
     workspaceRoot,
     target,
-    read,
+    async (oid, sink) => {
+      const content = await read(oid);
+      await sink(content);
+      return { decodedLength: content.byteLength };
+    },
     current,
     cutover,
   );
@@ -254,7 +263,7 @@ describe("applyTreeToWorkspace", () => {
     );
   });
 
-  it("crosses mutation authority after asynchronous preflight and rejects every write together", async () => {
+  it("rejects every write when mutation cutover fails", async () => {
     await writeFile(join(root, "a.txt"), "current a");
     await writeFile(join(root, "b.txt"), "current b");
     const current = await scanRealWorkspace(root);
@@ -262,36 +271,18 @@ describe("applyTreeToWorkspace", () => {
       regularTarget("a.txt", "target a"),
       regularTarget("b.txt", "target b"),
     ]);
-    let releaseBlobRead: (() => void) | undefined;
-    const blobReadReleased = new Promise<void>((resolve) => {
-      releaseBlobRead = resolve;
-    });
-    let observeBlobRead: (() => void) | undefined;
-    const blobReadObserved = new Promise<void>((resolve) => {
-      observeBlobRead = resolve;
-    });
     let cutovers = 0;
 
     const applying = applyTreeToWorkspace(
       root,
       target,
-      async (oid) => {
-        observeBlobRead?.();
-        await blobReadReleased;
-        return readBlob(oid);
-      },
+      readBlob,
       current,
       () => {
         cutovers += 1;
         throw new Error("authority drifted during apply preflight");
       },
     );
-
-    await blobReadObserved;
-    expect(cutovers).toBe(0);
-    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("current a");
-    expect(await readFile(join(root, "b.txt"), "utf8")).toBe("current b");
-    releaseBlobRead?.();
 
     await expect(applying).rejects.toThrow(
       "authority drifted during apply preflight",
@@ -391,7 +382,7 @@ describe("applyTreeToWorkspace", () => {
       });
 
     try {
-      const report = await applyTreeToWorkspaceFromStream(
+      const report = await applyStreamedTreeToWorkspace(
         root,
         manifest([
           {
@@ -425,7 +416,49 @@ describe("applyTreeToWorkspace", () => {
     );
   });
 
-  it("revalidates mutation authority before retrying a short write", async () => {
+  it("does not commit a new file when its streamed digest is wrong", async () => {
+    const expected = Buffer.from("expected");
+    const actual = Buffer.from("tampered");
+    const oid = sha256Hex(expected);
+
+    const report = await applyStreamedTreeToWorkspace(
+      root,
+      manifest([
+        {
+          path: "new.txt",
+          type: "regular",
+          blobOid: oid,
+          recreationMode: process.platform === "win32" ? null : 0o644,
+        },
+      ]),
+      async (requestedOid, sink) => {
+        expect(requestedOid).toBe(oid);
+        await sink(actual);
+        return { decodedLength: actual.byteLength };
+      },
+      snapshot([]),
+      () => ({ writeAuthority, storeRoot: authorityRoot }),
+    );
+
+    expect(report.created).toEqual([]);
+    expect(report.problems).toEqual([
+      {
+        path: "new.txt",
+        kind: "write-failed",
+        detail: expect.stringContaining("content id"),
+      },
+    ]);
+    await expect(lstat(join(root, "new.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(
+      (await readdir(root)).filter(
+        (name) => name.startsWith(".cyclotomy-") && name.endsWith(".tmp"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("stops a streamed mutation when its authority is closed", async () => {
     const content = Buffer.alloc(2 * 1024 * 1024, 0x41);
     const oid = sha256Hex(content);
     await writeFile(join(root, "large.bin"), "old");
@@ -472,7 +505,7 @@ describe("applyTreeToWorkspace", () => {
 
     try {
       await expect(
-        applyTreeToWorkspaceFromStream(
+        applyStreamedTreeToWorkspace(
           root,
           manifest([
             {
@@ -495,6 +528,61 @@ describe("applyTreeToWorkspace", () => {
       writeSpy.mockRestore();
     }
     expect(writes).toBe(1);
+  });
+
+  it("stops before committing when the physical lock is replaced", async () => {
+    const storeRoot = await mkdtemp(
+      join(tmpdir(), "cyclotomy-apply-replaced-authority-"),
+    );
+    const displaced = join(storeRoot, "displaced-workspace.lock");
+    let replacement: WorkspaceLock | undefined;
+    try {
+      const target = manifest([
+        regularTarget("a.txt", "target a"),
+        regularTarget("b.txt", "target b"),
+      ]);
+      let replaced = false;
+      const execution = await runWithWorkspaceLock(
+        storeRoot,
+        "restore",
+        async (authority) =>
+          applyStreamedTreeToWorkspace(
+            root,
+            target,
+            async (oid, sink) => {
+              const content = blobs.get(oid);
+              if (content === undefined)
+                throw new Error(`missing blob: ${oid}`);
+              await sink(content);
+              if (!replaced) {
+                replaced = true;
+                await rename(join(storeRoot, "workspace.lock"), displaced);
+                replacement = await acquireWorkspaceLock(storeRoot, "capture");
+              }
+              return { decodedLength: content.byteLength };
+            },
+            snapshot([]),
+            () => ({ writeAuthority: authority, storeRoot }),
+          ),
+      );
+
+      expect(execution.kind).toBe("action-failed");
+      if (execution.kind !== "action-failed") {
+        throw new Error("apply unexpectedly completed");
+      }
+      expect(execution.cause).toBeInstanceOf(WorkspaceLockOwnershipLostError);
+      expect(execution.cleanup.kind).toBe("failed");
+      await expect(lstat(join(root, "a.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(join(root, "b.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await replacement?.release();
+      await rm(displaced, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
   });
 
   it("refuses to delete an unmanaged descendant for an ancestor type replacement", async () => {

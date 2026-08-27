@@ -431,6 +431,33 @@ export async function scanWorkspaceForScope(
   return scanWorkspaceWithScope(root, options, targetScope);
 }
 
+export interface RestoreComparisonScanOptions {
+  readonly gitIgnoreScratchParent?: string;
+}
+
+/** Compare a workspace with durable history, independent of capture quotas. */
+export async function scanWorkspaceForRestoreComparison(
+  root: string,
+  targetScope: WorkspaceScope,
+  options: RestoreComparisonScanOptions = {},
+): Promise<WorkspaceSnapshot> {
+  return scanWorkspaceWithScope(
+    root,
+    {
+      maxFileBytes: Number.MAX_SAFE_INTEGER,
+      maxSnapshotBytes: Number.MAX_SAFE_INTEGER,
+      maxEntries: ABSOLUTE_MAX_TREE_ENTRIES,
+      maxManifestBytes: ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
+      maxPathBytes: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
+      maxPathComponents: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
+      ...(options.gitIgnoreScratchParent === undefined
+        ? {}
+        : { gitIgnoreScratchParent: options.gitIgnoreScratchParent }),
+    },
+    targetScope,
+  );
+}
+
 /**
  * Recursively hash a workspace into a snapshot description. Regular files
  * are read in bounded chunks and retain an absolute source reference for the
