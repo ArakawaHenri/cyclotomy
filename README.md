@@ -183,6 +183,9 @@ setting stops Cyclotomy and reports the problem. Fix it, then run
 `/cyclotomy resume`. To apply settings while Cyclotomy is running, stop and
 resume it.
 
+Checkpoint limits apply when saving a new checkpoint or importing history.
+Lowering them does not make an existing checkpoint unreadable or unrestorable.
+
 Changing `storageDir` selects a different store; it does not move existing
 data. Pi's `PI_CODING_AGENT_DIR` changes the location of both the agent
 directory and Cyclotomy's default storage root.
@@ -190,8 +193,9 @@ directory and Cyclotomy's default storage root.
 ## Compatibility
 
 Cyclotomy upgrades an older store when all of its saved checkpoints can be
-represented without loss. An interrupted or incompatible upgrade leaves the
-previous store version intact.
+represented without loss. Each upgrade step is atomic. If an upgrade fails,
+the store remains at the last successfully completed compatible version; the
+failing step is not partially applied.
 
 Cyclotomy 0.1.x could save ignore files containing NUL bytes. Those checkpoints
 cannot be upgraded by 0.2.x. Editing the current `.gitignore` does not change a
