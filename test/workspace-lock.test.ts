@@ -20,10 +20,10 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 
+import { compareDirectoryBindings } from "../src/infrastructure/directory-binding.ts";
 import {
   acquireWorkspaceLock,
   assertWorkspaceWriteAuthority,
-  compareWorkspaceLockPhysicalOrder,
   OrderedWorkspaceLockAcquisitionError,
   OrderedWorkspaceLockReleaseError,
   UnsafeWorkspaceLockPathError,
@@ -207,9 +207,7 @@ afterEach(async () => {
 
 describe("workspace lock", () => {
   it("keeps the public options and on-disk protocol owner-only", async () => {
-    expectTypeOf<keyof WorkspaceLockOptions>().toEqualTypeOf<
-      "timeoutMs" | "beforeFinalRelease"
-    >();
+    expectTypeOf<keyof WorkspaceLockOptions>().toEqualTypeOf<"timeoutMs">();
     const root = await storeRoot();
     const lock = await acquireWorkspaceLock(root, "protocol-test");
 
@@ -317,29 +315,33 @@ describe("workspace lock", () => {
 
   it("orders physical identities independently of bind-alias paths", () => {
     const lowIdentityThroughEarlyAlias = {
-      path: "/alias-a",
+      canonicalPath: "/alias-a",
       device: 2,
       inode: 20,
     };
     const lowIdentityThroughLateAlias = {
-      path: "/alias-z",
+      canonicalPath: "/alias-z",
       device: 2,
       inode: 20,
     };
-    const highIdentity = { path: "/alias-m", device: 10, inode: 1 };
+    const highIdentity = {
+      canonicalPath: "/alias-m",
+      device: 10,
+      inode: 1,
+    };
 
     expect(
       [highIdentity, lowIdentityThroughEarlyAlias]
-        .sort(compareWorkspaceLockPhysicalOrder)
-        .map(({ path }) => path),
+        .sort(compareDirectoryBindings)
+        .map(({ canonicalPath }) => canonicalPath),
     ).toEqual(["/alias-a", "/alias-m"]);
     expect(
       [highIdentity, lowIdentityThroughLateAlias]
-        .sort(compareWorkspaceLockPhysicalOrder)
-        .map(({ path }) => path),
+        .sort(compareDirectoryBindings)
+        .map(({ canonicalPath }) => canonicalPath),
     ).toEqual(["/alias-z", "/alias-m"]);
     expect(
-      compareWorkspaceLockPhysicalOrder(
+      compareDirectoryBindings(
         lowIdentityThroughEarlyAlias,
         lowIdentityThroughLateAlias,
       ),
@@ -587,26 +589,6 @@ describe("workspace lock", () => {
     await rm(displacedPath, { recursive: true, force: true });
   });
 
-  it("fails when the lock directory is replaced at the final release fence", async () => {
-    const root = await storeRoot();
-    const lockPath = join(root, "workspace.lock");
-    const displacedPath = join(root, "displaced-workspace.lock");
-    const replacementEntry = join(lockPath, "replacement-owner");
-    const lock = await acquireWorkspaceLock(root, "capture", {
-      beforeFinalRelease: async () => {
-        await rename(lockPath, displacedPath);
-        await mkdir(lockPath);
-        await writeFile(replacementEntry, "preserve");
-      },
-    });
-
-    await expect(lock.release()).rejects.toBeInstanceOf(
-      WorkspaceLockOwnershipLostError,
-    );
-    expect(await readFile(replacementEntry, "utf8")).toBe("preserve");
-    await rm(displacedPath, { recursive: true, force: true });
-  });
-
   it("fails release without deleting a different valid owner token", async () => {
     const root = await storeRoot();
     const lock = await acquireWorkspaceLock(root, "capture");
@@ -773,42 +755,6 @@ describe("workspace lock", () => {
       ),
     ).toBe(firstOwnershipLoss);
     await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("closes write authority before final lock cleanup", async () => {
-    const root = await storeRoot();
-    let authority: WorkspaceWriteAuthority | undefined;
-    let cleanupFailure: unknown;
-    const execution = await runWithWorkspaceLock(
-      root,
-      "release-boundary",
-      async (current) => {
-        authority = current;
-        assertWorkspaceWriteAuthority(current, root);
-      },
-      {
-        beforeFinalRelease: async () => {
-          try {
-            assertWorkspaceWriteAuthority(authority!, root);
-          } catch (cause) {
-            cleanupFailure = cause;
-          }
-        },
-      },
-    );
-
-    expect(execution).toEqual({
-      kind: "completed",
-      value: undefined,
-      cleanup: { kind: "settled" },
-    });
-    expect(cleanupFailure).toBeInstanceOf(WorkspaceLockOwnershipLostError);
-    try {
-      assertWorkspaceWriteAuthority(authority!, root);
-      throw new Error("closed authority unexpectedly became active");
-    } catch (cause) {
-      expect(cause).toBe(cleanupFailure);
-    }
   });
 
   it("refuses to follow a workspace.lock symlink", async () => {

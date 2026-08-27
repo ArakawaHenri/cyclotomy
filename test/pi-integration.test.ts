@@ -32,9 +32,9 @@ import {
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
+import { compareDirectoryBindings } from "../src/infrastructure/directory-binding.ts";
 import {
   acquireWorkspaceLock,
-  compareWorkspaceLockPhysicalOrder,
   runWithWorkspaceLock,
   type WorkspaceWriteAuthority,
 } from "../src/infrastructure/workspace-lock.ts";
@@ -7429,7 +7429,7 @@ describe("checkpoint authority lifecycle", () => {
               workspace: candidateWorkspace,
               storeRoot,
               order: {
-                path: storeRoot,
+                canonicalPath: storeRoot,
                 device: identity.dev,
                 inode: identity.ino,
               },
@@ -7437,7 +7437,7 @@ describe("checkpoint authority lifecycle", () => {
           }),
         );
         candidates.sort((left, right) =>
-          compareWorkspaceLockPhysicalOrder(left.order, right.order),
+          compareDirectoryBindings(left.order, right.order),
         );
         const targetWorkspace = candidates[0]!.workspace;
         const targetStoreRoot = candidates[0]!.storeRoot;

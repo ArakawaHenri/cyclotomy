@@ -4,14 +4,12 @@ import {
   lstatSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   type Stats,
 } from "node:fs";
 import {
   lstat,
   mkdir,
   open,
-  realpath,
   readdir,
   rmdir,
   unlink,
@@ -22,6 +20,14 @@ import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
+import {
+  assertDirectoryStillBound,
+  bindDirectory,
+  compareDirectoryBindings,
+  DirectoryBindingError,
+  sameDirectoryBinding,
+  type DirectoryBinding,
+} from "./directory-binding.ts";
 import { systemErrorCode } from "./system-error.ts";
 
 const LOCK_DIRECTORY = "workspace.lock";
@@ -32,8 +38,6 @@ const OWNER_FILE_MAX_BYTES = 16 * 1024;
 export interface WorkspaceLockOptions {
   /** Time to wait for another cooperative operation. Default 5 seconds. */
   readonly timeoutMs?: number;
-  /** Deterministic test seam immediately before the final lock-directory release. */
-  readonly beforeFinalRelease?: () => Promise<void>;
 }
 
 export interface WorkspaceLock {
@@ -73,17 +77,6 @@ interface LockObservation {
   readonly owner: LockOwnerState;
 }
 
-interface DirectoryObservation {
-  readonly path: string;
-  readonly device: number;
-  readonly inode: number;
-}
-
-type PhysicalWorkspaceOrderKey = Pick<
-  DirectoryObservation,
-  "path" | "device" | "inode"
->;
-
 interface ProtocolFileObservation {
   readonly device: number;
   readonly inode: number;
@@ -104,7 +97,7 @@ type WorkspaceWriteAuthorityPhase =
     };
 
 interface WorkspaceWriteAuthorityState {
-  readonly binding: DirectoryObservation;
+  readonly binding: DirectoryBinding;
   readonly lockPath: string;
   readonly lock: LockObservation;
   readonly owner: LockOwner;
@@ -122,6 +115,21 @@ const workspaceLockAuthorities = new WeakMap<
   WorkspaceWriteAuthority
 >();
 
+function activeWorkspaceWriteAuthorityState(
+  authority: WorkspaceWriteAuthority,
+  expectedStoreRoot: string,
+): WorkspaceWriteAuthorityState {
+  const state = workspaceWriteAuthorityStates.get(authority);
+  if (state === undefined) {
+    throw new WorkspaceLockOwnershipLostError(
+      resolve(expectedStoreRoot),
+      "write authority is not recognized by this process",
+    );
+  }
+  if (state.phase.kind !== "active") throw state.phase.cause;
+  return state;
+}
+
 export class WorkspaceLockTimeoutError extends Error {
   readonly lockPath: string;
 
@@ -135,8 +143,11 @@ export class WorkspaceLockTimeoutError extends Error {
 }
 
 export class UnsafeWorkspaceLockPathError extends Error {
-  constructor(path: string) {
-    super(`refusing to use a non-directory Cyclotomy workspace lock: ${path}`);
+  constructor(path: string, options?: ErrorOptions) {
+    super(
+      `refusing to use an unsafe Cyclotomy workspace lock path: ${path}`,
+      options,
+    );
     this.name = "UnsafeWorkspaceLockPathError";
   }
 }
@@ -190,41 +201,22 @@ function isTransientContentionObservationError(error: unknown): boolean {
   return code === "EACCES" || code === "EPERM";
 }
 
-function sameDirectoryObservation(
-  expected: DirectoryObservation,
-  current: Stats,
-): boolean {
-  return (
-    current.isDirectory() &&
-    !current.isSymbolicLink() &&
-    current.dev === expected.device &&
-    current.ino === expected.inode
-  );
-}
-
-async function bindStoreRoot(path: string): Promise<DirectoryObservation> {
-  const canonicalPath = await realpath(path);
-  const first = await lstat(canonicalPath);
-  if (!first.isDirectory() || first.isSymbolicLink()) {
-    throw new UnsafeWorkspaceLockPathError(canonicalPath);
+async function bindStoreRoot(path: string): Promise<DirectoryBinding> {
+  try {
+    return await bindDirectory(path, "Cyclotomy workspace store");
+  } catch (cause) {
+    if (cause instanceof DirectoryBindingError) {
+      if (cause.failure === "changed") {
+        throw new WorkspaceLockOwnershipLostError(
+          cause.path,
+          "workspace store changed while its identity was read",
+          { cause },
+        );
+      }
+      throw new UnsafeWorkspaceLockPathError(cause.path, { cause });
+    }
+    throw cause;
   }
-  const rebound = await realpath(path);
-  const reboundEntry = await lstat(rebound);
-  const binding = {
-    path: canonicalPath,
-    device: first.dev,
-    inode: first.ino,
-  };
-  if (
-    rebound !== canonicalPath ||
-    !sameDirectoryObservation(binding, reboundEntry)
-  ) {
-    throw new WorkspaceLockOwnershipLostError(
-      canonicalPath,
-      "workspace store changed while its identity was read",
-    );
-  }
-  return binding;
 }
 
 function protocolFileObservation(entry: Stats): ProtocolFileObservation {
@@ -259,7 +251,7 @@ function ownershipLoss(
   cause?: unknown,
 ): WorkspaceLockOwnershipLostError {
   return new WorkspaceLockOwnershipLostError(
-    state.binding.path,
+    state.binding.canonicalPath,
     detail,
     cause === undefined ? undefined : { cause },
   );
@@ -289,23 +281,6 @@ function closeWorkspaceWriteAuthority(
   };
 }
 
-function assertBoundDirectory(
-  expected: DirectoryObservation,
-  path: string,
-  label: string,
-): void {
-  const canonical = realpathSync(path);
-  const current = lstatSync(canonical);
-  // The physical directory is the authority boundary. Windows may return a
-  // different canonical spelling for the same directory (for example after
-  // expanding a short path or normalizing case), so comparing realpath text
-  // would revoke a valid authority. Device and inode still reject any path
-  // rebound to another directory, including a lexical alias.
-  if (!sameDirectoryObservation(expected, current)) {
-    throw new Error(`${label} changed`);
-  }
-}
-
 /**
  * Synchronously revalidate an opaque authority immediately before one durable
  * write. The first failed revalidation revokes it permanently, even if the old
@@ -316,17 +291,17 @@ export function assertWorkspaceWriteAuthority(
   authority: WorkspaceWriteAuthority,
   expectedStoreRoot: string,
 ): void {
-  const state = workspaceWriteAuthorityStates.get(authority);
-  if (state === undefined) {
-    throw new WorkspaceLockOwnershipLostError(
-      resolve(expectedStoreRoot),
-      "write authority is not recognized by this process",
-    );
-  }
-  if (state.phase.kind !== "active") throw state.phase.cause;
+  const state = activeWorkspaceWriteAuthorityState(
+    authority,
+    expectedStoreRoot,
+  );
   try {
-    assertBoundDirectory(state.binding, state.binding.path, "workspace store");
-    assertBoundDirectory(
+    assertDirectoryStillBound(
+      state.binding,
+      state.binding.canonicalPath,
+      "workspace store",
+    );
+    assertDirectoryStillBound(
       state.binding,
       expectedStoreRoot,
       "expected workspace store",
@@ -370,6 +345,17 @@ export function assertWorkspaceWriteAuthority(
       cause,
     );
   }
+}
+
+/**
+ * Check that an authority already authenticated for the current operation has
+ * not since been closed or revoked by this process.
+ */
+export function assertWorkspaceWriteAuthorityActive(
+  authority: WorkspaceWriteAuthority,
+  expectedStoreRoot: string,
+): void {
+  activeWorkspaceWriteAuthorityState(authority, expectedStoreRoot);
 }
 
 function ownerFileName(token: string): string {
@@ -665,7 +651,7 @@ export async function acquireWorkspaceLock(
   validateTimingOptions(timeoutMs);
 
   const binding = await bindStoreRoot(storeRoot);
-  const lockPath = join(binding.path, LOCK_DIRECTORY);
+  const lockPath = join(binding.canonicalPath, LOCK_DIRECTORY);
   const wallStartedAt = Date.now();
   const monotonicStartedAt = performance.now();
   const owner: LockOwner = {
@@ -824,8 +810,7 @@ export async function acquireWorkspaceLock(
           authorityState,
           "owner record",
         );
-        await options.beforeFinalRelease?.();
-        await releaseDirectoryIfSame(lockPath, acquired, binding.path);
+        await releaseDirectoryIfSame(lockPath, acquired, binding.canonicalPath);
       })();
       return releaseInFlight;
     },
@@ -919,7 +904,7 @@ export type OrderedWorkspaceAuthorities = ReadonlyMap<
 >;
 
 interface BoundOrderedWorkspaceLockTarget extends OrderedWorkspaceLockTarget {
-  readonly binding: DirectoryObservation;
+  readonly binding: DirectoryBinding;
 }
 
 export type OrderedWorkspaceLockCleanup =
@@ -945,7 +930,7 @@ async function orderedTargets(
 ): Promise<readonly BoundOrderedWorkspaceLockTarget[]> {
   const unique = new Map<string, BoundOrderedWorkspaceLockTarget>();
   for (const target of targets) {
-    let binding: DirectoryObservation;
+    let binding: DirectoryBinding;
     try {
       binding = await bindStoreRoot(target.storeRoot);
     } catch (cause) {
@@ -958,24 +943,14 @@ async function orderedTargets(
     if (!unique.has(physicalIdentity)) {
       unique.set(physicalIdentity, {
         ...target,
-        storeRoot: binding.path,
+        storeRoot: binding.canonicalPath,
         binding,
       });
     }
   }
   return [...unique.values()].sort((left, right) =>
-    compareWorkspaceLockPhysicalOrder(left.binding, right.binding),
+    compareDirectoryBindings(left.binding, right.binding),
   );
-}
-
-/** @internal Pure ordering seam for physical-identity regression tests. */
-export function compareWorkspaceLockPhysicalOrder(
-  left: PhysicalWorkspaceOrderKey,
-  right: PhysicalWorkspaceOrderKey,
-): number {
-  if (left.device !== right.device) return left.device < right.device ? -1 : 1;
-  if (left.inode !== right.inode) return left.inode < right.inode ? -1 : 1;
-  return Buffer.from(left.path).compare(Buffer.from(right.path));
 }
 
 async function releaseOrderedLocks(
@@ -1038,8 +1013,7 @@ export async function runWithOrderedWorkspaceLocks<T>(
           : workspaceWriteAuthorityStates.get(authority)?.binding;
       if (
         acquiredBinding === undefined ||
-        acquiredBinding.device !== target.binding.device ||
-        acquiredBinding.inode !== target.binding.inode
+        !sameDirectoryBinding(acquiredBinding, target.binding)
       ) {
         throw new WorkspaceLockOwnershipLostError(
           target.storeRoot,

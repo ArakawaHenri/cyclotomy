@@ -21,6 +21,13 @@ import type { TreeOid } from "../domain/model.ts";
 import { retainFailureCause } from "../infrastructure/failure-settlement.ts";
 import { systemErrorCode } from "../infrastructure/system-error.ts";
 import {
+  assertDirectoryStillBound,
+  bindDirectory,
+  directoryStillBound,
+  sameDirectoryBinding,
+  type DirectoryBinding,
+} from "../infrastructure/directory-binding.ts";
+import {
   inspectMetadataSessionIdentity,
   openAuthenticatedCurrentMetadataStore,
   openCurrentMetadataStore,
@@ -64,14 +71,9 @@ import {
   type SessionView,
 } from "./session-view.ts";
 import {
-  assertDirectoryStillBound,
   assertSessionWorkspaceStillBound,
-  bindDirectory,
   bindSessionWorkspace,
-  directoryStillBound,
-  sameDirectoryBinding,
   sessionWorkspaceStillBound,
-  type DirectoryBinding,
   type WorkspaceBinding,
 } from "./workspace-binding.ts";
 

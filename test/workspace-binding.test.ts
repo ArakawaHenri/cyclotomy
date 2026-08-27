@@ -13,10 +13,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assertDirectoryStillBound,
-  assertSessionWorkspaceStillBound,
   bindDirectory,
-  bindSessionWorkspace,
   directoryStillBound,
+} from "../src/infrastructure/directory-binding.ts";
+import {
+  assertSessionWorkspaceStillBound,
+  bindSessionWorkspace,
   sessionWorkspaceStillBound,
 } from "../src/pi/workspace-binding.ts";
 
