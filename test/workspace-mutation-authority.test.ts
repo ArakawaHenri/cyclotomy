@@ -75,7 +75,6 @@ function authority(options: {
   readonly admitResolvedLocation?: (
     writeAuthority: WorkspaceWriteAuthority,
   ) => "admitted" | "slot-changed";
-  readonly admit?: () => void;
   readonly ordinaryClaim?: () => OrdinaryMutationClaim;
   readonly admitArrival?: () => boolean;
   readonly arrivalCanProceed?: () => boolean;
@@ -101,17 +100,12 @@ function authority(options: {
   readonly writeAuthority?: WorkspaceWriteAuthority;
 }) {
   const events = options.events ?? [];
-  const admit = vi.fn(options.admit);
   const admission =
     options.checkpointAdmission ??
     ({
-      admit,
-      claimOrdinaryMutation: vi.fn(() => {
-        const claim =
-          options.ordinaryClaim?.() ?? ({ kind: "claimed" } as const);
-        if (claim.kind === "claimed") admit();
-        return claim;
-      }),
+      claimOrdinaryMutation: vi.fn(
+        options.ordinaryClaim ?? (() => ({ kind: "claimed" }) as const),
+      ),
       admitArrival: vi.fn(options.admitArrival ?? (() => true)),
       arrivalCanProceed: vi.fn(options.arrivalCanProceed ?? (() => true)),
       arrivalCanCommitPlannedTarget: vi.fn(
@@ -616,7 +610,10 @@ describe("workspace mutation authority", () => {
       const current = authority({
         events: currentEvents,
         storeRoot,
-        admit: () => currentEvents.push("ephemeral-admit"),
+        ordinaryClaim: () => {
+          currentEvents.push("ephemeral-admit");
+          return { kind: "claimed" };
+        },
       });
       const host = context();
       const view = readSessionView(host);
@@ -633,7 +630,10 @@ describe("workspace mutation authority", () => {
           exactEvents.push("durable-admit");
           return "admitted";
         },
-        admit: () => exactEvents.push("ephemeral-admit"),
+        ordinaryClaim: () => {
+          exactEvents.push("ephemeral-admit");
+          return { kind: "claimed" };
+        },
       });
 
       expect(
@@ -894,7 +894,7 @@ describe("workspace mutation authority", () => {
     await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
       const checkpointAdmission = new CheckpointAdmission();
       const current = readSessionView(context());
-      checkpointAdmission.admit(current, node);
+      checkpointAdmission.claimOrdinaryMutation(current, node);
       const attempt = checkpointAdmission.beginTreeArrival();
       const { service, metadata } = authority({
         checkpointAdmission,
@@ -953,7 +953,7 @@ describe("workspace mutation authority", () => {
     await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
       const checkpointAdmission = new CheckpointAdmission();
       const current = readSessionView(context());
-      checkpointAdmission.admit(current, node);
+      checkpointAdmission.claimOrdinaryMutation(current, node);
       const attempt = checkpointAdmission.beginTreeArrival();
       const { service } = authority({
         checkpointAdmission,
@@ -1046,7 +1046,7 @@ describe("workspace mutation authority", () => {
           sessionFile,
         },
       );
-      expect(admission.admit).not.toHaveBeenCalled();
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
     });
   });
 
@@ -1056,7 +1056,10 @@ describe("workspace mutation authority", () => {
       const { service, admission } = authority({
         events,
         storeRoot,
-        admit: () => events.push("ephemeral-admit"),
+        ordinaryClaim: () => {
+          events.push("ephemeral-admit");
+          return { kind: "claimed" };
+        },
       });
 
       expect(
@@ -1073,7 +1076,7 @@ describe("workspace mutation authority", () => {
           admission: { kind: "settled" },
         },
       });
-      expect(admission.admit).toHaveBeenCalledOnce();
+      expect(admission.claimOrdinaryMutation).toHaveBeenCalledOnce();
       expect(events).toEqual([
         "quarantine",
         "binding",
@@ -1127,7 +1130,7 @@ describe("workspace mutation authority", () => {
           },
         },
       });
-      expect(admission.admit).not.toHaveBeenCalled();
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
       expect(admission.reset).toHaveBeenCalled();
     });
   });
@@ -1151,7 +1154,7 @@ describe("workspace mutation authority", () => {
           },
         },
       });
-      expect(admission.admit).not.toHaveBeenCalled();
+      expect(admission.claimOrdinaryMutation).not.toHaveBeenCalled();
     });
   });
 
@@ -1160,7 +1163,7 @@ describe("workspace mutation authority", () => {
     await withWorkspaceWriteAuthority((writeAuthority, storeRoot) => {
       const { service, metadata } = authority({
         storeRoot,
-        admit: () => {
+        ordinaryClaim: () => {
           throw secondaryFailure;
         },
       });

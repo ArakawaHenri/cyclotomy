@@ -215,7 +215,7 @@ describe("checkpoint admission", () => {
   it("makes a hanging preparation stale when tree arrival begins", async () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(current, node("parent"));
+    admission.claimOrdinaryMutation(current, node("parent"));
 
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
@@ -238,7 +238,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
@@ -263,7 +263,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const arrival = admission.beginTreeArrival();
 
     expect(admission.claimOrdinaryMutation(current, parent)).toEqual({
@@ -280,7 +280,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const plan: PendingNavigation = {
       sessionId: "session",
       cwd: "/workspace",
@@ -312,7 +312,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     expect(
       admission.claimOrdinaryMutation(
@@ -337,7 +337,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     let releaseStale!: () => void;
     const staleBlocked = new Promise<void>((resolve) => {
@@ -348,7 +348,8 @@ describe("checkpoint admission", () => {
       return "stale";
     });
 
-    admission.admit(current, parent);
+    admission.reset();
+    admission.claimOrdinaryMutation(current, parent);
     let releaseReplacement!: () => void;
     const replacementBlocked = new Promise<void>((resolve) => {
       releaseReplacement = resolve;
@@ -372,7 +373,7 @@ describe("checkpoint admission", () => {
   it("keeps its permit while proving natural append-only progress", async () => {
     const admission = new CheckpointAdmission();
     const parentView = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(parentView, node("parent"));
+    admission.claimOrdinaryMutation(parentView, node("parent"));
     const childView = view({
       leafId: "child",
       entries: [
@@ -432,7 +433,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
@@ -452,7 +453,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     let releaseStale!: () => void;
     const staleBlocked = new Promise<void>((resolve) => {
@@ -473,7 +474,7 @@ describe("checkpoint admission", () => {
     // Model a complete runtime replacement with the same public coordinates:
     // object identity, not value inequality, must close the ABA window.
     admission.reset();
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const replacementLease = admission.decideCapture({
       view: current,
       node: parent,
@@ -524,7 +525,7 @@ describe("checkpoint admission", () => {
         { id: "label", parentId: "stable", type: "label" },
       ],
     });
-    admission.admit(before, stable);
+    admission.claimOrdinaryMutation(before, stable);
 
     const decision = admission.decideCapture({
       view: after,
@@ -547,7 +548,7 @@ describe("checkpoint admission", () => {
         { id: "stable-b", parentId: "stable-a" },
       ],
     });
-    admission.admit(current, node("stable-a"));
+    admission.claimOrdinaryMutation(current, node("stable-a"));
 
     expect(
       admission.decideCapture({
@@ -561,7 +562,7 @@ describe("checkpoint admission", () => {
   it("derives natural descent from an append-only graph snapshot", () => {
     const admission = new CheckpointAdmission();
     const parentView = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(parentView, node("parent"));
+    admission.claimOrdinaryMutation(parentView, node("parent"));
 
     const childView = view({
       leafId: "child",
@@ -585,7 +586,7 @@ describe("checkpoint admission", () => {
       { id: "label", parentId: "parent", type: "label" },
     ];
     const parentView = view({ leafId: "label", entries: prior });
-    admission.admit(parentView, node("parent"));
+    admission.claimOrdinaryMutation(parentView, node("parent"));
     const childView = view({
       leafId: "child",
       entries: [...prior, { id: "child", parentId: "label", type: "message" }],
@@ -607,7 +608,7 @@ describe("checkpoint admission", () => {
       { id: "existing-child", parentId: "parent", type: "message" },
     ];
     const parentView = view({ leafId: "parent", entries });
-    admission.admit(parentView, node("parent"));
+    admission.claimOrdinaryMutation(parentView, node("parent"));
     const childView = view({ leafId: "existing-child", entries });
 
     expect(
@@ -622,7 +623,7 @@ describe("checkpoint admission", () => {
   it("blocks descent when an existing graph coordinate was rewritten", () => {
     const admission = new CheckpointAdmission();
     const parentView = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(parentView, node("parent"));
+    admission.claimOrdinaryMutation(parentView, node("parent"));
     const rewritten = view({
       leafId: "child",
       entries: [
@@ -642,7 +643,10 @@ describe("checkpoint admission", () => {
 
   it("admits the first stable child below an authenticated root editor", () => {
     const admission = new CheckpointAdmission();
-    admission.admit(view({ leafId: null, entries: [] }), undefined);
+    admission.claimOrdinaryMutation(
+      view({ leafId: null, entries: [] }),
+      undefined,
+    );
     const first = view({
       leafId: "first",
       entries: [{ id: "first", parentId: null, type: "message" }],
@@ -659,7 +663,10 @@ describe("checkpoint admission", () => {
 
   it("carries an authenticated root editor through a label wrapper", () => {
     const admission = new CheckpointAdmission();
-    admission.admit(view({ leafId: null, entries: [] }), undefined);
+    admission.claimOrdinaryMutation(
+      view({ leafId: null, entries: [] }),
+      undefined,
+    );
     const labeled = view({
       leafId: "root-label",
       entries: [{ id: "root-label", parentId: null, type: "label" }],
@@ -699,7 +706,7 @@ describe("checkpoint admission", () => {
         { id: "right", parentId: "root" },
       ],
     });
-    admission.admit(left, node("left"));
+    admission.claimOrdinaryMutation(left, node("left"));
     const siblingView = view({
       leafId: "right",
       entries: left.projection,
@@ -721,7 +728,7 @@ describe("checkpoint admission", () => {
       entries: [parentEntry],
     });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const decision = admission.decideCapture({
       view: current,
       node: parent,
@@ -765,9 +772,10 @@ describe("checkpoint admission", () => {
   it("lets only the latest arrival attempt settle", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(current, node("parent"));
+    admission.claimOrdinaryMutation(current, node("parent"));
     const first = admission.beginTreeArrival();
-    admission.admit(current, node("parent"));
+    admission.reset();
+    admission.claimOrdinaryMutation(current, node("parent"));
     const second = admission.beginTreeArrival();
 
     expect(admission.admitArrival(first, current, node("parent"))).toBe(false);
@@ -800,7 +808,7 @@ describe("checkpoint admission", () => {
         { id: "descendant", parentId: "target" },
       ],
     });
-    admission.admit(before, node("descendant"));
+    admission.claimOrdinaryMutation(before, node("descendant"));
     const plan: PendingNavigation = {
       sessionId: "session",
       cwd: "/workspace",
@@ -838,7 +846,7 @@ describe("checkpoint admission", () => {
   it("carries the source mode through a verified same-anchor arrival", () => {
     const admission = new CheckpointAdmission();
     const before = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(before, node("parent"));
+    admission.claimOrdinaryMutation(before, node("parent"));
     const attempt = admission.beginTreeArrival();
     const after = view({
       leafId: "label",
@@ -861,7 +869,7 @@ describe("checkpoint admission", () => {
   it("refuses to carry a mode across a graph rewrite", () => {
     const admission = new CheckpointAdmission();
     const before = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(before, node("parent"));
+    admission.claimOrdinaryMutation(before, node("parent"));
     const attempt = admission.beginTreeArrival();
     const rewritten = view({
       leafId: "parent",
@@ -884,7 +892,7 @@ describe("checkpoint admission", () => {
   it("cannot admit a tree arrival after its armed source graph was rewritten", () => {
     const admission = new CheckpointAdmission();
     const before = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(before, node("parent"));
+    admission.claimOrdinaryMutation(before, node("parent"));
     const attempt = admission.beginTreeArrival();
     const rewritten = view({
       leafId: "parent",
@@ -916,7 +924,7 @@ describe("checkpoint admission", () => {
       },
     });
 
-    admission.admit(guarded, node("parent"));
+    admission.claimOrdinaryMutation(guarded, node("parent"));
     expect(
       admission.decideCapture({
         view: guarded,
@@ -929,7 +937,7 @@ describe("checkpoint admission", () => {
   it("blocks an exact-looking coordinate when its graph was rewritten", () => {
     const admission = new CheckpointAdmission();
     const before = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(before, node("parent"));
+    admission.claimOrdinaryMutation(before, node("parent"));
     const rewritten = view({
       leafId: "parent",
       entries: [{ ...parentEntry, parentId: "forged" }],
@@ -947,7 +955,7 @@ describe("checkpoint admission", () => {
   it("rejects a node key from another session", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
-    admission.admit(current, node("parent"));
+    admission.claimOrdinaryMutation(current, node("parent"));
     const foreign = { sessionId: "other", entryId: "parent" };
 
     expect(
@@ -969,7 +977,7 @@ describe("checkpoint admission", () => {
         { id: "inactive", parentId: "parent" },
       ],
     });
-    admission.admit(current, node("inactive"));
+    admission.claimOrdinaryMutation(current, node("inactive"));
 
     expect(
       admission.decideCapture({
@@ -984,7 +992,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const decision = admission.decideCapture({
       view: current,
       node: parent,
@@ -1000,7 +1008,7 @@ describe("checkpoint admission", () => {
       },
     });
 
-    expect(() => admission.admit(throwing, parent)).toThrow(
+    expect(() => admission.claimOrdinaryMutation(throwing, parent)).toThrow(
       "injected snapshot accessor failure",
     );
     expect(admission.leaseIsCurrent(decision.lease, current, parent)).toBe(
@@ -1012,7 +1020,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const first = admission.decideCapture({
       view: current,
       node: parent,
@@ -1021,7 +1029,7 @@ describe("checkpoint admission", () => {
     expect(first.kind).toBe("capture");
     if (first.kind !== "capture") return;
 
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     expect(admission.leaseIsCurrent(first.lease, current, parent)).toBe(false);
     const second = admission.decideCapture({
       view: current,
@@ -1070,7 +1078,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
 
     expect(admission.cutoverMutation(current, parent)).toBe(true);
     expect(
@@ -1087,7 +1095,7 @@ describe("checkpoint admission", () => {
     const admission = new CheckpointAdmission();
     const current = view({ leafId: "parent", entries: [parentEntry] });
     const parent = node("parent");
-    admission.admit(current, parent);
+    admission.claimOrdinaryMutation(current, parent);
     const changed = view({
       leafId: "parent",
       entries: [parentEntry, { id: "other", parentId: "parent" }],

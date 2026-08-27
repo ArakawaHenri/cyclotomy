@@ -1,10 +1,4 @@
 import type { NodeKey } from "../domain/model.ts";
-import {
-  AuthorityCoordinator,
-  type ArrivalToken,
-  type CaptureLease as StructuralCaptureLease,
-  type ProposalResult,
-} from "../domain/authority.ts";
 import type { SessionView } from "./session-view.ts";
 import type { PendingNavigation } from "./navigation-plan.ts";
 
@@ -20,11 +14,32 @@ export type PreparationResult<T> =
   | { readonly kind: "completed"; readonly value: T };
 
 export type TreePreparationResult =
-  ProposalResult | { readonly kind: "busy" | "cancelled" | "stale" };
+  | { readonly kind: "accepted" | "retired-conflict" | "closed" }
+  | { readonly kind: "busy" | "cancelled" | "stale" };
 
 interface AdmissionLocation {
   readonly leafId: string | null;
   readonly entryId: string | null;
+}
+
+interface LiveAdmission {
+  readonly kind: "live";
+  readonly observation: SessionView;
+  readonly location: AdmissionLocation;
+}
+
+interface ArrivalAdmission {
+  readonly kind: "arrival";
+  readonly attempt: ArrivalAttempt<PendingNavigation | undefined>;
+  readonly source: LiveAdmission | undefined;
+}
+
+type AdmissionState =
+  { readonly kind: "closed" } | LiveAdmission | ArrivalAdmission;
+
+interface PendingProposal {
+  readonly plan: PendingNavigation;
+  readonly source: LiveAdmission;
 }
 
 export interface AdmissionLease {
@@ -126,7 +141,7 @@ function isNaturalDescendant(
  *
  * - closed: no location may be captured;
  * - live: one exact immutable session snapshot has structural authority;
- * - armed: a committed tree arrival is being authenticated, so the old live
+ * - arrival: a committed tree arrival is being authenticated, so the old live
  *   authority is retained only inside its one-shot attempt and cannot capture.
  *
  * Writable/blocked policy lives only in durable checkpoint slots. This class
@@ -134,24 +149,14 @@ function isNaturalDescendant(
  * from surviving a navigation or other authority handoff.
  */
 export class CheckpointAdmission {
-  readonly #authority = new AuthorityCoordinator<
-    SessionView,
-    AdmissionLocation,
-    PendingNavigation
-  >();
+  #state: AdmissionState = { kind: "closed" };
+  #proposal: PendingProposal | undefined;
   #preparing: PreparationPermit | undefined;
-  readonly #arrivals = new WeakMap<
-    ArrivalAttempt,
-    ArrivalToken<PendingNavigation>
-  >();
-  readonly #leases = new WeakMap<
-    AdmissionLease,
-    StructuralCaptureLease<SessionView, AdmissionLocation>
-  >();
+  readonly #leases = new WeakMap<AdmissionLease, LiveAdmission>();
 
   reset(): void {
     this.#invalidateLifecycle();
-    this.#authority.close();
+    this.#close();
   }
 
   /**
@@ -162,7 +167,7 @@ export class CheckpointAdmission {
     if (this.#preparing !== undefined) return undefined;
     const permit = Object.freeze({}) as PreparationPermit;
     this.#preparing = permit;
-    if (this.#authority.retireProposal()) {
+    if (this.#retireProposal()) {
       this.#finishPreparation(permit);
       return undefined;
     }
@@ -205,7 +210,7 @@ export class CheckpointAdmission {
         return { kind: "stale" };
       }
       if (proposal === undefined) return { kind: "cancelled" };
-      return this.#authority.propose(proposal);
+      return this.#propose(proposal);
     } finally {
       this.#finishPreparation(permit);
     }
@@ -215,8 +220,8 @@ export class CheckpointAdmission {
   rejectTransitionConflict(): boolean {
     return (
       this.#preparing !== undefined ||
-      this.#authority.snapshot().kind === "arrival" ||
-      this.#authority.retireProposal()
+      this.#state.kind === "arrival" ||
+      this.#retireProposal()
     );
   }
 
@@ -229,13 +234,10 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey | undefined,
   ): OrdinaryMutationClaim {
-    if (
-      this.#preparing !== undefined ||
-      this.#authority.snapshot().kind === "arrival"
-    ) {
+    if (this.#preparing !== undefined || this.#state.kind === "arrival") {
       return { kind: "transition-conflict" };
     }
-    if (this.#authority.retireProposal()) {
+    if (this.#retireProposal()) {
       return { kind: "transition-conflict" };
     }
     return this.#setLive(view, node)
@@ -243,35 +245,32 @@ export class CheckpointAdmission {
       : { kind: "invalid-location" };
   }
 
-  admit(view: SessionView, node: NodeKey | undefined): void {
-    this.#setLive(view, node);
-  }
-
   beginTreeArrival(): ArrivalAttempt<PendingNavigation | undefined> {
     this.#invalidateLifecycle();
-    const token = this.#authority.beginArrival();
+    const current = this.#state;
+    const proposal = current.kind === "live" ? this.#proposal : undefined;
+    const source =
+      proposal?.source ?? (current.kind === "live" ? current : undefined);
+    this.#proposal = undefined;
     const attempt: ArrivalAttempt<PendingNavigation | undefined> =
       Object.freeze({
-        planned: token.planned,
-        plan: token.planned ? token.proposal : undefined,
+        planned: proposal !== undefined,
+        plan: proposal?.plan,
       });
-    this.#arrivals.set(attempt, token);
+    this.#state = { kind: "arrival", attempt, source };
     return attempt;
   }
 
   /** Consume a failed or abandoned arrival attempt without admitting anything. */
   closeArrival(attempt: ArrivalAttempt): boolean {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined || !this.#authority.arrivalIsCurrent(token)) {
-      return false;
-    }
+    if (!this.arrivalIsCurrent(attempt)) return false;
     this.#invalidateLifecycle();
-    return this.#authority.abandonArrival(token);
+    this.#close();
+    return true;
   }
 
   arrivalIsCurrent(attempt: ArrivalAttempt): boolean {
-    const token = this.#arrivals.get(attempt);
-    return token !== undefined && this.#authority.arrivalIsCurrent(token);
+    return this.#state.kind === "arrival" && this.#state.attempt === attempt;
   }
 
   /** Non-consuming proof required before any planned arrival side effect. */
@@ -280,9 +279,8 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey | undefined,
   ): boolean {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined) return false;
-    const source = this.#authority.arrivalSource(token)?.observation;
+    const state = this.#arrival(attempt);
+    const source = state?.source?.observation;
     return (
       source !== undefined &&
       nodeMatchesSnapshot(view, node) &&
@@ -300,11 +298,11 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey,
   ): boolean {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined || !attempt.planned || attempt.plan === undefined) {
+    const state = this.#arrival(attempt);
+    if (state === undefined || !attempt.planned || attempt.plan === undefined) {
       return false;
     }
-    const source = this.#authority.arrivalSource(token)?.observation;
+    const source = state.source?.observation;
     try {
       return (
         source !== undefined &&
@@ -353,9 +351,7 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey | undefined,
   ): boolean {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined) return false;
-    const arrivalSource = this.#authority.arrivalSource(token);
+    const arrivalSource = this.#arrival(attempt)?.source;
     const source = arrivalSource?.location;
     try {
       if (
@@ -377,7 +373,7 @@ export class CheckpointAdmission {
 
   /** Preserve classification across an authenticated label/raw-leaf rewrite. */
   carry(view: SessionView, node: NodeKey | undefined): boolean {
-    const state = this.#authority.snapshot();
+    const state = this.#state;
     if (state.kind !== "live") return false;
     const source = state.location;
     try {
@@ -390,7 +386,7 @@ export class CheckpointAdmission {
         return false;
       }
       const location = locationOf(view, node);
-      if (location === undefined || !this.#authority.advance(view, location)) {
+      if (location === undefined || !this.#advance(view, location)) {
         this.reset();
         return false;
       }
@@ -398,7 +394,7 @@ export class CheckpointAdmission {
       this.reset();
       return false;
     }
-    return this.#authority.snapshot().kind === "live";
+    return this.#state.kind === "live";
   }
 
   decideCapture(input: {
@@ -407,7 +403,7 @@ export class CheckpointAdmission {
     readonly writeProtected: boolean;
   }): AdmissionDecision {
     const { view, node } = input;
-    let state = this.#authority.snapshot();
+    let state = this.#state;
     if (state.kind !== "live") return { kind: "not-admitted" };
     try {
       if (
@@ -430,7 +426,7 @@ export class CheckpointAdmission {
       location.entryId === (node?.entryId ?? null)
     ) {
       if (!this.carry(view, node)) return { kind: "not-admitted" };
-      state = this.#authority.snapshot();
+      state = this.#state;
       if (state.kind !== "live") return { kind: "not-admitted" };
       location = state.location;
     }
@@ -461,7 +457,7 @@ export class CheckpointAdmission {
       return { kind: "write-protected" };
     }
     if (!this.#advanceLive(view, node)) return this.#closeAndBlock();
-    state = this.#authority.snapshot();
+    state = this.#state;
     return state.kind === "live"
       ? { kind: "capture", lease: this.#lease() }
       : { kind: "not-admitted" };
@@ -472,15 +468,8 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey,
   ): boolean {
-    const structural = this.#leases.get(lease);
-    if (
-      structural === undefined ||
-      !this.#authority.captureLeaseIsCurrent(structural)
-    ) {
-      return false;
-    }
-    const state = this.#authority.snapshot();
-    if (state.kind !== "live") return false;
+    const state = this.#leases.get(lease);
+    if (state === undefined || this.#state !== state) return false;
     const location = state.location;
     try {
       return (
@@ -497,7 +486,7 @@ export class CheckpointAdmission {
 
   /** Validate and synchronously close one live destructive cutover. */
   cutoverMutation(view: SessionView, node: NodeKey | undefined): boolean {
-    const state = this.#authority.snapshot();
+    const state = this.#state;
     if (state.kind !== "live") return false;
     try {
       if (
@@ -510,9 +499,9 @@ export class CheckpointAdmission {
     } catch {
       return false;
     }
-    const cutover = this.#authority.cutoverLive();
-    if (cutover) this.#invalidateLifecycle();
-    return cutover;
+    if (this.#state !== state) return false;
+    this.reset();
+    return true;
   }
 
   /** Validate and synchronously close one tree-arrival destructive cutover. */
@@ -521,8 +510,8 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey | undefined,
   ): boolean {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined || !this.arrivalCanProceed(attempt, view, node)) {
+    const state = this.#arrival(attempt);
+    if (state === undefined || !this.arrivalCanProceed(attempt, view, node)) {
       return false;
     }
     try {
@@ -530,9 +519,9 @@ export class CheckpointAdmission {
     } catch {
       return false;
     }
-    const cutover = this.#authority.cutoverArrival(token);
-    if (cutover) this.#invalidateLifecycle();
-    return cutover;
+    if (this.#state !== state) return false;
+    this.reset();
+    return true;
   }
 
   #settleArrival(
@@ -540,8 +529,8 @@ export class CheckpointAdmission {
     view: SessionView,
     node: NodeKey | undefined,
   ): EphemeralArrivalSettlement {
-    const token = this.#arrivals.get(attempt);
-    if (token === undefined || !this.#authority.arrivalIsCurrent(token)) {
+    const state = this.#arrival(attempt);
+    if (state === undefined) {
       return {
         kind: "unsettled",
         cause: new Error("tree arrival authority is stale"),
@@ -551,13 +540,13 @@ export class CheckpointAdmission {
     try {
       location = locationOf(view, node);
     } catch (cause) {
-      if (this.#authority.arrivalIsCurrent(token)) {
+      if (this.#state === state) {
         this.#invalidateLifecycle();
-        this.#authority.abandonArrival(token);
+        this.#close();
       }
       return { kind: "unsettled", cause };
     }
-    if (!this.#authority.arrivalIsCurrent(token)) {
+    if (this.#state !== state) {
       return {
         kind: "unsettled",
         cause: new Error("tree arrival authority changed during settlement"),
@@ -565,28 +554,24 @@ export class CheckpointAdmission {
     }
     this.#invalidateLifecycle();
     if (location === undefined) {
-      this.#authority.abandonArrival(token);
+      this.#close();
       return {
         kind: "unsettled",
         cause: new Error("tree arrival has no authenticated location"),
       };
     }
-    return this.#authority.settleArrival(token, view, location)
-      ? { kind: "settled" }
-      : {
-          kind: "unsettled",
-          cause: new Error("tree arrival authority changed during settlement"),
-        };
+    this.#state = { kind: "live", observation: view, location };
+    return { kind: "settled" };
   }
 
   #setLive(view: SessionView, node: NodeKey | undefined): boolean {
     // Invalidate before reading the new snapshot. An exceptional accessor can
     // never leave the preceding live authority or one of its leases usable.
     this.#invalidateLifecycle();
-    this.#authority.close();
+    this.#close();
     const location = locationOf(view, node);
     if (location === undefined) return false;
-    this.#authority.open(view, location);
+    this.#state = { kind: "live", observation: view, location };
     return true;
   }
 
@@ -594,7 +579,7 @@ export class CheckpointAdmission {
     const location = locationOf(view, node);
     // Natural append/label progress neither proves that an ambiguous host
     // proposal ended nor replaces the preparation that may be proving it.
-    return location !== undefined && this.#authority.advance(view, location);
+    return location !== undefined && this.#advance(view, location);
   }
 
   #invalidateLifecycle(): void {
@@ -616,14 +601,49 @@ export class CheckpointAdmission {
   }
 
   #lease(): AdmissionLease {
-    const structural = this.#authority.issueCaptureLease();
-    if (structural === undefined) {
+    const state = this.#state;
+    if (state.kind !== "live") {
       throw new Error("capture authority is unavailable");
     }
     const lease: AdmissionLease = Object.freeze({
       __admissionLease: true,
     });
-    this.#leases.set(lease, structural);
+    this.#leases.set(lease, state);
     return lease;
+  }
+
+  #arrival(attempt: ArrivalAttempt): ArrivalAdmission | undefined {
+    const state = this.#state;
+    return state.kind === "arrival" && state.attempt === attempt
+      ? state
+      : undefined;
+  }
+
+  #advance(observation: SessionView, location: AdmissionLocation): boolean {
+    if (this.#state.kind !== "live") return false;
+    this.#state = { kind: "live", observation, location };
+    return true;
+  }
+
+  #close(): void {
+    this.#proposal = undefined;
+    this.#state = { kind: "closed" };
+  }
+
+  #propose(plan: PendingNavigation): TreePreparationResult {
+    const state = this.#state;
+    if (state.kind !== "live") return { kind: "closed" };
+    if (this.#proposal !== undefined) {
+      this.#proposal = undefined;
+      return { kind: "retired-conflict" };
+    }
+    this.#proposal = { plan, source: state };
+    return { kind: "accepted" };
+  }
+
+  #retireProposal(): boolean {
+    if (this.#proposal === undefined) return false;
+    this.#proposal = undefined;
+    return true;
   }
 }
