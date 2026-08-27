@@ -50,13 +50,14 @@ function sameIdentity(
 }
 
 /**
- * An operation-owned, bounded LRU of authenticated pack handles. A permit is
+ * An operation-owned, bounded LRU of pack handles. A permit is
  * held for the complete lease, so recursive readers can prove that no more
  * than `maximumHandles` descriptors are in use or retained by this pool.
  */
 export class PackHandlePool {
   readonly #catalog: PackCatalog;
   readonly #maximumHandles: number;
+  readonly #openMode: "authenticated" | "logical-read";
   readonly #entries = new Map<PackId, CachedPackHandle>();
   readonly #waiters: Array<() => void> = [];
   #availablePermits: number;
@@ -66,12 +67,17 @@ export class PackHandlePool {
   #resolveDrain: (() => void) | undefined;
   #closePromise: Promise<void> | undefined;
 
-  constructor(catalog: PackCatalog, maximumHandles = 2) {
+  constructor(
+    catalog: PackCatalog,
+    maximumHandles = 2,
+    openMode: "authenticated" | "logical-read" = "authenticated",
+  ) {
     if (!Number.isSafeInteger(maximumHandles) || maximumHandles <= 0) {
       throw new RangeError("maximum pack handles must be a positive integer");
     }
     this.#catalog = catalog;
     this.#maximumHandles = maximumHandles;
+    this.#openMode = openMode;
     this.#availablePermits = maximumHandles;
   }
 
@@ -212,7 +218,10 @@ export class PackHandlePool {
         // acquisitions therefore share one open, and no zero-user reservation
         // can be mistaken for an evictable cached handle.
         const entry: CachedPackHandle = {
-          pending: this.#catalog.openPack(packId),
+          pending:
+            this.#openMode === "authenticated"
+              ? this.#catalog.openPack(packId)
+              : this.#catalog.openPackForRead(packId),
           users: 0,
         };
         this.#entries.set(packId, entry);
@@ -256,10 +265,13 @@ export class PackHandlePool {
             entry.resolveIdle = resolve;
           });
     const retirement = (async () => {
-      await idle;
-      const handle = await entry.pending;
-      if (handle !== undefined) await handle.close();
-      this.#deleteEntry(packId, entry);
+      try {
+        await idle;
+        const handle = await entry.pending;
+        if (handle !== undefined) await handle.close();
+      } finally {
+        this.#deleteEntry(packId, entry);
+      }
     })();
     entry.retirement = retirement;
     return retirement;

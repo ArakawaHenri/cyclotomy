@@ -1706,45 +1706,6 @@ describe("object garbage collection", () => {
     await expect(store.readBlob(contentId)).resolves.toEqual(content);
   });
 
-  it("opens each shared pack once per authentication phase", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-mark-scope-"));
-    roots.push(root);
-    const store = await openObjectStore(root);
-    const blobOids = await Promise.all([
-      publishTestBlob(store, Buffer.from("mark alpha")),
-      publishTestBlob(store, Buffer.from("mark beta")),
-    ]);
-    const treeOid = await publishTestTree(
-      store,
-      blobOids.map((blobOid, index) => ({
-        path: `${index}.txt`,
-        type: "regular" as const,
-        blobOid,
-        recreationMode: 0o644,
-      })),
-      scope,
-    );
-    const metadata = { listReferencedTreeOids: () => [treeOid] };
-    const options = { graceMs: 0, now: Date.now() + 1_000 };
-    await collectGarbage(store, metadata, options);
-    const inventory = await new PackCatalog(
-      nativeObjectLayout(root),
-    ).inventory();
-    expect(inventory.packs.length).toBeGreaterThanOrEqual(2);
-
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
-    await collectGarbage(store, metadata, options);
-    for (const { view } of inventory.packs) {
-      const exactStructuralCoverage = view.entries.some(
-        ({ kind }) =>
-          kind === "tree-root" || kind === "tree-node" || kind === "scope",
-      );
-      expect(
-        openPack.mock.calls.filter(([packId]) => packId === view.packId),
-      ).toHaveLength(exactStructuralCoverage ? 3 : 2);
-    }
-  });
-
   it("keeps a newly materialized large legacy closure live through zero-grace cutover", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-legacy-large-"));
     roots.push(root);

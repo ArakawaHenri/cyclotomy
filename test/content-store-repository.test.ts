@@ -26,7 +26,10 @@ import {
   MAX_RECIPE_OBJECT_BYTES,
 } from "../src/infrastructure/content-store/chunk-recipe.ts";
 import { chunkFastCdcV1 } from "../src/infrastructure/content-store/fastcdc.ts";
-import { PackCatalog } from "../src/infrastructure/content-store/pack-catalog.ts";
+import {
+  PackCatalog,
+  PackCatalogError,
+} from "../src/infrastructure/content-store/pack-catalog.ts";
 import { PackHandlePool } from "../src/infrastructure/content-store/pack-handle-pool.ts";
 import {
   encodePack,
@@ -40,6 +43,10 @@ import {
   ContentRepository,
   ContentRepositoryError,
 } from "../src/infrastructure/content-store/repository.ts";
+import {
+  chunkedContentRecipeId,
+  type ChunkedContentRecord,
+} from "../src/infrastructure/content-store/representation.ts";
 import type { RecordEnvelope } from "../src/infrastructure/content-store/record.ts";
 import {
   nativeLooseRecordPath,
@@ -91,11 +98,13 @@ async function withDisplacedAuthority<T>(
 }
 
 async function fileHandlePrototype(root: string): Promise<{
+  readonly read: FileHandle["read"];
   readonly stat: FileHandle["stat"];
 }> {
   const path = join(root, "file-handle-probe");
   const probe = await open(path, "w");
   const prototype = Object.getPrototypeOf(probe) as {
+    readonly read: FileHandle["read"];
     readonly stat: FileHandle["stat"];
   };
   await probe.close();
@@ -211,12 +220,16 @@ describe("content repository", () => {
     );
     const cleanup = new Error("injected private-file close failure");
     let closeCalls = 0;
+    let handleStats = 0;
     let installed = false;
     vi.spyOn(prototype, "stat").mockImplementation(async function (
       this: FileHandle,
     ) {
       const observation = await originalStat.call(this);
-      if (!installed) {
+      handleStats += 1;
+      // Logical reads authenticate before emitting. Install the failing close
+      // on the replay handle, where the sink failure is the primary failure.
+      if (!installed && handleStats === 3) {
         installed = true;
         const originalClose = this.close;
         Object.defineProperty(this, "close", {
@@ -633,7 +646,7 @@ describe("content repository", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("does not fall through a corrupt legacy blob to a valid pack", async () => {
+  it("falls through a corrupt legacy blob to a valid pack", async () => {
     const { layout, repository } = await setupRepository();
     const content = Buffer.from("valid packed bytes", "utf8");
     const contentId = contentIdFromBytes(content);
@@ -661,10 +674,28 @@ describe("content repository", () => {
 
     await expect(
       collect(repository, contentId, content.byteLength),
-    ).rejects.toMatchObject({ code: "object-integrity" });
+    ).resolves.toEqual(content);
   });
 
-  it("does not fall through a corrupt loose record to a valid pack", async () => {
+  it("falls through a legacy read failure to a healthy loose record", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("healthy loose bytes", "utf8");
+    const contentId = contentIdFromBytes(content);
+    await repository.ensureRawContent(contentId, content);
+    const legacyPath = nativeObjectPath(layout, "blob", contentId);
+    await mkdir(dirname(legacyPath), { recursive: true });
+    await writeFile(legacyPath, content);
+    const prototype = await fileHandlePrototype(layout.root);
+    vi.spyOn(prototype, "read").mockRejectedValueOnce(
+      Object.assign(new Error("injected legacy read failure"), { code: "EIO" }),
+    );
+
+    await expect(
+      collect(repository, contentId, content.byteLength),
+    ).resolves.toEqual(content);
+  });
+
+  it("falls through a corrupt loose record to a valid pack", async () => {
     const { layout, repository } = await setupRepository();
     const content = Buffer.from("valid packed bytes", "utf8");
     const contentId = contentIdFromBytes(content);
@@ -694,7 +725,424 @@ describe("content repository", () => {
 
     await expect(
       collect(repository, contentId, content.byteLength),
+    ).resolves.toEqual(content);
+  });
+
+  it("falls through corrupt loose structural bytes to a valid pack", async () => {
+    const { layout, repository } = await setupRepository();
+    const structure = Buffer.from("valid packed structure", "utf8");
+    const structureId = parseMetadataId(contentIdFromBytes(structure));
+    const packed = await encodePack(
+      {
+        packClass: "metadata",
+        records: [
+          {
+            kind: "tree-node",
+            encoding: "raw",
+            logicalId: structureId,
+            decodedLength: structure.byteLength,
+            payload: structure,
+          },
+        ],
+      },
+      {
+        verifyMetadataId: (_kind, id, bytes) =>
+          String(id) === String(structureId) &&
+          String(contentIdFromBytes(bytes)) === String(structureId),
+      },
+    );
+    await publishPackFile(layout, packed);
+    const loosePath = nativeObjectPath(layout, "tree", structureId);
+    await mkdir(dirname(loosePath), { recursive: true });
+    await writeFile(loosePath, Buffer.from("corrupt", "utf8"));
+
+    expect(
+      Buffer.from(
+        await repository.readStructural(
+          "node",
+          structureId,
+          structure.byteLength,
+        ),
+      ),
+    ).toEqual(structure);
+  });
+
+  it("uses another packed representation when the first candidate is corrupt", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("duplicated packed content", "utf8");
+    const contentId = contentIdFromBytes(content);
+    const publications = await Promise.all(
+      ["first companion", "second companion"].map(
+        async (companion) =>
+          await encodePack({
+            packClass: "data",
+            records: [content, Buffer.from(companion, "utf8")].map(
+              (payload) => ({
+                kind: "content" as const,
+                encoding: "raw" as const,
+                logicalId: contentIdFromBytes(payload),
+                decodedLength: payload.byteLength,
+                payload,
+              }),
+            ),
+          }),
+      ),
+    );
+    for (const publication of publications) {
+      await publishPackFile(layout, publication);
+    }
+    await publishCurrentMultiPackIndex(layout);
+
+    const catalog = new PackCatalog(layout);
+    const inventory = await catalog.inventory();
+    const first = catalog
+      .rebuildMultiPackIndex(inventory)
+      .index.lookup({ kind: "content", logicalId: contentId })[0]!;
+    const path = nativePackPath(layout, first.packId);
+    const damaged = Buffer.from(await readFile(path));
+    damaged[first.offset + first.length - 1] =
+      (damaged[first.offset + first.length - 1] ?? 0) ^ 0xff;
+    await writeFile(path, damaged);
+
+    const chunks: Uint8Array[] = [];
+    await repository.streamContent(
+      contentId,
+      content.byteLength,
+      async (chunk) => {
+        chunks.push(Uint8Array.from(chunk));
+      },
+    );
+    expect(Buffer.concat(chunks)).toEqual(content);
+    expect(chunks).toHaveLength(1);
+  });
+
+  it("uses another packed representation when the first candidate cannot be read", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("duplicated packed content", "utf8");
+    const contentId = contentIdFromBytes(content);
+    const publications = await Promise.all(
+      ["first companion", "second companion"].map(
+        async (companion) =>
+          await encodePack({
+            packClass: "data",
+            records: [content, Buffer.from(companion, "utf8")].map(
+              (payload) => ({
+                kind: "content" as const,
+                encoding: "raw" as const,
+                logicalId: contentIdFromBytes(payload),
+                decodedLength: payload.byteLength,
+                payload,
+              }),
+            ),
+          }),
+      ),
+    );
+    for (const publication of publications) {
+      await publishPackFile(layout, publication);
+    }
+    await publishCurrentMultiPackIndex(layout);
+    const catalog = new PackCatalog(layout);
+    const inventory = await catalog.inventory();
+    const first = catalog
+      .rebuildMultiPackIndex(inventory)
+      .index.lookup({ kind: "content", logicalId: contentId })[0]!;
+    const originalOpen = PackCatalog.prototype.openPackForRead;
+    vi.spyOn(PackCatalog.prototype, "openPackForRead").mockImplementation(
+      async function (this: PackCatalog, packId) {
+        if (packId === first.packId) {
+          throw new PackCatalogError(
+            "storage-failure",
+            "injected pack read failure",
+          );
+        }
+        return await originalOpen.call(this, packId);
+      },
+    );
+
+    await expect(
+      collect(repository, contentId, content.byteLength),
+    ).resolves.toEqual(content);
+  });
+
+  it("builds read routing from healthy packs when one candidate cannot be opened", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("duplicated packed content", "utf8");
+    const contentId = contentIdFromBytes(content);
+    const publications = await Promise.all(
+      ["first companion", "second companion"].map(
+        async (companion) =>
+          await encodePack({
+            packClass: "data",
+            records: [content, Buffer.from(companion, "utf8")].map(
+              (payload) => ({
+                kind: "content" as const,
+                encoding: "raw" as const,
+                logicalId: contentIdFromBytes(payload),
+                decodedLength: payload.byteLength,
+                payload,
+              }),
+            ),
+          }),
+      ),
+    );
+    for (const publication of publications) {
+      await publishPackFile(layout, publication);
+    }
+    const prototype = await fileHandlePrototype(layout.root);
+    vi.spyOn(prototype, "read").mockRejectedValueOnce(
+      Object.assign(new Error("injected pack open failure"), { code: "EIO" }),
+    );
+
+    await expect(
+      collect(repository, contentId, content.byteLength),
+    ).resolves.toEqual(content);
+  });
+
+  it("publishes additive representations despite unrelated pack damage", async () => {
+    const { layout, repository } = await setupRepository();
+    const corruptPackId = "00".repeat(32);
+    await mkdir(join(layout.packs, corruptPackId.slice(0, 2)), {
+      recursive: true,
+    });
+    await writeFile(
+      nativePackPath(layout, corruptPackId),
+      Buffer.from("corrupt unrelated pack", "utf8"),
+    );
+
+    const content = Buffer.from("new additive content", "utf8");
+    const contentId = contentIdFromBytes(content);
+    await expect(
+      repository.publishContentFromStream(
+        contentId,
+        content.byteLength,
+        async (sink) => sink(content),
+      ),
+    ).resolves.toMatchObject({ contentId });
+    expect(await collect(repository, contentId, content.byteLength)).toEqual(
+      content,
+    );
+
+    const structure = Buffer.from("new additive structure", "utf8");
+    const structureId = contentIdFromBytes(structure);
+    await expect(
+      repository.publishStructural("node", structureId, structure),
+    ).resolves.toBeUndefined();
+    expect(
+      Buffer.from(
+        await repository.readStructural(
+          "node",
+          structureId,
+          structure.byteLength,
+        ),
+      ),
+    ).toEqual(structure);
+  });
+
+  it("publishes loose representations when the pack namespace is unusable", async () => {
+    const { layout, repository } = await setupRepository();
+    await writeFile(
+      join(layout.packs, "unexpected"),
+      Buffer.from("not a pack shard", "utf8"),
+    );
+
+    const content = Buffer.from("new content beside an invalid pack namespace");
+    const contentId = contentIdFromBytes(content);
+    await expect(
+      repository.publishContentFromStream(
+        contentId,
+        content.byteLength,
+        async (sink) => sink(content),
+      ),
+    ).resolves.toMatchObject({ contentId });
+    expect(
+      await readFile(nativeLooseRecordPath(layout, "content", contentId)),
+    ).not.toHaveLength(0);
+
+    const structure = Buffer.from(
+      "new structure beside an invalid pack namespace",
+    );
+    const structureId = contentIdFromBytes(structure);
+    await expect(
+      repository.publishStructural("node", structureId, structure),
+    ).resolves.toBeUndefined();
+    await expect(
+      readFile(nativeObjectPath(layout, "tree", structureId)),
+    ).resolves.toEqual(structure);
+  });
+
+  it("publishes loose representations when optional pack reuse cannot be read", async () => {
+    const { layout, repository } = await setupRepository();
+    vi.spyOn(PackCatalog.prototype, "readInventory").mockRejectedValue(
+      new PackCatalogError(
+        "storage-failure",
+        "pack namespace is temporarily unreadable",
+      ),
+    );
+
+    const content = Buffer.from("new content beside unreadable packs");
+    const contentId = contentIdFromBytes(content);
+    await expect(
+      repository.publishContentFromStream(
+        contentId,
+        content.byteLength,
+        async (sink) => sink(content),
+      ),
+    ).resolves.toMatchObject({ contentId });
+    await expect(
+      readFile(nativeLooseRecordPath(layout, "content", contentId)),
+    ).resolves.not.toHaveLength(0);
+
+    const structure = Buffer.from("new structure beside unreadable packs");
+    const structureId = contentIdFromBytes(structure);
+    await expect(
+      repository.publishStructural("node", structureId, structure),
+    ).resolves.toBeUndefined();
+    await expect(
+      readFile(nativeObjectPath(layout, "tree", structureId)),
+    ).resolves.toEqual(structure);
+  });
+
+  it("repairs a corrupt packed target by publishing trusted source bytes", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("repairable packed target", "utf8");
+    const contentId = contentIdFromBytes(content);
+    const packed = await encodePack({
+      packClass: "data",
+      records: [
+        {
+          kind: "content",
+          encoding: "raw",
+          logicalId: contentId,
+          decodedLength: content.byteLength,
+          payload: content,
+        },
+      ],
+    });
+    await publishPackFile(layout, packed);
+    await publishCurrentMultiPackIndex(layout);
+    const path = nativePackPath(layout, packed.pack.packId);
+    const damaged = Buffer.from(await readFile(path));
+    const entry = packed.pack.lookup({
+      kind: "content",
+      logicalId: contentId,
+    })[0]!;
+    damaged[entry.offset + entry.length - 1] =
+      (damaged[entry.offset + entry.length - 1] ?? 0) ^ 0xff;
+    await writeFile(path, damaged);
+
+    await expect(
+      repository.publishContentFromStream(
+        contentId,
+        content.byteLength,
+        async (sink) => sink(content),
+      ),
+    ).resolves.toMatchObject({ contentId });
+    expect(
+      await readFile(nativeLooseRecordPath(layout, "content", contentId)),
+    ).not.toHaveLength(0);
+  });
+
+  it("falls back between representations inside a chunk recipe graph", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = deterministicContent(700 * 1024);
+    const contentId = contentIdFromBytes(content);
+    await repository.publishContentFromStream(
+      contentId,
+      content.byteLength,
+      async (sink) => sink(content),
+    );
+
+    const root = decodeRecord(
+      await readFile(nativeLooseRecordPath(layout, "content", contentId)),
+      {
+        maxDecodedBytes: content.byteLength,
+        maxPayloadBytes: 512 * 1024,
+      },
+    );
+    expect(root.encoding).toBe("chunked-v1");
+    const recipeId = chunkedContentRecipeId(root as ChunkedContentRecord);
+    const recipePath = nativeLooseRecordPath(layout, "recipe", recipeId);
+    const recipeBytes = await readFile(recipePath);
+    const recipe = decodeRecord(recipeBytes, {
+      maxDecodedBytes: MAX_RECIPE_OBJECT_BYTES,
+      maxPayloadBytes: MAX_RECIPE_OBJECT_BYTES,
+    });
+    const packed = await encodePack({
+      packClass: "metadata",
+      records: [recipe],
+    });
+    await publishPackFile(layout, packed);
+    await publishCurrentMultiPackIndex(layout);
+    await writeFile(recipePath, Buffer.from("corrupt recipe", "utf8"));
+
+    expect(await collect(repository, contentId, content.byteLength)).toEqual(
+      content,
+    );
+  });
+
+  it("does not switch representations after replay has begun", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = Buffer.from("fixed replay representation", "utf8");
+    const contentId = contentIdFromBytes(content);
+    await repository.publishContentFromStream(
+      contentId,
+      content.byteLength,
+      async (sink) => sink(content),
+    );
+    const loosePath = nativeLooseRecordPath(layout, "content", contentId);
+    const looseBytes = await readFile(loosePath);
+    const packed = await encodePack({
+      packClass: "data",
+      records: [
+        {
+          kind: "content",
+          encoding: "raw",
+          logicalId: contentId,
+          decodedLength: content.byteLength,
+          payload: content,
+        },
+      ],
+    });
+    await publishPackFile(layout, packed);
+    await publishCurrentMultiPackIndex(layout);
+
+    const chunks: Buffer[] = [];
+    await expect(
+      repository.streamContent(contentId, content.byteLength, async (chunk) => {
+        chunks.push(Buffer.from(chunk));
+        await unlink(loosePath);
+        await writeFile(loosePath, looseBytes);
+      }),
     ).rejects.toMatchObject({ code: "object-integrity" });
+    expect(chunks).toHaveLength(1);
+    expect(Buffer.concat(chunks)).toEqual(content);
+  });
+
+  it("fails after a selected chunked root changes during replay", async () => {
+    const { layout, repository } = await setupRepository();
+    const content = deterministicContent(700 * 1024);
+    const contentId = contentIdFromBytes(content);
+    await repository.publishContentFromStream(
+      contentId,
+      content.byteLength,
+      async (sink) => sink(content),
+    );
+    const rootPath = nativeLooseRecordPath(layout, "content", contentId);
+    const rootBytes = await readFile(rootPath);
+    const chunks: Buffer[] = [];
+    let replaced = false;
+
+    await expect(
+      repository.streamContent(contentId, content.byteLength, async (chunk) => {
+        chunks.push(Buffer.from(chunk));
+        if (!replaced) {
+          replaced = true;
+          await unlink(rootPath);
+          await writeFile(rootPath, rootBytes);
+        }
+      }),
+    ).rejects.toMatchObject({ code: "object-integrity" });
+    expect(Buffer.concat(chunks)).toEqual(content);
   });
 
   it("uses a valid MIDX hint without inventorying or opening unrelated packs", async () => {
@@ -730,8 +1178,8 @@ describe("content repository", () => {
     await publishPackFile(layout, unrelatedPack);
     await publishCurrentMultiPackIndex(layout);
 
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
+    const openPack = vi.spyOn(PackCatalog.prototype, "openPackForRead");
     expect(await collect(repository, targetId, target.byteLength)).toEqual(
       target,
     );
@@ -741,7 +1189,48 @@ describe("content repository", () => {
     ]);
   });
 
-  it("shares one MIDX read and one authenticated read per pack within an operation scope", async () => {
+  it("does not authenticate unrelated record payloads during logical reads", async () => {
+    const { layout, repository } = await setupRepository();
+    const target = Buffer.from("intact target", "utf8");
+    const unrelated = Buffer.from("unrelated payload", "utf8");
+    const packed = await encodePack({
+      packClass: "data",
+      records: [target, unrelated].map((bytes) => ({
+        kind: "content" as const,
+        encoding: "raw" as const,
+        logicalId: contentIdFromBytes(bytes),
+        decodedLength: bytes.byteLength,
+        payload: bytes,
+      })),
+    });
+    await publishPackFile(layout, packed);
+    await publishCurrentMultiPackIndex(layout);
+
+    const damaged = Buffer.from(
+      await readFile(nativePackPath(layout, packed.pack.packId)),
+    );
+    const unrelatedEntry = packed.pack.lookup({
+      kind: "content",
+      logicalId: contentIdFromBytes(unrelated),
+    })[0]!;
+    const damageOffset = unrelatedEntry.offset + unrelatedEntry.length - 1;
+    damaged[damageOffset] = (damaged[damageOffset] ?? 0) ^ 0xff;
+    await writeFile(nativePackPath(layout, packed.pack.packId), damaged);
+
+    await expect(
+      collect(repository, contentIdFromBytes(target), target.byteLength),
+    ).resolves.toEqual(target);
+    await expect(new PackCatalog(layout).inventory()).rejects.toMatchObject({
+      code: "pack-integrity",
+    });
+
+    await unlink(layout.multiPackIndex);
+    await expect(
+      collect(repository, contentIdFromBytes(target), target.byteLength),
+    ).resolves.toEqual(target);
+  });
+
+  it("shares one MIDX read and one pack read per pack within an operation scope", async () => {
     const { layout, repository } = await setupRepository();
     const contents = [
       Buffer.from("first packed operation content", "utf8"),
@@ -783,7 +1272,7 @@ describe("content repository", () => {
     await publishCurrentMultiPackIndex(layout);
 
     const readHint = vi.spyOn(PackCatalog.prototype, "readMultiPackIndexHint");
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
+    const openPack = vi.spyOn(PackCatalog.prototype, "openPackForRead");
     const scope = repository.openResolutionScope();
     try {
       await Promise.all([
@@ -886,7 +1375,7 @@ describe("content repository", () => {
       ],
     });
     await publishPackFile(layout, packed);
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
 
     expect(await collect(repository, contentId, bytes.byteLength)).toEqual(
       bytes,
@@ -904,7 +1393,7 @@ describe("content repository", () => {
     expect(inventory).toHaveBeenCalledTimes(1);
   });
 
-  it("fails closed on any corrupt pack encountered by a required inventory", async () => {
+  it("reads an exact target despite an unreadable unrelated pack", async () => {
     const { layout, repository } = await setupRepository();
     const bytes = Buffer.from("valid inventory target", "utf8");
     const contentId = contentIdFromBytes(bytes);
@@ -932,6 +1421,46 @@ describe("content repository", () => {
 
     await expect(
       collect(repository, contentId, bytes.byteLength),
+    ).resolves.toEqual(bytes);
+
+    await expect(
+      collect(repository, contentIdFromBytes(Buffer.from("missing")), 7),
+    ).rejects.toMatchObject({ code: "object-integrity" });
+  });
+
+  it("authenticates pack routing before reporting a missing object", async () => {
+    const { layout, repository } = await setupRepository();
+    const bytes = Buffer.from("negative lookup target", "utf8");
+    const contentId = contentIdFromBytes(bytes);
+    const packed = await encodePack({
+      packClass: "data",
+      records: [
+        {
+          kind: "content",
+          encoding: "raw",
+          logicalId: contentId,
+          decodedLength: bytes.byteLength,
+          payload: bytes,
+        },
+      ],
+    });
+    await publishPackFile(layout, packed);
+
+    const path = nativePackPath(layout, packed.pack.packId);
+    const damaged = Buffer.from(await readFile(path));
+    const footerLengthOffset = damaged.byteLength - 48;
+    const footerLength = Number(damaged.readBigUInt64BE(footerLengthOffset));
+    const footerOffset = footerLengthOffset - footerLength;
+    const logicalIdOffset = damaged.indexOf(
+      Buffer.from(contentId, "hex"),
+      footerOffset,
+    );
+    expect(logicalIdOffset).toBeGreaterThanOrEqual(footerOffset);
+    damaged[logicalIdOffset + 1] = (damaged[logicalIdOffset + 1] ?? 0) ^ 1;
+    await writeFile(path, damaged);
+
+    await expect(
+      collect(repository, contentId, bytes.byteLength),
     ).rejects.toMatchObject({ code: "object-integrity" });
   });
 
@@ -952,7 +1481,7 @@ describe("content repository", () => {
       ],
     });
     await publishPackFile(layout, packed);
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
     const inventoryStillCurrent = vi
       .spyOn(PackCatalog.prototype, "inventoryStillCurrent")
       .mockResolvedValueOnce(false);
@@ -997,7 +1526,7 @@ describe("content repository", () => {
       ],
     });
     await publishPackFile(layout, appearedPack);
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
 
     expect(await collect(repository, appearedId, appeared.byteLength)).toEqual(
       appeared,
@@ -1046,7 +1575,7 @@ describe("content repository", () => {
       ],
     });
     await publishPackFile(layout, replacement);
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
 
     expect(await collect(repository, targetId, target.byteLength)).toEqual(
       target,
@@ -1054,7 +1583,7 @@ describe("content repository", () => {
     expect(inventory).toHaveBeenCalledTimes(1);
   });
 
-  it("fails closed when the pack selected by a valid hint is corrupt", async () => {
+  it("searches for another representation when a hinted pack is corrupt", async () => {
     const { layout, repository } = await setupRepository();
     const bytes = Buffer.from("candidate integrity", "utf8");
     const contentId = contentIdFromBytes(bytes);
@@ -1076,12 +1605,16 @@ describe("content repository", () => {
       nativePackPath(layout, packed.pack.packId),
       Buffer.from("corrupt pack", "utf8"),
     );
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
+    let sinkCalls = 0;
 
     await expect(
-      collect(repository, contentId, bytes.byteLength),
+      repository.streamContent(contentId, bytes.byteLength, async () => {
+        sinkCalls += 1;
+      }),
     ).rejects.toMatchObject({ code: "object-integrity" });
-    expect(inventory).not.toHaveBeenCalled();
+    expect(sinkCalls).toBe(0);
+    expect(inventory).toHaveBeenCalledTimes(1);
   });
 
   it("does not bind publication proofs to the rebuildable MIDX cache", async () => {
@@ -1111,8 +1644,8 @@ describe("content repository", () => {
     );
 
     await writeFile(layout.multiPackIndex, Buffer.from("replacement", "utf8"));
-    const inventory = vi.spyOn(PackCatalog.prototype, "inventory");
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
+    const inventory = vi.spyOn(PackCatalog.prototype, "readInventory");
+    const openPack = vi.spyOn(PackCatalog.prototype, "openPackForRead");
     await expect(
       repository.revalidatePublishedContent(proof, bytes.byteLength),
     ).resolves.toBeUndefined();
@@ -1163,7 +1696,7 @@ describe("content repository", () => {
     await mkdir(join(layout.blobs, contentId.slice(0, 2)), { recursive: true });
     await writeFile(nativeObjectPath(layout, "blob", contentId), bytes);
 
-    const proof = await withAuthority(layout, (authority) =>
+    const materialized = await withAuthority(layout, (authority) =>
       repository.materializeLooseContent(
         contentId,
         bytes.byteLength,
@@ -1171,6 +1704,7 @@ describe("content repository", () => {
         authority,
       ),
     );
+    expect(materialized.disposition).toBe("published");
     const record = decodeRecord(
       await readFile(nativeLooseRecordPath(layout, "content", contentId)),
       {
@@ -1180,7 +1714,10 @@ describe("content repository", () => {
     );
     expect(record.encoding).toBe("chunked-v1");
     await expect(
-      repository.revalidatePublishedContent(proof, bytes.byteLength),
+      repository.revalidatePublishedContent(
+        materialized.proof,
+        bytes.byteLength,
+      ),
     ).resolves.toBeUndefined();
   });
 

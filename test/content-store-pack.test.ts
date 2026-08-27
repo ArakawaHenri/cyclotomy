@@ -213,19 +213,16 @@ describe("content-store pack", () => {
     expect(handle.indexView()).toEqual(encoded.pack.indexView());
 
     const checksumOffset = encoded.bytes.byteLength - 32 - 8;
-    const firstHashRead = source.reads.findIndex(
-      ({ position }) => position === 0,
-    );
-    expect(firstHashRead).toBeGreaterThanOrEqual(0);
-    let covered = 0;
-    for (const read of source.reads.slice(firstHashRead)) {
-      if (read.position !== covered || covered === checksumOffset) break;
-      expect(read.length).toBeLessThanOrEqual(
-        PACK_AUTHENTICATION_READ_BUFFER_BYTES,
-      );
-      covered += read.length;
-    }
-    expect(covered).toBe(checksumOffset);
+    const authenticatedWholePrefix = source.reads.some((_, start) => {
+      let covered = 0;
+      for (const read of source.reads.slice(start)) {
+        if (read.position !== covered || covered === checksumOffset) break;
+        if (read.length > PACK_AUTHENTICATION_READ_BUFFER_BYTES) return false;
+        covered += read.length;
+      }
+      return covered === checksumOffset;
+    });
+    expect(authenticatedWholePrefix).toBe(true);
     expect(
       Math.max(...source.reads.map(({ length }) => length)),
     ).toBeLessThanOrEqual(PACK_AUTHENTICATION_READ_BUFFER_BYTES);
@@ -402,7 +399,7 @@ describe("content-store pack", () => {
     ).toEqual(decoded);
   });
 
-  it("admits a legal oversized metadata singleton beyond the former 64 MiB ceiling", async () => {
+  it("admits a 65 MiB metadata singleton within the format limit", async () => {
     const decoded = new Uint8Array(65 * 1024 * 1024);
     decoded[0] = 0x43;
     decoded[decoded.byteLength - 1] = 0x59;

@@ -19,6 +19,7 @@ import {
   type NativeObjectLayout,
 } from "../workspace-store.ts";
 import {
+  hasRetainedCleanupFailure,
   primaryFailure,
   retainCleanupFailure,
   withRetainedCleanup,
@@ -45,8 +46,10 @@ import {
   type RecipeId,
 } from "./ids.ts";
 import {
+  buildMultiPackIndexFromViews,
   resolveMultiPackIndexEntry,
   type MultiPackIndex,
+  type MultiPackIndexEntry,
 } from "./multi-pack-index.ts";
 import { PackHandlePool, type PackHandleLease } from "./pack-handle-pool.ts";
 import {
@@ -59,8 +62,9 @@ import {
   DEFAULT_MAX_PACK_CATALOG_BYTES,
   PackCatalog,
   PackCatalogError,
-  type PackCatalogEntry,
   type PackCatalogInventory,
+  type PackCatalogReadEntry,
+  type PackCatalogReadInventory,
   type CatalogPackIdentityReceipt,
 } from "./pack-catalog.ts";
 import {
@@ -97,7 +101,7 @@ export type StructuralRecordKind = "root" | "node" | "scope";
 
 export interface ContentRepositoryOptions {
   readonly maxDecodedBytes: number;
-  /** Bounds the authenticated pack inventory used to rebuild the MIDX hint. */
+  /** Bounds the pack inventory used to rebuild the MIDX hint. */
   readonly maxPackInventoryBytes?: number;
 }
 
@@ -151,6 +155,11 @@ export interface PublishedContent extends VerifiedContentRead {
   readonly contentId: string;
 }
 
+export interface LooseContentMaterialization {
+  readonly disposition: "reused" | "published";
+  readonly proof: PublishedContent;
+}
+
 interface PublishedContentRecord {
   readonly owner: object;
   readonly contentId: string;
@@ -194,6 +203,51 @@ export class ContentRepositoryError extends Error {
     this.name = "ContentRepositoryError";
     this.code = code;
   }
+}
+
+function candidateFailureRank(error: unknown): number {
+  const primary = primaryFailure(error);
+  if (primary instanceof ContentRepositoryError) {
+    switch (primary.code) {
+      case "namespace-invalid":
+        return 5;
+      case "storage-failure":
+        return 4;
+      case "limit-exceeded":
+        return 3;
+      case "object-integrity":
+        return 2;
+      case "missing-object":
+        return 1;
+      case "invalid-input":
+        return 0;
+    }
+  }
+  if (primary instanceof PackCatalogError) {
+    switch (primary.code) {
+      case "namespace-invalid":
+        return 5;
+      case "storage-failure":
+        return 4;
+      case "limit-exceeded":
+        return 3;
+      case "pack-integrity":
+        return 2;
+      case "invalid-input":
+        return 0;
+    }
+  }
+  return 0;
+}
+
+function preferredCandidateFailure(
+  current: unknown,
+  candidate: unknown,
+): unknown {
+  return current === undefined ||
+    candidateFailureRank(candidate) > candidateFailureRank(current)
+    ? candidate
+    : current;
 }
 
 function invalid(message: string, cause?: unknown): never {
@@ -278,6 +332,34 @@ interface PrivateFileRead {
   readonly identity: FileIdentity;
 }
 
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return (
+    left.path === right.path &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
+}
+
+async function readPrivateFileRange(
+  opened: OpenedPrivateFile,
+  buffer: Uint8Array,
+  offset: number,
+  length: number,
+  position: number,
+): Promise<number> {
+  try {
+    return (await opened.handle.read(buffer, offset, length, position))
+      .bytesRead;
+  } catch (error) {
+    storage("could not read object bytes", error);
+  }
+}
+
 async function readPrivateFileWithIdentityIfPresent(
   path: string,
   maximumBytes: number,
@@ -296,18 +378,25 @@ async function readPrivateFileWithIdentityIfPresent(
       const bytes = Buffer.allocUnsafe(opened.observation.size);
       let offset = 0;
       while (offset < bytes.byteLength) {
-        const result = await opened.handle.read(
+        const bytesRead = await readPrivateFileRange(
+          opened,
           bytes,
           offset,
           bytes.byteLength - offset,
           offset,
         );
-        if (result.bytesRead === 0) break;
-        offset += result.bytesRead;
+        if (bytesRead === 0) break;
+        offset += bytesRead;
       }
       const probe = Buffer.allocUnsafe(1);
-      const extra = await opened.handle.read(probe, 0, 1, offset);
-      if (extra.bytesRead !== 0 || offset !== bytes.byteLength) {
+      const extraBytes = await readPrivateFileRange(
+        opened,
+        probe,
+        0,
+        1,
+        offset,
+      );
+      if (extraBytes !== 0 || offset !== bytes.byteLength) {
         integrity("object size changed while it was read");
       }
       await finishPrivateRead(opened);
@@ -333,6 +422,7 @@ async function streamPrivateFileIfPresent(
   path: string,
   maximumBytes: number,
   sink: ContentStreamSink,
+  expectedIdentity?: FileIdentity,
 ): Promise<
   | {
       readonly digest: string;
@@ -346,6 +436,12 @@ async function streamPrivateFileIfPresent(
   if (opened === undefined) return undefined;
   return await withDeterministicCleanup(
     async () => {
+      if (
+        expectedIdentity !== undefined &&
+        !sameFileIdentity(opened.identity, expectedIdentity)
+      ) {
+        integrity("object identity changed before it was streamed");
+      }
       if (opened.observation.size > maximumBytes) {
         throw new ContentRepositoryError(
           "limit-exceeded",
@@ -356,21 +452,27 @@ async function streamPrivateFileIfPresent(
       const buffer = Buffer.allocUnsafe(STREAM_BUFFER_BYTES);
       let offset = 0;
       while (offset < opened.observation.size) {
-        const result = await opened.handle.read(
+        const bytesRead = await readPrivateFileRange(
+          opened,
           buffer,
           0,
           Math.min(buffer.byteLength, opened.observation.size - offset),
           offset,
         );
-        if (result.bytesRead === 0)
-          integrity("object was truncated while streaming");
-        const chunk = Buffer.from(buffer.subarray(0, result.bytesRead));
+        if (bytesRead === 0) integrity("object was truncated while streaming");
+        const chunk = Buffer.from(buffer.subarray(0, bytesRead));
         hash.update(chunk);
-        offset += result.bytesRead;
+        offset += bytesRead;
         await sink(chunk);
       }
-      const probe = await opened.handle.read(buffer, 0, 1, offset);
-      if (probe.bytesRead !== 0) integrity("object grew while streaming");
+      const probeBytes = await readPrivateFileRange(
+        opened,
+        buffer,
+        0,
+        1,
+        offset,
+      );
+      if (probeBytes !== 0) integrity("object grew while streaming");
       await finishPrivateRead(opened);
       return {
         digest: hash.digest("hex"),
@@ -585,6 +687,22 @@ class ClosureAccumulator {
     );
   }
 
+  merge(other: ClosureAccumulator): void {
+    for (const [key, location] of other.#objects) {
+      const previous = this.#objects.get(key);
+      if (previous?.retention !== "logical") {
+        this.#objects.set(key, location);
+      }
+    }
+    for (const [key, identity] of other.#identities) {
+      this.#identities.set(key, identity);
+    }
+  }
+
+  identities(): readonly VerifiedDependencyIdentity[] {
+    return [...this.#identities.values()];
+  }
+
   finish(): VerifiedContentClosure {
     const closure = Object.freeze({
       objects: Object.freeze([...this.#objects.values()]),
@@ -604,6 +722,14 @@ interface ResolvedLooseRecord {
   readonly identity: FileIdentity;
 }
 
+interface ResolvedLegacyRecord {
+  readonly source: "legacy-blob";
+  readonly path: string;
+  readonly logicalId: ContentId;
+  readonly byteLength: number;
+  readonly identity: FileIdentity;
+}
+
 interface ResolvedPackRecord {
   readonly source: "pack";
   readonly pack: CatalogPackHandle;
@@ -615,10 +741,19 @@ interface ResolvedPackRecord {
   readonly release: () => Promise<void>;
 }
 
+type RecordCandidate =
+  ResolvedLegacyRecord | ResolvedLooseRecord | ResolvedPackRecord;
+type EncodedRecordCandidate = Exclude<RecordCandidate, ResolvedLegacyRecord>;
+
+interface AuthenticatedContentPlan {
+  readonly decodedLength: number;
+  replay(sink: ContentStreamSink): Promise<void>;
+}
+
 interface LoadedPackInventory {
-  readonly inventory: PackCatalogInventory;
+  readonly inventory: PackCatalogInventory | PackCatalogReadInventory;
   readonly index: MultiPackIndex;
-  readonly entriesByPackId: ReadonlyMap<string, PackCatalogEntry>;
+  readonly entriesByPackId: ReadonlyMap<string, PackCatalogReadEntry>;
 }
 
 interface ResolutionContext {
@@ -632,7 +767,7 @@ declare const CONTENT_REPOSITORY_RESOLUTION_SCOPE: unique symbol;
 
 /**
  * Opaque lifetime token for one repository operation. Resolution hints and at
- * most two authenticated pack handles may be shared only while this token is
+ * most two pack handles may be shared only while this token is
  * open; callers cannot inspect or manufacture its cache state.
  */
 export interface ContentRepositoryResolutionScope {
@@ -778,18 +913,35 @@ export class ContentRepository {
           context,
         );
       } catch (error) {
-        if (
-          !(error instanceof ContentRepositoryError) ||
-          error.code !== "missing-object"
-        ) {
-          throw error;
-        }
+        if (!this.#isOptionalReuseFailure(error)) throw error;
       }
       if (existing !== undefined) {
         if (options.authenticateSource === true) {
           await this.#verifySource(expectedId, decodedLength, source);
         }
         return existing;
+      }
+
+      // A damaged pack or legacy copy can be replaced additively. The loose
+      // pathname is the publication target itself and must remain immutable.
+      try {
+        const loose = await this.#authenticateContentRepresentation(
+          expectedId,
+          decodedLength,
+          "loose",
+          context,
+        );
+        if (options.authenticateSource === true) {
+          await this.#verifySource(expectedId, decodedLength, source);
+        }
+        return loose;
+      } catch (error) {
+        if (
+          !(error instanceof ContentRepositoryError) ||
+          error.code !== "missing-object"
+        ) {
+          throw error;
+        }
       }
 
       await this.#publishNewLooseRepresentation(
@@ -818,7 +970,7 @@ export class ContentRepository {
     source: ContentStreamSource,
     authority: WorkspaceWriteAuthority,
     scope?: ContentRepositoryResolutionScope,
-  ): Promise<PublishedContent> {
+  ): Promise<LooseContentMaterialization> {
     assertOid(contentId, "content id");
     assertLimit(decodedLength, "decoded content length");
     if (decodedLength > this.#options.maxDecodedBytes) {
@@ -847,7 +999,7 @@ export class ContentRepository {
       }
       if (existing !== undefined) {
         await this.#verifySource(expectedId, decodedLength, source);
-        return existing;
+        return Object.freeze({ disposition: "reused", proof: existing });
       }
       await this.#publishNewLooseRepresentation(
         expectedId,
@@ -856,12 +1008,13 @@ export class ContentRepository {
         context,
         authority,
       );
-      return await this.#authenticateContentRepresentation(
+      const proof = await this.#authenticateContentRepresentation(
         expectedId,
         decodedLength,
         "loose",
         context,
       );
+      return Object.freeze({ disposition: "published", proof });
     });
   }
 
@@ -907,47 +1060,62 @@ export class ContentRepository {
     maximumBytes: number,
     context: ResolutionContext,
   ): Promise<Uint8Array> {
-    const raw = await readPrivateFileIfPresent(
-      nativeObjectPath(this.#layout, "tree", oid),
-      maximumBytes,
-    );
-    if (raw !== undefined) {
-      if (contentIdFromBytes(raw) !== oid) {
-        integrity("structural object does not match its id");
-      }
-      return raw;
-    }
-    const recordKind = this.#structuralRecordKind(kind);
-    const resolved = await this.#resolvePackedRecord(
-      recordKind,
-      parseMetadataId(oid),
-      context,
-    );
-    if (resolved === undefined) {
-      throw new ContentRepositoryError(
-        "missing-object",
-        "structural object does not exist",
+    let firstFailure: unknown;
+    try {
+      const raw = await readPrivateFileIfPresent(
+        nativeObjectPath(this.#layout, "tree", oid),
+        maximumBytes,
       );
+      if (raw !== undefined) {
+        if (contentIdFromBytes(raw) !== oid) {
+          integrity("structural object does not match its id");
+        }
+        return raw;
+      }
+    } catch (error) {
+      if (!this.#isCandidateFailure(error)) throw error;
+      firstFailure = preferredCandidateFailure(firstFailure, error);
     }
-    return await withDeterministicCleanup(
-      async () => {
-        if (resolved.envelope.decodedLength > maximumBytes) {
-          throw new ContentRepositoryError(
-            "limit-exceeded",
-            "structural object exceeds its read limit",
-          );
-        }
-        try {
-          return await resolved.pack.readVerified(resolved.entry, {
-            verifyMetadataId: (_candidateKind, logicalId, decoded) =>
-              logicalId === oid && contentIdFromBytes(decoded) === oid,
-          });
-        } catch (error) {
-          integrity("packed structural object failed authentication", error);
-        }
-      },
-      resolved.release,
-      "structural-object read and pack release both failed",
+
+    const recordKind = this.#structuralRecordKind(kind);
+    try {
+      const packed = await this.#findAuthenticatedPackedRecord(
+        recordKind,
+        parseMetadataId(oid),
+        context,
+        async (candidate) => {
+          if (candidate.envelope.decodedLength > maximumBytes) {
+            throw new ContentRepositoryError(
+              "limit-exceeded",
+              "structural object exceeds its read limit",
+            );
+          }
+          if (
+            candidate.envelope.kind !== recordKind ||
+            candidate.envelope.logicalId !== oid
+          ) {
+            integrity("packed structural object has the wrong identity");
+          }
+          try {
+            return await candidate.pack.readVerified(candidate.entry, {
+              verifyMetadataId: (_candidateKind, logicalId, decoded) =>
+                logicalId === oid && contentIdFromBytes(decoded) === oid,
+            });
+          } catch (error) {
+            integrity("packed structural object failed authentication", error);
+          }
+        },
+      );
+      if (packed !== undefined) return packed;
+    } catch (error) {
+      if (!this.#isCandidateFailure(error)) throw error;
+      firstFailure = preferredCandidateFailure(firstFailure, error);
+    }
+
+    if (firstFailure !== undefined) throw firstFailure;
+    throw new ContentRepositoryError(
+      "missing-object",
+      "structural object does not exist",
     );
   }
 
@@ -974,12 +1142,7 @@ export class ContentRepository {
         }
         return;
       } catch (error) {
-        if (
-          !(error instanceof ContentRepositoryError) ||
-          error.code !== "missing-object"
-        ) {
-          throw error;
-        }
+        if (!this.#isOptionalReuseFailure(error)) throw error;
       }
       await this.#publishLooseStructuralObject(oid, bytes);
     });
@@ -1039,22 +1202,24 @@ export class ContentRepository {
     context: ResolutionContext,
   ): Promise<PublishedContent> {
     const closure = new ClosureAccumulator();
-    const observed = await this.#streamContent(
+    const plan = await this.#authenticateContentPlan(
       contentId,
       decodedLength,
-      async () => undefined,
       closure,
       context,
       true,
       rootSource,
     );
-    if (observed !== decodedLength) {
+    if (!(await this.#identitiesStillMatch(closure.identities()))) {
+      integrity("content representation changed during authentication");
+    }
+    if (plan.decodedLength !== decodedLength) {
       integrity("content has an unexpected decoded length");
     }
     return await this.#sealPublishedContent(
       Object.freeze({
         contentId,
-        decodedLength: observed,
+        decodedLength: plan.decodedLength,
         closure: closure.finish(),
       }),
     );
@@ -1143,7 +1308,12 @@ export class ContentRepository {
       plan.rootId,
       { contentId: expectedId, decodedLength },
       (recipeId) =>
-        this.#readRecipe(recipeId, context, new ClosureAccumulator(), "loose"),
+        this.#authenticateRecipe(
+          recipeId,
+          context,
+          new ClosureAccumulator(),
+          "loose",
+        ),
       this.#recipeLimits(decodedLength),
     );
     if (
@@ -1265,218 +1435,451 @@ export class ContentRepository {
     allowChunked: boolean,
     rootSource: "any" | "loose" = "any",
   ): Promise<number> {
+    const plan = await this.#authenticateContentPlan(
+      contentId,
+      maximumBytes,
+      closure,
+      context,
+      allowChunked,
+      rootSource,
+    );
+    const identities = closure.identities();
+    if (!(await this.#identitiesStillMatch(identities))) {
+      integrity("content representation changed before replay");
+    }
+    await plan.replay(sink);
+    if (!(await this.#identitiesStillMatch(identities))) {
+      integrity("content representation changed during replay");
+    }
+    return plan.decodedLength;
+  }
+
+  async #authenticateContentPlan(
+    contentId: ContentId,
+    maximumBytes: number,
+    closure: ClosureAccumulator,
+    context: ResolutionContext,
+    allowChunked: boolean,
+    rootSource: "any" | "loose",
+  ): Promise<AuthenticatedContentPlan> {
+    let firstFailure: unknown;
+
     if (rootSource === "any") {
       const legacyPath = nativeObjectPath(this.#layout, "blob", contentId);
-      const legacy = await streamPrivateFileIfPresent(
-        legacyPath,
-        maximumBytes,
-        sink,
-      );
-      if (legacy !== undefined) {
-        if (legacy.digest !== contentId) {
-          integrity("legacy blob bytes do not match their content id");
-        }
-        closure.add(
-          {
-            source: "legacy-blob",
-            kind: "content",
-            logicalId: contentId,
-            encoding: "raw",
-            retention: "logical",
-          },
-          legacy.identity,
+      try {
+        const legacy = await streamPrivateFileIfPresent(
+          legacyPath,
+          maximumBytes,
+          async () => undefined,
         );
-        return legacy.byteLength;
+        if (legacy !== undefined) {
+          if (legacy.digest !== contentId) {
+            integrity("legacy blob bytes do not match their content id");
+          }
+          const candidate: RecordCandidate = Object.freeze({
+            source: "legacy-blob",
+            path: legacyPath,
+            logicalId: contentId,
+            byteLength: legacy.byteLength,
+            identity: legacy.identity,
+          });
+          const candidateClosure = new ClosureAccumulator();
+          candidateClosure.add(
+            {
+              source: "legacy-blob",
+              kind: "content",
+              logicalId: candidate.logicalId,
+              encoding: "raw",
+              retention: "logical",
+            },
+            candidate.identity,
+          );
+          closure.merge(candidateClosure);
+          return this.#legacyContentPlan(candidate, maximumBytes);
+        }
+      } catch (error) {
+        if (!this.#isCandidateFailure(error)) throw error;
+        firstFailure = preferredCandidateFailure(firstFailure, error);
       }
     }
 
-    const loose = await this.#readLooseRecord("content", contentId);
-    const resolved =
-      loose ??
-      (rootSource === "any"
-        ? await this.#resolvePackedRecord("content", contentId, context)
-        : undefined);
-    if (resolved === undefined) {
-      throw new ContentRepositoryError(
-        "missing-object",
-        `content ${contentId} does not exist`,
-      );
-    }
-    const release =
-      resolved.source === "pack"
-        ? resolved.release
-        : async (): Promise<void> => undefined;
-    return await withDeterministicCleanup(
-      async () => {
-        if (resolved.envelope.decodedLength > maximumBytes) {
-          throw new ContentRepositoryError(
-            "limit-exceeded",
-            `content exceeds the ${maximumBytes}-byte read limit`,
-          );
-        }
-        closure.add(
-          resolved.location,
-          resolved.identity,
-          resolved.source === "pack" ? resolved.identityReceipt : undefined,
+    try {
+      const loose = await this.#readLooseRecord("content", contentId);
+      if (loose !== undefined) {
+        const candidateClosure = new ClosureAccumulator();
+        const plan = await this.#authenticateRecordCandidate(
+          loose,
+          contentId,
+          maximumBytes,
+          candidateClosure,
+          context,
+          allowChunked,
+          rootSource,
         );
+        closure.merge(candidateClosure);
+        return plan;
+      }
+    } catch (error) {
+      if (!this.#isCandidateFailure(error)) throw error;
+      firstFailure = preferredCandidateFailure(firstFailure, error);
+    }
 
-        const record = resolved.envelope;
-        if (record.kind !== "content") {
-          integrity("resolved content has the wrong record kind");
-        }
-        if (record.encoding === "raw" || record.encoding === "zstd-v1") {
-          let decoded: Uint8Array;
-          try {
-            decoded =
-              resolved.source === "pack"
-                ? await resolved.pack.readVerified(resolved.entry)
-                : await authenticateFullRecordPayload(
-                    record as SelfAuthenticatingRecord,
-                  );
-          } catch (error) {
-            integrity("content record failed authentication", error);
-          }
-          await release();
-          await sink(decoded);
-          return decoded.byteLength;
-        }
-        if (record.encoding === "delta1") {
-          if (resolved.source !== "pack") {
-            integrity("delta1 is only valid inside an authenticated pack");
-          }
-          // A delta remains a terminal leaf: pack authentication requires its
-          // earlier base to be full, so this cannot introduce a delta chain or
-          // recurse into another chunk recipe.
-          let decoded: Uint8Array;
-          try {
-            const program = decodeDelta1Program(
-              record.payload,
-              record.decodedLength,
+    if (rootSource === "any") {
+      try {
+        const packed = await this.#findAuthenticatedPackedRecord(
+          "content",
+          contentId,
+          context,
+          async (candidate) => {
+            const candidateClosure = new ClosureAccumulator();
+            const plan = await this.#authenticateRecordCandidate(
+              candidate,
+              contentId,
+              maximumBytes,
+              candidateClosure,
+              context,
+              allowChunked,
+              rootSource,
             );
-            const baseEntry = resolved.pack.entryForPhysicalOrdinal(
-              resolved.entry.physicalOrdinal - program.baseBackDistance,
-            );
-            if (baseEntry === undefined)
-              integrity("delta1 base is unavailable");
-            closure.add(
-              this.#packLocation(resolved.pack, baseEntry, "pack-local"),
-              resolved.identity,
-              resolved.identityReceipt,
-            );
-            decoded = await resolved.pack.readVerified(resolved.entry);
-          } catch (error) {
-            integrity("delta1 record failed authentication", error);
-          }
-          await release();
-          await sink(decoded);
-          return decoded.byteLength;
+            return { plan, closure: candidateClosure };
+          },
+        );
+        if (packed !== undefined) {
+          closure.merge(packed.closure);
+          return packed.plan;
         }
-        if (!allowChunked) {
-          integrity("a chunk recipe referenced another chunked representation");
-        }
+      } catch (error) {
+        if (!this.#isCandidateFailure(error)) throw error;
+        firstFailure = preferredCandidateFailure(firstFailure, error);
+      }
+    }
 
-        const rootId = chunkedContentRecipeId(record as ChunkedContentRecord);
-        // The envelope is authenticated framing. Release its pack before the
-        // recipe graph recursively acquires other packs; two chunked roots can
-        // otherwise consume both permits while each waits for a dependency.
-        await release();
-        let graph: Awaited<ReturnType<typeof authenticateChunkRecipeGraph>>;
-        try {
-          graph = await authenticateChunkRecipeGraph(
-            rootId,
-            { contentId, decodedLength: record.decodedLength },
-            (recipeId) =>
-              this.#readRecipe(recipeId, context, closure, rootSource),
-            this.#recipeLimits(maximumBytes),
-          );
-        } catch (error) {
-          integrity("chunk recipe failed authentication", error);
-        }
-        const hash = createHash("sha256");
-        let decodedLength = 0;
-        for (const chunk of graph.chunks) {
-          const observed = await this.#streamContent(
-            chunk.contentId,
-            chunk.decodedLength,
-            async (bytes) => {
-              hash.update(bytes);
-              decodedLength += bytes.byteLength;
-              if (decodedLength > record.decodedLength) {
-                integrity("chunk recipe emitted too many bytes");
-              }
-              await sink(bytes);
-            },
-            closure,
-            context,
-            false,
-            rootSource,
-          );
-          if (observed !== chunk.decodedLength) {
-            integrity(
-              "chunk decoded length does not match its recipe reference",
-            );
-          }
-        }
-        if (
-          decodedLength !== record.decodedLength ||
-          hash.digest("hex") !== contentId
-        ) {
-          integrity("reconstructed chunks do not match the logical content");
-        }
-        return decodedLength;
-      },
-      release,
-      "content reconstruction and pack release both failed",
+    if (firstFailure !== undefined) throw firstFailure;
+    throw new ContentRepositoryError(
+      "missing-object",
+      `content ${contentId} does not exist`,
     );
   }
 
-  async #readRecipe(
+  #legacyContentPlan(
+    candidate: ResolvedLegacyRecord,
+    maximumBytes: number,
+  ): AuthenticatedContentPlan {
+    return Object.freeze({
+      decodedLength: candidate.byteLength,
+      replay: async (sink: ContentStreamSink): Promise<void> => {
+        const replayed = await streamPrivateFileIfPresent(
+          candidate.path,
+          maximumBytes,
+          sink,
+          candidate.identity,
+        );
+        if (
+          replayed === undefined ||
+          replayed.byteLength !== candidate.byteLength ||
+          replayed.digest !== candidate.logicalId
+        ) {
+          integrity("legacy blob changed before it was replayed");
+        }
+      },
+    });
+  }
+
+  async #authenticateRecordCandidate(
+    candidate: EncodedRecordCandidate,
+    contentId: ContentId,
+    maximumBytes: number,
+    closure: ClosureAccumulator,
+    context: ResolutionContext,
+    allowChunked: boolean,
+    rootSource: "any" | "loose",
+  ): Promise<AuthenticatedContentPlan> {
+    const record = candidate.envelope;
+    if (record.decodedLength > maximumBytes) {
+      throw new ContentRepositoryError(
+        "limit-exceeded",
+        `content exceeds the ${maximumBytes}-byte read limit`,
+      );
+    }
+    if (record.kind !== "content" || record.logicalId !== contentId) {
+      integrity("resolved content has the wrong namespace identity");
+    }
+
+    if (record.encoding === "raw" || record.encoding === "zstd-v1") {
+      let decoded: Uint8Array;
+      try {
+        decoded =
+          candidate.source === "pack"
+            ? await candidate.pack.readVerified(candidate.entry)
+            : await authenticateFullRecordPayload(
+                record as SelfAuthenticatingRecord,
+              );
+      } catch (error) {
+        integrity("content record failed authentication", error);
+      }
+      closure.add(
+        candidate.location,
+        candidate.identity,
+        candidate.source === "pack" ? candidate.identityReceipt : undefined,
+      );
+      return this.#fullContentPlan(candidate, decoded, context);
+    }
+
+    if (record.encoding === "delta1") {
+      if (candidate.source !== "pack") {
+        integrity("delta1 is only valid inside a pack");
+      }
+      let decoded: Uint8Array;
+      try {
+        const program = decodeDelta1Program(
+          record.payload,
+          record.decodedLength,
+        );
+        const baseEntry = candidate.pack.entryForPhysicalOrdinal(
+          candidate.entry.physicalOrdinal - program.baseBackDistance,
+        );
+        if (baseEntry === undefined) integrity("delta1 base is unavailable");
+        closure.add(
+          this.#packLocation(candidate.pack, baseEntry, "pack-local"),
+          candidate.identity,
+          candidate.identityReceipt,
+        );
+        decoded = await candidate.pack.readVerified(candidate.entry);
+      } catch (error) {
+        integrity("delta1 record failed authentication", error);
+      }
+      closure.add(
+        candidate.location,
+        candidate.identity,
+        candidate.identityReceipt,
+      );
+      return this.#fullContentPlan(candidate, decoded, context);
+    }
+
+    if (!allowChunked) {
+      integrity("a chunk recipe referenced another chunked representation");
+    }
+
+    const rootId = chunkedContentRecipeId(record as ChunkedContentRecord);
+    if (candidate.source === "pack") await candidate.release();
+    const graph = await authenticateChunkRecipeGraph(
+      rootId,
+      { contentId, decodedLength: record.decodedLength },
+      (recipeId) =>
+        this.#authenticateRecipe(recipeId, context, closure, rootSource),
+      this.#recipeLimits(maximumBytes),
+    ).catch((error: unknown) => {
+      integrity("chunk recipe failed authentication", error);
+    });
+
+    const chunks: AuthenticatedContentPlan[] = [];
+    const hash = createHash("sha256");
+    let decodedLength = 0;
+    for (const chunk of graph.chunks) {
+      const plan = await this.#authenticateContentPlan(
+        chunk.contentId,
+        chunk.decodedLength,
+        closure,
+        context,
+        false,
+        rootSource,
+      );
+      if (plan.decodedLength !== chunk.decodedLength) {
+        integrity("chunk decoded length does not match its recipe reference");
+      }
+      await plan.replay(async (bytes) => {
+        hash.update(bytes);
+        decodedLength += bytes.byteLength;
+        if (decodedLength > record.decodedLength) {
+          integrity("chunk recipe emitted too many bytes");
+        }
+      });
+      chunks.push(plan);
+    }
+    if (
+      decodedLength !== record.decodedLength ||
+      hash.digest("hex") !== contentId
+    ) {
+      integrity("reconstructed chunks do not match the logical content");
+    }
+    closure.add(
+      candidate.location,
+      candidate.identity,
+      candidate.source === "pack" ? candidate.identityReceipt : undefined,
+    );
+    return Object.freeze({
+      decodedLength,
+      replay: async (sink: ContentStreamSink): Promise<void> => {
+        for (const chunk of chunks) await chunk.replay(sink);
+      },
+    });
+  }
+
+  #fullContentPlan(
+    candidate: EncodedRecordCandidate,
+    authenticatedBytes: Uint8Array,
+    context: ResolutionContext,
+  ): AuthenticatedContentPlan {
+    let cached: Uint8Array | undefined = authenticatedBytes;
+    return Object.freeze({
+      decodedLength: authenticatedBytes.byteLength,
+      replay: async (sink: ContentStreamSink): Promise<void> => {
+        const bytes = cached;
+        cached = undefined;
+        if (bytes !== undefined) {
+          await sink(bytes);
+          return;
+        }
+        const replayed = await this.#readExactFullCandidate(candidate, context);
+        await sink(replayed);
+      },
+    });
+  }
+
+  async #readExactFullCandidate(
+    candidate: EncodedRecordCandidate,
+    context: ResolutionContext,
+  ): Promise<Uint8Array> {
+    if (candidate.source === "loose") {
+      const current = await this.#readLooseRecord(
+        candidate.envelope.kind as NativeLooseRecordKind,
+        candidate.envelope.logicalId as ContentId | RecipeId,
+      );
+      if (
+        current === undefined ||
+        !sameFileIdentity(current.identity, candidate.identity) ||
+        current.envelope.kind !== "content" ||
+        current.envelope.logicalId !== candidate.envelope.logicalId ||
+        (current.envelope.encoding !== "raw" &&
+          current.envelope.encoding !== "zstd-v1")
+      ) {
+        integrity("loose content representation changed before replay");
+      }
+      try {
+        return await authenticateFullRecordPayload(
+          current.envelope as SelfAuthenticatingRecord,
+        );
+      } catch (error) {
+        integrity("loose content representation failed replay", error);
+      }
+    }
+
+    const acquired = await this.#acquireContextPack(
+      candidate.pack.packId,
+      context,
+      candidate.identity,
+    );
+    if (acquired.kind !== "acquired") {
+      integrity("packed content representation changed before replay");
+    }
+    return await withDeterministicCleanup(
+      async () => {
+        const entry = acquired.lease.handle.entryForPhysicalOrdinal(
+          candidate.entry.physicalOrdinal,
+        );
+        if (
+          entry === undefined ||
+          !this.#samePackEntry(entry, candidate.entry)
+        ) {
+          integrity("packed content entry changed before replay");
+        }
+        try {
+          return await acquired.lease.handle.readVerified(entry);
+        } catch (error) {
+          integrity("packed content representation failed replay", error);
+        }
+      },
+      acquired.lease.release,
+      "packed content replay and lease release both failed",
+    );
+  }
+
+  async #authenticateRecipe(
     recipeId: RecipeId,
     context: ResolutionContext,
     closure: ClosureAccumulator,
     rootSource: "any" | "loose" = "any",
   ): Promise<Uint8Array> {
-    const loose = await this.#readLooseRecord("recipe", recipeId);
-    const resolved =
-      loose ??
-      (rootSource === "any"
-        ? await this.#resolvePackedRecord("recipe", recipeId, context)
-        : undefined);
-    if (resolved === undefined) {
-      throw new ContentRepositoryError(
-        "missing-object",
-        `recipe ${recipeId} does not exist`,
-      );
-    }
-    return await withDeterministicCleanup(
-      async () => {
-        closure.add(
-          resolved.location,
-          resolved.identity,
-          resolved.source === "pack" ? resolved.identityReceipt : undefined,
+    let firstFailure: unknown;
+    try {
+      const loose = await this.#readLooseRecord("recipe", recipeId);
+      if (loose !== undefined) {
+        const candidateClosure = new ClosureAccumulator();
+        const bytes = await this.#authenticateRecipeCandidate(
+          loose,
+          recipeId,
+          candidateClosure,
         );
-        if (
-          resolved.envelope.kind !== "recipe" ||
-          (resolved.envelope.encoding !== "raw" &&
-            resolved.envelope.encoding !== "zstd-v1")
-        ) {
-          integrity("recipe does not have a full representation");
+        closure.merge(candidateClosure);
+        return bytes;
+      }
+    } catch (error) {
+      if (!this.#isCandidateFailure(error)) throw error;
+      firstFailure = preferredCandidateFailure(firstFailure, error);
+    }
+
+    if (rootSource === "any") {
+      try {
+        const packed = await this.#findAuthenticatedPackedRecord(
+          "recipe",
+          recipeId,
+          context,
+          async (candidate) => {
+            const candidateClosure = new ClosureAccumulator();
+            const bytes = await this.#authenticateRecipeCandidate(
+              candidate,
+              recipeId,
+              candidateClosure,
+            );
+            return { bytes, closure: candidateClosure };
+          },
+        );
+        if (packed !== undefined) {
+          closure.merge(packed.closure);
+          return packed.bytes;
         }
-        try {
-          return resolved.source === "pack"
-            ? await resolved.pack.readVerified(resolved.entry)
-            : await authenticateFullRecordPayload(
-                resolved.envelope as SelfAuthenticatingRecord,
-              );
-        } catch (error) {
-          integrity("recipe record failed authentication", error);
-        }
-      },
-      resolved.source === "pack"
-        ? resolved.release
-        : async (): Promise<void> => undefined,
-      "recipe authentication and pack release both failed",
+      } catch (error) {
+        if (!this.#isCandidateFailure(error)) throw error;
+        firstFailure = preferredCandidateFailure(firstFailure, error);
+      }
+    }
+    if (firstFailure !== undefined) throw firstFailure;
+    throw new ContentRepositoryError(
+      "missing-object",
+      `recipe ${recipeId} does not exist`,
     );
+  }
+
+  async #authenticateRecipeCandidate(
+    candidate: EncodedRecordCandidate,
+    recipeId: RecipeId,
+    closure: ClosureAccumulator,
+  ): Promise<Uint8Array> {
+    if (
+      candidate.envelope.kind !== "recipe" ||
+      candidate.envelope.logicalId !== recipeId ||
+      (candidate.envelope.encoding !== "raw" &&
+        candidate.envelope.encoding !== "zstd-v1")
+    ) {
+      integrity("recipe does not have a full representation");
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes =
+        candidate.source === "pack"
+          ? await candidate.pack.readVerified(candidate.entry)
+          : await authenticateFullRecordPayload(
+              candidate.envelope as SelfAuthenticatingRecord,
+            );
+    } catch (error) {
+      integrity("recipe record failed authentication", error);
+    }
+    closure.add(
+      candidate.location,
+      candidate.identity,
+      candidate.source === "pack" ? candidate.identityReceipt : undefined,
+    );
+    return bytes;
   }
 
   async #readLooseRecord(
@@ -1484,12 +1887,23 @@ export class ContentRepository {
     logicalId: ContentId | RecipeId,
   ): Promise<ResolvedLooseRecord | undefined> {
     const path = nativeLooseRecordPath(this.#layout, kind, logicalId);
-    const read = await readPrivateFileWithIdentityIfPresent(
-      path,
-      kind === "content"
-        ? MAX_LOOSE_CONTENT_RECORD_BYTES
-        : MAX_LOOSE_RECIPE_RECORD_BYTES,
-    );
+    let read: PrivateFileRead | undefined;
+    try {
+      read = await readPrivateFileWithIdentityIfPresent(
+        path,
+        kind === "content"
+          ? MAX_LOOSE_CONTENT_RECORD_BYTES
+          : MAX_LOOSE_RECIPE_RECORD_BYTES,
+      );
+    } catch (error) {
+      if (
+        error instanceof ContentRepositoryError &&
+        error.code === "limit-exceeded"
+      ) {
+        integrity("loose record exceeds its representation limit", error);
+      }
+      throw error;
+    }
     if (read === undefined) return undefined;
     let envelope: RecordEnvelope;
     try {
@@ -1529,7 +1943,7 @@ export class ContentRepository {
           chunkedContentRecipeId(envelope as ChunkedContentRecord);
         }
         if (envelope.encoding === "delta1") {
-          integrity("loose delta1 record has no authenticated pack-local base");
+          integrity("loose delta1 record has no pack-local base");
         }
       } else {
         if (
@@ -1558,58 +1972,66 @@ export class ContentRepository {
     };
   }
 
-  async #resolvePackedRecord(
+  async #findAuthenticatedPackedRecord<T>(
     kind: RecordKind,
     logicalId: LogicalId,
     context: ResolutionContext,
-  ): Promise<ResolvedPackRecord | undefined> {
+    authenticate: (candidate: ResolvedPackRecord) => Promise<T>,
+  ): Promise<T | undefined> {
+    const seen = new Set<string>();
     try {
-      if (context.packInventory !== undefined) {
-        return await this.#resolveFromPackInventory(kind, logicalId, context);
-      }
-      context.packHint ??= this.#readPackHint();
-      const hint = await context.packHint;
-      if (hint !== undefined) {
-        const candidate = hint.lookup({ kind, logicalId })[0];
-        if (candidate !== undefined) {
-          const acquired = await this.#acquireContextPack(
-            candidate.packId,
+      if (context.packInventory === undefined) {
+        context.packHint ??= this.#readPackHint();
+        const hint = await context.packHint;
+        if (hint !== undefined) {
+          const hinted = await this.#tryPackCandidates(
+            hint,
+            hint.lookup({ kind, logicalId }),
             context,
+            seen,
+            authenticate,
+            undefined,
           );
-          if (acquired.kind === "acquired") {
-            let handedOff = false;
-            try {
-              const { handle } = acquired.lease;
-              const location = resolveMultiPackIndexEntry(
-                hint,
-                candidate,
-                new Map([[handle.packId, handle]]),
-              );
-              if (location.kind === "hit") {
-                handedOff = true;
-                try {
-                  return await this.#resolvedPackRecord(
-                    acquired.lease,
-                    location.packEntry,
-                  );
-                } catch (error) {
-                  if (
-                    !(error instanceof PackCatalogError) ||
-                    error.code !== "namespace-invalid"
-                  ) {
-                    throw error;
-                  }
-                  handedOff = false;
-                  await context.packPool?.invalidate(candidate.packId);
-                }
-              }
-            } finally {
-              if (!handedOff) await acquired.lease.release();
-            }
-          }
+          if (hinted !== undefined) return hinted;
         }
       }
-      return await this.#resolveFromPackInventory(kind, logicalId, context);
+
+      context.packInventory ??= this.#loadPackInventory();
+      const routing = await context.packInventory;
+      const routed = await this.#tryPackCandidates(
+        routing.index,
+        routing.index.lookup({ kind, logicalId }),
+        context,
+        seen,
+        authenticate,
+        routing.entriesByPackId,
+      );
+      if (routed !== undefined) return routed;
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const inventory = await this.#loadAuthenticatedPackInventory();
+        let authoritativeFailure: unknown;
+        const authenticated = await this.#tryPackCandidates(
+          inventory.index,
+          inventory.index.lookup({ kind, logicalId }),
+          context,
+          new Set(),
+          authenticate,
+          inventory.entriesByPackId,
+          (error) => {
+            authoritativeFailure = preferredCandidateFailure(
+              authoritativeFailure,
+              error,
+            );
+          },
+        );
+        if (authenticated !== undefined) return authenticated;
+        if (await this.#catalog.inventoryStillCurrent(inventory.inventory)) {
+          if (authoritativeFailure !== undefined) throw authoritativeFailure;
+          return undefined;
+        }
+      }
+      integrity("pack namespace did not stabilize while resolving an object");
     } catch (error) {
       this.#rethrowCatalogError(error);
     }
@@ -1662,9 +2084,10 @@ export class ContentRepository {
     return read.kind === "hint" ? read.index : undefined;
   }
 
-  async #loadPackInventory(): Promise<LoadedPackInventory> {
-    const inventory = await this.#catalog.inventory();
-    const index = this.#catalog.rebuildMultiPackIndex(inventory).index;
+  #indexPackInventory(
+    inventory: PackCatalogInventory | PackCatalogReadInventory,
+  ): LoadedPackInventory {
+    const index = buildMultiPackIndexFromViews(inventory.views).index;
     return {
       inventory,
       index,
@@ -1674,32 +2097,44 @@ export class ContentRepository {
     };
   }
 
-  async #resolveFromPackInventory(
-    kind: RecordKind,
-    logicalId: LogicalId,
+  async #loadPackInventory(): Promise<LoadedPackInventory> {
+    return this.#indexPackInventory(await this.#catalog.readInventory());
+  }
+
+  async #loadAuthenticatedPackInventory(): Promise<LoadedPackInventory> {
+    return this.#indexPackInventory(await this.#catalog.inventory());
+  }
+
+  async #tryPackCandidates<T>(
+    index: MultiPackIndex,
+    candidates: readonly MultiPackIndexEntry[],
     context: ResolutionContext,
-  ): Promise<ResolvedPackRecord | undefined> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      if (attempt > 0 || context.packInventory === undefined) {
-        context.packInventory = this.#loadPackInventory();
+    seen: Set<string>,
+    authenticate: (candidate: ResolvedPackRecord) => Promise<T>,
+    entriesByPackId?: ReadonlyMap<string, PackCatalogReadEntry>,
+    recordFailure?: (error: unknown) => void,
+  ): Promise<T | undefined> {
+    for (const candidate of candidates) {
+      const candidateKey = `${candidate.packId}:${candidate.physicalOrdinal}`;
+      if (seen.has(candidateKey)) continue;
+      seen.add(candidateKey);
+      const expected = entriesByPackId?.get(candidate.packId);
+      if (entriesByPackId !== undefined && expected === undefined) {
+        integrity("pack index refers to an absent inventory entry");
       }
-      const state = await context.packInventory;
-      const candidate = state.index.lookup({ kind, logicalId })[0];
-      if (candidate === undefined) {
-        if (await this.#catalog.inventoryStillCurrent(state.inventory)) {
-          return undefined;
-        }
+      let acquired;
+      try {
+        acquired = await this.#acquireContextPack(
+          candidate.packId,
+          context,
+          expected?.identity,
+        );
+      } catch (error) {
+        if (!this.#isPackCandidateFailure(error)) throw error;
+        recordFailure?.(error);
+        await context.packPool?.invalidate(candidate.packId);
         continue;
       }
-      const entry = state.entriesByPackId.get(candidate.packId);
-      if (entry === undefined) {
-        integrity("rebuilt pack index refers to an absent inventory entry");
-      }
-      const acquired = await this.#acquireContextPack(
-        candidate.packId,
-        context,
-        entry,
-      );
       if (acquired.kind !== "acquired") {
         await context.packPool?.invalidate(candidate.packId);
         continue;
@@ -1708,49 +2143,93 @@ export class ContentRepository {
       try {
         const { handle } = acquired.lease;
         const location = resolveMultiPackIndexEntry(
-          state.index,
+          index,
           candidate,
           new Map([[handle.packId, handle]]),
         );
         if (location.kind === "stale") {
-          await acquired.lease.release();
           await context.packPool?.invalidate(candidate.packId);
           continue;
         }
         handedOff = true;
         try {
-          return await this.#resolvedPackRecord(
+          const resolved = await this.#resolvedPackRecord(
             acquired.lease,
             location.packEntry,
           );
+          const result = await authenticate(resolved);
+          await resolved.release();
+          return result;
         } catch (error) {
-          if (
-            !(error instanceof PackCatalogError) ||
-            error.code !== "namespace-invalid"
-          ) {
-            throw error;
-          }
+          if (!this.#isPackCandidateFailure(error)) throw error;
+          recordFailure?.(error);
           handedOff = false;
           await context.packPool?.invalidate(candidate.packId);
-          continue;
+          const settled = await retainCleanupFailure(
+            error,
+            acquired.lease.release,
+            "pack candidate rejection and lease release both failed",
+          );
+          handedOff = true;
+          if (settled !== error) {
+            rethrowRepositoryPrimary(primaryFailure(error), settled);
+          }
         }
       } finally {
         if (!handedOff) await acquired.lease.release();
       }
     }
-    integrity("pack namespace did not stabilize while resolving an object");
+    return undefined;
+  }
+
+  #isCandidateFailure(error: unknown): boolean {
+    if (hasRetainedCleanupFailure(error)) return false;
+    const primary = primaryFailure(error);
+    return (
+      primary instanceof ContentRepositoryError &&
+      primary.code !== "invalid-input"
+    );
+  }
+
+  #isOptionalReuseFailure(error: unknown): boolean {
+    return this.#isCandidateFailure(error);
+  }
+
+  #isPackCandidateFailure(error: unknown): boolean {
+    if (hasRetainedCleanupFailure(error)) return false;
+    const primary = primaryFailure(error);
+    return (
+      this.#isCandidateFailure(primary) ||
+      (primary instanceof PackCatalogError && primary.code !== "invalid-input")
+    );
+  }
+
+  #samePackEntry(left: PackIndexEntry, right: PackIndexEntry): boolean {
+    return (
+      left.logicalId === right.logicalId &&
+      left.kind === right.kind &&
+      left.encoding === right.encoding &&
+      left.decodedLength === right.decodedLength &&
+      left.physicalOrdinal === right.physicalOrdinal &&
+      left.offset === right.offset &&
+      left.length === right.length
+    );
   }
 
   async #acquireContextPack(
     packId: PackId,
     context: ResolutionContext,
-    expected?: PackCatalogEntry,
+    expectedIdentity?: FileIdentity,
   ) {
     if (context.closed === true) {
       invalid("resolution scope closed while resolving a packed object");
     }
-    context.packPool ??= new PackHandlePool(this.#catalog, MAX_CONTEXT_PACKS);
-    return await context.packPool.acquire(packId, expected?.identity);
+    context.packPool ??= new PackHandlePool(
+      this.#catalog,
+      MAX_CONTEXT_PACKS,
+      "logical-read",
+    );
+    return await context.packPool.acquire(packId, expectedIdentity);
   }
 
   #rethrowCatalogError(error: unknown): never {

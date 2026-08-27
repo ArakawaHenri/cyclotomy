@@ -96,7 +96,7 @@ describe("canonical content-store primitives", () => {
 });
 
 describe("logical content-store ids", () => {
-  it("keeps ContentId exactly equal to legacy SHA-256(raw bytes)", () => {
+  it("defines ContentId as SHA-256 of the raw bytes", () => {
     expect(contentIdFromBytes(Buffer.from("abc", "utf8"))).toBe(
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     );

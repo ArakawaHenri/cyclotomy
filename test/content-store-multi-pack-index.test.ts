@@ -69,7 +69,7 @@ function firstMidxEntryOffsetPosition(bytes: Uint8Array): number {
 }
 
 describe("multi-pack index", () => {
-  it("builds a canonical cache and resolves only through an authenticated pack footer", async () => {
+  it("builds a canonical cache and resolves only through a matching pack footer", async () => {
     const firstBytes = Buffer.from("first", "utf8");
     const secondBytes = Buffer.from("second", "utf8");
     const first = await dataPack(firstBytes);
@@ -129,7 +129,7 @@ describe("multi-pack index", () => {
     ).resolves.toMatchObject({ kind: "stale" });
   });
 
-  it("rejects candidates that do not exactly match their authenticated footer", async () => {
+  it("rejects candidates that do not exactly match their pack footer", async () => {
     const pack = await dataPack(Buffer.from("content", "utf8"));
     const { index } = buildMultiPackIndex([pack]);
     const candidate = index.entries[0]!;

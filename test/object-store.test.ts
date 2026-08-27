@@ -2574,7 +2574,7 @@ describe("targeted blob verification", () => {
       ),
     ]);
 
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
+    const openPack = vi.spyOn(PackCatalog.prototype, "openPackForRead");
     await expect(store.readTree(treeOid)).resolves.toMatchObject({ entries });
     expect(
       openPack.mock.calls.filter(([packId]) => packId === dataPack.pack.packId),

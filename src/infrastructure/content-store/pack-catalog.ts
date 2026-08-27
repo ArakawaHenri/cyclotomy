@@ -19,6 +19,7 @@ import {
 } from "../workspace-store.ts";
 import {
   aggregateFailures,
+  hasRetainedCleanupFailure,
   primaryFailure,
   retainCleanupFailure,
   withRetainedCleanup as withDeterministicCleanup,
@@ -44,15 +45,16 @@ import {
   DATA_PACK_HARD_MAX_BYTES,
   METADATA_PACK_HARD_MAX_BYTES,
   openAuthenticatedPack,
+  openPackForRead,
   parsePackId,
-  type AuthenticatedPackIndex,
-  type AuthenticatedPackReader,
   type EncodedPack,
   type PackEntryKey,
   type PackId,
+  type PackIndex,
   type PackIndexEntry,
   type PackIndexView,
   type PackPositionalReader,
+  type PackReader,
   type PackVerificationOptions,
   PackFormatError,
 } from "./pack.ts";
@@ -134,18 +136,25 @@ export type CatalogFileIdentity = PrivateFileIdentity;
 declare const CATALOG_PACK_IDENTITY_RECEIPT: unique symbol;
 
 /**
- * Opaque capability proving that a catalog authenticated one exact pack file
- * together with its complete parent-directory chain.
+ * Opaque capability binding one opened pack file to its complete
+ * parent-directory chain.
  */
 export interface CatalogPackIdentityReceipt {
   readonly [CATALOG_PACK_IDENTITY_RECEIPT]: true;
 }
 
-export interface PackCatalogEntry {
+export interface PackCatalogReadEntry {
   readonly path: string;
   readonly identity: CatalogFileIdentity;
   readonly identityReceipt: CatalogPackIdentityReceipt;
   readonly view: PackIndexView;
+}
+
+declare const PACK_CATALOG_DELETION_ENTRY: unique symbol;
+
+/** Fully authenticated inventory entry accepted by destructive operations. */
+export interface PackCatalogEntry extends PackCatalogReadEntry {
+  readonly [PACK_CATALOG_DELETION_ENTRY]: true;
 }
 
 export type PackCatalogIncomingKind = "pack" | "multi-pack-index";
@@ -165,6 +174,14 @@ export interface PackCatalogInventory {
   readonly totalIndexEntries: number;
   readonly incomingFiles: number;
   readonly incomingBytes: number;
+}
+
+/** Routing facts for logical reads; never a deletion authority. */
+export interface PackCatalogReadInventory {
+  readonly packs: readonly PackCatalogReadEntry[];
+  readonly views: readonly PackIndexView[];
+  readonly totalPackBytes: number;
+  readonly totalIndexEntries: number;
 }
 
 export interface PublishedCatalogPack {
@@ -200,6 +217,13 @@ interface NamespaceSnapshot {
   readonly incomingBytes: number;
   readonly fingerprint: string;
   readonly packFingerprint: string;
+}
+
+interface CollectedPackInventory {
+  readonly packs: readonly PackCatalogReadEntry[];
+  readonly authenticatedPacks: readonly PackCatalogEntry[];
+  readonly totalPackBytes: number;
+  readonly totalIndexEntries: number;
 }
 
 interface StableFileRead {
@@ -296,14 +320,14 @@ function rethrowPackOpenFailure(packId: PackId, failure: unknown): never {
   if (primary instanceof PackFormatError) {
     fail(
       "pack-integrity",
-      `pack ${packId} failed physical authentication`,
+      `pack ${packId} failed physical validation`,
       failure,
     );
   }
   rethrowCatalogPrimary(
     primary,
     failure,
-    `pack ${packId} could not be authenticated`,
+    `pack ${packId} could not be validated`,
   );
 }
 
@@ -701,11 +725,11 @@ function handleCloseWaiter(): HandleCloseWaiter {
 }
 
 /**
- * An authenticated pack bound to the exact file and parent directories that
- * were observed when it was opened. The caller owns this asynchronous scope.
+ * A pack bound to the exact file and parent directories observed when it was
+ * opened. The caller owns this asynchronous scope.
  */
 export class CatalogPackHandle {
-  readonly #pack: AuthenticatedPackReader;
+  readonly #pack: PackReader;
   readonly #source: StableCatalogPackReader;
   #acceptingReads = true;
   #activeReads = 0;
@@ -714,11 +738,11 @@ export class CatalogPackHandle {
 
   readonly identity: CatalogFileIdentity;
   readonly identityReceipt: CatalogPackIdentityReceipt;
-  readonly index: AuthenticatedPackIndex;
+  readonly index: PackIndex;
 
   constructor(
     input: {
-      readonly pack: AuthenticatedPackReader;
+      readonly pack: PackReader;
       readonly source: StableCatalogPackReader;
       readonly identity: CatalogFileIdentity;
       readonly identityReceipt: CatalogPackIdentityReceipt;
@@ -1160,13 +1184,17 @@ async function unlinkExact(
   }
 }
 
-function freezeEntry(entry: PackCatalogEntry): PackCatalogEntry {
+function freezeReadEntry(entry: PackCatalogReadEntry): PackCatalogReadEntry {
   return Object.freeze({
     path: entry.path,
     identity: entry.identity,
     identityReceipt: entry.identityReceipt,
     view: entry.view,
   });
+}
+
+function freezeEntry(entry: PackCatalogReadEntry): PackCatalogEntry {
+  return freezeReadEntry(entry) as PackCatalogEntry;
 }
 
 function samePackIndexView(left: PackIndexView, right: PackIndexView): boolean {
@@ -1232,71 +1260,20 @@ export class PackCatalog {
 
   async inventory(): Promise<PackCatalogInventory> {
     const before = await this.#namespaceSnapshot();
-    const packs: PackCatalogEntry[] = [];
-    let totalPackBytes = 0;
-    let totalIndexEntries = 0;
-    for (const candidate of before.candidates) {
-      const handle = await this.#openDiscoveredPack(
-        candidate.id,
-        candidate.path,
-        candidate.identity,
-        candidate.parents,
-      );
-      try {
-        await withDeterministicCleanup(
-          async () => {
-            totalPackBytes += handle.byteLength;
-            if (totalPackBytes > this.#limits.maxTotalPackBytes) {
-              fail(
-                "limit-exceeded",
-                `pack inventory exceeds ${this.#limits.maxTotalPackBytes} total bytes`,
-              );
-            }
-            if (
-              handle.entries.length >
-              this.#limits.maxIndexEntries - totalIndexEntries
-            ) {
-              fail(
-                "limit-exceeded",
-                `pack inventory exceeds ${this.#limits.maxIndexEntries} index entries`,
-              );
-            }
-            totalIndexEntries += handle.entries.length;
-            const entry = freezeEntry({
-              path: candidate.path,
-              identity: handle.identity,
-              identityReceipt: handle.identityReceipt,
-              view: handle.indexView(),
-            });
-            packs.push(entry);
-            this.#entryReceipts.set(entry, {
-              owner: this.#receiptOwner,
-              parents: candidate.parents,
-            });
-          },
-          () => handle.close(),
-          `pack ${candidate.id} inventory and cleanup both failed`,
-        );
-      } catch (error) {
-        rethrowCatalogPrimary(
-          primaryFailure(error),
-          error,
-          `pack ${candidate.id} could not be inventoried`,
-        );
-      }
-    }
+    const collected = await this.#collectPackInventory(before, "authenticated");
     const after = await this.#namespaceSnapshot();
     if (before.fingerprint !== after.fingerprint) {
       fail("namespace-invalid", "pack namespace changed during inventory");
     }
 
-    const frozenPacks = Object.freeze(packs);
     const inventory = Object.freeze({
-      packs: frozenPacks,
-      views: Object.freeze(frozenPacks.map(({ view }) => view)),
+      packs: collected.authenticatedPacks,
+      views: Object.freeze(
+        collected.authenticatedPacks.map(({ view }) => view),
+      ),
       incoming: Object.freeze(before.incoming.map(({ entry }) => entry)),
-      totalPackBytes,
-      totalIndexEntries,
+      totalPackBytes: collected.totalPackBytes,
+      totalIndexEntries: collected.totalIndexEntries,
       incomingFiles: before.incomingFiles,
       incomingBytes: before.incomingBytes,
     });
@@ -1310,9 +1287,134 @@ export class PackCatalog {
     return inventory;
   }
 
+  /**
+   * Read enough pack metadata to route logical object reads. Corrupt routing
+   * metadata does not prevent reading an object found in another pack. Callers
+   * must use a fully authenticated inventory before concluding that an object
+   * is absent.
+   */
+  async readInventory(): Promise<PackCatalogReadInventory> {
+    const before = await this.#namespaceSnapshot();
+    const collected = await this.#collectPackInventory(before, "logical-read");
+    const after = await this.#namespaceSnapshot();
+    if (before.fingerprint !== after.fingerprint) {
+      fail("namespace-invalid", "pack namespace changed during inventory");
+    }
+    const inventory = Object.freeze({
+      packs: collected.packs,
+      views: Object.freeze(collected.packs.map(({ view }) => view)),
+      totalPackBytes: collected.totalPackBytes,
+      totalIndexEntries: collected.totalIndexEntries,
+    });
+    this.#inventoryPackFingerprints.set(inventory, before.packFingerprint);
+    return inventory;
+  }
+
+  async #collectPackInventory(
+    snapshot: NamespaceSnapshot,
+    mode: "authenticated" | "logical-read",
+  ): Promise<CollectedPackInventory> {
+    const packs: PackCatalogReadEntry[] = [];
+    const authenticatedPacks: PackCatalogEntry[] = [];
+    let totalPackBytes = 0;
+    let totalIndexEntries = 0;
+    for (const candidate of snapshot.candidates) {
+      if (mode === "logical-read") {
+        totalPackBytes += candidate.identity.size;
+        if (totalPackBytes > this.#limits.maxTotalPackBytes) {
+          fail(
+            "limit-exceeded",
+            `pack inventory exceeds ${this.#limits.maxTotalPackBytes} total bytes`,
+          );
+        }
+      }
+      let handle: CatalogPackHandle;
+      try {
+        handle = await this.#openDiscoveredPack(
+          candidate.id,
+          candidate.path,
+          candidate.identity,
+          candidate.parents,
+          mode === "authenticated",
+        );
+      } catch (error) {
+        const primary = primaryFailure(error);
+        if (
+          mode === "logical-read" &&
+          !hasRetainedCleanupFailure(error) &&
+          primary instanceof PackCatalogError &&
+          primary.code !== "invalid-input"
+        ) {
+          continue;
+        }
+        rethrowCatalogPrimary(
+          primary,
+          error,
+          `pack ${candidate.id} could not be inventoried`,
+        );
+      }
+      try {
+        await withDeterministicCleanup(
+          async () => {
+            if (mode === "authenticated") {
+              totalPackBytes += handle.byteLength;
+              if (totalPackBytes > this.#limits.maxTotalPackBytes) {
+                fail(
+                  "limit-exceeded",
+                  `pack inventory exceeds ${this.#limits.maxTotalPackBytes} total bytes`,
+                );
+              }
+            }
+            if (
+              handle.entries.length >
+              this.#limits.maxIndexEntries - totalIndexEntries
+            ) {
+              fail(
+                "limit-exceeded",
+                `pack inventory exceeds ${this.#limits.maxIndexEntries} index entries`,
+              );
+            }
+            totalIndexEntries += handle.entries.length;
+            const readEntry = freezeReadEntry({
+              path: candidate.path,
+              identity: handle.identity,
+              identityReceipt: handle.identityReceipt,
+              view: handle.indexView(),
+            });
+            if (mode === "authenticated") {
+              const entry = freezeEntry(readEntry);
+              packs.push(entry);
+              authenticatedPacks.push(entry);
+              this.#entryReceipts.set(entry, {
+                owner: this.#receiptOwner,
+                parents: candidate.parents,
+              });
+            } else {
+              packs.push(readEntry);
+            }
+          },
+          () => handle.close(),
+          `pack ${candidate.id} inventory and cleanup both failed`,
+        );
+      } catch (error) {
+        rethrowCatalogPrimary(
+          primaryFailure(error),
+          error,
+          `pack ${candidate.id} could not be inventoried`,
+        );
+      }
+    }
+    return Object.freeze({
+      packs: Object.freeze(packs),
+      authenticatedPacks: Object.freeze(authenticatedPacks),
+      totalPackBytes,
+      totalIndexEntries,
+    });
+  }
+
   /** Recheck namespace identities without retaining or decoding pack payloads. */
   async inventoryStillCurrent(
-    inventory: PackCatalogInventory,
+    inventory: PackCatalogInventory | PackCatalogReadInventory,
   ): Promise<boolean> {
     const expected = this.#inventoryFingerprint(inventory);
     return (await this.#namespaceSnapshot()).packFingerprint === expected;
@@ -1419,12 +1521,22 @@ export class PackCatalog {
     await syncDirectory(this.#layout.root, incoming.path, authority, incoming);
   }
 
-  /**
-   * Open one physically authenticated pack as an explicitly owned scope.
-   * An MIDX hit is intentionally insufficient; this always authenticates the
-   * pack's own checksum, footer, header, and record framing.
-   */
+  /** Open one fully authenticated pack for publication or maintenance. */
   async openPack(packId: string): Promise<CatalogPackHandle | undefined> {
+    return await this.#openPack(packId, true);
+  }
+
+  /** Open one pack for logical reads without hashing unrelated payloads. */
+  async openPackForRead(
+    packId: string,
+  ): Promise<CatalogPackHandle | undefined> {
+    return await this.#openPack(packId, false);
+  }
+
+  async #openPack(
+    packId: string,
+    authenticateWholePack: boolean,
+  ): Promise<CatalogPackHandle | undefined> {
     let id: PackId;
     try {
       id = parsePackId(packId);
@@ -1453,7 +1565,13 @@ export class PackCatalog {
       return undefined;
     }
     assertSameDevice(parent, path, discovered.dev);
-    return await this.#openDiscoveredPack(id, path, discovered, parents);
+    return await this.#openDiscoveredPack(
+      id,
+      path,
+      discovered,
+      parents,
+      authenticateWholePack,
+    );
   }
 
   async #openPackReceipt(
@@ -1927,6 +2045,7 @@ export class PackCatalog {
     path: string,
     expected: CatalogFileIdentity,
     parents: CatalogDirectoryChain,
+    authenticateWholePack = true,
   ): Promise<CatalogPackHandle> {
     if (expected.size > this.#limits.maxSinglePackBytes) {
       fail(
@@ -1963,11 +2082,13 @@ export class PackCatalog {
       rethrowPackOpenFailure(id, failure);
     }
 
-    let pack: AuthenticatedPackReader;
+    let pack: PackReader;
     try {
-      // openAuthenticatedPack owns and closes the source if authentication
-      // fails; do not issue a second close from this layer.
-      pack = await openAuthenticatedPack(source, id);
+      // The pack opener owns and closes the source if validation fails; do not
+      // issue a second close from this layer.
+      pack = authenticateWholePack
+        ? await openAuthenticatedPack(source, id)
+        : await openPackForRead(source, id);
     } catch (error) {
       rethrowPackOpenFailure(id, error);
     }
@@ -1996,7 +2117,9 @@ export class PackCatalog {
     this.#inventoryFingerprint(inventory);
   }
 
-  #inventoryFingerprint(inventory: PackCatalogInventory): string {
+  #inventoryFingerprint(
+    inventory: PackCatalogInventory | PackCatalogReadInventory,
+  ): string {
     const fingerprint = this.#inventoryPackFingerprints.get(inventory);
     if (fingerprint === undefined) {
       fail("invalid-input", "inventory does not belong to this pack catalog");

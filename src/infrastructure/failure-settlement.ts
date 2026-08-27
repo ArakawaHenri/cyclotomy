@@ -14,6 +14,14 @@ export function primaryFailure(error: unknown): unknown {
   return primary;
 }
 
+/** Whether a classified failure also retained a mandatory cleanup failure. */
+export function hasRetainedCleanupFailure(error: unknown): boolean {
+  return (
+    error instanceof AggregateError ||
+    (error instanceof Error && error.cause instanceof AggregateError)
+  );
+}
+
 function appendFailure(
   failure: unknown,
   failures: unknown[],

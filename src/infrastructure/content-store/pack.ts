@@ -102,8 +102,8 @@ const FANOUT_ENTRIES = 256;
 const FIXED_TRAILER_BYTES =
   FOOTER_LENGTH_BYTES + CHECKSUM_BYTES + TRAILER_MAGIC.byteLength;
 const AUTHENTICATED_PACK_TOKEN = Symbol("authenticated-pack");
-const AUTHENTICATED_PACK_INDEX_TOKEN = Symbol("authenticated-pack-index");
-const AUTHENTICATED_PACK_READER_TOKEN = Symbol("authenticated-pack-reader");
+const PACK_INDEX_TOKEN = Symbol("pack-index");
+const PACK_READER_TOKEN = Symbol("pack-reader");
 const RECORD_MAGIC = Uint8Array.of(0x43, 0x59, 0x52, 0x43); // CYRC
 const RECORD_FORMAT_VERSION = 1;
 const RECORD_FLAGS_NONE = 0;
@@ -842,10 +842,24 @@ function assertDeltaBaseCompatibility(
   }
 }
 
-async function authenticatePackIndexInternal(
+interface ParsedPackIndex {
+  readonly index: PackIndex;
+  readonly expectedChecksum: Uint8Array;
+  readonly footerOffset: number;
+  readonly header: ParsedPackHeader;
+  readonly physicalEntries: readonly PackIndexEntry[];
+}
+
+/**
+ * Read the pack's own routing metadata without authenticating unrelated record
+ * payloads. A logical read still verifies every record it consumes against its
+ * declared id; whole-pack authentication is reserved for publication and
+ * maintenance operations.
+ */
+async function readPackIndexInternal(
   source: PackPositionalReader,
   expectedPackId?: PackId,
-): Promise<AuthenticatedPackIndex> {
+): Promise<ParsedPackIndex> {
   const absoluteMax = Math.max(
     DATA_PACK_HARD_MAX_BYTES,
     METADATA_PACK_HARD_MAX_BYTES,
@@ -890,17 +904,7 @@ async function authenticatePackIndexInternal(
   if (!bytesEqual(trailerMagic, TRAILER_MAGIC)) {
     invalid("invalid-format", "pack trailer magic is invalid");
   }
-
-  const checksumOffset =
-    source.byteLength - (CHECKSUM_BYTES + TRAILER_MAGIC.byteLength);
-  const observedChecksum = await hashAuthenticatedPrefix(
-    source,
-    checksumOffset,
-  );
-  if (!bytesEqual(expectedChecksum, observedChecksum)) {
-    invalid("integrity", "pack checksum does not match its contents");
-  }
-  const packId = digestToPackId(observedChecksum);
+  const packId = digestToPackId(expectedChecksum);
   if (expectedPackId !== undefined && packId !== expectedPackId) {
     invalid("integrity", "pack bytes do not match the expected pack id");
   }
@@ -949,17 +953,87 @@ async function authenticatePackIndexInternal(
       );
     }
     physicalEntries[entry.physicalOrdinal] = entry;
+    if (packClassForRecordKind(entry.kind) !== header.packClass) {
+      invalid(
+        "invalid-format",
+        `${header.packClass} pack cannot contain ${entry.kind} records`,
+      );
+    }
+  }
+
+  let nextOffset = header.byteLength;
+  for (let ordinal = 0; ordinal < physicalEntries.length; ordinal += 1) {
+    const entry = physicalEntries[ordinal];
+    if (
+      entry === undefined ||
+      entry.offset !== nextOffset ||
+      entry.length === 0 ||
+      entry.length > footerOffset - nextOffset
+    ) {
+      invalid(
+        "integrity",
+        "pack footer entry does not match its physical record boundary",
+      );
+    }
+    nextOffset += entry.length;
+  }
+  if (nextOffset !== footerOffset) {
+    invalid("invalid-format", "pack body has unindexed trailing bytes");
+  }
+
+  return {
+    index: new PackIndex(
+      {
+        packId,
+        packClass: header.packClass,
+        byteLength: source.byteLength,
+        entries: footer.entries,
+        fanout: footer.fanout,
+      },
+      PACK_INDEX_TOKEN,
+    ),
+    expectedChecksum: Uint8Array.from(expectedChecksum),
+    footerOffset,
+    header,
+    physicalEntries: Object.freeze(
+      physicalEntries.map((entry) => {
+        if (entry === undefined) {
+          invalid("invalid-format", "pack footer physical index is incomplete");
+        }
+        return entry;
+      }),
+    ),
+  };
+}
+
+async function authenticatePackIndexInternal(
+  source: PackPositionalReader,
+  expectedPackId?: PackId,
+): Promise<PackIndex> {
+  const parsed = await readPackIndexInternal(source, expectedPackId);
+  const checksumOffset =
+    source.byteLength - (CHECKSUM_BYTES + TRAILER_MAGIC.byteLength);
+  const observedChecksum = await hashAuthenticatedPrefix(
+    source,
+    checksumOffset,
+  );
+  if (!bytesEqual(parsed.expectedChecksum, observedChecksum)) {
+    invalid("integrity", "pack checksum does not match its contents");
+  }
+  const packId = digestToPackId(observedChecksum);
+  if (expectedPackId !== undefined && packId !== expectedPackId) {
+    invalid("integrity", "pack bytes do not match the expected pack id");
   }
 
   const window = new PackReadWindow(source);
   const duplicateKeys = new Set<string>();
-  let nextOffset = header.byteLength;
+  let nextOffset = parsed.header.byteLength;
   for (
     let physicalOrdinal = 0;
-    physicalOrdinal < header.recordCount;
+    physicalOrdinal < parsed.header.recordCount;
     physicalOrdinal += 1
   ) {
-    const entry = physicalEntries[physicalOrdinal];
+    const entry = parsed.physicalEntries[physicalOrdinal];
     if (entry === undefined || entry.offset !== nextOffset) {
       invalid(
         "integrity",
@@ -968,7 +1042,7 @@ async function authenticatePackIndexInternal(
     }
     const prefixLength = Math.min(
       MAX_SAFE_VARINT_BYTES,
-      footerOffset - nextOffset,
+      parsed.footerOffset - nextOffset,
     );
     const framePrefix = await window.readExactly(
       nextOffset,
@@ -977,7 +1051,10 @@ async function authenticatePackIndexInternal(
     );
     const decodedFrameLength = decodeUnsignedVarint(framePrefix);
     const recordLength = decodedFrameLength.value;
-    if (recordLength === 0 || recordLength > packHardMax(header.packClass)) {
+    if (
+      recordLength === 0 ||
+      recordLength > packHardMax(parsed.header.packClass)
+    ) {
       invalid(
         "limit-exceeded",
         `pack record ${physicalOrdinal} length is outside the pack limit`,
@@ -986,7 +1063,7 @@ async function authenticatePackIndexInternal(
     const frameLength = decodedFrameLength.nextOffset + recordLength;
     if (
       frameLength !== entry.length ||
-      frameLength > footerOffset - nextOffset
+      frameLength > parsed.footerOffset - nextOffset
     ) {
       invalid(
         "integrity",
@@ -1004,7 +1081,7 @@ async function authenticatePackIndexInternal(
     if (
       recordHeader.headerLength + recordHeader.payloadLength !== recordLength ||
       !entryMatchesHeader(entry, recordHeader) ||
-      packClassForRecordKind(recordHeader.kind) !== header.packClass
+      packClassForRecordKind(recordHeader.kind) !== parsed.header.packClass
     ) {
       invalid(
         "integrity",
@@ -1033,7 +1110,8 @@ async function authenticatePackIndexInternal(
           "delta1 base back-reference precedes the pack",
         );
       }
-      const base = physicalEntries[physicalOrdinal - program.baseBackDistance];
+      const base =
+        parsed.physicalEntries[physicalOrdinal - program.baseBackDistance];
       if (
         base === undefined ||
         base.kind !== "content" ||
@@ -1049,20 +1127,10 @@ async function authenticatePackIndexInternal(
     }
     nextOffset += frameLength;
   }
-  if (nextOffset !== footerOffset) {
+  if (nextOffset !== parsed.footerOffset) {
     invalid("invalid-format", "pack body has unindexed trailing bytes");
   }
-
-  return new AuthenticatedPackIndex(
-    {
-      packId,
-      packClass: header.packClass,
-      byteLength: source.byteLength,
-      entries: footer.entries,
-      fanout: footer.fanout,
-    },
-    AUTHENTICATED_PACK_INDEX_TOKEN,
-  );
+  return parsed.index;
 }
 
 function readPhysicalRecords(
@@ -1269,8 +1337,8 @@ async function decodeAndVerifyRecord(
   return decoded;
 }
 
-/** Authenticated pack identity and footer facts without retained payloads. */
-export class AuthenticatedPackIndex {
+/** Parsed pack identity and footer facts without retained payloads. */
+export class PackIndex {
   readonly #fanout: readonly number[];
   readonly #physicalEntries: readonly PackIndexEntry[];
 
@@ -1289,10 +1357,10 @@ export class AuthenticatedPackIndex {
     },
     authenticationToken: symbol,
   ) {
-    if (authenticationToken !== AUTHENTICATED_PACK_INDEX_TOKEN) {
+    if (authenticationToken !== PACK_INDEX_TOKEN) {
       invalid(
         "invalid-input",
-        "AuthenticatedPackIndex can only be created by pack authentication",
+        "PackIndex can only be created by reading pack metadata",
       );
     }
     this.packId = input.packId;
@@ -1353,7 +1421,7 @@ export class AuthenticatedPackIndex {
 
 async function readEnvelopeFromReader(
   source: PackPositionalReader,
-  index: AuthenticatedPackIndex,
+  index: PackIndex,
   entry: PackIndexEntry,
 ): Promise<RecordEnvelope> {
   const physical = index.entryForPhysicalOrdinal(entry.physicalOrdinal);
@@ -1372,18 +1440,12 @@ async function readEnvelopeFromReader(
     recordLength === 0 ||
     decodedFrameLength.nextOffset + recordLength !== frame.byteLength
   ) {
-    invalid(
-      "integrity",
-      "authenticated pack entry no longer matches its record boundary",
-    );
+    invalid("integrity", "pack entry no longer matches its record boundary");
   }
   const recordBytes = frame.subarray(decodedFrameLength.nextOffset);
   const header = parseRecordHeader(recordBytes);
   if (header.headerLength + header.payloadLength !== recordBytes.byteLength) {
-    invalid(
-      "integrity",
-      "authenticated pack entry no longer matches its record envelope",
-    );
+    invalid("integrity", "pack entry no longer matches its record envelope");
   }
   const payload = recordBytes.subarray(header.headerLength);
   const envelope = {
@@ -1397,10 +1459,7 @@ async function readEnvelopeFromReader(
     packClassForRecordKind(envelope.kind) !== index.packClass ||
     !entryMatchesHeader(entry, header)
   ) {
-    invalid(
-      "integrity",
-      "authenticated pack entry no longer matches its record envelope",
-    );
+    invalid("integrity", "pack entry no longer matches its record envelope");
   }
   return envelope;
 }
@@ -1419,27 +1478,27 @@ function closeWaiter(): CloseWaiter {
 }
 
 /**
- * Scope-owned authenticated reader. Closing stops new reads, waits for reads
+ * Scope-owned pack reader. Closing stops new reads, waits for reads
  * already in flight, and closes its source exactly once.
  */
-export class AuthenticatedPackReader {
+export class PackReader {
   readonly #source: PackPositionalReader;
   #acceptingReads = true;
   #activeReads = 0;
   #drained: CloseWaiter | undefined;
   #closePromise: Promise<void> | undefined;
 
-  readonly index: AuthenticatedPackIndex;
+  readonly index: PackIndex;
 
   constructor(
     source: PackPositionalReader,
-    index: AuthenticatedPackIndex,
+    index: PackIndex,
     authenticationToken: symbol,
   ) {
-    if (authenticationToken !== AUTHENTICATED_PACK_READER_TOKEN) {
+    if (authenticationToken !== PACK_READER_TOKEN) {
       invalid(
         "invalid-input",
-        "AuthenticatedPackReader can only be created by opening an authenticated reader",
+        "PackReader can only be created by opening a pack source",
       );
     }
     this.#source = source;
@@ -1545,7 +1604,7 @@ export class AuthenticatedPackReader {
 
   async #withRead<T>(action: () => Promise<T>): Promise<T> {
     if (!this.#acceptingReads) {
-      invalid("invalid-input", "authenticated pack reader is closed");
+      invalid("invalid-input", "pack reader is closed");
     }
     this.#activeReads += 1;
     try {
@@ -1561,7 +1620,7 @@ export class AuthenticatedPackReader {
 export async function authenticatePackReader(
   source: PackPositionalReader,
   expectedPackId?: string,
-): Promise<AuthenticatedPackIndex> {
+): Promise<PackIndex> {
   try {
     return await authenticatePackIndexInternal(
       source,
@@ -1580,34 +1639,67 @@ export async function authenticatePackReader(
   }
 }
 
-/** Authenticate a source and transfer its lifetime to an explicit handle. */
-export async function openAuthenticatedPack(
+/** Read and validate pack routing metadata without hashing record payloads. */
+export async function readPackIndex(
   source: PackPositionalReader,
-  expectedPackId?: string,
-): Promise<AuthenticatedPackReader> {
+  expectedPackId: string,
+): Promise<PackIndex> {
   try {
-    const index = await authenticatePackReader(source, expectedPackId);
-    return new AuthenticatedPackReader(
-      source,
-      index,
-      AUTHENTICATED_PACK_READER_TOKEN,
-    );
+    return (await readPackIndexInternal(source, parsePackId(expectedPackId)))
+      .index;
+  } catch (error) {
+    if (error instanceof PackFormatError) throw error;
+    if (error instanceof CanonicalBinaryError || error instanceof TypeError) {
+      invalid("invalid-format", `invalid pack: ${error.message}`, error);
+    }
+    throw error;
+  }
+}
+
+async function openPackWithIndex(
+  source: PackPositionalReader,
+  loadIndex: () => Promise<PackIndex>,
+): Promise<PackReader> {
+  try {
+    return new PackReader(source, await loadIndex(), PACK_READER_TOKEN);
   } catch (error) {
     try {
       await source.close();
     } catch (closeError) {
       throw new AggregateError(
         [error, closeError],
-        "pack authentication and reader cleanup both failed",
+        "pack open and reader cleanup both failed",
       );
     }
     throw error;
   }
 }
 
+/** Open a pack for logical reads without hashing unrelated payloads. */
+export async function openPackForRead(
+  source: PackPositionalReader,
+  expectedPackId: string,
+): Promise<PackReader> {
+  return await openPackWithIndex(
+    source,
+    async () => await readPackIndex(source, expectedPackId),
+  );
+}
+
+/** Authenticate a source and transfer its lifetime to an explicit handle. */
+export async function openAuthenticatedPack(
+  source: PackPositionalReader,
+  expectedPackId?: string,
+): Promise<PackReader> {
+  return await openPackWithIndex(
+    source,
+    async () => await authenticatePackReader(source, expectedPackId),
+  );
+}
+
 export class AuthenticatedPack {
   readonly #records: readonly PhysicalRecord[];
-  readonly #index: AuthenticatedPackIndex;
+  readonly #index: PackIndex;
 
   constructor(
     input: {
@@ -1627,7 +1719,7 @@ export class AuthenticatedPack {
       );
     }
     this.#records = input.records;
-    this.#index = new AuthenticatedPackIndex(
+    this.#index = new PackIndex(
       {
         packId: input.packId,
         packClass: input.packClass,
@@ -1635,7 +1727,7 @@ export class AuthenticatedPack {
         entries: input.entries,
         fanout: input.fanout,
       },
-      AUTHENTICATED_PACK_INDEX_TOKEN,
+      PACK_INDEX_TOKEN,
     );
     Object.freeze(this);
   }

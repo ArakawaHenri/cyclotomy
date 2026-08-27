@@ -182,7 +182,7 @@ describe("pack catalog", () => {
     });
   });
 
-  it("retains opened-file validation and cleanup failures without changing the primary category", async () => {
+  it("does not skip a logical-read candidate whose cleanup also failed", async () => {
     const layout = await createLayout();
     const catalog = new PackCatalog(layout);
     const encoded = await dataPack("opened file cleanup evidence");
@@ -211,7 +211,7 @@ describe("pack catalog", () => {
         throw validationFailure;
       });
 
-    const failure = await rejected(catalog.openPack(encoded.pack.packId));
+    const failure = await rejected(catalog.readInventory());
     expect(failure).toMatchObject({
       name: "PackCatalogError",
       code: "storage-failure",

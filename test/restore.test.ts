@@ -576,7 +576,7 @@ describe("pure workspace restore", () => {
     await writeFile(join(root, "a.txt"), "current a");
 
     const readTree = vi.spyOn(setup.store, "readTree");
-    const openPack = vi.spyOn(PackCatalog.prototype, "openPack");
+    const openPack = vi.spyOn(PackCatalog.prototype, "openPackForRead");
     const outcome = await restoreWorkspace(
       { store: setup.store },
       root,

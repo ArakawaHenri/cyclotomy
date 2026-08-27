@@ -234,6 +234,7 @@ interface MaterializedContent {
   readonly proofs: readonly PublishedContent[];
   readonly liveKeys: ReadonlyMap<string, LogicalRecordKey>;
   readonly skippedContentIds: ReadonlySet<string>;
+  readonly published: boolean;
 }
 
 interface MutableReport {
@@ -2033,6 +2034,7 @@ async function ensureLargeLegacyRepresentations(
   const proofs: PublishedContent[] = [];
   const liveKeys = new Map<string, LogicalRecordKey>();
   const skippedContentIds = new Set<string>();
+  let published = false;
   let remainingLooseObjects = maximumNewLooseObjects;
   let remainingReplacementKeys = maximumNewReplacementKeys;
   for (const object of inventory.objects) {
@@ -2061,7 +2063,7 @@ async function ensureLargeLegacyRepresentations(
       skippedContentIds.add(contentId);
       continue;
     }
-    const proof = await repository.materializeLooseContent(
+    const materialized = await repository.materializeLooseContent(
       contentId,
       object.byteLength,
       async (sink) => {
@@ -2076,8 +2078,12 @@ async function ensureLargeLegacyRepresentations(
       },
       authority,
     );
-    remainingLooseObjects -= maximumGraphObjects;
-    remainingReplacementKeys -= maximumGraphObjects;
+    const { proof } = materialized;
+    if (materialized.disposition === "published") {
+      published = true;
+      remainingLooseObjects -= maximumGraphObjects;
+      remainingReplacementKeys -= maximumGraphObjects;
+    }
     proofs.push(proof);
     for (const dependency of proof.closure.objects) {
       if (dependency.retention !== "logical") continue;
@@ -2089,6 +2095,7 @@ async function ensureLargeLegacyRepresentations(
     proofs: Object.freeze(proofs),
     liveKeys,
     skippedContentIds,
+    published,
   });
 }
 

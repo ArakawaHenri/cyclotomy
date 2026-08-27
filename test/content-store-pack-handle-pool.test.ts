@@ -235,7 +235,7 @@ describe("pack handle pool", () => {
     expect(closed).toHaveBeenCalledTimes(1);
   });
 
-  it("does not reuse capacity after a retirement failure", async () => {
+  it("releases capacity after reporting a retirement failure", async () => {
     const { catalog, packIds } = await setup();
     const opened = vi.spyOn(catalog, "openPack");
     const pool = new PackHandlePool(catalog, 1);
@@ -255,10 +255,15 @@ describe("pack handle pool", () => {
       });
 
     await expect(pool.invalidate(packIds[0]!)).rejects.toBe(failure);
-    await expect(pool.acquire(packIds[1]!)).rejects.toBe(failure);
-    await expect(pool.close()).rejects.toBe(failure);
-    expect(opened.mock.calls.map(([packId]) => packId)).toEqual([packIds[0]]);
-    expect(closed).toHaveBeenCalledTimes(1);
+    const second = await pool.acquire(packIds[1]!);
+    expect(second.kind).toBe("acquired");
+    if (second.kind === "acquired") await second.lease.release();
+    await pool.close();
+    expect(opened.mock.calls.map(([packId]) => packId)).toEqual([
+      packIds[0],
+      packIds[1],
+    ]);
+    expect(closed).toHaveBeenCalledTimes(2);
 
     await originalClose.call(firstHandle);
   });

@@ -107,15 +107,15 @@ export type MultiPackIndexResolution =
     }
   | { readonly kind: "stale"; readonly reason: string };
 
-/** Authenticated footer capability shared by in-memory and streaming packs. */
-export interface AuthenticatedPackLookup {
+/** Pack-index capability shared by in-memory and streaming packs. */
+export interface PackIndexLookup {
   readonly packId: PackId;
   readonly packClass: PackClass;
   readonly byteLength: number;
   entryForPhysicalOrdinal(physicalOrdinal: number): PackIndexEntry | undefined;
 }
 
-export interface AuthenticatedPackReadLookup extends AuthenticatedPackLookup {
+export interface PackReadLookup extends PackIndexLookup {
   readVerified(
     entry: PackIndexEntry,
     options?: PackVerificationOptions,
@@ -129,7 +129,7 @@ interface AuthenticatedPackViewSource {
 export type MultiPackIndexLocation =
   | {
       readonly kind: "hit";
-      readonly pack: AuthenticatedPackLookup;
+      readonly pack: PackIndexLookup;
       readonly packEntry: PackIndexEntry;
     }
   | { readonly kind: "stale"; readonly reason: string };
@@ -385,7 +385,7 @@ export function buildMultiPackIndex(
   );
 }
 
-/** Build from payload-free authenticated footer views, one retained per pack. */
+/** Build from payload-free pack footer views, one retained per pack. */
 export function buildMultiPackIndexFromViews(
   sourcePacks: readonly PackIndexView[],
 ): BuiltMultiPackIndex {
@@ -635,7 +635,7 @@ export function validateMultiPackIndex(
   );
 }
 
-/** Validate cache completeness using only authenticated footer views. */
+/** Validate cache completeness using only pack footer views. */
 export function validateMultiPackIndexViews(
   index: MultiPackIndex,
   sourcePacks: readonly PackIndexView[],
@@ -694,12 +694,12 @@ export function validateMultiPackIndexViews(
 
 /**
  * Locate one caller-selected representation. MIDX is only a cache: the
- * candidate must exactly match an authenticated pack footer entry.
+ * candidate must exactly match the selected pack's footer entry.
  */
 export function resolveMultiPackIndexEntry(
   index: MultiPackIndex,
   candidate: MultiPackIndexEntry,
-  packsById: ReadonlyMap<string, AuthenticatedPackLookup>,
+  packsById: ReadonlyMap<string, PackIndexLookup>,
 ): MultiPackIndexLocation {
   if (
     !index
@@ -737,7 +737,7 @@ export function resolveMultiPackIndexEntry(
   ) {
     return {
       kind: "stale",
-      reason: "candidate does not match the authenticated pack footer",
+      reason: "candidate does not match the pack footer",
     };
   }
   return {
@@ -751,7 +751,7 @@ export function resolveMultiPackIndexEntry(
 export async function readMultiPackIndexEntry(
   index: MultiPackIndex,
   candidate: MultiPackIndexEntry,
-  packsById: ReadonlyMap<string, AuthenticatedPackReadLookup>,
+  packsById: ReadonlyMap<string, PackReadLookup>,
   options: PackVerificationOptions = {},
 ): Promise<MultiPackIndexResolution> {
   const location = resolveMultiPackIndexEntry(index, candidate, packsById);
@@ -760,7 +760,7 @@ export async function readMultiPackIndexEntry(
   }
   const readable = packsById.get(location.pack.packId);
   if (readable === undefined) {
-    return { kind: "stale", reason: "authenticated pack is unavailable" };
+    return { kind: "stale", reason: "selected pack is unavailable" };
   }
   return {
     kind: "hit",
