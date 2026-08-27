@@ -45,6 +45,7 @@ import {
   PackCatalogError,
   type CatalogFileIdentity,
   type PackCatalogEntry,
+  type PackCatalogIncomingEntry,
   type PackCatalogInventory,
 } from "./content-store/pack-catalog.ts";
 import {
@@ -96,7 +97,6 @@ export interface GcReport {
   readonly removedTmpFiles: number;
   readonly freedBytes: number;
   readonly keptObjects: number;
-  /** New physical-layer detail; legacy consumers can ignore these fields. */
   readonly removedRecords?: number;
   readonly removedPacks?: number;
   readonly compactedObjects?: number;
@@ -235,6 +235,37 @@ interface MaterializedContent {
   readonly liveKeys: ReadonlyMap<string, LogicalRecordKey>;
   readonly skippedContentIds: ReadonlySet<string>;
   readonly published: boolean;
+}
+
+interface GarbageCollectionInventories {
+  readonly objects: MaintenanceInventory;
+  readonly packs: PackCatalogInventory;
+}
+
+interface SweepResources {
+  readonly authority: WorkspaceWriteAuthority;
+  readonly store: NativeObjectStore;
+  readonly repository: ReturnType<typeof nativeObjectStoreRepository>;
+  readonly maintenance: ObjectStoreMaintenance;
+  readonly catalog: PackCatalog;
+  readonly metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">;
+  readonly layout: ReturnType<typeof nativeObjectStoreLayout>;
+}
+
+interface SweepFence {
+  readonly initialRoots: readonly string[];
+  readonly maxObjects: number;
+  readonly replacementPackIds: ReadonlySet<string>;
+}
+
+interface SweepPlan {
+  readonly inventories: GarbageCollectionInventories;
+  readonly mark: MarkState;
+  readonly removableObjects: readonly MaintenanceObject[];
+  readonly removableObjectSet: ReadonlySet<MaintenanceObject>;
+  readonly removablePacks: readonly PackCatalogEntry[];
+  readonly removablePackIds: ReadonlySet<string>;
+  readonly removableIncoming: readonly PackCatalogIncomingEntry[];
 }
 
 interface MutableReport {
@@ -763,49 +794,62 @@ async function strictInventories(
   maintenance: ObjectStoreMaintenance,
   catalog: PackCatalog,
   maximumObjects: number,
-): Promise<{
-  readonly objects: MaintenanceInventory;
-  readonly packs: PackCatalogInventory;
-}> {
+): Promise<GarbageCollectionInventories> {
   try {
     const objects = await maintenance.inventory(maximumObjects);
     const packs = await catalog.inventory();
-    const count = inventoryObjectCount({ objects, packs });
-    if (count > maximumObjects) {
-      throw new RangeError(
-        `refusing to sweep because object inventory exceeds the ${maximumObjects}-candidate limit`,
-      );
-    }
-    return { objects, packs };
+    const inventories = { objects, packs };
+    assertInventoryCapacity(inventories, maximumObjects);
+    return inventories;
   } catch (error) {
     mapInfrastructureError("objects", error);
   }
 }
 
-function withAuthenticatedStructuralCoverage(
-  mark: MarkState,
-  inventory: MaintenanceInventory,
-): MarkState {
-  const authenticatedCoverage = new Set(mark.authenticatedCoverage);
-  const looseStructuralIds = new Set(
-    inventory.objects
-      .filter(
-        (object) => !object.temporary && object.kind === "loose-structural",
-      )
-      .map(({ logicalId }) => logicalId),
-  );
-  for (const [oid, kinds] of mark.structuralKinds) {
-    const loose = looseStructuralIds.has(oid);
-    for (const kind of kinds) {
-      const recordKind = structuralRecordKind(kind);
-      if (loose) {
-        authenticatedCoverage.add(
-          objectCoverageKey("loose-structural", recordKind, oid),
-        );
-      }
-    }
+function assertInventoryCapacity(
+  inventories: GarbageCollectionInventories,
+  maximumObjects: number,
+): void {
+  if (inventoryObjectCount(inventories) > maximumObjects) {
+    throw new RangeError(
+      `refusing to sweep because object inventory exceeds the ${maximumObjects}-candidate limit`,
+    );
   }
-  return Object.freeze({ ...mark, authenticatedCoverage });
+}
+
+async function refreshObjectInventory(
+  inventories: GarbageCollectionInventories,
+  maintenance: ObjectStoreMaintenance,
+  maximumObjects: number,
+): Promise<GarbageCollectionInventories> {
+  try {
+    const refreshed = {
+      objects: await maintenance.inventory(maximumObjects),
+      packs: inventories.packs,
+    };
+    assertInventoryCapacity(refreshed, maximumObjects);
+    return refreshed;
+  } catch (error) {
+    mapInfrastructureError("objects", error);
+  }
+}
+
+async function refreshPackInventory(
+  inventories: GarbageCollectionInventories,
+  catalog: PackCatalog,
+  maximumObjects: number,
+  packsPath: string,
+): Promise<GarbageCollectionInventories> {
+  try {
+    const refreshed = {
+      objects: inventories.objects,
+      packs: await catalog.inventory(),
+    };
+    assertInventoryCapacity(refreshed, maximumObjects);
+    return refreshed;
+  } catch (error) {
+    mapInfrastructureError(packsPath, error);
+  }
 }
 
 class CompactionResolver {
@@ -837,7 +881,11 @@ class CompactionResolver {
     this.#maintenance = maintenance;
     this.#objectInventory = objectInventory;
     this.#catalog = catalog;
-    this.#packPool = new PackHandlePool(catalog, MAX_RESOLVER_PACKS);
+    this.#packPool = new PackHandlePool(
+      catalog,
+      MAX_RESOLVER_PACKS,
+      "logical-read",
+    );
     for (const object of objectInventory.objects) {
       for (const key of maintenanceObjectKeys(object, mark)) {
         const text = recordKey(key.kind, key.logicalId);
@@ -2119,6 +2167,267 @@ function countRemovedRecord(report: MutableReport, kind: RecordKind): void {
   }
 }
 
+async function planSweep(
+  resources: SweepResources,
+  fence: SweepFence,
+  {
+    materialized,
+    inventories,
+    selection,
+    plannedPacksById,
+    graceMs,
+    now,
+  }: {
+    readonly materialized: MaterializedContent;
+    readonly inventories: GarbageCollectionInventories;
+    readonly selection: PackRewriteSelection;
+    readonly plannedPacksById: ReadonlyMap<string, PackCatalogEntry>;
+    readonly graceMs: number;
+    readonly now: number;
+  },
+): Promise<SweepPlan> {
+  const { store, repository, metadata } = resources;
+  const { initialRoots, maxObjects, replacementPackIds } = fence;
+  const rootsBeforeVerification = stableRoots(
+    metadata.listReferencedTreeOids(maxObjects + 1),
+  );
+  if (!sameStrings(initialRoots, rootsBeforeVerification)) {
+    throw new GarbageCollectionRootDriftError();
+  }
+  for (const proof of materialized.proofs) {
+    await repository.revalidatePublishedContent(
+      proof,
+      repository.maxDecodedBytes,
+    );
+  }
+
+  let mark = await authenticateRoots(store, initialRoots, maxObjects);
+  mark = extendLiveMark(mark, materialized.liveKeys, maxObjects);
+
+  const removableObjects: MaintenanceObject[] = [];
+  for (const object of inventories.objects.objects) {
+    const isExpired = expired(object.modifiedAt, graceMs, now);
+    if (object.temporary) {
+      if (isExpired) removableObjects.push(object);
+      continue;
+    }
+    const live = objectIsLive(object, mark);
+    if (!live) {
+      if (isExpired) removableObjects.push(object);
+      continue;
+    }
+    const keys = maintenanceObjectKeys(object, mark);
+    if (
+      keys.length > 0 &&
+      keys.every((key) =>
+        selection.replacementKeys.has(recordKey(key.kind, key.logicalId)),
+      )
+    ) {
+      removableObjects.push(object);
+    }
+  }
+
+  const removablePacks: PackCatalogEntry[] = [];
+  for (const pack of inventories.packs.packs) {
+    if (replacementPackIds.has(pack.view.packId)) continue;
+    const liveKeys = livePackKeys(pack, mark);
+    if (
+      liveKeys.length === 0 &&
+      selection.fullyDeadPackIds.has(pack.view.packId) &&
+      expired(pack.identity.mtimeMs, graceMs, now)
+    ) {
+      removablePacks.push(pack);
+      continue;
+    }
+    if (
+      selection.partialPackIds.has(pack.view.packId) ||
+      (selection.redundantPackIds.has(pack.view.packId) &&
+        expired(pack.identity.mtimeMs, graceMs, now))
+    ) {
+      removablePacks.push(pack);
+    }
+  }
+  for (const pack of removablePacks) {
+    const expected = plannedPacksById.get(pack.view.packId);
+    if (
+      expected === undefined ||
+      !identitiesEqual(expected.identity, pack.identity)
+    ) {
+      throw new GarbageCollectionNamespaceError(
+        pack.path,
+        "pack changed between planning and cutover",
+      );
+    }
+  }
+
+  return Object.freeze({
+    inventories,
+    mark,
+    removableObjects: Object.freeze(removableObjects),
+    removableObjectSet: new Set(removableObjects),
+    removablePacks: Object.freeze(removablePacks),
+    removablePackIds: new Set(removablePacks.map(({ view }) => view.packId)),
+    removableIncoming: Object.freeze(
+      inventories.packs.incoming.filter((incoming) =>
+        expired(incoming.identity.mtimeMs, graceMs, now),
+      ),
+    ),
+  });
+}
+
+async function authorizeSweep(
+  resources: SweepResources,
+  fence: SweepFence,
+  plan: SweepPlan,
+): Promise<void> {
+  const { authority, store, maintenance, catalog, metadata, layout } =
+    resources;
+  const { initialRoots, maxObjects, replacementPackIds } = fence;
+  const coverageResolver = new CompactionResolver(
+    store,
+    maintenance,
+    plan.inventories.objects,
+    catalog,
+    plan.inventories.packs,
+    plan.mark,
+  );
+  try {
+    await withRetainedCleanup(
+      () =>
+        authenticateRetainedCoverage(
+          plan.inventories,
+          plan.mark,
+          coverageResolver,
+          plan.removableObjectSet,
+          plan.removablePackIds,
+          replacementPackIds,
+          plan.mark.authenticatedCoverage,
+        ),
+      () => coverageResolver.dispose(),
+      "retained-coverage authentication and cleanup both failed",
+    );
+  } catch (error) {
+    rethrowGarbageCollectionPrimary(error);
+  }
+
+  try {
+    for (const object of plan.removableObjects) {
+      if (
+        !(await maintenance.objectIdentityStillCurrent(
+          plan.inventories.objects,
+          object,
+        ))
+      ) {
+        throw new GarbageCollectionNamespaceError(
+          layout.objects,
+          "object changed between final inventory and cutover",
+        );
+      }
+    }
+    for (const pack of plan.removablePacks) {
+      if (!(await catalog.packIdentityStillCurrent(pack))) {
+        throw new GarbageCollectionNamespaceError(
+          pack.path,
+          "pack changed between final inventory and cutover",
+        );
+      }
+    }
+  } catch (error) {
+    mapInfrastructureError(layout.objects, error);
+  }
+
+  if (
+    plan.removableObjects.length === 0 &&
+    plan.removablePacks.length === 0 &&
+    plan.removableIncoming.length === 0
+  ) {
+    return;
+  }
+  const rootsAtCutover = stableRoots(
+    metadata.listReferencedTreeOids(maxObjects + 1),
+  );
+  if (!sameStrings(initialRoots, rootsAtCutover)) {
+    throw new GarbageCollectionRootDriftError();
+  }
+  assertWorkspaceWriteAuthority(authority, layout.root);
+}
+
+async function executeSweep(
+  resources: SweepResources,
+  plan: SweepPlan,
+  report: MutableReport,
+  maxObjects: number,
+): Promise<GcReport> {
+  const { maintenance, catalog, authority, layout } = resources;
+  try {
+    for (const object of plan.removableObjects) {
+      const wasLive = objectIsLive(object, plan.mark);
+      const bytes = await maintenance.removeObject(
+        plan.inventories.objects,
+        object,
+        authority,
+      );
+      report.freedBytes += bytes;
+      if (object.temporary) {
+        report.removedTmpFiles += 1;
+      } else {
+        if (object.kind === "loose-content" || object.kind === "loose-recipe") {
+          report.removedRecords += 1;
+        }
+        if (wasLive) {
+          report.compactedObjects += 1;
+        } else if (object.kind === "loose-structural") {
+          report.removedTrees += 1;
+        } else {
+          report.removedBlobs += 1;
+        }
+      }
+    }
+  } catch (error) {
+    mapInfrastructureError(layout.objects, error);
+  }
+
+  try {
+    for (const pack of plan.removablePacks) {
+      await catalog.removePack(pack, authority);
+      report.removedPacks += 1;
+      report.freedBytes += pack.identity.size;
+      for (const entry of pack.view.entries) {
+        if (!plan.mark.liveKeys.has(recordKey(entry.kind, entry.logicalId))) {
+          countRemovedRecord(report, entry.kind);
+        }
+      }
+    }
+    for (const incoming of plan.removableIncoming) {
+      await catalog.removeIncoming(incoming, authority);
+      report.removedTmpFiles += 1;
+      report.freedBytes += incoming.identity.size;
+    }
+    let packInventory = plan.inventories.packs;
+    if (plan.removablePacks.length > 0 || plan.removableIncoming.length > 0) {
+      packInventory = (
+        await refreshPackInventory(
+          plan.inventories,
+          catalog,
+          maxObjects,
+          layout.packs,
+        )
+      ).packs;
+    }
+    await ensureMultiPackIndex(catalog, packInventory, authority);
+  } catch (error) {
+    mapInfrastructureError(layout.packs, error);
+  }
+
+  report.keptObjects += plan.inventories.objects.objects.filter(
+    (object) => !object.temporary && !plan.removableObjectSet.has(object),
+  ).length;
+  report.keptObjects += plan.inventories.packs.packs
+    .filter(({ view }) => !plan.removablePackIds.has(view.packId))
+    .reduce((count, pack) => count + pack.view.entries.length, 0);
+  return Object.freeze({ ...report });
+}
+
 /**
  * Authenticate, compact, then sweep under the caller's exclusive workspace
  * lock. Every write before the final root fence is additive; deletion starts
@@ -2218,7 +2527,13 @@ export async function collectGarbage(
     materialized.liveKeys,
     maxCompactionObjects,
   );
-  inventories = await strictInventories(maintenance, catalog, maxObjects);
+  if (materialized.published) {
+    inventories = await refreshObjectInventory(
+      inventories,
+      maintenance,
+      maxObjects,
+    );
+  }
   selection = await boundCompactionDecodedBytes(
     selection,
     inventories,
@@ -2426,11 +2741,14 @@ export async function collectGarbage(
             replacementPackIds.add(published.view.packId);
             if (published.disposition === "published") report.writtenPacks += 1;
           }
-          inventories = await strictInventories(
-            maintenance,
-            catalog,
-            maxObjects,
-          );
+          if (report.writtenPacks > 0) {
+            inventories = await refreshPackInventory(
+              inventories,
+              catalog,
+              maxObjects,
+              layout.packs,
+            );
+          }
           const publishedPackIds = new Set<string>(
             inventories.packs.packs.map(({ view }) => view.packId),
           );
@@ -2454,221 +2772,28 @@ export async function collectGarbage(
     rethrowGarbageCollectionPrimary(error);
   }
 
-  // Final fence: strict current inventory, complete logical authentication,
-  // then another root observation immediately before the first unlink.
-  inventories = await strictInventories(maintenance, catalog, maxObjects);
-  const rootsBeforeVerification = stableRoots(
-    metadata.listReferencedTreeOids(maxObjects + 1),
-  );
-  if (!sameStrings(initialRoots, rootsBeforeVerification)) {
-    throw new GarbageCollectionRootDriftError();
-  }
-  for (const proof of materialized.proofs) {
-    await repository.revalidatePublishedContent(
-      proof,
-      repository.maxDecodedBytes,
-    );
-  }
-  mark = await authenticateRoots(store, initialRoots, maxObjects);
-  mark = extendLiveMark(mark, materialized.liveKeys, maxObjects);
-  mark = withAuthenticatedStructuralCoverage(mark, inventories.objects);
-  const removableObjects: MaintenanceObject[] = [];
-  for (const object of inventories.objects.objects) {
-    const isExpired = expired(object.modifiedAt, graceMs, now);
-    if (object.temporary) {
-      if (isExpired) removableObjects.push(object);
-      continue;
-    }
-    const live = objectIsLive(object, mark);
-    if (!live) {
-      if (isExpired) removableObjects.push(object);
-      continue;
-    }
-    const keys = maintenanceObjectKeys(object, mark);
-    if (
-      keys.length > 0 &&
-      keys.every((key) =>
-        selection.replacementKeys.has(recordKey(key.kind, key.logicalId)),
-      )
-    ) {
-      removableObjects.push(object);
-    }
-  }
-
-  const removablePacks: PackCatalogEntry[] = [];
-  for (const pack of inventories.packs.packs) {
-    if (replacementPackIds.has(pack.view.packId)) continue;
-    const liveKeys = [
-      ...new Map(
-        pack.view.entries
-          .filter((entry) =>
-            mark.liveKeys.has(recordKey(entry.kind, entry.logicalId)),
-          )
-          .map((entry) => {
-            const key = logicalKey(entry.kind, entry.logicalId);
-            return [recordKey(key.kind, key.logicalId), key] as const;
-          }),
-      ).values(),
-    ];
-    if (
-      liveKeys.length === 0 &&
-      selection.fullyDeadPackIds.has(pack.view.packId) &&
-      expired(pack.identity.mtimeMs, graceMs, now)
-    ) {
-      removablePacks.push(pack);
-      continue;
-    }
-    if (
-      selection.partialPackIds.has(pack.view.packId) ||
-      (selection.redundantPackIds.has(pack.view.packId) &&
-        expired(pack.identity.mtimeMs, graceMs, now))
-    ) {
-      removablePacks.push(pack);
-    }
-  }
-  for (const pack of removablePacks) {
-    const expected = plannedPacksById.get(pack.view.packId);
-    if (
-      expected === undefined ||
-      !identitiesEqual(expected.identity, pack.identity)
-    ) {
-      throw new GarbageCollectionNamespaceError(
-        pack.path,
-        "pack changed between planning and cutover",
-      );
-    }
-  }
-
-  const removableObjectSet = new Set(removableObjects);
-  const removablePackIdSet = new Set(
-    removablePacks.map(({ view }) => view.packId),
-  );
-  const coverageResolver = new CompactionResolver(
+  const sweepResources: SweepResources = {
+    authority,
     store,
+    repository,
     maintenance,
-    inventories.objects,
     catalog,
-    inventories.packs,
-    mark,
-  );
-  try {
-    await withRetainedCleanup(
-      () =>
-        authenticateRetainedCoverage(
-          inventories,
-          mark,
-          coverageResolver,
-          removableObjectSet,
-          removablePackIdSet,
-          replacementPackIds,
-          mark.authenticatedCoverage,
-        ),
-      () => coverageResolver.dispose(),
-      "retained-coverage authentication and cleanup both failed",
-    );
-  } catch (error) {
-    rethrowGarbageCollectionPrimary(error);
-  }
-
-  try {
-    for (const object of removableObjects) {
-      if (
-        !(await maintenance.objectIdentityStillCurrent(
-          inventories.objects,
-          object,
-        ))
-      ) {
-        throw new GarbageCollectionNamespaceError(
-          layout.objects,
-          "object changed between final inventory and cutover",
-        );
-      }
-    }
-    for (const pack of removablePacks) {
-      if (!(await catalog.packIdentityStillCurrent(pack))) {
-        throw new GarbageCollectionNamespaceError(
-          pack.path,
-          "pack changed between final inventory and cutover",
-        );
-      }
-    }
-  } catch (error) {
-    mapInfrastructureError(layout.objects, error);
-  }
-
-  const removableIncoming = inventories.packs.incoming.filter((incoming) =>
-    expired(incoming.identity.mtimeMs, graceMs, now),
-  );
-  if (
-    removableObjects.length > 0 ||
-    removablePacks.length > 0 ||
-    removableIncoming.length > 0
-  ) {
-    const rootsAtCutover = stableRoots(
-      metadata.listReferencedTreeOids(maxObjects + 1),
-    );
-    if (!sameStrings(initialRoots, rootsAtCutover)) {
-      throw new GarbageCollectionRootDriftError();
-    }
-    assertWorkspaceWriteAuthority(authority, layout.root);
-  }
-
-  try {
-    for (const object of removableObjects) {
-      const wasLive = objectIsLive(object, mark);
-      const bytes = await maintenance.removeObject(
-        inventories.objects,
-        object,
-        authority,
-      );
-      report.freedBytes += bytes;
-      if (object.temporary) {
-        report.removedTmpFiles += 1;
-      } else {
-        if (object.kind === "loose-content" || object.kind === "loose-recipe") {
-          report.removedRecords += 1;
-        }
-        if (wasLive) {
-          report.compactedObjects += 1;
-        } else if (object.kind === "loose-structural") {
-          report.removedTrees += 1;
-        } else {
-          report.removedBlobs += 1;
-        }
-      }
-    }
-  } catch (error) {
-    mapInfrastructureError(layout.objects, error);
-  }
-
-  try {
-    for (const pack of removablePacks) {
-      await catalog.removePack(pack, authority);
-      report.removedPacks += 1;
-      report.freedBytes += pack.identity.size;
-      for (const entry of pack.view.entries) {
-        if (!mark.liveKeys.has(recordKey(entry.kind, entry.logicalId))) {
-          countRemovedRecord(report, entry.kind);
-        }
-      }
-    }
-    for (const incoming of removableIncoming) {
-      await catalog.removeIncoming(incoming, authority);
-      report.removedTmpFiles += 1;
-      report.freedBytes += incoming.identity.size;
-    }
-    const afterDeletion = await catalog.inventory();
-    await ensureMultiPackIndex(catalog, afterDeletion, authority);
-  } catch (error) {
-    mapInfrastructureError(layout.packs, error);
-  }
-
-  report.keptObjects += inventories.objects.objects.filter(
-    (object) => !object.temporary && !removableObjectSet.has(object),
-  ).length;
-  const removedPackIds = new Set(removablePacks.map(({ view }) => view.packId));
-  report.keptObjects += inventories.packs.packs
-    .filter(({ view }) => !removedPackIds.has(view.packId))
-    .reduce((count, pack) => count + pack.view.entries.length, 0);
-  return Object.freeze({ ...report });
+    metadata,
+    layout,
+  };
+  const sweepFence: SweepFence = {
+    initialRoots,
+    maxObjects,
+    replacementPackIds,
+  };
+  const sweep = await planSweep(sweepResources, sweepFence, {
+    materialized,
+    inventories,
+    selection,
+    plannedPacksById,
+    graceMs,
+    now,
+  });
+  await authorizeSweep(sweepResources, sweepFence, sweep);
+  return await executeSweep(sweepResources, sweep, report, maxObjects);
 }

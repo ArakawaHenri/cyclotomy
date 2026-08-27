@@ -303,6 +303,47 @@ afterEach(async () => {
 });
 
 describe("object garbage collection", () => {
+  it("authenticates an unchanged inventory once per collection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-inventory-"));
+    roots.push(root);
+    const store = await openObjectStore(root);
+    const content = Buffer.from("rooted inventory evidence", "utf8");
+    const blobOid = await publishTestBlob(store, content);
+    const treeOid = await publishTestTree(
+      store,
+      [
+        {
+          path: "rooted.txt",
+          type: "regular",
+          blobOid,
+          recreationMode: 0o644,
+        },
+      ],
+      scope,
+    );
+    const metadata = { listReferencedTreeOids: () => [treeOid] };
+    await collectGarbage(store, metadata, { graceMs: 0 });
+    expect(
+      (await new PackCatalog(nativeObjectLayout(root)).inventory()).packs
+        .length,
+    ).toBeGreaterThan(0);
+
+    const packInventory = vi.spyOn(PackCatalog.prototype, "inventory");
+    const authenticatedPackOpen = vi.spyOn(PackCatalog.prototype, "openPack");
+    const logicalPackOpen = vi.spyOn(PackCatalog.prototype, "openPackForRead");
+    const objectInventory = vi.spyOn(
+      ObjectStoreMaintenance.prototype,
+      "inventory",
+    );
+
+    await collectGarbage(store, metadata, { graceMs: 0 });
+
+    expect(packInventory).toHaveBeenCalledTimes(1);
+    expect(authenticatedPackOpen).not.toHaveBeenCalled();
+    expect(logicalPackOpen).toHaveBeenCalled();
+    expect(objectInventory).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses no-delete MIDX publication after its authority is displaced", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-midx-lease-"));
     roots.push(root);
