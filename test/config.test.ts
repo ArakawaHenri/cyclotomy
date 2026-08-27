@@ -210,7 +210,7 @@ describe("Cyclotomy configuration", () => {
       futureRootSetting: { enabled: true },
       gc: {
         intervalMs: 0,
-        sessionRetentionMs: "no longer interpreted",
+        futureNestedSetting: "ignored",
         futureGcSetting: -1,
       },
     });

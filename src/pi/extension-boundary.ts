@@ -229,25 +229,6 @@ export function projectStableGraph(
   });
 }
 
-export function sameStableCoordinates(
-  left: readonly StableCoordinate[],
-  right: readonly StableCoordinate[],
-): boolean {
-  return (
-    left.length === right.length &&
-    left.every((coordinate, index) => {
-      const other = right[index];
-      return (
-        other !== undefined &&
-        coordinate.id === other.id &&
-        coordinate.stableParentId === other.stableParentId &&
-        coordinate.type === other.type &&
-        coordinate.messageRole === other.messageRole
-      );
-    })
-  );
-}
-
 function indexStableCoordinates(
   coordinates: readonly StableCoordinate[],
 ): ReadonlyMap<

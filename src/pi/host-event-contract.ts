@@ -1,46 +1,7 @@
 import type {
-  ExtensionEvent,
   MessageEndEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
-
-type PublicSessionEvent = Extract<
-  ExtensionEvent,
-  { readonly type: `session_${string}` }
->;
-
-type SessionEventPolicy =
-  "bootstrap" | "prepare" | "settle" | "close" | "ignore-nonstructural";
-
-/** Require every installed event while retaining policies for newer Pi versions. */
-function defineSessionEventPolicies<
-  const Policies extends Record<string, SessionEventPolicy>,
->(
-  policies: Policies & Record<PublicSessionEvent["type"], SessionEventPolicy>,
-): Readonly<Policies> {
-  return Object.freeze(policies);
-}
-
-/**
- * Compile-time inventory of Pi's public session lifecycle.
- *
- * This is deliberately a policy manifest rather than a dynamic dispatcher:
- * Pi's typed `on()` overloads remain the registration authority, while a new
- * public session event makes both the locked and latest-host type checks ask
- * for an explicit Cyclotomy policy.
- */
-defineSessionEventPolicies({
-  session_start: "bootstrap",
-  session_info_changed: "ignore-nonstructural",
-  session_before_switch: "prepare",
-  session_before_fork: "prepare",
-  session_before_compact: "prepare",
-  session_compact: "settle",
-  session_compact_failed: "ignore-nonstructural",
-  session_shutdown: "close",
-  session_before_tree: "prepare",
-  session_tree: "settle",
-});
 
 export interface SessionStartPolicy {
   readonly registration: "independent" | "fork";

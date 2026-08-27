@@ -333,7 +333,7 @@ describe("metadata adjacent-version chain", () => {
     }
   });
 
-  it("does not encode a named or numeric legacy root in the chain engine", () => {
+  it("represents the chain root without a predecessor", () => {
     const rootSchema = metadataSchemaSpec({
       version: 7,
       errorLabel: "synthetic root",
@@ -352,7 +352,7 @@ describe("metadata adjacent-version chain", () => {
     expect(root.previous).toBeUndefined();
   });
 
-  it("rejects an unverified successor schema that reuses the old writer protocol", () => {
+  it("rejects a successor whose schema identity has not advanced", () => {
     expect(() =>
       defineMetadataVersion({
         version: SUCCESSOR_METADATA_VERSION,

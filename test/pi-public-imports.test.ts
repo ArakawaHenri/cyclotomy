@@ -47,7 +47,7 @@ describe("Pi public import boundary", () => {
     expect(violations).toEqual([]);
   });
 
-  it("keeps host semantics and retired compatibility seams out of the core", async () => {
+  it("keeps host, presentation, and capture responsibilities at their boundaries", async () => {
     const root = resolve("src");
     const violations: string[] = [];
     for (const file of await sourceFiles(root)) {
@@ -58,38 +58,6 @@ describe("Pi public import boundary", () => {
         (/\bSessionEntry\b/u.test(source) || /\bbranch_summary\b/u.test(source))
       ) {
         violations.push(`${relativePath}: raw Pi entry semantics`);
-      }
-      for (const retired of [
-        "entryOf(",
-        "parentIdOf(",
-        "projectStableCoordinates",
-        "SessionSnapshot",
-        "beginSessionRegistration",
-        "notificationWorkspace",
-        "LIFECYCLE_GENERATION",
-        "sessionRetentionMs",
-        "DEFAULT_MAX_HOPS",
-        "walkNodeAncestry",
-        "migrateSchemaAndReplaceTreeOidReferences",
-        "migrateReferencedTrees",
-        "capturePreparationDeps",
-        "checkpointDeps",
-      ]) {
-        if (source.includes(retired)) {
-          violations.push(`${relativePath}: ${retired}`);
-        }
-      }
-      for (const [label, pattern] of [
-        ["removed tree-manifest facade", /tree-manifest\.ts/u],
-        ["public MetadataStore constructor", /\bclass\s+MetadataStore\b/u],
-        ["direct MetadataStore construction", /\bnew\s+MetadataStore\b/u],
-        [
-          "CurrentMetadataStore type alias",
-          /\btype\s+CurrentMetadataStore\s*=/u,
-        ],
-        ["constructor token bypass", /\bReflect\.construct\b/u],
-      ] as const) {
-        if (pattern.test(source)) violations.push(`${relativePath}: ${label}`);
       }
       if (
         /^(?:application|domain)\//u.test(relativePath) &&

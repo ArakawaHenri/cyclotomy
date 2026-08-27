@@ -3061,22 +3061,22 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
-  it("does not follow the former predictable GC-state temporary symlink", async (context) => {
+  it("leaves neighboring symlinks untouched while publishing GC state", async (context) => {
     context.skip(
       process.platform === "win32",
       "Windows symlink creation is privilege-dependent",
     );
     const { parent, runtime } = await createRuntime();
     const statePath = join(runtime.storeRoot, "gc-state.json");
-    const predictable = `${statePath}.${process.pid}.tmp`;
+    const neighboringPath = `${statePath}.${process.pid}.tmp`;
     const victim = join(parent, "victim.txt");
     await writeFile(victim, "must remain untouched");
-    await symlink(victim, predictable);
+    await symlink(victim, neighboringPath);
 
     await runtime.maybeRunAutomaticGc();
 
     expect(await readFile(victim, "utf8")).toBe("must remain untouched");
-    expect((await lstat(predictable)).isSymbolicLink()).toBe(true);
+    expect((await lstat(neighboringPath)).isSymbolicLink()).toBe(true);
     const state = JSON.parse(await readFile(statePath, "utf8")) as {
       lastGcAt: number;
     };
