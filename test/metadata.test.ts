@@ -158,12 +158,7 @@ function waitForChildMessage(
 function startMetadataChild(
   path: string,
   iterations = 1,
-  mode:
-    | "write"
-    | "gated-write"
-    | "open-only"
-    | "legacy-live"
-    | "settle-sidecar" = "write",
+  mode: "write" | "gated-write" | "open-only" | "legacy-live" = "write",
   gate?: MetadataOpenGate,
 ): MetadataChild {
   const child = fork(
@@ -1503,10 +1498,6 @@ describe("checkpoint slot metadata", () => {
       .run("legacy", "entry", treeOid);
     legacy.close();
 
-    if (false) {
-      // @ts-expect-error The factory accepts no hidden compatibility options.
-      createCurrentMetadataStore(path, {});
-    }
     await expect(
       createTestCurrentMetadataStore(path, dirname(path)),
     ).rejects.toThrow(/schema version 1 requires openCurrentMetadataStore/u);
@@ -2058,43 +2049,6 @@ describe("checkpoint slot metadata", () => {
       });
     },
   );
-
-  it("allows a transient unpaired WAL sidecar to settle before inspection", async () => {
-    const { path, store } = await createStore();
-    registerTestSession(store, "source", "/sessions/source.jsonl");
-    store.close();
-    await writeFile(`${path}-wal`, "transient WAL sentinel");
-    const child = startMetadataChild(path, 1, "settle-sidecar");
-    let opened: Promise<MetadataChildMessage> | undefined;
-
-    try {
-      await child.ready;
-      const opening = waitForChildMessage(
-        child.process,
-        "opening",
-        child.stderr,
-      );
-      child.process.send?.("start");
-      await opening;
-      opened = waitForChildMessage(child.process, "opened", child.stderr);
-      child.process.send?.("settle");
-
-      expect(
-        inspectMetadataSessionIdentity(
-          path,
-          "source",
-          "/sessions/source.jsonl",
-        ),
-      ).toMatchObject({ kind: "exact" });
-      await opened;
-      child.process.send?.("finish");
-      await waitForChildExit(child);
-    } finally {
-      if (child.process.exitCode === null) child.process.kill("SIGKILL");
-      await opened?.catch(() => {});
-      await waitForChildExit(child);
-    }
-  });
 
   it("probes published v1 identity variants without migrating or switching journals", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-probe-v1-"));

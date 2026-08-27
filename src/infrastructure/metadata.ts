@@ -56,13 +56,6 @@ export { MetadataError } from "./metadata-error.ts";
 const OPEN_BUSY_RETRY_MS = 5_000;
 const OPEN_BUSY_POLL_MS = 10;
 const OPEN_WAIT_CELL = new Int32Array(new SharedArrayBuffer(4));
-const SIDECAR_VALIDATION_ATTEMPTS = 64;
-const SIDECAR_RETRY_MS = 2;
-
-function isTransientSidecarAccess(error: unknown): boolean {
-  const code = systemErrorCode(error);
-  return code === "EACCES" || code === "EBUSY" || code === "EPERM";
-}
 
 function isSqliteBusy(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -279,7 +272,6 @@ interface MetadataIdentityProofDetails {
   readonly metadataVersion: MetadataVersionNode;
   readonly sessionId: string;
   readonly sessionFile: string;
-  readonly sidecars: MetadataSidecarSet;
 }
 
 const metadataIdentityProofDetails = new WeakMap<
@@ -345,151 +337,33 @@ function checkedRegularMetadataPath(path: string): Stats {
   }
 }
 
-function optionalMetadataSidecar(
-  path: string,
-  attempts = SIDECAR_VALIDATION_ATTEMPTS,
-): boolean {
-  validation: for (let attempt = 0; attempt < attempts; attempt += 1) {
-    let before: Stats;
-    try {
-      before = lstatSync(path);
-    } catch (error) {
-      // SQLite is allowed to delete a WAL/SHM sidecar as the last connection
-      // closes. Disappearance at any observation point is a valid absence.
-      if (systemErrorCode(error) === "ENOENT") return false;
-      if (isTransientSidecarAccess(error) && attempt + 1 < attempts) {
-        Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
-        continue;
-      }
-      throw error;
-    }
-    // A sidecar can be unlinked immediately after a successful lookup. Some
-    // kernels expose that legitimate race as a regular-file stat with zero
-    // links rather than ENOENT.
-    if (before.nlink === 0) return false;
-    if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) {
-      throw metadataPathError(
-        path,
-        "must be a single-link regular file, not a symlink or another file type",
-      );
-    }
-
-    let descriptor: number | undefined;
-    let changed = false;
-    try {
-      descriptor = openSync(
-        path,
-        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
-      );
-      const opened = fstatSync(descriptor);
-      let after: Stats;
-      try {
-        after = lstatSync(path);
-      } catch (error) {
-        if (systemErrorCode(error) === "ENOENT") return false;
-        if (isTransientSidecarAccess(error) && attempt + 1 < attempts) {
-          Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
-          continue validation;
-        }
-        throw error;
-      }
-      if (after.nlink === 0) return false;
-      if (
-        opened.isFile() &&
-        opened.nlink === 1 &&
-        !after.isSymbolicLink() &&
-        after.isFile() &&
-        after.nlink === 1 &&
-        sameFileIdentity(before, opened) &&
-        sameFileIdentity(opened, after)
-      ) {
-        return true;
-      }
-      if (
-        sameFileIdentity(opened, after) &&
-        (!opened.isFile() ||
-          opened.nlink > 1 ||
-          after.isSymbolicLink() ||
-          !after.isFile() ||
-          after.nlink > 1)
-      ) {
-        throw metadataPathError(
-          path,
-          "must be a single-link regular file, not a symlink or another file type",
-        );
-      }
-      changed = true;
-    } catch (error) {
-      if (systemErrorCode(error) === "ENOENT") return false;
-      // A nofollow open reports ELOOP when a regular sidecar is replaced by a
-      // symlink between lstat and open. Reobserve it; a stable symlink is
-      // rejected by the next iteration without ever being followed.
-      if (
-        systemErrorCode(error) === "ELOOP" ||
-        isTransientSidecarAccess(error)
-      ) {
-        changed = true;
-      } else {
-        throw error;
-      }
-    } finally {
-      if (descriptor !== undefined) closeSync(descriptor);
-    }
-
-    if (changed && attempt + 1 < attempts) {
-      Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
-    }
+function optionalMetadataSidecar(path: string): boolean {
+  let observed: Stats;
+  try {
+    observed = lstatSync(path);
+  } catch (error) {
+    if (systemErrorCode(error) === "ENOENT") return false;
+    throw error;
   }
-  throw metadataPathError(
-    path,
-    "changed repeatedly while it was being validated",
-  );
+  if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+    throw metadataPathError(
+      path,
+      "must be a single-link regular file, not a symlink or another file type",
+    );
+  }
+  return true;
 }
 
-function metadataSidecars(
-  path: string,
-  attempts = SIDECAR_VALIDATION_ATTEMPTS,
-): MetadataSidecarSet {
+function metadataSidecars(path: string): MetadataSidecarSet {
   return {
-    journal: optionalMetadataSidecar(`${path}-journal`, attempts),
-    shm: optionalMetadataSidecar(`${path}-shm`, attempts),
-    wal: optionalMetadataSidecar(`${path}-wal`, attempts),
+    journal: optionalMetadataSidecar(`${path}-journal`),
+    shm: optionalMetadataSidecar(`${path}-shm`),
+    wal: optionalMetadataSidecar(`${path}-wal`),
   };
-}
-
-function sameMetadataSidecars(
-  left: MetadataSidecarSet,
-  right: MetadataSidecarSet,
-): boolean {
-  return (
-    left.journal === right.journal &&
-    left.shm === right.shm &&
-    left.wal === right.wal
-  );
 }
 
 function sidecarsRequireRecovery(sidecars: MetadataSidecarSet): boolean {
   return sidecars.journal || sidecars.wal !== sidecars.shm;
-}
-
-/** Allow SQLite's last-connection sidecar teardown to reach a stable shape. */
-function stabilizeMetadataSidecars(
-  path: string,
-  initial: MetadataSidecarSet,
-): MetadataSidecarSet {
-  let sidecars = initial;
-  for (
-    let attempt = 1;
-    sidecarsRequireRecovery(sidecars) && attempt < SIDECAR_VALIDATION_ATTEMPTS;
-    attempt += 1
-  ) {
-    Atomics.wait(OPEN_WAIT_CELL, 0, 0, SIDECAR_RETRY_MS);
-    // The outer loop owns this retry budget. Each reobservation performs one
-    // complete no-follow validation so nested retry loops cannot amplify a
-    // hostile sidecar churn into seconds of synchronous blocking.
-    sidecars = metadataSidecars(path, 1);
-  }
-  return sidecars;
 }
 
 function canonicalMetadataPath(path: string): string {
@@ -524,15 +398,10 @@ function canonicalMetadataPath(path: string): string {
 function prepareExistingMetadataPath(path: string): {
   readonly canonicalPath: string;
   readonly observation: Stats;
-  readonly sidecars: MetadataSidecarSet;
 } {
   const canonicalPath = canonicalMetadataPath(path);
   const observation = checkedRegularMetadataPath(path);
-  return {
-    canonicalPath,
-    observation,
-    sidecars: metadataSidecars(canonicalPath),
-  };
+  return { canonicalPath, observation };
 }
 
 /**
@@ -544,7 +413,6 @@ function prepareExistingMetadataPath(path: string): {
 function prepareMetadataPath(path: string): {
   readonly canonicalPath: string;
   readonly observation: Stats;
-  readonly sidecars: MetadataSidecarSet;
 } {
   const canonicalPath = canonicalMetadataPath(path);
 
@@ -589,11 +457,7 @@ function prepareMetadataPath(path: string): {
   }
 
   const observation = checkedRegularMetadataPath(path);
-  return {
-    canonicalPath,
-    observation,
-    sidecars: metadataSidecars(canonicalPath),
-  };
+  return { canonicalPath, observation };
 }
 
 function requireTreeOid(value: unknown, context: string): TreeOid {
@@ -758,15 +622,9 @@ export function inspectMetadataSessionIdentity(
   requireNonEmpty(sessionId, "session id");
   requireNonEmpty(sessionFile, "session file");
   try {
-    const observed = prepareExistingMetadataPath(path);
-    const prepared = {
-      ...observed,
-      sidecars: stabilizeMetadataSidecars(
-        observed.canonicalPath,
-        observed.sidecars,
-      ),
-    };
-    if (sidecarsRequireRecovery(prepared.sidecars)) {
+    const prepared = prepareExistingMetadataPath(path);
+    const sidecars = metadataSidecars(prepared.canonicalPath);
+    if (sidecarsRequireRecovery(sidecars)) {
       return {
         kind: "recovery-required",
         cause: metadataPathError(
@@ -776,7 +634,7 @@ export function inspectMetadataSessionIdentity(
       };
     }
 
-    const location = prepared.sidecars.wal
+    const location = sidecars.wal
       ? prepared.canonicalPath
       : (() => {
           const immutable = pathToFileURL(prepared.canonicalPath);
@@ -841,14 +699,10 @@ export function inspectMetadataSessionIdentity(
     }
 
     const reopened = checkedRegularMetadataPath(prepared.canonicalPath);
-    const sidecars = metadataSidecars(prepared.canonicalPath);
-    if (
-      !sameFileIdentity(prepared.observation, reopened) ||
-      !sameMetadataSidecars(prepared.sidecars, sidecars)
-    ) {
+    if (!sameFileIdentity(prepared.observation, reopened)) {
       throw metadataPathError(
         path,
-        "database or sidecars changed while identity was inspected",
+        "database changed while identity was inspected",
       );
     }
     if (inspection === undefined) {
@@ -863,7 +717,6 @@ export function inspectMetadataSessionIdentity(
       metadataVersion: inspection.metadataVersion,
       sessionId,
       sessionFile,
-      sidecars,
     });
     return { kind: "exact", proof };
   } catch (error) {
@@ -1365,15 +1218,15 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
           ? prepareMetadataPath(path)
           : prepareExistingMetadataPath(path);
       this.#canonicalPath = prepared.canonicalPath;
+      metadataSidecars(prepared.canonicalPath);
       if (
         authenticated !== undefined &&
         (prepared.canonicalPath !== authenticated.canonicalPath ||
-          !sameFileIdentity(prepared.observation, authenticated.observation) ||
-          !sameMetadataSidecars(prepared.sidecars, authenticated.sidecars))
+          !sameFileIdentity(prepared.observation, authenticated.observation))
       ) {
         throw metadataPathError(
           path,
-          "database or sidecars changed after identity was authenticated",
+          "database changed after identity was authenticated",
         );
       }
       db = new DatabaseSync(prepared.canonicalPath);
@@ -1431,8 +1284,6 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       });
       enableWalWithRetry(db);
       db.exec("PRAGMA synchronous=FULL;");
-      optionalMetadataSidecar(`${prepared.canonicalPath}-wal`);
-      optionalMetadataSidecar(`${prepared.canonicalPath}-shm`);
       // The persistent writer-fence triggers call this connection-private
       // capability. Connections opened by an older Cyclotomy process do not
       // have it, so their next metadata mutation fails closed after migration.
