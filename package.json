@@ -1,6 +1,6 @@
 {
   "name": "cyclotomy",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": false,
   "description": "A provenance-aware workspace checkpointer for Pi Coding Agent.",
   "author": "Henri",
