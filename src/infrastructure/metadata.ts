@@ -5,7 +5,7 @@ import {
   lstatSync,
   openSync,
   realpathSync,
-  type Stats,
+  type BigIntStats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -268,7 +268,7 @@ interface MetadataSidecarSet {
 
 interface MetadataIdentityProofDetails {
   readonly canonicalPath: string;
-  readonly observation: Stats;
+  readonly observation: BigIntStats;
   readonly metadataVersion: MetadataVersionNode;
   readonly sessionId: string;
   readonly sessionFile: string;
@@ -296,14 +296,14 @@ function metadataPathError(
   );
 }
 
-function sameFileIdentity(left: Stats, right: Stats): boolean {
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function checkedRegularMetadataPath(path: string): Stats {
-  let observed: Stats;
+function checkedRegularMetadataPath(path: string): BigIntStats {
+  let observed: BigIntStats;
   try {
-    observed = lstatSync(path);
+    observed = lstatSync(path, { bigint: true });
   } catch (error) {
     throw metadataPathError(
       path,
@@ -311,7 +311,11 @@ function checkedRegularMetadataPath(path: string): Stats {
       error,
     );
   }
-  if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+  if (
+    observed.isSymbolicLink() ||
+    !observed.isFile() ||
+    observed.nlink !== 1n
+  ) {
     throw metadataPathError(
       path,
       "must be a single-link regular file, not a symlink or another file type",
@@ -323,10 +327,10 @@ function checkedRegularMetadataPath(path: string): Stats {
       path,
       fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
     );
-    const opened = fstatSync(descriptor);
+    const opened = fstatSync(descriptor, { bigint: true });
     if (
       !opened.isFile() ||
-      opened.nlink !== 1 ||
+      opened.nlink !== 1n ||
       !sameFileIdentity(observed, opened)
     ) {
       throw metadataPathError(path, "changed while it was being validated");
@@ -338,14 +342,18 @@ function checkedRegularMetadataPath(path: string): Stats {
 }
 
 function optionalMetadataSidecar(path: string): boolean {
-  let observed: Stats;
+  let observed: BigIntStats;
   try {
-    observed = lstatSync(path);
+    observed = lstatSync(path, { bigint: true });
   } catch (error) {
     if (systemErrorCode(error) === "ENOENT") return false;
     throw error;
   }
-  if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+  if (
+    observed.isSymbolicLink() ||
+    !observed.isFile() ||
+    observed.nlink !== 1n
+  ) {
     throw metadataPathError(
       path,
       "must be a single-link regular file, not a symlink or another file type",
@@ -371,9 +379,9 @@ function canonicalMetadataPath(path: string): string {
     throw metadataPathError(path, "path must be canonical and absolute");
   }
   const parent = dirname(path);
-  let parentInfo: Stats;
+  let parentInfo: BigIntStats;
   try {
-    parentInfo = lstatSync(parent);
+    parentInfo = lstatSync(parent, { bigint: true });
   } catch (error) {
     throw metadataPathError(
       path,
@@ -397,7 +405,7 @@ function canonicalMetadataPath(path: string): string {
 
 function prepareExistingMetadataPath(path: string): {
   readonly canonicalPath: string;
-  readonly observation: Stats;
+  readonly observation: BigIntStats;
 } {
   const canonicalPath = canonicalMetadataPath(path);
   const observation = checkedRegularMetadataPath(path);
@@ -412,13 +420,13 @@ function prepareExistingMetadataPath(path: string): {
  */
 function prepareMetadataPath(path: string): {
   readonly canonicalPath: string;
-  readonly observation: Stats;
+  readonly observation: BigIntStats;
 } {
   const canonicalPath = canonicalMetadataPath(path);
 
   let pathExists = false;
   try {
-    lstatSync(path);
+    lstatSync(path, { bigint: true });
     pathExists = true;
   } catch (error) {
     if (systemErrorCode(error) !== "ENOENT") {

@@ -102,6 +102,7 @@ export type CaptureBoundaryResult =
 export interface WorkspaceMutationAuthorityOptions {
   readonly admission: MutationAdmission;
   readonly participationIsActive: () => boolean;
+  readonly agentIsRunning: (context: ExtensionContext) => boolean;
   readonly registrations: RegistrationAuthority;
   readonly checkpoints: () => CheckpointService;
   readonly metadata: () => CurrentMetadataStore;
@@ -277,7 +278,7 @@ export class WorkspaceMutationAuthority {
       ) {
         throw new Error("tree arrival changed before workspace mutation");
       }
-      if (!context.isIdle()) {
+      if (this.#options.agentIsRunning(context)) {
         throw new Error("Pi became busy before tree workspace mutation");
       }
       if (!this.#options.participationIsActive()) {

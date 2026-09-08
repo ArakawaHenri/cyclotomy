@@ -7,6 +7,7 @@ type RetryScenario =
   | "formation-before-owner"
   | "formation-after-owner"
   | "vanished-contention"
+  | "transient-mkdir"
   | "transient-contention-observation";
 
 interface RetryState {
@@ -30,6 +31,7 @@ const scenarios: readonly RetryScenario[] = [
   "formation-after-owner",
   "vanished-contention",
   "transient-contention-observation",
+  ...(process.platform === "win32" ? ["transient-mkdir" as const] : []),
 ];
 const retriedAfterDeadline = new Error("retried after zero timeout");
 let state: RetryState | undefined;
@@ -52,6 +54,8 @@ const fileSystemMock = mock.module("node:fs/promises", {
       state.mkdirCalls += 1;
       if (state.mkdirCalls > 1) throw retriedAfterDeadline;
       switch (state.scenario) {
+        case "transient-mkdir":
+          throw fileSystemError("EPERM");
         case "formation-before-owner":
           return undefined;
         case "formation-after-owner":

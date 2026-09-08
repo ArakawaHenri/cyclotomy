@@ -79,7 +79,7 @@ export async function executeTreeArrivalInWorkspaceLock(
   ) {
     return { kind: "target-changed" };
   }
-  if (!context.isIdle()) return { kind: "busy" };
+  if (runtime.agentIsRunning(context)) return { kind: "busy" };
 
   switch (plan.target.kind) {
     case "protected-missing": {
@@ -131,7 +131,7 @@ export async function executeTreeArrivalInWorkspaceLock(
       if (current === undefined) {
         return { kind: "location-changed" };
       }
-      if (!context.isIdle()) return { kind: "busy" };
+      if (runtime.agentIsRunning(context)) return { kind: "busy" };
       const currentAnchor = runtime.checkpoints.captureAnchor(current);
       if (!sameNavigationNode(currentAnchor, actualAnchor)) {
         return { kind: "location-changed" };
@@ -264,7 +264,7 @@ export async function executeTreeArrivalInWorkspaceLock(
     ) {
       return { kind: "target-changed" };
     }
-    if (!context.isIdle()) return { kind: "busy" };
+    if (runtime.agentIsRunning(context)) return { kind: "busy" };
     const committedTarget = runtime.commitTreeArrivalCapture(
       writeAuthority,
       arrival,
@@ -400,7 +400,7 @@ export async function executeTreeArrivalInWorkspaceLock(
     return { kind: "target-changed" };
   }
   if (plan.target.kind === "inherit-source") {
-    if (!context.isIdle()) return { kind: "busy" };
+    if (runtime.agentIsRunning(context)) return { kind: "busy" };
     const disposition = runtime.workspaceMutations.admitTreeArrivalIfResolution(
       writeAuthority,
       arrival,

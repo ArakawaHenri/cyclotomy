@@ -206,7 +206,7 @@ export function registerNavigationLifecycle(
             );
             return { cancel: true };
           }
-          if (!context.isIdle()) {
+          if (runtime.agentIsRunning(context)) {
             runtime.notify(
               context,
               runtime.i18n.t("transitionInProgress"),
@@ -588,7 +588,7 @@ export function registerNavigationLifecycle(
               // Workspace execution resolves through a microtask. Recheck the public
               // streaming boundary after that yield and immediately before publishing
               // the host proposal.
-              if (!context.isIdle()) {
+              if (runtime.agentIsRunning(context)) {
                 runtime.notify(
                   context,
                   runtime.i18n.t("transitionInProgress"),
@@ -727,7 +727,7 @@ export function registerNavigationLifecycle(
         }
         authenticatedArrival = authenticated;
         actualAnchor = runtime.checkpoints.captureAnchor(view);
-        if (!context.isIdle()) {
+        if (runtime.agentIsRunning(context)) {
           await protectAndAttend(() =>
             runtime.notify(
               context,

@@ -230,6 +230,9 @@ export class FakePi {
   hasUI = true;
   mode: "tui" | "rpc" | "json" | "print" = "tui";
   idle = true;
+  readonly #agentAbortController = new AbortController();
+  #agentRunActive = false;
+  #treeEventDepth = 0;
   waitForIdleCalls = 0;
   reloadCalls = 0;
   waitForIdleHook: (() => Promise<void>) | undefined;
@@ -371,7 +374,11 @@ export class FakePi {
         return self.mode;
       },
       ui,
-      isIdle: () => self.idle,
+      isIdle: () =>
+        self.idle && !self.#agentRunActive && self.#treeEventDepth === 0,
+      get signal() {
+        return self.idle ? undefined : self.#agentAbortController.signal;
+      },
       async waitForIdle() {
         self.waitForIdleCalls += 1;
         await self.waitForIdleHook?.();
@@ -394,10 +401,28 @@ export class FakePi {
     event: EventOf<T>,
   ): Promise<unknown[]> {
     const results: unknown[] = [];
-    for (const handler of this.#handlers.get(type) ?? []) {
-      results.push(await handler(event, this.context));
+    const treeEvent = type === "session_before_tree" || type === "session_tree";
+    if (treeEvent) this.#treeEventDepth += 1;
+    try {
+      for (const handler of this.#handlers.get(type) ?? []) {
+        results.push(await handler(event, this.context));
+      }
+      return results;
+    } finally {
+      if (treeEvent) this.#treeEventDepth -= 1;
     }
-    return results;
+  }
+
+  async startAgentRun(): Promise<void> {
+    this.#agentRunActive = true;
+    this.idle = false;
+    await this.#emit("agent_start", { type: "agent_start" });
+  }
+
+  async settleAgentRun(): Promise<void> {
+    this.#agentRunActive = false;
+    this.idle = true;
+    await this.#emit("agent_settled", { type: "agent_settled" });
   }
 
   async #persistCurrentSessionIfPresent(): Promise<void> {

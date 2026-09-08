@@ -219,14 +219,14 @@ describe("chunked roots in mixed compaction packs", () => {
       const fixture = await mixedPack();
       const pack =
         dependency === "root" ? fixture.rootPack : fixture.recipePack;
-      const original =
-        ContentRepository.prototype.verifiedContentClosureStillCurrent;
+      const close = ContentRepository.prototype.closeResolutionScope;
       const remove = vi.spyOn(PackCatalog.prototype, "removePack");
       let replaced = false;
       vi.spyOn(
         ContentRepository.prototype,
-        "verifiedContentClosureStillCurrent",
-      ).mockImplementation(async function (this: ContentRepository, closure) {
+        "closeResolutionScope",
+      ).mockImplementation(async function (this: ContentRepository, scope) {
+        await close.call(this, scope);
         if (!replaced) {
           replaced = true;
           const replacement = join(fixture.base, "replacement.pack");
@@ -235,7 +235,6 @@ describe("chunked roots in mixed compaction packs", () => {
           });
           await rename(replacement, pack.path);
         }
-        return original.call(this, closure);
       });
 
       await expect(fixture.collect()).rejects.toBeInstanceOf(

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants, type Stats } from "node:fs";
+import { constants, type BigIntStats, type Stats } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -66,7 +66,6 @@ import {
   privateFileIdentity as identityFor,
   PrivateFileBoundaryError,
   revalidateOpenedPrivateFile,
-  sameFileObservation,
   samePrivateFileIdentity as sameCatalogIdentity,
   type OpenedPrivateFile,
   type PrivateFileIdentity,
@@ -248,8 +247,8 @@ interface OwnedTemporary {
 
 interface CatalogDirectoryIdentity {
   readonly path: string;
-  readonly dev: number;
-  readonly ino: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
 }
 
 type CatalogDirectoryChain = readonly CatalogDirectoryIdentity[];
@@ -411,13 +410,24 @@ function resolveLimits(
   return Object.freeze(resolved);
 }
 
-function sameIdentity(left: Stats, right: Stats): boolean {
-  return sameFileObservation(left, right);
+function sameDirectoryObservation(
+  left: BigIntStats,
+  right: BigIntStats,
+): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
 }
 
 function directoryIdentity(
   path: string,
-  observation: Stats,
+  observation: BigIntStats,
 ): CatalogDirectoryIdentity {
   return Object.freeze({
     path,
@@ -428,7 +438,7 @@ function directoryIdentity(
 
 function sameDirectoryIdentity(
   left: CatalogDirectoryIdentity,
-  right: Stats,
+  right: BigIntStats,
 ): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
@@ -437,10 +447,10 @@ function directoryFingerprint(identity: CatalogDirectoryIdentity): string {
   return [identity.path, identity.dev, identity.ino].join("\0");
 }
 
-async function observeDirectory(path: string): Promise<Stats> {
-  let observation: Stats;
+async function observeDirectory(path: string): Promise<BigIntStats> {
+  let observation: BigIntStats;
   try {
-    observation = await lstat(path);
+    observation = await lstat(path, { bigint: true });
   } catch (error) {
     fail("storage-failure", `could not inspect directory ${path}`, error);
   }
@@ -452,10 +462,10 @@ async function observeDirectory(path: string): Promise<Stats> {
 
 async function observeDirectoryIfPresent(
   path: string,
-): Promise<Stats | undefined> {
-  let observation: Stats;
+): Promise<BigIntStats | undefined> {
+  let observation: BigIntStats;
   try {
-    observation = await lstat(path);
+    observation = await lstat(path, { bigint: true });
   } catch (error) {
     if (systemErrorCode(error) === "ENOENT") return undefined;
     fail("storage-failure", `could not inspect directory ${path}`, error);
@@ -469,9 +479,9 @@ async function observeDirectoryIfPresent(
 function assertSameDevice(
   parent: CatalogDirectoryIdentity,
   childPath: string,
-  childDevice: number,
+  childDevice: number | bigint,
 ): void {
-  if (childDevice !== parent.dev) {
+  if (BigInt(childDevice) !== parent.dev) {
     fail("namespace-invalid", `${childPath} crosses a device boundary`);
   }
 }
@@ -524,9 +534,9 @@ async function directoryChainStillCurrent(
   expected: CatalogDirectoryChain,
 ): Promise<boolean> {
   for (const identity of expected) {
-    let current: Stats;
+    let current: BigIntStats;
     try {
-      current = await lstat(identity.path);
+      current = await lstat(identity.path, { bigint: true });
     } catch (error) {
       if (systemErrorCode(error) === "ENOENT") return false;
       fail(
@@ -590,7 +600,7 @@ async function readDirectoryNames(
     );
   }
   const after = await observeDirectory(path);
-  if (!sameIdentity(before, after)) {
+  if (!sameDirectoryObservation(before, after)) {
     fail("namespace-invalid", `${path} changed while it was inventoried`);
   }
   if (expected !== undefined && !sameDirectoryIdentity(expected, after)) {
@@ -945,10 +955,10 @@ async function syncDirectory(
   try {
     await withDeterministicCleanup(
       async () => {
-        const observation = await handle.stat();
+        const observation = await handle.stat({ bigint: true });
         if (
           !observation.isDirectory() ||
-          !sameIdentity(before, observation) ||
+          !sameDirectoryObservation(before, observation) ||
           (expected !== undefined &&
             !sameDirectoryIdentity(expected, observation))
         ) {
@@ -958,7 +968,7 @@ async function syncDirectory(
         await handle.sync();
         const after = await observeDirectory(path);
         if (
-          !sameIdentity(observation, after) ||
+          !sameDirectoryObservation(observation, after) ||
           (expected !== undefined && !sameDirectoryIdentity(expected, after))
         ) {
           fail("namespace-invalid", `${path} changed while synchronizing`);
@@ -1096,7 +1106,7 @@ async function createAndSyncTemporary(
     if (
       identity.size !== bytes.byteLength ||
       !sameCatalogIdentity(identity, openedIdentity) ||
-      identity.dev !== expectedParent.dev ||
+      BigInt(identity.dev) !== expectedParent.dev ||
       !(await directoryChainStillCurrent(parents))
     ) {
       fail("namespace-invalid", `${path} changed after it was written`);
@@ -1649,7 +1659,10 @@ export class PackCatalog {
       this.#layout,
       receipt.view.packId.slice(0, 2),
     );
-    if (shard.path !== expectedShard || receipt.identity.dev !== shard.dev) {
+    if (
+      shard.path !== expectedShard ||
+      BigInt(receipt.identity.dev) !== shard.dev
+    ) {
       fail(
         "namespace-invalid",
         `pack ${receipt.view.packId} is outside its authenticated shard`,

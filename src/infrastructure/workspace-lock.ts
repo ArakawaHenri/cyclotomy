@@ -4,7 +4,7 @@ import {
   lstatSync,
   readFileSync,
   readdirSync,
-  type Stats,
+  type BigIntStats,
 } from "node:fs";
 import {
   lstat,
@@ -73,17 +73,17 @@ type LockOwnerState =
   | { readonly kind: "ambiguous" };
 
 interface LockObservation {
-  readonly device: number;
-  readonly inode: number;
+  readonly device: bigint;
+  readonly inode: bigint;
   readonly owner: LockOwnerState;
 }
 
 interface ProtocolFileObservation {
-  readonly device: number;
-  readonly inode: number;
-  readonly mode: number;
-  readonly links: number;
-  readonly size: number;
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly mode: bigint;
+  readonly links: bigint;
+  readonly size: bigint;
 }
 
 type WorkspaceWriteAuthorityPhase =
@@ -220,7 +220,7 @@ async function bindStoreRoot(path: string): Promise<DirectoryBinding> {
   }
 }
 
-function protocolFileObservation(entry: Stats): ProtocolFileObservation {
+function protocolFileObservation(entry: BigIntStats): ProtocolFileObservation {
   return {
     device: entry.dev,
     inode: entry.ino,
@@ -232,12 +232,12 @@ function protocolFileObservation(entry: Stats): ProtocolFileObservation {
 
 function sameProtocolFile(
   expected: ProtocolFileObservation,
-  current: Stats,
+  current: BigIntStats,
 ): boolean {
   return (
     current.isFile() &&
     !current.isSymbolicLink() &&
-    current.nlink === 1 &&
+    current.nlink === 1n &&
     current.dev === expected.device &&
     current.ino === expected.inode &&
     current.mode === expected.mode &&
@@ -307,7 +307,7 @@ export function assertWorkspaceWriteAuthority(
       expectedStoreRoot,
       "expected workspace store",
     );
-    const lock = lstatSync(state.lockPath);
+    const lock = lstatSync(state.lockPath, { bigint: true });
     if (
       !lock.isDirectory() ||
       lock.isSymbolicLink() ||
@@ -324,7 +324,7 @@ export function assertWorkspaceWriteAuthority(
     ) {
       throw new Error("lock protocol entries changed");
     }
-    const ownerEntry = lstatSync(state.ownerPath);
+    const ownerEntry = lstatSync(state.ownerPath, { bigint: true });
     if (!sameProtocolFile(state.ownerFile, ownerEntry)) {
       throw new Error("owner record changed");
     }
@@ -401,16 +401,16 @@ async function readOwnerFile(
   path: string,
   expectedToken: string | undefined,
 ): Promise<OwnerRecord | undefined> {
-  let pathBefore: Stats;
+  let pathBefore: BigIntStats;
   try {
-    pathBefore = await lstat(path);
+    pathBefore = await lstat(path, { bigint: true });
   } catch {
     return undefined;
   }
   if (
     pathBefore.isSymbolicLink() ||
     !pathBefore.isFile() ||
-    pathBefore.nlink !== 1 ||
+    pathBefore.nlink !== 1n ||
     pathBefore.size > OWNER_FILE_MAX_BYTES
   ) {
     return undefined;
@@ -419,16 +419,16 @@ async function readOwnerFile(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    const before = await handle.stat();
+    const before = await handle.stat({ bigint: true });
     if (
       !before.isFile() ||
-      before.nlink !== 1 ||
+      before.nlink !== 1n ||
       before.size > OWNER_FILE_MAX_BYTES ||
       !sameOwnerFileObservation(pathBefore, before)
     ) {
       return undefined;
     }
-    const allocated = Buffer.allocUnsafe(before.size);
+    const allocated = Buffer.allocUnsafe(Number(before.size));
     let offset = 0;
     while (offset < allocated.byteLength) {
       const { bytesRead } = await handle.read(
@@ -442,7 +442,10 @@ async function readOwnerFile(
     }
     const probe = Buffer.allocUnsafe(1);
     const { bytesRead: extraBytes } = await handle.read(probe, 0, 1, offset);
-    const [after, pathAfter] = await Promise.all([handle.stat(), lstat(path)]);
+    const [after, pathAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+    ]);
     if (
       extraBytes !== 0 ||
       offset !== allocated.byteLength ||
@@ -461,15 +464,18 @@ async function readOwnerFile(
   }
 }
 
-function sameOwnerFileObservation(left: Stats, right: Stats): boolean {
+function sameOwnerFileObservation(
+  left: BigIntStats,
+  right: BigIntStats,
+): boolean {
   return (
     left.dev === right.dev &&
     left.ino === right.ino &&
     left.mode === right.mode &&
     left.nlink === right.nlink &&
     left.size === right.size &&
-    left.mtimeMs === right.mtimeMs &&
-    left.ctimeMs === right.ctimeMs
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
   );
 }
 
@@ -512,7 +518,7 @@ async function observeLock(
 ): Promise<LockObservation | undefined> {
   let lockInfo;
   try {
-    lockInfo = await lstat(lockPath);
+    lockInfo = await lstat(lockPath, { bigint: true });
   } catch (error) {
     if (systemErrorCode(error) === "ENOENT") {
       return undefined;
@@ -557,9 +563,9 @@ async function removeDirectoryIfSame(
   path: string,
   expected: LockObservation,
 ): Promise<void> {
-  let current: Awaited<ReturnType<typeof lstat>>;
+  let current: BigIntStats;
   try {
-    current = await lstat(path);
+    current = await lstat(path, { bigint: true });
   } catch (error) {
     if (systemErrorCode(error) === "ENOENT") return;
     throw error;
@@ -574,9 +580,9 @@ async function releaseDirectoryIfSame(
   expected: LockObservation,
   storeRoot: string,
 ): Promise<void> {
-  let current: Awaited<ReturnType<typeof lstat>>;
+  let current: BigIntStats;
   try {
-    current = await lstat(path);
+    current = await lstat(path, { bigint: true });
   } catch (error) {
     if (systemErrorCode(error) === "ENOENT") {
       throw new WorkspaceLockOwnershipLostError(
@@ -619,9 +625,9 @@ async function unlinkExactProtocolFile(
   state: WorkspaceWriteAuthorityState,
   label: string,
 ): Promise<void> {
-  let current: Stats;
+  let current: BigIntStats;
   try {
-    current = await lstat(path);
+    current = await lstat(path, { bigint: true });
   } catch (cause) {
     throw ownershipLoss(state, `${label} disappeared during release`, cause);
   }
@@ -678,7 +684,23 @@ export async function acquireWorkspaceLock(
     }
     firstAttempt = false;
     try {
-      await mkdir(lockPath, { mode: 0o700 });
+      try {
+        await mkdir(lockPath, { mode: 0o700 });
+      } catch (error) {
+        if (
+          process.platform !== "win32" ||
+          !isTransientContentionObservationError(error)
+        ) {
+          throw error;
+        }
+        // Windows can keep a removed directory pending deletion until another
+        // process closes its last handle. The acquisition deadline still applies.
+        const elapsed = performance.now() - monotonicStartedAt;
+        if (elapsed < timeoutMs) {
+          await wait(Math.min(50, Math.max(1, timeoutMs - elapsed)));
+        }
+        continue;
+      }
       const created = await observeLock(lockPath);
       if (created === undefined || created.owner.kind !== "empty") {
         throw new WorkspaceLockFormationChangedError();
@@ -690,7 +712,7 @@ export async function acquireWorkspaceLock(
           mode: 0o600,
         });
         const published = await observeLock(lockPath);
-        const publishedOwner = await lstat(ownerPath);
+        const publishedOwner = await lstat(ownerPath, { bigint: true });
         if (
           published === undefined ||
           published.device !== created.device ||
@@ -699,7 +721,7 @@ export async function acquireWorkspaceLock(
           published.owner.record.owner.token !== owner.token ||
           !publishedOwner.isFile() ||
           publishedOwner.isSymbolicLink() ||
-          publishedOwner.nlink !== 1
+          publishedOwner.nlink !== 1n
         ) {
           throw new WorkspaceLockFormationChangedError();
         }

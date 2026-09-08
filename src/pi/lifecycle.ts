@@ -1354,6 +1354,8 @@ export function registerCyclotomyLifecycle(
   runtime: CyclotomyRuntime,
 ): void {
   const views = new SessionViewTracker();
+  pi.on("agent_start", (event) => runtime.observeAgentRun(event));
+  pi.on("agent_settled", (event) => runtime.observeAgentRun(event));
   let automaticGcFailureNotified = false;
   const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
     if (!runtime.isActive) return;

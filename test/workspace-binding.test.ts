@@ -15,6 +15,8 @@ import {
   assertDirectoryStillBound,
   bindDirectory,
   directoryStillBound,
+  sameDirectoryBinding,
+  compareDirectoryBindings,
 } from "../src/infrastructure/directory-binding.ts";
 import {
   assertSessionWorkspaceStillBound,
@@ -37,6 +39,17 @@ afterEach(async () => {
 });
 
 describe("session workspace binding", () => {
+  it("distinguishes adjacent 64-bit file IDs beyond Number precision", () => {
+    const first = {
+      canonicalPath: "/same",
+      device: 3606225537n,
+      inode: 98234766873289889n,
+    };
+    const second = { ...first, inode: first.inode + 1n };
+    expect(Number(first.inode)).toBe(Number(second.inode));
+    expect(sameDirectoryBinding(first, second)).toBe(false);
+    expect(compareDirectoryBindings(first, second)).toBeLessThan(0);
+  });
   it("binds two aliases only when they name the same directory object", async () => {
     const root = await testRoot();
     const workspace = join(root, "workspace");

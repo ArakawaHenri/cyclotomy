@@ -17,6 +17,8 @@ import { CyclotomyRuntime } from "./runtime.ts";
 
 export type CyclotomyLifecycleEventType =
   | "session_start"
+  | "agent_start"
+  | "agent_settled"
   | "context"
   | "turn_end"
   | "input"
@@ -31,6 +33,8 @@ export type CyclotomyLifecycleEventType =
 
 const LIFECYCLE_EVENT_TYPES = [
   "session_start",
+  "agent_start",
+  "agent_settled",
   "context",
   "turn_end",
   "input",

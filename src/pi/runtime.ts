@@ -1,4 +1,8 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentStartEvent,
+  AgentSettledEvent,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { basename, join } from "node:path";
 
@@ -81,6 +85,7 @@ export class CyclotomyRuntime {
   readonly #captureAbortController = new AbortController();
   #checkpointService: CheckpointService | undefined;
   #queue: Promise<unknown> = Promise.resolve();
+  #agentRunActive = false;
   #initFailureNotified = false;
   #captureFailureNotified = false;
   #initFailureDetail: string | undefined;
@@ -104,6 +109,7 @@ export class CyclotomyRuntime {
     this.#workspaceMutations = new WorkspaceMutationAuthority({
       admission: this.#admission,
       participationIsActive: () => this.isActive,
+      agentIsRunning: (context) => this.agentIsRunning(context),
       registrations: this.#registrations,
       checkpoints: () => this.checkpoints,
       metadata: () => this.metadata,
@@ -116,6 +122,16 @@ export class CyclotomyRuntime {
       enqueueWorkspaceExecution: (operation, action) =>
         this.enqueueWorkspaceExecution(operation, action),
     });
+  }
+
+  observeAgentRun(event: AgentStartEvent | AgentSettledEvent): void {
+    this.#agentRunActive = event.type === "agent_start";
+  }
+
+  /** Navigation itself keeps Pi non-idle; agent settlement includes retry gaps. */
+  agentIsRunning(context: ExtensionContext): boolean {
+    // The signal also covers a run before our agent_start handler is reached.
+    return this.#agentRunActive || context.signal !== undefined;
   }
 
   get config(): CyclotomyConfig {

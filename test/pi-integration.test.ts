@@ -4288,18 +4288,29 @@ describe("checkpoint authority lifecycle", () => {
       expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
     });
 
-    it("cancels tree, fork, and switch requests while the agent is busy", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      const { first, second } = await twoStates(pi);
-      const target = pi.newDetachedSession();
-      pi.idle = false;
+    it.each(["streaming", "settling"])(
+      "cancels tree, fork, and switch requests while the agent is %s",
+      async (phase) => {
+        const pi = new FakePi(workspace);
+        registerCyclotomy(pi.api);
+        const { first, second } = await twoStates(pi);
+        const target = pi.newDetachedSession();
+        await pi.startAgentRun();
+        if (phase === "settling") {
+          // The provider run has ended, but Pi still owns its continuation work.
+          pi.idle = true;
+          expect(pi.context.signal).toBeUndefined();
+        }
 
-      expect(await pi.navigate(first)).toBe("cancelled");
-      expect(await pi.fork(first)).toBe("cancelled");
-      expect(await pi.resumeTo(target)).toBe("cancelled");
-      expect(pi.manager.getLeafId()).toBe(second);
-    });
+        expect(await pi.navigate(first)).toBe("cancelled");
+        expect(await pi.fork(first)).toBe("cancelled");
+        expect(await pi.resumeTo(target)).toBe("cancelled");
+        expect(pi.manager.getLeafId()).toBe(second);
+        await pi.settleAgentRun();
+        expect(await pi.navigate(first)).toBe("done");
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v1");
+      },
+    );
 
     it("lets a missing descendant inherit the source state being captured", async () => {
       const pi = new FakePi(workspace);
@@ -4899,92 +4910,100 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
     });
 
-    it("blocks the actual arrival when an earlier tree handler makes Pi busy", async () => {
-      const pi = new FakePi(workspace);
-      pi.api.on("session_tree", async () => {
-        pi.idle = false;
-      });
-      registerCyclotomy(pi.api);
-      const { first } = await twoStates(pi);
-      const before = await metadata();
-      const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
-      before.close();
-      if (firstSlot.kind !== "open-checkpoint") {
-        throw new Error("two-state fixture did not capture its first node");
-      }
+    it.each(["streaming", "settling"])(
+      "blocks the actual arrival when an earlier tree handler leaves the agent %s",
+      async (phase) => {
+        const pi = new FakePi(workspace);
+        pi.api.on("session_tree", async () => {
+          await pi.startAgentRun();
+          if (phase === "settling") pi.idle = true;
+        });
+        registerCyclotomy(pi.api);
+        const { first } = await twoStates(pi);
+        const before = await metadata();
+        const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
+        before.close();
+        if (firstSlot.kind !== "open-checkpoint") {
+          throw new Error("two-state fixture did not capture its first node");
+        }
 
-      try {
-        expect(await pi.navigate(first)).toBe("done");
-      } finally {
-        pi.idle = true;
-      }
+        try {
+          expect(await pi.navigate(first)).toBe("done");
+        } finally {
+          await pi.settleAgentRun();
+        }
 
-      expect(pi.manager.getLeafId()).toBe(first);
-      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      expect(notified(pi, "transitionInProgress")).toBe(true);
-      expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = await metadata();
-      expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
-        kind: "blocked-checkpoint",
-        treeOid: firstSlot.treeOid,
-      });
-      expect(
-        db.hasSessionBarrier({
-          sessionId: pi.manager.sessionId,
-          sessionFile: pi.manager.getSessionFile()!,
-        }),
-      ).toBe(false);
-      db.close();
-    });
+        expect(pi.manager.getLeafId()).toBe(first);
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+        expect(notified(pi, "transitionInProgress")).toBe(true);
+        expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
+        const db = await metadata();
+        expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
+          kind: "blocked-checkpoint",
+          treeOid: firstSlot.treeOid,
+        });
+        expect(
+          db.hasSessionBarrier({
+            sessionId: pi.manager.sessionId,
+            sessionFile: pi.manager.getSessionFile()!,
+          }),
+        ).toBe(false);
+        db.close();
+      },
+    );
 
-    it("rejects the mutation lease if Pi becomes busy after restore staging", async () => {
-      const pi = new FakePi(workspace);
-      registerCyclotomy(pi.api);
-      const { first } = await twoStates(pi);
-      const before = await metadata();
-      const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
-      before.close();
-      if (firstSlot.kind !== "open-checkpoint") {
-        throw new Error("two-state fixture did not capture its first node");
-      }
+    it.each(["streaming", "settling"])(
+      "rejects the mutation lease if the agent is %s after restore staging",
+      async (phase) => {
+        const pi = new FakePi(workspace);
+        registerCyclotomy(pi.api);
+        const { first } = await twoStates(pi);
+        const before = await metadata();
+        const firstSlot = before.getCheckpointSlot(pi.manager.sessionId, first);
+        before.close();
+        if (firstSlot.kind !== "open-checkpoint") {
+          throw new Error("two-state fixture did not capture its first node");
+        }
 
-      let staged = false;
-      const streamBlob = await interceptRepositoryContentStream({
-        storageRoot: await realpath(storeRoot),
-        contentId: contentIdForText("v1"),
-        occurrence: 3,
-        action: async () => {
-          staged = true;
-          pi.idle = false;
-        },
-      });
+        let staged = false;
+        const streamBlob = await interceptRepositoryContentStream({
+          storageRoot: await realpath(storeRoot),
+          contentId: contentIdForText("v1"),
+          occurrence: 3,
+          action: async () => {
+            staged = true;
+            await pi.startAgentRun();
+            if (phase === "settling") pi.idle = true;
+          },
+        });
 
-      try {
-        expect(await pi.navigate(first)).toBe("done");
-      } finally {
-        streamBlob.spy.mockRestore();
-        pi.idle = true;
-      }
+        try {
+          expect(await pi.navigate(first)).toBe("done");
+        } finally {
+          streamBlob.spy.mockRestore();
+          await pi.settleAgentRun();
+        }
 
-      expect(staged).toBe(true);
-      expect(streamBlob.triggered()).toBe(true);
-      expect(streamBlob.matchingStreams()).toBe(3);
-      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
-      expect(
-        notifiedWithDetail(
-          pi,
-          "restoreNotStarted",
-          "Pi became busy before tree workspace mutation",
-        ),
-      ).toBe(true);
-      expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
-      const db = await metadata();
-      expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
-        kind: "blocked-checkpoint",
-        treeOid: firstSlot.treeOid,
-      });
-      db.close();
-    });
+        expect(staged).toBe(true);
+        expect(streamBlob.triggered()).toBe(true);
+        expect(streamBlob.matchingStreams()).toBe(3);
+        expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("v2");
+        expect(
+          notifiedWithDetail(
+            pi,
+            "restoreNotStarted",
+            "Pi became busy before tree workspace mutation",
+          ),
+        ).toBe(true);
+        expect(lastStatus(pi)).toBe(messageFor("navigationAttentionStatus"));
+        const db = await metadata();
+        expect(db.getCheckpointSlot(pi.manager.sessionId, first)).toEqual({
+          kind: "blocked-checkpoint",
+          treeOid: firstSlot.treeOid,
+        });
+        db.close();
+      },
+    );
 
     it("revalidates Pi after asynchronous staging and before its first write", async () => {
       const pi = new FakePi(workspace);
@@ -7499,7 +7518,7 @@ describe("checkpoint authority lifecycle", () => {
               .digest("hex");
             const storeRoot = join(canonicalStorageA, hash);
             await mkdir(storeRoot);
-            const identity = await lstat(storeRoot);
+            const identity = await lstat(storeRoot, { bigint: true });
             return {
               workspace: candidateWorkspace,
               storeRoot,

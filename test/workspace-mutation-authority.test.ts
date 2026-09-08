@@ -46,8 +46,12 @@ function context(
 ): ExtensionContext {
   const entry = { id: node.entryId, parentId: null, type: "custom" };
   const entries = options.entries ?? (() => [entry]);
+  const signal = new AbortController().signal;
   return {
     isIdle: options.idle ?? (() => true),
+    get signal() {
+      return options.idle?.() === false ? signal : undefined;
+    },
     sessionManager: {
       getSessionId: () => node.sessionId,
       getCwd: () => workspace,
@@ -170,6 +174,7 @@ function authority(options: {
     service: new WorkspaceMutationAuthority({
       admission,
       participationIsActive: options.participationIsActive ?? (() => true),
+      agentIsRunning: (context) => context.signal !== undefined,
       registrations,
       checkpoints: () => checkpoints,
       metadata: () => metadata,

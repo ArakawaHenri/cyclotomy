@@ -323,9 +323,7 @@ export async function commitNavigationDepartureInWorkspaceLock(
   prepared: PreparedNavigationDeparture,
   navigationChoice: "restore" | "detach",
 ): Promise<NavigationDepartureCommit> {
-  // `isIdle` has only its public product meaning: never begin or publish
-  // transition work while Pi is streaming. It is not a transition mutex.
-  if (!context.isIdle()) return { kind: "busy" };
+  if (runtime.agentIsRunning(context)) return { kind: "busy" };
   const commitView = revalidateNavigationLocation(
     runtime,
     views,
@@ -487,7 +485,7 @@ export async function commitNavigationDepartureInWorkspaceLock(
     if (!(await runtime.registrations.workspaceStillBound(expectedView.cwd))) {
       return { kind: "workspace-binding-lost" };
     }
-    if (!context.isIdle()) return { kind: "busy" };
+    if (runtime.agentIsRunning(context)) return { kind: "busy" };
     const validatedView = revalidateNavigationLocation(
       runtime,
       views,
@@ -504,7 +502,7 @@ export async function commitNavigationDepartureInWorkspaceLock(
     ) {
       return { kind: "location-changed" };
     }
-    if (!context.isIdle()) return { kind: "busy" };
+    if (runtime.agentIsRunning(context)) return { kind: "busy" };
     const sourceExpectedSlot = prepared.sourceExpectedSlot;
     if (sourceExpectedSlot === undefined) {
       return { kind: "target-changed" };
@@ -531,7 +529,7 @@ export async function commitNavigationDepartureInWorkspaceLock(
   if (!(await runtime.registrations.workspaceStillBound(expectedView.cwd))) {
     return { kind: "workspace-binding-lost" };
   }
-  if (!context.isIdle()) return { kind: "busy" };
+  if (runtime.agentIsRunning(context)) return { kind: "busy" };
   const departureView = revalidateNavigationLocation(
     runtime,
     views,

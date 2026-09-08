@@ -27,6 +27,7 @@ import {
   parseMetadataId,
 } from "../src/infrastructure/content-store/ids.ts";
 import { PackCatalog } from "../src/infrastructure/content-store/pack-catalog.ts";
+import { ContentRepositoryError } from "../src/infrastructure/content-store/repository.ts";
 import { encodePack } from "../src/infrastructure/content-store/pack.ts";
 import {
   decodeRecord,
@@ -1802,14 +1803,18 @@ describe("cross-store tree import", () => {
         ],
         completeScope,
       );
-      const targetContentRoot = join(
-        targetRoot,
-        "objects",
-        "records",
-        "content",
-      );
-      await rm(targetContentRoot, { recursive: true });
-      await writeFile(targetContentRoot, "blocks target publication");
+      const repository = nativeObjectStoreRepository(target, "test");
+      const begin = repository.beginPublication.bind(repository);
+      vi.spyOn(repository, "beginPublication").mockImplementation((options) => {
+        const batch = begin(options);
+        vi.spyOn(batch, "flush").mockRejectedValue(
+          new ContentRepositoryError(
+            "storage-failure",
+            "target publication failed",
+          ),
+        );
+        return batch;
+      });
 
       const rejection = await importTestTrees(
         target,

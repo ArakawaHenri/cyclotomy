@@ -278,6 +278,7 @@ describe("workspace lock", () => {
       "formation-after-owner",
       "vanished-contention",
       "transient-contention-observation",
+      ...(process.platform === "win32" ? ["transient-mkdir"] : []),
     ]);
     for (const result of results) {
       expect(result).toMatchObject({
@@ -329,18 +330,18 @@ describe("workspace lock", () => {
   it("orders physical identities independently of bind-alias paths", () => {
     const lowIdentityThroughEarlyAlias = {
       canonicalPath: "/alias-a",
-      device: 2,
-      inode: 20,
+      device: 2n,
+      inode: 20n,
     };
     const lowIdentityThroughLateAlias = {
       canonicalPath: "/alias-z",
-      device: 2,
-      inode: 20,
+      device: 2n,
+      inode: 20n,
     };
     const highIdentity = {
       canonicalPath: "/alias-m",
-      device: 10,
-      inode: 1,
+      device: 10n,
+      inode: 1n,
     };
 
     expect(

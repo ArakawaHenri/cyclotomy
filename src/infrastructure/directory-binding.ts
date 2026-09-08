@@ -1,10 +1,10 @@
-import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { lstatSync, realpathSync, type BigIntStats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 
 export interface DirectoryBinding {
   readonly canonicalPath: string;
-  readonly device: number;
-  readonly inode: number;
+  readonly device: bigint;
+  readonly inode: bigint;
 }
 
 export type DirectoryBindingFailure =
@@ -24,12 +24,12 @@ export class DirectoryBindingError extends Error {
 
 function directoryBindingMatches(
   binding: Pick<DirectoryBinding, "device" | "inode">,
-  entry: Stats,
+  entry: BigIntStats,
 ): boolean {
   return (
     entry.isDirectory() &&
     !entry.isSymbolicLink() &&
-    entry.ino !== 0 &&
+    entry.ino !== 0n &&
     entry.dev === binding.device &&
     entry.ino === binding.inode
   );
@@ -41,7 +41,7 @@ export async function bindDirectory(
   label = "directory",
 ): Promise<DirectoryBinding> {
   const canonicalPath = await realpath(path);
-  const entry = await lstat(canonicalPath);
+  const entry = await lstat(canonicalPath, { bigint: true });
   if (!entry.isDirectory() || entry.isSymbolicLink()) {
     throw new DirectoryBindingError(
       canonicalPath,
@@ -49,7 +49,7 @@ export async function bindDirectory(
       `${label} is not a real directory`,
     );
   }
-  if (entry.ino === 0) {
+  if (entry.ino === 0n) {
     throw new DirectoryBindingError(
       canonicalPath,
       "identity-unavailable",
@@ -63,7 +63,7 @@ export async function bindDirectory(
     inode: entry.ino,
   };
   const rebound = await realpath(path);
-  const reboundEntry = await lstat(rebound);
+  const reboundEntry = await lstat(rebound, { bigint: true });
   if (!directoryBindingMatches(binding, reboundEntry)) {
     throw new DirectoryBindingError(
       canonicalPath,
@@ -110,9 +110,9 @@ export function assertDirectoryStillBound(
   label: string,
 ): void {
   const canonicalPath = realpathSync(path);
-  const entry = lstatSync(canonicalPath);
+  const entry = lstatSync(canonicalPath, { bigint: true });
   const rebound = realpathSync(path);
-  const reboundEntry = lstatSync(rebound);
+  const reboundEntry = lstatSync(rebound, { bigint: true });
   if (
     !directoryBindingMatches(binding, entry) ||
     !directoryBindingMatches(binding, reboundEntry)

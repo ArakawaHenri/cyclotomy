@@ -282,6 +282,12 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
   pi.on("context", (event, context) =>
     dispatch<undefined>(event, context, undefined),
   );
+  pi.on("agent_start", (event, context) =>
+    dispatch<undefined>(event, context, undefined),
+  );
+  pi.on("agent_settled", (event, context) =>
+    dispatch<undefined>(event, context, undefined),
+  );
   pi.on("turn_end", (event, context) =>
     dispatch<undefined>(event, context, undefined),
   );
