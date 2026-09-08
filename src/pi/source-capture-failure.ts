@@ -40,6 +40,7 @@ export function sourceCaptureFailureImpact(
             : "cancel-operation";
         case "state-changed":
         case "write-protected":
+        case "cancelled":
           return "cancel-operation";
       }
   }

@@ -328,6 +328,10 @@ describe("object garbage collection", () => {
         .length,
     ).toBeGreaterThan(0);
 
+    const streamContent = vi.spyOn(
+      ContentRepository.prototype,
+      "streamContent",
+    );
     const packInventory = vi.spyOn(PackCatalog.prototype, "inventory");
     const authenticatedPackOpen = vi.spyOn(PackCatalog.prototype, "openPack");
     const logicalPackOpen = vi.spyOn(PackCatalog.prototype, "openPackForRead");
@@ -338,10 +342,25 @@ describe("object garbage collection", () => {
 
     await collectGarbage(store, metadata, { graceMs: 0 });
 
+    expect(streamContent).toHaveBeenCalledTimes(1);
     expect(packInventory).toHaveBeenCalledTimes(1);
     expect(authenticatedPackOpen).not.toHaveBeenCalled();
     expect(logicalPackOpen).toHaveBeenCalled();
     expect(objectInventory).toHaveBeenCalledTimes(1);
+  });
+
+  it("observes root drift even when no object is eligible for collection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-idle-roots-"));
+    roots.push(root);
+    const store = await openObjectStore(root);
+    const listReferencedTreeOids = vi
+      .fn()
+      .mockReturnValueOnce([])
+      .mockReturnValue(["00".repeat(32)]);
+    await expect(
+      collectGarbage(store, { listReferencedTreeOids }),
+    ).rejects.toBeInstanceOf(GarbageCollectionRootDriftError);
+    expect(await packPaths(root)).toEqual([]);
   });
 
   it("refuses no-delete MIDX publication after its authority is displaced", async () => {

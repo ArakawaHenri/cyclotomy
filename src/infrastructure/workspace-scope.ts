@@ -1,3 +1,5 @@
+import { compareUtf8 } from "./utf8-order.ts";
+
 /** A `.gitignore` captured at its repository-relative location. */
 export interface WorkspaceGitignoreSource {
   readonly path: string;
@@ -85,6 +87,7 @@ export class WorkspaceScopeError extends Error {
  * structural check deterministic and fixed-pass.
  */
 export function portableWorkspacePathKey(path: string): string {
+  if (/^[\x00-\x7f]*$/u.test(path)) return path.toLowerCase();
   const once = path
     .normalize("NFC")
     .toLocaleUpperCase("en-US")
@@ -104,20 +107,11 @@ function exactKeys(
   value: Record<string, unknown>,
   expected: readonly string[],
 ): boolean {
-  const actual = Object.keys(value).sort();
-  const canonical = [...expected].sort();
+  const actual = Object.keys(value);
   return (
-    actual.length === canonical.length &&
-    actual.every((key, index) => key === canonical[index])
+    actual.length === expected.length &&
+    actual.every((key) => expected.includes(key))
   );
-}
-
-function isExactUtf8String(value: string): boolean {
-  return Buffer.from(value, "utf8").toString("utf8") === value;
-}
-
-function comparePathBytes(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 export function assertWorkspacePathLimits(limits: WorkspacePathLimits): void {
@@ -142,7 +136,7 @@ export function canonicalWorkspaceRelativePath(
   assertWorkspacePathLimits(limits);
   if (
     typeof value !== "string" ||
-    !isExactUtf8String(value) ||
+    !value.isWellFormed() ||
     value.includes("\0") ||
     value.includes("\\") ||
     value.startsWith("/") ||
@@ -391,9 +385,7 @@ export function canonicalizeWorkspaceScope(
       ),
     };
   });
-  gitignoreSources.sort((left, right) =>
-    comparePathBytes(left.path, right.path),
-  );
+  gitignoreSources.sort((left, right) => compareUtf8(left.path, right.path));
   for (let index = 1; index < gitignoreSources.length; index += 1) {
     if (gitignoreSources[index]?.path === gitignoreSources[index - 1]?.path) {
       return invalidScope("Git workspace scope has duplicate ignore sources");

@@ -3,6 +3,7 @@ import type {
   ExtensionContext,
   ExtensionEvent,
   ExtensionHandler,
+  TerminalInputHandler,
 } from "@earendil-works/pi-coding-agent";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
@@ -218,6 +219,7 @@ export class FakePi {
   readonly notifications: FakeNotification[] = [];
   readonly selections: FakeSelection[] = [];
   readonly statuses = new Map<string, string>();
+  readonly terminalInputHandlers = new Set<TerminalInputHandler>();
   selectDestructive = true;
   /** undefined follows selectDestructive; null simulates Escape. */
   selectionOverride: string | null | undefined;
@@ -335,6 +337,12 @@ export class FakePi {
         } else {
           self.statuses.set(key, message);
         }
+      },
+      onTerminalInput(handler: TerminalInputHandler) {
+        self.terminalInputHandlers.add(handler);
+        return () => {
+          self.terminalInputHandlers.delete(handler);
+        };
       },
       async select(
         title: string,
@@ -557,6 +565,15 @@ export class FakePi {
     )
       ? "handled"
       : "continued";
+  }
+
+  terminalInput(data: string): boolean {
+    for (const handler of this.terminalInputHandlers) {
+      const result = handler(data);
+      if (result?.consume) return true;
+      if (result?.data !== undefined) data = result.data;
+    }
+    return false;
   }
 
   async emitContext(): Promise<void> {

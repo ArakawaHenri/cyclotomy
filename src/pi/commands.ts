@@ -163,6 +163,10 @@ function finishRestore(
       );
       break;
     case "capture-failed":
+      if (execution.failure.kind === "cancelled") {
+        runtime.notify(context, runtime.i18n.t("captureCancelled"), "info");
+        break;
+      }
       runtime.notify(
         context,
         runtime.i18n.t("restorePrepareFailed", {

@@ -1,7 +1,15 @@
 import { isAbsolute, join } from "node:path";
 
-import { retainFailureCause } from "./failure-settlement.ts";
-import type { ObjectStore } from "./object-store.ts";
+import { aggregateFailures, retainFailureCause } from "./failure-settlement.ts";
+import type {
+  ObjectStore,
+  SnapshotPublicationOptions,
+} from "./object-store.ts";
+import {
+  isOperationCancelled,
+  type WorkspaceOperationOptions,
+} from "./workspace-operation.ts";
+import { withWorkspaceLock } from "./workspace-lock.ts";
 import {
   summarizeScanProblems,
   type ScanProblem,
@@ -15,6 +23,7 @@ const PUBLICATION_CONCURRENCY = 8;
 async function runPublicationPool<T>(
   items: readonly T[],
   worker: (item: T) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<void> {
   let next = 0;
   let failed = false;
@@ -28,6 +37,7 @@ async function runPublicationPool<T>(
         next += 1;
         if (index >= items.length) return;
         try {
+          signal?.throwIfAborted();
           await worker(items[index] as T);
         } catch (error) {
           failures.push({ index, error });
@@ -38,6 +48,18 @@ async function runPublicationPool<T>(
   );
   if (failures.length > 0) {
     failures.sort((left, right) => left.index - right.index);
+    if (signal?.aborted) {
+      const retained = failures
+        .map(({ error }) => error)
+        .filter((error) => !isOperationCancelled(error, signal));
+      if (retained.length > 1) {
+        throw aggregateFailures(
+          retained,
+          "snapshot publication failed while cancelling",
+        );
+      }
+      if (retained.length === 1) throw retained[0];
+    }
     throw failures[0]!.error;
   }
 }
@@ -126,17 +148,31 @@ function assertCaptureEvaluatorBound(snapshot: WorkspaceSnapshot): void {
 export async function publishSnapshot(
   store: ObjectStore,
   snapshot: WorkspaceSnapshot,
+  options: SnapshotPublicationOptions & WorkspaceOperationOptions = {},
 ): Promise<string> {
+  options.signal?.throwIfAborted();
   if (snapshot.problems.length > 0) {
     throw new IncompleteSnapshotError(snapshot.problems);
   }
   assertEntrySourcesBound(snapshot);
   assertCaptureEvaluatorBound(snapshot);
-  const publication = store.beginSnapshotPublication();
+  if (options.writeAuthority === undefined) {
+    return withWorkspaceLock(
+      store.storageRoot,
+      "snapshot publication",
+      (writeAuthority) =>
+        publishSnapshot(store, snapshot, { ...options, writeAuthority }),
+      options.signal === undefined ? undefined : { signal: options.signal },
+    );
+  }
+  const publication = store.beginSnapshotPublication(options);
   let publicationFailed = false;
   let publicationFailure: unknown;
   try {
     const publishedBlobs = new Set<string>();
+    let files = 0;
+    let bytes = 0;
+    options.onProgress?.({ files, bytes });
     const blobSources: Array<{
       readonly sourcePath: string;
       readonly oid: string;
@@ -155,19 +191,27 @@ export async function publishSnapshot(
       }
     }
 
-    await runPublicationPool(blobSources, async (source) => {
-      const blobOid = await publication.publishBlobFromFile(
-        source.sourcePath,
-        source.oid,
-        source.byteLength,
-      );
-      if (blobOid !== source.oid) {
-        throw new Error(
-          `object store is broken: blob id ${blobOid} does not match the scanned digest ${source.oid} of "${source.entryPath}"`,
+    await runPublicationPool(
+      blobSources,
+      async (source) => {
+        const blobOid = await publication.publishBlobFromFile(
+          source.sourcePath,
+          source.oid,
+          source.byteLength,
         );
-      }
-    });
+        if (blobOid !== source.oid) {
+          throw new Error(
+            `object store is broken: blob id ${blobOid} does not match the scanned digest ${source.oid} of "${source.entryPath}"`,
+          );
+        }
+        files += 1;
+        bytes += source.byteLength;
+        options.onProgress?.({ files, bytes });
+      },
+      options.signal,
+    );
 
+    options.signal?.throwIfAborted();
     const treeEntries = snapshot.entries.map(workspaceEntryAsTreeEntry);
 
     return await publication.publishTree(treeEntries, snapshot.scope);

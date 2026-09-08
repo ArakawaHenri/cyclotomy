@@ -1,8 +1,11 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { basename, join } from "node:path";
 
 import type {
   CaptureFailure,
+  CaptureOperationOptions,
+  CaptureProgress,
   CaptureSuccess,
   MissingNodeStateIntent,
 } from "../application/capture.ts";
@@ -36,6 +39,11 @@ import {
   type WorkspaceSnapshot,
 } from "../infrastructure/workspace-scan.ts";
 import type { WorkspaceScope } from "../infrastructure/workspace-scope.ts";
+import {
+  isOperationCancelled,
+  type WorkspaceOperationOptions,
+  type WorkspaceProgress,
+} from "../infrastructure/workspace-operation.ts";
 import { CyclotomyI18n } from "./i18n.ts";
 import {
   CheckpointAdmission,
@@ -70,6 +78,7 @@ export class CyclotomyRuntime {
   readonly #admission = new CheckpointAdmission();
   readonly #registrations: SessionRegistrationService;
   readonly #workspaceMutations: WorkspaceMutationAuthority;
+  readonly #captureAbortController = new AbortController();
   #checkpointService: CheckpointService | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   #initFailureNotified = false;
@@ -87,6 +96,7 @@ export class CyclotomyRuntime {
   ) {
     this.i18n = i18n;
     this.#registrations = new SessionRegistrationService({
+      signal: this.captureSignal,
       globalConfig: config,
       registrationFailure,
       runExclusively: (action) => this.enqueue(action),
@@ -168,6 +178,10 @@ export class CyclotomyRuntime {
     return this.#activation.kind === "active";
   }
 
+  get captureSignal(): AbortSignal {
+    return this.#captureAbortController.signal;
+  }
+
   /** Assert that this Pi observation still names the registered authority. */
   assertSessionUsable(view: SessionView): void {
     if (!this.#registrations.sessionIsUsable(view)) {
@@ -176,6 +190,7 @@ export class CyclotomyRuntime {
   }
 
   markSessionActive(): void {
+    if (this.#captureAbortController.signal.aborted) return;
     this.#activation = { kind: "active" };
   }
 
@@ -211,6 +226,7 @@ export class CyclotomyRuntime {
    */
   retire(): void {
     if (this.#activation.kind === "closed") return;
+    this.#captureAbortController.abort();
     this.markSessionIntentionallyInactive();
   }
 
@@ -231,6 +247,128 @@ export class CyclotomyRuntime {
       });
     }
     return this.#checkpointService;
+  }
+
+  prepareCurrentCapture(
+    context: ExtensionContext,
+    view: SessionView,
+    writeAuthority: WorkspaceWriteAuthority,
+  ): Promise<Result<CaptureSuccess, CaptureFailure>> {
+    return this.#runCapture(context, writeAuthority, "scan", (options) =>
+      this.checkpoints.prepareCurrent(view, options),
+    );
+  }
+
+  prepareObservedCapture(
+    context: ExtensionContext,
+    snapshot: WorkspaceSnapshot,
+    writeAuthority: WorkspaceWriteAuthority,
+  ): Promise<Result<CaptureSuccess, CaptureFailure>> {
+    return this.#runCapture(context, writeAuthority, "publish", (options) =>
+      this.checkpoints.prepareObserved(snapshot, options),
+    );
+  }
+
+  prepareWorkspaceObservation(
+    context: ExtensionContext,
+    cwd: string,
+    writeAuthority: WorkspaceWriteAuthority,
+    scope?: WorkspaceScope,
+  ): Promise<Result<WorkspaceSnapshot, CaptureFailure>> {
+    return this.#runCapture(
+      context,
+      writeAuthority,
+      "scan",
+      async (options) => {
+        const scanOptions = {
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          onProgress: (progress: WorkspaceProgress) =>
+            options.onProgress?.({ ...progress, phase: "scan" }),
+        };
+        try {
+          const snapshot =
+            scope === undefined
+              ? await this.scanCurrentWorkspace(cwd, scanOptions)
+              : await this.scanCurrentWorkspaceForScope(
+                  cwd,
+                  scope,
+                  scanOptions,
+                );
+          return { ok: true, value: snapshot };
+        } catch (cause) {
+          return {
+            ok: false,
+            error: isOperationCancelled(cause, options.signal)
+              ? { kind: "cancelled" }
+              : { kind: "scan-failed", phase: "capture", cause },
+          };
+        }
+      },
+    );
+  }
+
+  async #runCapture<Value>(
+    context: ExtensionContext,
+    writeAuthority: WorkspaceWriteAuthority,
+    initialPhase: CaptureProgress["phase"],
+    action: (
+      options: CaptureOperationOptions,
+    ) => Promise<Result<Value, CaptureFailure>>,
+  ): Promise<Result<Value, CaptureFailure>> {
+    const cancellation = new AbortController();
+    const signal = AbortSignal.any([
+      this.#captureAbortController.signal,
+      cancellation.signal,
+    ]);
+    let unsubscribe: (() => void) | undefined;
+    let lastPhase: CaptureProgress["phase"] | undefined;
+    let lastUpdateAt = 0;
+    try {
+      if (context.hasUI && context.mode === "tui") {
+        unsubscribe = context.ui.onTerminalInput((data) => {
+          if (!matchesKey(data, "escape")) return undefined;
+          cancellation.abort();
+          return { consume: true };
+        });
+      }
+    } catch {
+      // Terminal controls can disappear while Pi replaces the active UI.
+    }
+    const onProgress = (progress: CaptureProgress): void => {
+      const now = performance.now();
+      if (lastPhase === progress.phase && now - lastUpdateAt < 250) return;
+      lastPhase = progress.phase;
+      lastUpdateAt = now;
+      this.setStatus(
+        context,
+        this.i18n.t("captureProgress", {
+          phase: this.i18n.t(
+            progress.phase === "scan"
+              ? "captureProgressScan"
+              : progress.phase === "publish"
+                ? "captureProgressPublish"
+                : "captureProgressValidate",
+          ),
+          files: progress.files,
+          bytes: (progress.bytes / (1024 * 1024)).toFixed(1),
+          cancel:
+            unsubscribe === undefined
+              ? ""
+              : this.i18n.t("captureProgressCancel"),
+        }),
+      );
+    };
+    try {
+      onProgress({ phase: initialPhase, files: 0, bytes: 0 });
+      return await action({ signal, onProgress, writeAuthority });
+    } finally {
+      try {
+        unsubscribe?.();
+      } catch {
+        // A stale UI must not turn capture cleanup into a storage failure.
+      }
+      this.setStatus(context, undefined);
+    }
   }
 
   async #validateManifestScope(
@@ -363,13 +501,16 @@ export class CyclotomyRuntime {
   enqueueWorkspaceExecution<T>(
     operation: string,
     action: (writeAuthority: WorkspaceWriteAuthority) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<WorkspaceLockExecution<T>> {
     return this.enqueue(async () => {
       const execution = await runWithWorkspaceLock(
         this.storeRoot,
         operation,
         action,
-        this.config.lock,
+        signal === undefined
+          ? this.config.lock
+          : { ...this.config.lock, signal },
       );
       // A failed release leaves the cooperative lock's future ownership
       // uncertain. Preserve the action's typed result, but stop this engine
@@ -384,8 +525,18 @@ export class CyclotomyRuntime {
     });
   }
 
-  async scanCurrentWorkspace(cwd: string): Promise<WorkspaceSnapshot> {
-    const snapshot = await scanWorkspace(cwd, this.#scanOptions());
+  async scanCurrentWorkspace(
+    cwd: string,
+    options: WorkspaceOperationOptions = {},
+  ): Promise<WorkspaceSnapshot> {
+    const snapshot = await scanWorkspace(cwd, {
+      ...this.#scanOptions(),
+      ...options,
+      signal:
+        options.signal === undefined
+          ? this.captureSignal
+          : AbortSignal.any([this.captureSignal, options.signal]),
+    });
     if (snapshot.rootPath !== this.workspaceRoot) {
       throw new Error(
         "workspace root changed after the checkpoint store was selected",
@@ -398,9 +549,15 @@ export class CyclotomyRuntime {
   async scanCurrentWorkspaceForScope(
     cwd: string,
     targetScope: WorkspaceScope,
+    options: WorkspaceOperationOptions = {},
   ): Promise<WorkspaceSnapshot> {
     const snapshot = await scanWorkspaceForRestoreComparison(cwd, targetScope, {
       gitIgnoreScratchParent: this.store.storageRoot,
+      ...options,
+      signal:
+        options.signal === undefined
+          ? this.captureSignal
+          : AbortSignal.any([this.captureSignal, options.signal]),
     });
     if (snapshot.rootPath !== this.workspaceRoot) {
       throw new Error(
@@ -523,6 +680,7 @@ export class CyclotomyRuntime {
   }
 
   close(): void {
+    this.#captureAbortController.abort();
     this.#activation = { kind: "closed" };
     this.#registrations.close();
     this.#checkpointService = undefined;

@@ -7,13 +7,21 @@ import {
   ABSOLUTE_WORKSPACE_PATH_LIMITS,
   type WorkspaceScope,
 } from "./workspace-scope.ts";
-import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
+import {
+  aggregateFailures,
+  primaryFailure,
+  withRetainedCleanup,
+} from "./failure-settlement.ts";
+import { isOperationCancelled } from "./workspace-operation.ts";
 import { systemErrorCode } from "./system-error.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
+import type { WorkspaceWriteAuthority } from "./workspace-lock.ts";
 import {
   ContentRepository,
   ContentRepositoryError,
   type ContentRepositoryResolutionScope,
+  type ContentRepositoryPublication,
+  type ContentPublicationReceipt,
   type PublishedContent,
   type VerifiedContentRead,
 } from "./content-store/repository.ts";
@@ -165,6 +173,11 @@ export interface SnapshotPublication {
   close(): Promise<void>;
 }
 
+export interface SnapshotPublicationOptions {
+  readonly writeAuthority?: WorkspaceWriteAuthority;
+  readonly signal?: AbortSignal;
+}
+
 export interface ObjectStore {
   /** Native filesystem-store root, used only to keep scratch state outside. */
   readonly storageRoot: string;
@@ -176,9 +189,13 @@ export interface ObjectStore {
   ): Promise<{ readonly decodedLength: number }>;
   /**
    * Open a short-lived publication boundary. Callers must publish every blob
-   * through the returned object before publishing its tree.
+   * through the returned object before publishing its tree. With a write
+   * authority, new objects are staged in packs and become durable by tree
+   * publication; standalone additive writes publish each blob immediately.
    */
-  beginSnapshotPublication(): SnapshotPublication;
+  beginSnapshotPublication(
+    options?: SnapshotPublicationOptions,
+  ): SnapshotPublication;
   /**
    * Read and authenticate the complete closure: the canonical manifest and
    * every regular-file blob it references.
@@ -229,7 +246,9 @@ interface NativeObjectStoreReadScope extends ObjectStoreReadScope {
 }
 
 interface NativeObjectAccess {
-  openReadScope(): NativeObjectStoreReadScope;
+  openReadScope(options?: {
+    readonly signal?: AbortSignal;
+  }): NativeObjectStoreReadScope;
   upgradeStoredTree(
     treeOid: string,
     targetFormat: string,
@@ -267,11 +286,12 @@ export interface NativeObjectStore extends ObjectStore {
   readonly [NATIVE_OBJECT_STORE]: true;
   /** Authenticate the stored tree graph and expose its complete mark closure. */
   readTreeClosure(treeOid: string): Promise<AuthenticatedCurrentTree>;
-  /** Import authenticated closures from another native CAS capability. */
+  /** Import authenticated closures while holding both workspace locks. */
   importTreesFrom(
     source: NativeObjectStore,
     treeOids: readonly string[],
     admission: TreeImportAdmission,
+    options: TreeImportOptions,
   ): Promise<void>;
 }
 
@@ -291,6 +311,11 @@ export interface TreeImportAdmission {
   ) => Promise<TreeImportAdmissionDecision>;
   /** Target workspace admission limit including files and symlink targets. */
   readonly maxSnapshotBytes: number;
+}
+
+export interface TreeImportOptions {
+  readonly writeAuthority: WorkspaceWriteAuthority;
+  readonly signal?: AbortSignal;
 }
 
 export type TreeImportAdmissionDecision =
@@ -422,9 +447,10 @@ export function openObjectStoreReadScope(
 export function openNativeObjectStoreReadScope(
   store: NativeObjectStore,
   operation: string,
+  options: { readonly signal?: AbortSignal } = {},
 ): NativeObjectStoreReadScope {
   const native = requireNativeObjectStore(store, operation);
-  return nativeObjectRecords.get(native)!.access.openReadScope();
+  return nativeObjectRecords.get(native)!.access.openReadScope(options);
 }
 
 /** Historical tree conversion is exposed only to the metadata migration path. */
@@ -558,6 +584,7 @@ async function runPool<T>(
   items: readonly T[],
   worker: (item: T) => Promise<void>,
   concurrency: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (items.length === 0) {
     return;
@@ -575,6 +602,7 @@ async function runPool<T>(
         return;
       }
       try {
+        signal?.throwIfAborted();
         await worker(items[index] as T);
       } catch (error) {
         failures.push({ index, error });
@@ -586,6 +614,17 @@ async function runPool<T>(
   await Promise.all(runners);
   if (failures.length > 0) {
     failures.sort((left, right) => left.index - right.index);
+    if (signal?.aborted) {
+      const retained = failures
+        .map(({ error }) => error)
+        .filter((error) => !isOperationCancelled(error, signal));
+      if (retained.length > 1)
+        throw aggregateFailures(
+          retained,
+          "object publication failed while cancelling",
+        );
+      if (retained.length === 1) throw retained[0];
+    }
     throw failures[0]!.error;
   }
 }
@@ -631,10 +670,12 @@ async function streamWorkspaceSourceFile(
   path: string,
   onChunk: (chunk: Buffer) => Promise<void>,
   maxBytes: number,
+  signal?: AbortSignal,
 ): Promise<{
   readonly digest: string;
   readonly byteLength: number;
 }> {
+  signal?.throwIfAborted();
   const pathBefore = await observeWorkspaceStreamSourceBeforeOpen(path);
   const handle = await openWorkspaceRegularCandidate(path, constants.O_RDONLY);
   return await withRetainedCleanup(
@@ -661,6 +702,7 @@ async function streamWorkspaceSourceFile(
       const buffer = Buffer.allocUnsafe(64 * 1024);
       let position = 0;
       while (true) {
+        signal?.throwIfAborted();
         const readLength = Math.min(
           buffer.byteLength,
           maxBytes - byteLength + 1,
@@ -735,13 +777,15 @@ class FileObjectStore implements NativeObjectStore {
   }
 
   readonly #nativeObjectAccess: NativeObjectAccess = {
-    openReadScope: () => this.#openNativeReadScope(),
+    openReadScope: (options) => this.#openNativeReadScope(options),
     upgradeStoredTree: (treeOid, targetFormat) =>
       this.#upgradeStoredTree(treeOid, targetFormat),
   };
 
-  #openNativeReadScope(): NativeObjectStoreReadScope {
-    const scope = this.#repository.openResolutionScope();
+  #openNativeReadScope(
+    options: { readonly signal?: AbortSignal } = {},
+  ): NativeObjectStoreReadScope {
+    const scope = this.#repository.openResolutionScope(options);
     let closePromise: Promise<void> | undefined;
     const close = (): Promise<void> => {
       if (closePromise !== undefined) return closePromise;
@@ -803,6 +847,7 @@ class FileObjectStore implements NativeObjectStore {
 
   #storedTreeWriteAccess(
     scope: ContentRepositoryResolutionScope,
+    publication?: ContentRepositoryPublication,
   ): StoredTreeWriteAccess {
     return {
       publishStructuralObject: async (kind, oid, canonicalBytes) => {
@@ -811,6 +856,10 @@ class FileObjectStore implements NativeObjectStore {
             "object-integrity",
             "tree structural bytes do not match their object id",
           );
+        }
+        if (publication !== undefined) {
+          await publication.publishStructural(kind, oid, canonicalBytes);
+          return;
         }
         await this.#repository.publishStructural(
           kind,
@@ -826,6 +875,10 @@ class FileObjectStore implements NativeObjectStore {
             "tree content bytes do not match their content id",
           );
         }
+        if (publication !== undefined) {
+          await publication.ensureRawContent(contentId, rawBytes);
+          return;
+        }
         await this.#repository.ensureRawContent(contentId, rawBytes, scope);
       },
     };
@@ -833,8 +886,9 @@ class FileObjectStore implements NativeObjectStore {
 
   async #withResolutionScope<T>(
     operation: (scope: ContentRepositoryResolutionScope) => Promise<T>,
+    options: { readonly signal?: AbortSignal } = {},
   ): Promise<T> {
-    const scope = this.#repository.openResolutionScope();
+    const scope = this.#repository.openResolutionScope(options);
     return await withRetainedCleanup(
       () => operation(scope),
       () => this.#repository.closeResolutionScope(scope),
@@ -847,7 +901,13 @@ class FileObjectStore implements NativeObjectStore {
     expectedOid: string,
     expectedByteLength: number,
     scope?: ContentRepositoryResolutionScope,
-  ): Promise<{ readonly oid: string; readonly proof: PublishedContent }> {
+    publication?: ContentRepositoryPublication,
+    signal?: AbortSignal,
+  ): Promise<{
+    readonly oid: string;
+    readonly proof: ContentPublicationReceipt;
+  }> {
+    signal?.throwIfAborted();
     assertOid(expectedOid);
     if (
       !isAbsolute(sourcePath) ||
@@ -866,27 +926,36 @@ class FileObjectStore implements NativeObjectStore {
       );
     }
     try {
-      const proof = await this.#repository.publishContentFromStream(
-        expectedOid,
-        expectedByteLength,
-        async (sink) => {
-          const observed = await streamWorkspaceSourceFile(
-            sourcePath,
-            async (chunk) => sink(chunk),
-            Math.min(this.#admissionMaxFileBytes, expectedByteLength),
+      const source = async (sink: (chunk: Uint8Array) => Promise<void>) => {
+        const observed = await streamWorkspaceSourceFile(
+          sourcePath,
+          async (chunk) => sink(chunk),
+          Math.min(this.#admissionMaxFileBytes, expectedByteLength),
+          signal,
+        );
+        if (
+          observed.byteLength !== expectedByteLength ||
+          observed.digest !== expectedOid
+        ) {
+          throw new StreamedFileChangedError(
+            "source file no longer matches the scanned blob digest and length",
           );
-          if (
-            observed.byteLength !== expectedByteLength ||
-            observed.digest !== expectedOid
-          ) {
-            throw new StreamedFileChangedError(
-              "source file no longer matches the scanned blob digest and length",
+        }
+      };
+      const proof =
+        publication === undefined
+          ? await this.#repository.publishContentFromStream(
+              expectedOid,
+              expectedByteLength,
+              source,
+              {},
+              scope,
+            )
+          : await publication.publishContentFromStream(
+              expectedOid,
+              expectedByteLength,
+              source,
             );
-          }
-        },
-        {},
-        scope,
-      );
       return { oid: expectedOid, proof };
     } catch (error) {
       if (primaryFailure(error) instanceof StreamedFileChangedError) {
@@ -1008,9 +1077,17 @@ class FileObjectStore implements NativeObjectStore {
     return streamed;
   }
 
-  beginSnapshotPublication(): SnapshotPublication {
-    const verified = new Map<string, PublishedContent>();
-    const resolutionScope = this.#repository.openResolutionScope();
+  beginSnapshotPublication(
+    options: SnapshotPublicationOptions = {},
+  ): SnapshotPublication {
+    options.signal?.throwIfAborted();
+    const batch =
+      options.writeAuthority === undefined
+        ? undefined
+        : this.#repository.beginPublication(options.writeAuthority, options);
+    const verified = new Map<string, ContentPublicationReceipt>();
+    const resolutionScope =
+      batch?.resolutionScope ?? this.#repository.openResolutionScope();
     const activeBlobs = new Set<Promise<string>>();
     let blobFailure: { readonly cause: unknown } | undefined;
     let state: "open" | "tree-publishing" | "closing" | "closed" = "open";
@@ -1028,7 +1105,8 @@ class FileObjectStore implements NativeObjectStore {
       resourceClose ??= (async () => {
         await Promise.allSettled([...activeBlobs]);
         try {
-          await this.#repository.closeResolutionScope(resolutionScope);
+          if (batch !== undefined) await batch.close();
+          else await this.#repository.closeResolutionScope(resolutionScope);
         } finally {
           state = "closed";
         }
@@ -1055,6 +1133,8 @@ class FileObjectStore implements NativeObjectStore {
             expectedOid,
             expectedByteLength,
             resolutionScope,
+            batch,
+            options.signal,
           );
           verified.set(oid, proof);
           return oid;
@@ -1081,9 +1161,11 @@ class FileObjectStore implements NativeObjectStore {
         const publish = (async () => {
           await Promise.allSettled([...activeBlobs]);
           if (blobFailure !== undefined) throw blobFailure.cause;
+          options.signal?.throwIfAborted();
+          await batch?.flush();
           const prepared = this.#prepareTree(entries, scope);
           const checked = new Set<string>();
-          const proofs: PublishedContent[] = [];
+          const proofs: ContentPublicationReceipt[] = [];
           for (const entry of prepared.entries) {
             if (entry.type !== "regular") {
               continue;
@@ -1103,18 +1185,25 @@ class FileObjectStore implements NativeObjectStore {
           await runPool(
             proofs,
             (proof) =>
-              this.#repository.revalidatePublishedContent(
-                proof,
-                this.#admissionMaxFileBytes,
-                resolutionScope,
-              ),
+              batch !== undefined
+                ? batch.revalidateContent(proof, this.#admissionMaxFileBytes)
+                : this.#repository.revalidatePublishedContent(
+                    proof as PublishedContent,
+                    this.#admissionMaxFileBytes,
+                    resolutionScope,
+                  ),
             VERIFICATION_CONCURRENCY,
           );
-          return await this.#publishCurrentTree(
+          options.signal?.throwIfAborted();
+          const treeOid = await this.#publishCurrentTree(
             prepared,
             this.#manifestLimits,
             resolutionScope,
+            batch,
           );
+          await batch?.flush();
+          options.signal?.throwIfAborted();
+          return treeOid;
         })();
         treePublication = withRetainedCleanup(
           async () => await publish,
@@ -1131,12 +1220,13 @@ class FileObjectStore implements NativeObjectStore {
     manifest: CurrentTreeManifest,
     limits: TreeManifestLimits = this.#manifestLimits,
     scope?: ContentRepositoryResolutionScope,
+    publication?: ContentRepositoryPublication,
   ): Promise<string> {
     try {
       if (scope !== undefined) {
         return await STORED_TREE_FORMAT_V3.publish(
           manifest,
-          this.#storedTreeWriteAccess(scope),
+          this.#storedTreeWriteAccess(scope, publication),
           limits,
         );
       }
@@ -1319,7 +1409,9 @@ class FileObjectStore implements NativeObjectStore {
     source: NativeObjectStore,
     treeOids: readonly string[],
     admission: TreeImportAdmission,
+    options: TreeImportOptions,
   ): Promise<void> {
+    options.signal?.throwIfAborted();
     const uniqueTreeOids: string[] = [];
     const seenTrees = new Set<string>();
     for (const treeOid of treeOids) {
@@ -1330,8 +1422,12 @@ class FileObjectStore implements NativeObjectStore {
       }
     }
 
-    const sourceAccess = openNativeObjectStoreReadScope(source, "tree import");
-    const targetScope = this.#repository.openResolutionScope();
+    const sourceAccess = openNativeObjectStoreReadScope(
+      source,
+      "tree import",
+      options,
+    );
+    let publication: ContentRepositoryPublication | undefined;
     try {
       await withRetainedCleanup(
         async () => {
@@ -1341,22 +1437,34 @@ class FileObjectStore implements NativeObjectStore {
               sourceAccess,
               uniqueTreeOids,
               admission,
+              options.signal,
             );
           } catch (error) {
+            if (isOperationCancelled(error, options.signal)) throw error;
             if (error instanceof TreeImportSourceError) throw error;
             if (error instanceof TreeImportValidatorFailure) throw error.cause;
             if (error instanceof TreeImportAdmissionError) throw error;
             throw new TreeImportAdmissionError(error);
           }
           try {
-            await this.#publishTreeImport(sourceAccess, plan, targetScope);
+            options.signal?.throwIfAborted();
+            publication = this.#repository.beginPublication(
+              options.writeAuthority,
+              options,
+            );
+            await this.#publishTreeImport(
+              sourceAccess,
+              plan,
+              publication,
+              options.signal,
+            );
           } catch (error) {
             throw asStoreError("tree import", error);
           }
         },
         () =>
           withRetainedCleanup(
-            () => this.#repository.closeResolutionScope(targetScope),
+            async () => await publication?.close(),
             () => sourceAccess.close(),
             "tree import scope cleanup failed",
           ),
@@ -1377,7 +1485,9 @@ class FileObjectStore implements NativeObjectStore {
     source: NativeObjectStoreReadScope,
     treeOids: readonly string[],
     admission: TreeImportAdmission,
+    signal?: AbortSignal,
   ): Promise<TreeImportPlan> {
+    signal?.throwIfAborted();
     if (
       !Number.isSafeInteger(admission.maxSnapshotBytes) ||
       admission.maxSnapshotBytes <= 0
@@ -1389,6 +1499,7 @@ class FileObjectStore implements NativeObjectStore {
     }
     const blobOids = new Set<string>();
     for (const treeOid of treeOids) {
+      signal?.throwIfAborted();
       const manifest = await preflightSourceAccess(() =>
         source.readTreeManifest(treeOid),
       );
@@ -1398,6 +1509,7 @@ class FileObjectStore implements NativeObjectStore {
       } catch (cause) {
         throw new TreeImportValidatorFailure(cause);
       }
+      signal?.throwIfAborted();
       if (decision.kind === "rejected") {
         throw new TreeImportAdmissionError(decision.cause);
       }
@@ -1443,12 +1555,14 @@ class FileObjectStore implements NativeObjectStore {
         blobProofs.set(blobOid, proof);
       },
       VERIFICATION_CONCURRENCY,
+      signal,
     );
 
     // Count logical content per manifest entry. Repeated paths to a shared
     // blob consume snapshot quota independently even though CAS publishes the
     // physical blob only once; symlink targets count their UTF-8 byte length.
     for (const treeOid of treeOids) {
+      signal?.throwIfAborted();
       const manifest = await preflightSourceAccess(() =>
         source.readTreeManifest(treeOid),
       );
@@ -1486,19 +1600,23 @@ class FileObjectStore implements NativeObjectStore {
   async #publishTreeImport(
     source: NativeObjectStoreReadScope,
     plan: TreeImportPlan,
-    targetScope: ContentRepositoryResolutionScope,
+    publication: ContentRepositoryPublication,
+    signal?: AbortSignal,
   ): Promise<void> {
     const readSource = async <T>(
       operation: () => T | Promise<T>,
     ): Promise<T> => {
       try {
+        signal?.throwIfAborted();
         return await operation();
       } catch (error) {
+        if (isOperationCancelled(error, signal)) throw error;
         throw new TreeImportSourceError(error);
       }
     };
 
     let targetFailure: { readonly error: unknown } | undefined;
+    const publishedContents: ContentPublicationReceipt[] = [];
     try {
       await runPool(
         plan.blobOids,
@@ -1511,38 +1629,45 @@ class FileObjectStore implements NativeObjectStore {
                 "tree import plan omitted an authenticated blob proof",
               );
             }
-            await this.#publishBlobFromStream(
+            const receipt = await this.#publishBlobFromStream(
               blobOid,
               proof.decodedLength,
               (sink) =>
                 readSource(() =>
                   source.streamVerifiedContent(proof, plan.maxFileBytes, sink),
                 ),
-              targetScope,
+              publication,
             );
+            publishedContents.push(receipt);
           } catch (error) {
             // A source failure selected by input order must not hide a target
             // failure from another already-active lane: target failure stays
             // fatal regardless of which lane reports first.
-            if (!(error instanceof TreeImportSourceError)) {
+            if (
+              !(error instanceof TreeImportSourceError) &&
+              !isOperationCancelled(error, signal)
+            ) {
               targetFailure ??= { error };
             }
             throw error;
           }
         },
         VERIFICATION_CONCURRENCY,
+        signal,
       );
     } catch (error) {
       if (targetFailure !== undefined) throw targetFailure.error;
       throw error;
     }
 
+    await publication.flush();
     for (const treeOid of plan.treeOids) {
       const manifest = await readSource(() => source.readTreeManifest(treeOid));
       const published = await this.#publishCurrentTree(
         manifest,
         ABSOLUTE_TREE_MANIFEST_LIMITS,
-        targetScope,
+        publication.resolutionScope,
+        publication,
       );
       if (published !== treeOid) {
         throw new ObjectStoreError(
@@ -1550,15 +1675,26 @@ class FileObjectStore implements NativeObjectStore {
           "imported tree did not preserve its canonical object id",
         );
       }
-      await this.#readTreeManifest(treeOid, targetScope);
     }
 
-    // One final collective closure proof avoids retaining every large
-    // manifest or re-hashing shared blobs once per historical checkpoint.
-    await this.#verifyBlobs(plan.blobOids, undefined, targetScope);
-    for (const treeOid of plan.treeOids) {
-      await this.#readTreeManifest(treeOid, targetScope);
-    }
+    await publication.flush();
+    await runPool(
+      publishedContents,
+      (receipt) => publication.revalidateContent(receipt, plan.maxFileBytes),
+      VERIFICATION_CONCURRENCY,
+      signal,
+    );
+    // Reopen the newly published structural graph after every batch is durable.
+    await this.#withResolutionScope(
+      async (scope) => {
+        for (const treeOid of plan.treeOids) {
+          signal?.throwIfAborted();
+          await this.#readTreeManifest(treeOid, scope);
+        }
+      },
+      signal === undefined ? {} : { signal },
+    );
+    signal?.throwIfAborted();
   }
 
   async verifyBlobs(blobOids: readonly string[]): Promise<void> {
@@ -1669,11 +1805,11 @@ class FileObjectStore implements NativeObjectStore {
     stream: (
       sink: (chunk: Uint8Array) => Promise<void>,
     ) => Promise<{ readonly decodedLength: number }>,
-    scope?: ContentRepositoryResolutionScope,
-  ): Promise<PublishedContent> {
+    publication: ContentRepositoryPublication,
+  ): Promise<ContentPublicationReceipt> {
     let targetFailure: { readonly cause: unknown } | undefined;
     try {
-      return await this.#repository.publishContentFromStream(
+      return await publication.publishContentFromStream(
         oid,
         expectedByteLength,
         async (sink) => {
@@ -1692,7 +1828,6 @@ class FileObjectStore implements NativeObjectStore {
           }
         },
         { authenticateSource: true },
-        scope,
       );
     } catch (error) {
       if (targetFailure !== undefined) {

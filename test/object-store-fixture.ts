@@ -1,17 +1,42 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type {
+  NativeObjectStore,
   ObjectStore,
   SnapshotPublication,
+  TreeImportAdmission,
 } from "../src/infrastructure/object-store.ts";
+import { withOrderedWorkspaceLocks } from "../src/infrastructure/workspace-lock.ts";
 import type { TreeEntry } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
 
 function digest(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+export async function importTestTrees(
+  target: NativeObjectStore,
+  source: NativeObjectStore,
+  treeOids: readonly string[],
+  admission: TreeImportAdmission,
+  options: { readonly signal?: AbortSignal } = {},
+): Promise<void> {
+  const targetRoot = await realpath(target.storageRoot);
+  return await withOrderedWorkspaceLocks(
+    [source, target].map(({ storageRoot }) => ({
+      storeRoot: storageRoot,
+      options,
+    })),
+    "test tree import",
+    (authorities) =>
+      target.importTreesFrom(source, treeOids, admission, {
+        writeAuthority: authorities.get(targetRoot)!,
+        ...options,
+      }),
+  );
 }
 
 async function withSourceDirectory<T>(

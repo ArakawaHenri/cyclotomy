@@ -252,7 +252,11 @@ export async function runConfirmedRestore(
           if (mode !== "manual" || !protectedMissing) {
             return { kind: "missing" as const };
           }
-          const first = await runtime.checkpoints.prepareCurrent(view);
+          const first = await runtime.prepareCurrentCapture(
+            context,
+            view,
+            writeAuthority,
+          );
           if (!first.ok) {
             return {
               kind: "capture-failed" as const,

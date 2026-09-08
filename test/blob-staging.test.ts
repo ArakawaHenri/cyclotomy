@@ -1,14 +1,17 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  BlobStagingCleanupError,
   stageBlobs,
   type StagedBlobs,
 } from "../src/infrastructure/blob-staging.ts";
+
+vi.mock("node:fs/promises", { spy: true });
 
 function oidFor(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
@@ -35,6 +38,8 @@ describe("operation-local blob staging", () => {
   });
 
   afterEach(async () => {
+    vi.mocked(open).mockReset();
+    vi.restoreAllMocks();
     await rm(testRoot, { recursive: true, force: true });
   });
 
@@ -101,6 +106,83 @@ describe("operation-local blob staging", () => {
       firstOid,
       brokenOid,
     ]);
+  });
+
+  async function failStagedFileClose(failure: Error) {
+    const actual =
+      await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises",
+      );
+    const close = vi.fn();
+    vi.mocked(open).mockImplementation(async (...args) => {
+      const handle = await actual.open(...args);
+      if (basename(String(args[0])) === "0") {
+        const originalClose = handle.close.bind(handle);
+        vi.spyOn(handle, "close").mockImplementation(async () => {
+          close();
+          await originalClose();
+          throw failure;
+        });
+      }
+      return handle;
+    });
+    return close;
+  }
+
+  it("retains a source failure and the staging file close failure", async () => {
+    const sourceFailure = new Error("source read failed");
+    const closeFailure = new Error("staged file close failed");
+    const close = await failStagedFileClose(closeFailure);
+    const oid = oidFor(Buffer.from("unreadable"));
+    let observed: unknown;
+    try {
+      await stageBlobs(
+        [oid],
+        async () => {
+          throw sourceFailure;
+        },
+        {
+          workspaceRoot,
+          stagingParent,
+        },
+      );
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(BlobStagingCleanupError);
+    expect(observed).toMatchObject({
+      primary: sourceFailure,
+      cleanup: expect.objectContaining({ errors: [closeFailure] }),
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(await readdir(stagingParent)).toEqual([]);
+  });
+
+  it("retains a sink failure when the staged read handle also fails to close", async () => {
+    const bytes = Buffer.from("prepared bytes");
+    const oid = oidFor(bytes);
+    const staged = await stageBlobs(
+      [oid],
+      async (_oid, sink) => {
+        await sink(bytes);
+        return { decodedLength: bytes.byteLength };
+      },
+      { workspaceRoot, stagingParent },
+    );
+    const sinkFailure = new Error("workspace write failed");
+    const closeFailure = new Error("staged read close failed");
+    const close = await failStagedFileClose(closeFailure);
+    try {
+      await expect(
+        staged.streamBlob(oid, async () => {
+          throw sinkFailure;
+        }),
+      ).rejects.toMatchObject({ errors: [sinkFailure, closeFailure] });
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      await staged.dispose();
+    }
   });
 
   it("rejects staged bytes that do not match their content id", async () => {

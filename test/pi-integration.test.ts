@@ -29,6 +29,7 @@ import {
 } from "../src/infrastructure/metadata.ts";
 import {
   openObjectStore,
+  type NativeObjectStore,
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
@@ -5739,17 +5740,16 @@ describe("checkpoint authority lifecycle", () => {
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
       const db = await metadata();
-      const target = checkpointState(db, pi.manager.sessionId, second)!;
-      db.close();
-      await rm(
-        join(
-          storeRoot,
-          "objects",
-          "trees",
-          target.treeOid.slice(0, 2),
-          target.treeOid.slice(2),
+      await mutateMetadata(db, () =>
+        commitTestNodeState(
+          db,
+          pi.manager.sessionId,
+          second,
+          "f".repeat(64),
+          pi.manager.getSessionFile(),
         ),
       );
+      db.close();
       await writeFile(join(workspace, "a.txt"), "v3");
       await pi.endTurn();
 
@@ -7739,19 +7739,31 @@ describe("checkpoint authority lifecycle", () => {
           .digest("hex");
         const targetStoreRoot = join(canonicalStorageA, targetHash);
         let rebound = false;
-        const verifyBlobs = await interceptRepositoryContentStream({
-          storageRoot: targetStoreRoot,
-          contentId: contentIdForText("parent state"),
-          // Target publication authenticates through private repository
-          // primitives. Its first public scoped stream is the final collective
-          // closure proof, after CAS objects exist but before metadata commit.
-          occurrence: 1,
-          action: async () => {
+        let importedBundles = 0;
+        const prototype = Object.getPrototypeOf(
+          await openObjectStore(sourceStoreRoot),
+        ) as Pick<NativeObjectStore, "importTreesFrom">;
+        const originalImport = prototype.importTreesFrom;
+        const importTrees = vi
+          .spyOn(prototype, "importTreesFrom")
+          .mockImplementation(async function (
+            this: NativeObjectStore,
+            ...args
+          ) {
+            await originalImport.apply(this, args);
+            if (this.storageRoot !== targetStoreRoot) return;
+            importedBundles += 1;
+            await expect(this.readTree(sourceOid)).resolves.toBeDefined();
+            expect(
+              readTestSessionRegistration(
+                join(targetStoreRoot, "state.db"),
+                "published-child",
+              ),
+            ).toBeUndefined();
             rebound = true;
             await rm(storageAlias);
             await symlink(storageB, storageAlias);
-          },
-        });
+          });
         try {
           await writeFile(join(targetWorkspace, "state.txt"), "target state");
           const child = new FakePi(targetWorkspace);
@@ -7770,8 +7782,7 @@ describe("checkpoint authority lifecycle", () => {
           await child.startSession("fork", parentFile);
 
           expect(rebound).toBe(true);
-          expect(verifyBlobs.triggered()).toBe(true);
-          expect(verifyBlobs.matchingStreams()).toBe(1);
+          expect(importedBundles).toBe(1);
           expect(notified(child, "forkImportFailed")).toBe(true);
           expect(notified(child, "forkInheritanceSkipped")).toBe(false);
           expect(
@@ -7799,7 +7810,7 @@ describe("checkpoint authority lifecycle", () => {
           const targetStore = await openObjectStore(targetStoreRoot);
           await expect(targetStore.readTree(sourceOid)).resolves.toBeDefined();
         } finally {
-          verifyBlobs.spy.mockRestore();
+          importTrees.mockRestore();
         }
       } finally {
         await rm(targetWorkspace, { recursive: true, force: true });

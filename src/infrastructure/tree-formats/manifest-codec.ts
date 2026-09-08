@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { compareUtf8 } from "../utf8-order.ts";
 import { isTreeOid } from "../../domain/model.ts";
 import {
   ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
@@ -110,11 +111,10 @@ export function exactKeys(
   value: Record<string, unknown>,
   expected: readonly string[],
 ): boolean {
-  const actual = Object.keys(value).sort();
-  const canonical = [...expected].sort();
+  const actual = Object.keys(value);
   return (
-    actual.length === canonical.length &&
-    actual.every((key, index) => key === canonical[index])
+    actual.length === expected.length &&
+    actual.every((key) => expected.includes(key))
   );
 }
 
@@ -153,17 +153,6 @@ function assertEntryLimit(
       `tree has ${value.length} entries, exceeding the ${limits.maxEntries}-entry limit`,
     );
   }
-}
-
-function comparePathBytes(left: TreeEntry, right: TreeEntry): number {
-  return Buffer.compare(
-    Buffer.from(left.path, "utf8"),
-    Buffer.from(right.path, "utf8"),
-  );
-}
-
-function isWellFormedUnicode(value: string): boolean {
-  return Buffer.from(value, "utf8").toString("utf8") === value;
 }
 
 function validateEntryPath(path: string, limits: WorkspacePathLimits): void {
@@ -227,7 +216,7 @@ function validateEntryWithPath(
       typeof entry.target !== "string" ||
       entry.target.length === 0 ||
       entry.target.includes("\0") ||
-      !isWellFormedUnicode(entry.target) ||
+      !entry.target.isWellFormed() ||
       (entry.symlinkKind !== null &&
         entry.symlinkKind !== "file" &&
         entry.symlinkKind !== "directory")
@@ -277,7 +266,7 @@ function canonicalizeTreeEntries(
   assertEntryLimit(value, limits);
 
   const entries = value.map((entry) => validateEntry(entry, limits));
-  entries.sort(comparePathBytes);
+  entries.sort((left, right) => compareUtf8(left.path, right.path));
   const byPath = new Map<string, TreeEntry>();
   const namespaceByPortablePath = new Map<string, TreeNamespaceMember>();
   for (const entry of entries) {

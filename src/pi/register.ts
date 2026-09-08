@@ -9,7 +9,12 @@ import {
   type UserBashEventResult,
 } from "@earendil-works/pi-coding-agent";
 
-import { defaultCyclotomyConfig, loadCyclotomyConfig } from "../config.ts";
+import {
+  defaultCyclotomyConfig,
+  loadCyclotomyConfig,
+  setCyclotomyEnabled,
+  type CyclotomyConfig,
+} from "../config.ts";
 import {
   completeCyclotomyCommandArguments,
   parseCyclotomyCommandArguments,
@@ -24,7 +29,7 @@ import {
   type CyclotomyLifecycleEventType,
 } from "./cyclotomy-engine.ts";
 import { CyclotomyEngineController } from "./engine-controller.ts";
-import { createCyclotomyI18n, type CyclotomyI18n } from "./i18n.ts";
+import { createCyclotomyI18n } from "./i18n.ts";
 import {
   notifyArrivalDispositionFailure,
   notifyWorkspaceLockCleanupFailure,
@@ -43,11 +48,11 @@ interface EngineInitialization {
   readonly waitForIdle?: () => Promise<void>;
 }
 
-function startupI18n(agentDir: string): CyclotomyI18n {
+function startupConfig(agentDir: string): CyclotomyConfig {
   try {
-    return createCyclotomyI18n(loadCyclotomyConfig(agentDir).locale);
+    return loadCyclotomyConfig(agentDir);
   } catch {
-    return createCyclotomyI18n(defaultCyclotomyConfig(agentDir).locale);
+    return defaultCyclotomyConfig(agentDir);
   }
 }
 
@@ -66,10 +71,15 @@ function notify(
 
 /** Assemble Cyclotomy behind one permanent, pass-through Pi boundary. */
 export function registerCyclotomy(pi: ExtensionAPI): void {
-  const automaticStartupEnabled = process.env.CYCLOTOMY_ENABLED !== "0";
   let sessionStartObserved = false;
   const agentDir = getAgentDir();
-  let i18n = startupI18n(agentDir);
+  const config = startupConfig(agentDir);
+  const environmentEnabled = process.env.CYCLOTOMY_ENABLED;
+  const automaticStartupEnabled =
+    environmentEnabled === undefined
+      ? config.enabled
+      : environmentEnabled !== "0";
+  let i18n = createCyclotomyI18n(config.locale);
   const controller = new CyclotomyEngineController<
     CyclotomyEngine,
     EngineInitialization
@@ -327,17 +337,38 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix) =>
       completeCyclotomyCommandArguments(prefix, i18n),
     handler: async (args, context) => {
-      switch (parseCyclotomyCommandArguments(args)) {
+      const action = parseCyclotomyCommandArguments(args);
+      switch (action) {
         case "status":
           showStatus(context);
           return;
         case "usage":
           notify(context, i18n.t("cyclotomyUsage"));
           return;
-        case "stop":
+        case "enable":
+        case "disable": {
+          const enabled = action === "enable";
+          try {
+            setCyclotomyEnabled(agentDir, enabled);
+            notify(
+              context,
+              i18n.t(enabled ? "cyclotomyEnabled" : "cyclotomyDisabled"),
+            );
+          } catch (cause) {
+            notify(
+              context,
+              i18n.t("cyclotomySettingsSaveFailed", {
+                message: messageOfUnknown(cause),
+              }),
+              "error",
+            );
+          }
+          return;
+        }
+        case "pause":
           try {
             await retireCurrentParticipation(context);
-            notify(context, i18n.t("cyclotomyStopSucceeded"));
+            notify(context, i18n.t("cyclotomyPauseSucceeded"));
           } catch {
             showStatus(context);
           }

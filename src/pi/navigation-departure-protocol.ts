@@ -52,6 +52,7 @@ type NavigationDeparturePreparation =
   | PreparedNavigationDeparture
   | { readonly kind: "location-changed" }
   | { readonly kind: "source-blocked"; readonly reason: SourceBlockReason }
+  | { readonly kind: "capture-failed"; readonly failure: CaptureFailure }
   | {
       readonly kind: "scan-incomplete";
       readonly problems: readonly ScanProblem[];
@@ -199,20 +200,28 @@ export async function prepareNavigationDepartureInWorkspaceLock(
     if (source !== undefined) {
       sourceExpectedSlot = runtime.checkpoints.checkpointSlot(source);
     }
-    sourceSnapshot = await runtime.scanCurrentWorkspace(expectedView.cwd);
+    const observed = await runtime.prepareWorkspaceObservation(
+      context,
+      expectedView.cwd,
+      writeAuthority,
+    );
+    if (!observed.ok) {
+      return { kind: "capture-failed", failure: observed.error };
+    }
+    sourceSnapshot = observed.value;
     if (sourceSnapshot.problems.length > 0) {
       return { kind: "scan-incomplete", problems: sourceSnapshot.problems };
     }
-    const observed = revalidateNavigationLocation(
+    const observedView = revalidateNavigationLocation(
       runtime,
       views,
       context,
       expectedView,
     );
-    if (observed === undefined) {
+    if (observedView === undefined) {
       return { kind: "location-changed" };
     }
-    preparedView = observed;
+    preparedView = observedView;
   }
 
   const targetKind = classifyTarget(
@@ -264,10 +273,16 @@ export async function prepareNavigationDepartureInWorkspaceLock(
     };
   }
   const { resolution, manifest, scopeValidation } = readable;
-  const restoreSnapshot = await runtime.scanCurrentWorkspaceForScope(
+  const restoreObservation = await runtime.prepareWorkspaceObservation(
+    context,
     expectedView.cwd,
+    writeAuthority,
     manifest.scope,
   );
+  if (!restoreObservation.ok) {
+    return { kind: "capture-failed", failure: restoreObservation.error };
+  }
+  const restoreSnapshot = restoreObservation.value;
   if (restoreSnapshot.problems.length > 0) {
     return { kind: "scan-incomplete", problems: restoreSnapshot.problems };
   }
@@ -351,7 +366,15 @@ export async function commitNavigationDepartureInWorkspaceLock(
     ) {
       return { kind: "target-changed" };
     }
-    sourceCurrent = await runtime.scanCurrentWorkspace(expectedView.cwd);
+    const observed = await runtime.prepareWorkspaceObservation(
+      context,
+      expectedView.cwd,
+      writeAuthority,
+    );
+    if (!observed.ok) {
+      return { kind: "capture-failed", failure: observed.error };
+    }
+    sourceCurrent = observed.value;
     if (sourceCurrent.problems.length > 0) {
       return { kind: "scan-incomplete", problems: sourceCurrent.problems };
     }
@@ -390,10 +413,16 @@ export async function commitNavigationDepartureInWorkspaceLock(
     if (prepared.restoreSnapshot === undefined) {
       return { kind: "target-changed" };
     }
-    restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
+    const observed = await runtime.prepareWorkspaceObservation(
+      context,
       expectedView.cwd,
+      writeAuthority,
       prepared.restoreSnapshot.scope,
     );
+    if (!observed.ok) {
+      return { kind: "capture-failed", failure: observed.error };
+    }
+    restoreCurrent = observed.value;
     if (restoreCurrent.problems.length > 0) {
       return { kind: "scan-incomplete", problems: restoreCurrent.problems };
     }
@@ -446,7 +475,11 @@ export async function commitNavigationDepartureInWorkspaceLock(
         reason: "changed-before-publication",
       };
     }
-    const published = await runtime.checkpoints.prepareObserved(sourceCurrent);
+    const published = await runtime.prepareObservedCapture(
+      context,
+      sourceCurrent,
+      writeAuthority,
+    );
     if (!published.ok) {
       return { kind: "capture-failed", failure: published.error };
     }

@@ -263,6 +263,7 @@ describe("source capture failure impact", () => {
     [{ kind: "not-admitted", subject: "source" }, "cancel-operation"],
     [{ kind: "workspace-unavailable" }, "withdraw-participation"],
     [{ kind: "exception", cause }, "withdraw-participation"],
+    [{ kind: "capture", value: { kind: "cancelled" } }, "cancel-operation"],
     [
       {
         kind: "capture",

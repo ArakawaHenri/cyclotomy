@@ -148,6 +148,34 @@ function allRecords(batches: readonly EncodePackInput[]): RecordEnvelope[] {
 }
 
 describe("content-store compaction planning", () => {
+  it("plans authenticated raw bytes without reopening the logical content", async () => {
+    const bytes = deterministicBytes(64, 0x1234_5678);
+    const record = rawContent(bytes);
+    const plan = await planCompaction({
+      records: [live(record)],
+      contentPathOccurrences: [],
+      read: {
+        readEnvelope: async () => record,
+        readDecodedContent: async () => {
+          throw new Error("logical source is unavailable");
+        },
+      },
+    });
+    record.payload.fill(0);
+    expect(allRecords(plan.batches)).toEqual([rawContent(bytes)]);
+  });
+
+  it("rejects raw bytes that do not match their logical content id", async () => {
+    const record = rawContent(Buffer.from("expected"));
+    const corrupted = { ...record, payload: Buffer.from("tampered") };
+    await expect(
+      makePlan({
+        envelopes: [corrupted],
+        decoded: new Map([[record.logicalId, record.payload]]),
+      }),
+    ).rejects.toMatchObject({ code: "integrity" });
+  });
+
   it("packs repeated small-file history as one-hop deltas from an earlier full anchor", async () => {
     const baseBytes = deterministicBytes(16 * 1024, 0x1020_3040);
     const firstBytes = changed(baseBytes, 4_000, [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -421,33 +449,28 @@ describe("content-store compaction planning", () => {
     expect(encoded.bytes.byteLength).toBe(measurePackInputBytes(recipeBatch!));
   });
 
-  it("rejects one logical record above the decoded maintenance budget", async () => {
-    const contentId = contentIdFromBytes(Buffer.from("oversized root", "utf8"));
-    const recipeId = recipeIdFromCanonicalBytes(
-      Buffer.from("oversized recipe", "utf8"),
-    );
-    const root = createChunkedContentRecord(
-      contentId,
-      DEFAULT_COMPACTION_DECODED_BYTE_BUDGET + 1,
-      recipeId,
-    );
-    await expect(makePlan({ envelopes: [root] })).rejects.toMatchObject({
-      code: "limit-exceeded",
-    });
-  });
-
-  it("bounds aggregate decoded bytes independently of pack byte limits", async () => {
-    const decodedLength = 20 * 1024 * 1024;
+  it("keeps large authenticated chunked roots as recipe references", async () => {
     const roots = ["first", "second"].map((name) =>
       createChunkedContentRecord(
         contentIdFromBytes(Buffer.from(`budget ${name}`, "utf8")),
-        decodedLength,
-        recipeIdFromCanonicalBytes(
-          Buffer.from(`budget recipe ${name}`, "utf8"),
-        ),
+        DEFAULT_COMPACTION_DECODED_BYTE_BUDGET + 1,
+        recipeIdFromCanonicalBytes(Buffer.from(`recipe ${name}`, "utf8")),
       ),
     );
-    await expect(makePlan({ envelopes: roots })).rejects.toMatchObject({
+    const plan = await makePlan({ envelopes: roots });
+    expect(allRecords(plan.batches)).toEqual(expect.arrayContaining(roots));
+  });
+
+  it("bounds aggregate decoded metadata independently of packed byte limits", async () => {
+    const payload = Buffer.alloc(20 * 1024 * 1024);
+    const nodes = ["first", "second"].map((name): RecordEnvelope => ({
+      kind: "tree-node",
+      encoding: "raw",
+      logicalId: parseMetadataId(contentIdFromBytes(Buffer.from(name))),
+      decodedLength: payload.byteLength,
+      payload,
+    }));
+    await expect(makePlan({ envelopes: nodes })).rejects.toMatchObject({
       code: "limit-exceeded",
     });
   });

@@ -18,6 +18,7 @@ import {
   type ObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { ContentRepository } from "../src/infrastructure/content-store/repository.ts";
+import { ContentPackPublication } from "../src/infrastructure/content-store/publication.ts";
 import { CURRENT_TREE_MANIFEST_FORMAT } from "../src/infrastructure/tree-formats/current.ts";
 import {
   IncompleteSnapshotError,
@@ -145,7 +146,7 @@ describe("snapshot publication", () => {
     const primary = new Error("tree publication failed");
     const cleanup = new Error("resolution cleanup failed");
     vi.spyOn(
-      ContentRepository.prototype,
+      ContentPackPublication.prototype,
       "publishStructural",
     ).mockRejectedValue(primary);
     vi.spyOn(

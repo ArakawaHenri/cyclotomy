@@ -174,7 +174,16 @@ export class SyntheticGitDirectoryShape {
     )) {
       await this.#publishPolicy(source);
     }
-    for (const item of delegated) await this.#assertFilesystemKind(item);
+    for (let offset = 0; offset < delegated.length; offset += 8) {
+      const checked = await Promise.allSettled(
+        delegated
+          .slice(offset, offset + 8)
+          .map((item) => this.#assertFilesystemKind(item)),
+      );
+      for (const result of checked) {
+        if (result.status === "rejected") throw result.reason;
+      }
+    }
     for (const [key, item] of plannedQueries) {
       this.#queriesByAlias.set(key, item);
     }

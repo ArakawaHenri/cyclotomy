@@ -1,16 +1,11 @@
-import { createHash } from "node:crypto";
-
-import {
-  authenticateChunkRecipeGraph,
-  MAX_RECIPE_DEPTH,
-  type RecipeGraphLimits,
-} from "./content-store/chunk-recipe.ts";
+import { MAX_RECIPE_DEPTH } from "./content-store/chunk-recipe.ts";
 import {
   DEFAULT_COMPACTION_DECODED_BYTE_BUDGET,
   DELTA1_MAX_ANCHORS_PER_PATH,
   DELTA1_MIN_SAVED_BYTES,
   DELTA1_MIN_SAVED_PERCENT,
   planCompaction,
+  compactionRecordWorkingBytes,
   type CompactionPlan,
   type ContentPathOccurrence,
   type LogicalRecordKey,
@@ -75,6 +70,7 @@ import type {
   ContentRepositoryResolutionScope,
   PublishedContent,
   VerifiedObjectLocation,
+  VerifiedContentRead,
 } from "./content-store/repository.ts";
 import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
 import type { CurrentMetadataStore } from "./metadata.ts";
@@ -187,6 +183,51 @@ function rethrowGarbageCollectionPrimary(failure: unknown): never {
   throw failure;
 }
 
+interface MarkedChunkedContent {
+  readonly location: VerifiedObjectLocation;
+  readonly verified: VerifiedContentRead;
+  readonly recipeId: RecipeId;
+}
+
+function rememberContentLocations(
+  locations: Map<string, VerifiedObjectLocation>,
+  verified: VerifiedContentRead,
+  materializedRoot?: string,
+): void {
+  for (const location of verified.closure.objects) {
+    if (location.kind !== "content" || location.retention !== "logical")
+      continue;
+    const previous = locations.get(location.logicalId);
+    // A logical id used both as a file and as a chunk must retain a terminal representation.
+    if (
+      previous === undefined ||
+      previous.encoding === "chunked-v1" ||
+      location.logicalId === materializedRoot
+    ) {
+      locations.set(location.logicalId, location);
+    }
+  }
+}
+
+function rememberChunkedContent(
+  contents: Map<string, MarkedChunkedContent>,
+  verified: VerifiedContentRead,
+): void {
+  for (const location of verified.closure.objects) {
+    if (
+      location.kind === "content" &&
+      location.encoding === "chunked-v1" &&
+      location.recipeId !== undefined
+    ) {
+      contents.set(location.logicalId, {
+        location,
+        verified,
+        recipeId: location.recipeId,
+      });
+    }
+  }
+}
+
 interface MarkState {
   readonly liveKeys: ReadonlyMap<string, LogicalRecordKey>;
   readonly structuralKinds: ReadonlyMap<
@@ -196,6 +237,8 @@ interface MarkState {
   readonly occurrences: readonly ContentPathOccurrence[];
   /** Exact physical receipts authenticated while traversing the roots. */
   readonly authenticatedCoverage: ReadonlySet<string>;
+  readonly authenticatedChunked: ReadonlyMap<string, MarkedChunkedContent>;
+  readonly authenticatedContents: ReadonlyMap<string, VerifiedObjectLocation>;
 }
 
 interface PackRewriteSelection {
@@ -369,10 +412,22 @@ function extendLiveMark(
   mark: MarkState,
   additions: ReadonlyMap<string, LogicalRecordKey>,
   maximum: number,
+  proofs: readonly PublishedContent[] = [],
 ): MarkState {
   const liveKeys = new Map(mark.liveKeys);
   for (const key of additions.values()) addLiveKey(liveKeys, key, maximum);
-  return Object.freeze({ ...mark, liveKeys });
+  const authenticatedChunked = new Map(mark.authenticatedChunked);
+  const authenticatedContents = new Map(mark.authenticatedContents);
+  for (const proof of proofs) {
+    rememberChunkedContent(authenticatedChunked, proof);
+    rememberContentLocations(authenticatedContents, proof, proof.contentId);
+  }
+  return Object.freeze({
+    ...mark,
+    liveKeys,
+    authenticatedChunked,
+    authenticatedContents,
+  });
 }
 
 function extendCompactionSelection(
@@ -415,19 +470,6 @@ function withoutReplacementWork(
     rewriteRequirements: new Map<string, ReadonlySet<string>>(),
     opportunisticPackIds: new Set<string>(),
     opportunisticAddedKeys: new Map<string, ReadonlySet<string>>(),
-  });
-}
-
-function recipeLimits(maximumBytes: number): RecipeGraphLimits {
-  const maxChunks = Math.min(
-    1_000_000,
-    Math.ceil(maximumBytes / (16 * 1024)) + 1,
-  );
-  return Object.freeze({
-    maxChunks,
-    maxDecodedBytes: maximumBytes,
-    maxDepth: MAX_RECIPE_DEPTH,
-    maxNodes: Math.min(1_000_000, maxChunks * 2 + MAX_RECIPE_DEPTH),
   });
 }
 
@@ -481,6 +523,8 @@ async function authenticateRoots(
   const occurrences: ContentPathOccurrence[] = [];
   const authenticatedContent = new Set<string>();
   const authenticatedCoverage = new Set<string>();
+  const authenticatedChunked = new Map<string, MarkedChunkedContent>();
+  const authenticatedContents = new Map<string, VerifiedObjectLocation>();
 
   try {
     return await withRetainedCleanup(
@@ -524,6 +568,8 @@ async function authenticateRoots(
                 repository.maxDecodedBytes,
               );
               authenticatedContent.add(contentId);
+              rememberChunkedContent(authenticatedChunked, verified);
+              rememberContentLocations(authenticatedContents, verified);
               for (const object of verified.closure.objects) {
                 authenticatedCoverage.add(verifiedLocationCoverageKey(object));
                 if (object.retention !== "logical") continue;
@@ -550,6 +596,8 @@ async function authenticateRoots(
           ),
           occurrences: Object.freeze(occurrences),
           authenticatedCoverage: Object.freeze(authenticatedCoverage),
+          authenticatedChunked,
+          authenticatedContents,
         });
       },
       () => reads.close(),
@@ -731,14 +779,37 @@ function compactionPlanMetrics(
   });
 }
 
-function compactionPlanDecodedBytes(plan: CompactionPlan): number {
+function compactionReadBytes(
+  record: Pick<
+    RecordEnvelope,
+    "kind" | "logicalId" | "encoding" | "decodedLength"
+  >,
+  mark: MarkState,
+): number {
+  if (record.kind === "content") {
+    const selected = mark.authenticatedContents.get(record.logicalId);
+    return selected?.encoding === "chunked-v1"
+      ? compactionRecordWorkingBytes({
+          encoding: selected.encoding,
+          decodedLength: record.decodedLength,
+        })
+      : record.decodedLength;
+  }
+  return compactionRecordWorkingBytes(record);
+}
+
+function compactionPlanDecodedBytes(
+  plan: CompactionPlan,
+  mark: MarkState,
+): number {
   let total = 0;
   for (const batch of plan.batches) {
     for (const record of batch.records) {
-      if (record.decodedLength > Number.MAX_SAFE_INTEGER - total) {
+      const bytes = compactionReadBytes(record, mark);
+      if (bytes > Number.MAX_SAFE_INTEGER - total) {
         throw new RangeError("planned decoded bytes exceed the safe limit");
       }
-      total += record.decodedLength;
+      total += bytes;
     }
   }
   return total;
@@ -868,6 +939,8 @@ class CompactionResolver {
   readonly #packPool: PackHandlePool;
   readonly #repositoryScope: ContentRepositoryResolutionScope;
   readonly #verifiedChunked = new Set<string>();
+  readonly #markedChunked: ReadonlyMap<string, MarkedChunkedContent>;
+  readonly #markedContents: ReadonlyMap<string, VerifiedObjectLocation>;
 
   constructor(
     store: NativeObjectStore,
@@ -880,6 +953,8 @@ class CompactionResolver {
     this.#repository = nativeObjectStoreRepository(store, "compaction");
     this.#maintenance = maintenance;
     this.#objectInventory = objectInventory;
+    this.#markedChunked = mark.authenticatedChunked;
+    this.#markedContents = mark.authenticatedContents;
     this.#catalog = catalog;
     this.#packPool = new PackHandlePool(
       catalog,
@@ -989,7 +1064,10 @@ class CompactionResolver {
     if (envelope.kind !== key.kind || envelope.logicalId !== key.logicalId) {
       throw new Error("loose object does not cover its logical key");
     }
-    await this.#authenticateEnvelope(envelope);
+    await this.#authenticateEnvelope(
+      envelope,
+      objectCoverageKey(object.kind, envelope.kind, envelope.logicalId),
+    );
   }
 
   objectCoverageStillCurrent(object: MaintenanceObject): Promise<boolean> {
@@ -1023,7 +1101,10 @@ class CompactionResolver {
       "pack coverage verification and lease release both failed",
     );
     if (envelope.encoding === "chunked-v1") {
-      await this.#authenticateEnvelope(envelope);
+      await this.#authenticateEnvelope(
+        envelope,
+        packCoverageKey(catalogEntry.view.packId, entry.physicalOrdinal),
+      );
     }
   }
 
@@ -1068,60 +1149,89 @@ class CompactionResolver {
       throw new Error(`no authenticated representation for ${key.kind}`);
     }
 
+    if (key.kind === "content") return await this.#readMarkedContent(key);
+
     const loose = (
       this.#objectsByKey.get(recordKey(key.kind, key.logicalId)) ?? []
-    )
-      .filter(
-        (object) =>
-          !object.temporary &&
-          (object.kind === "loose-content" || object.kind === "loose-recipe"),
-      )
-      .sort((left, right) => compareText(left.kind, right.kind))[0];
+    ).find((object) => !object.temporary && object.kind === "loose-recipe");
     if (loose !== undefined) {
-      const bytes = await this.#maintenance.readObject(
-        this.#objectInventory,
-        loose,
-        loose.byteLength,
-      );
-      const envelope = decodeRecord(bytes, {
-        maxDecodedBytes: this.#repository.maxDecodedBytes,
-        maxPayloadBytes: bytes.byteLength,
-      });
-      if (envelope.kind !== key.kind || envelope.logicalId !== key.logicalId) {
-        throw new Error("loose record does not match its inventory key");
-      }
-      await this.#authenticateEnvelope(envelope);
-      return envelope;
+      return await this.#readLooseEnvelope(loose, key);
     }
-
     const packed = this.#packEntriesByKey.get(
       recordKey(key.kind, key.logicalId),
     )?.[0];
-    if (packed !== undefined) {
+    if (packed !== undefined)
       return await this.#readPackedEnvelope(packed, key);
-    }
-
-    if (key.kind === "content") {
-      const legacy = (
-        this.#objectsByKey.get(recordKey(key.kind, key.logicalId)) ?? []
-      ).find((object) => !object.temporary && object.kind === "legacy-blob");
-      if (legacy !== undefined) {
-        const bytes = await this.#maintenance.readObject(
-          this.#objectInventory,
-          legacy,
-          MAX_FULL_CONTENT_RECORD_BYTES,
-        );
-        const envelope = await createContentRecord(bytes);
-        if (envelope.logicalId !== key.logicalId) {
-          throw new Error("legacy blob does not match its logical id");
-        }
-        return envelope;
-      }
-    }
     throw new Error(`no authenticated representation for ${key.kind}`);
   }
 
-  async #authenticateEnvelope(envelope: RecordEnvelope): Promise<void> {
+  async #readMarkedContent(
+    key: Extract<LogicalRecordKey, { readonly kind: "content" }>,
+  ): Promise<RecordEnvelope> {
+    const location = this.#markedContents.get(key.logicalId);
+    if (location === undefined)
+      throw new Error("content was not authenticated by marking");
+    if (location.source === "pack") {
+      const packed = this.#packEntriesByKey
+        .get(recordKey(key.kind, key.logicalId))
+        ?.find(
+          ({ catalog, entry }) =>
+            catalog.view.packId === location.packId &&
+            entry.physicalOrdinal === location.physicalOrdinal,
+        );
+      if (packed === undefined)
+        throw new Error("marked content pack is unavailable");
+      return await this.#readPackedEnvelope(packed, key);
+    }
+    const objectKind =
+      location.source === "legacy-blob" ? "legacy-blob" : "loose-content";
+    const object = this.#objectsByKey
+      .get(recordKey(key.kind, key.logicalId))
+      ?.find(
+        (candidate) => !candidate.temporary && candidate.kind === objectKind,
+      );
+    if (object === undefined)
+      throw new Error("marked content object is unavailable");
+    if (object.kind !== "legacy-blob")
+      return await this.#readLooseEnvelope(object, key);
+    const bytes = await this.#maintenance.readObject(
+      this.#objectInventory,
+      object,
+      MAX_FULL_CONTENT_RECORD_BYTES,
+    );
+    const envelope = await createContentRecord(bytes);
+    if (envelope.logicalId !== key.logicalId)
+      throw new Error("legacy blob does not match its logical id");
+    return envelope;
+  }
+
+  async #readLooseEnvelope(
+    object: MaintenanceObject,
+    key: LogicalRecordKey,
+  ): Promise<RecordEnvelope> {
+    const bytes = await this.#maintenance.readObject(
+      this.#objectInventory,
+      object,
+      object.byteLength,
+    );
+    const envelope = decodeRecord(bytes, {
+      maxDecodedBytes: this.#repository.maxDecodedBytes,
+      maxPayloadBytes: bytes.byteLength,
+    });
+    if (envelope.kind !== key.kind || envelope.logicalId !== key.logicalId) {
+      throw new Error("loose record does not match its inventory key");
+    }
+    await this.#authenticateEnvelope(
+      envelope,
+      objectCoverageKey(object.kind, envelope.kind, envelope.logicalId),
+    );
+    return envelope;
+  }
+
+  async #authenticateEnvelope(
+    envelope: RecordEnvelope,
+    coverageKey?: string,
+  ): Promise<void> {
     if (envelope.encoding === "raw" || envelope.encoding === "zstd-v1") {
       if (envelope.kind === "content" || envelope.kind === "recipe") {
         await authenticateFullRecordPayload(
@@ -1137,41 +1247,26 @@ class CompactionResolver {
       throw new Error("only content can use chunked encoding");
     }
     const rootId = chunkedContentRecipeId(envelope as ChunkedContentRecord);
-    const graph = await authenticateChunkRecipeGraph(
-      rootId,
-      {
-        contentId: envelope.logicalId,
-        decodedLength: envelope.decodedLength,
-      },
-      async (recipeId) => {
-        const recipe = await this.readEnvelope(logicalKey("recipe", recipeId));
-        return await authenticateFullRecordPayload(
-          recipe as SelfAuthenticatingRecord,
-        );
-      },
-      recipeLimits(envelope.decodedLength),
-    );
-    const hash = createHash("sha256");
-    let total = 0;
-    for (const chunk of graph.chunks) {
-      const read = await this.#repository.streamContent(
-        chunk.contentId,
-        chunk.decodedLength,
-        async (bytes) => {
-          total += bytes.byteLength;
-          hash.update(bytes);
-        },
-        this.#repositoryScope,
-      );
-      if (read.decodedLength !== chunk.decodedLength) {
-        throw new Error("chunked representation has a length mismatch");
-      }
-    }
+    const marked = this.#markedChunked.get(envelope.logicalId);
+    const selected = this.#markedContents.get(envelope.logicalId);
+    // The opaque closure binds this exact root record and every recipe/chunk.
     if (
-      total !== envelope.decodedLength ||
-      hash.digest("hex") !== envelope.logicalId
+      coverageKey === undefined ||
+      marked === undefined ||
+      selected?.encoding !== "chunked-v1" ||
+      verifiedLocationCoverageKey(marked.location) !== coverageKey ||
+      verifiedLocationCoverageKey(selected) !== coverageKey ||
+      marked.location.encoding !== envelope.encoding ||
+      marked.recipeId !== rootId ||
+      marked.verified.decodedLength !== envelope.decodedLength ||
+      !(await this.#repository.verifiedContentClosureStillCurrent(
+        marked.verified.closure,
+      ))
     ) {
-      throw new Error("chunked representation does not match its content id");
+      throw new GarbageCollectionNamespaceError(
+        coverageKey ?? envelope.logicalId,
+        "chunked representation is not the unchanged marked content graph",
+      );
     }
     this.#verifiedChunked.add(
       `${envelope.logicalId}:${rootId}:${envelope.decodedLength}`,
@@ -1225,7 +1320,13 @@ class CompactionResolver {
       "packed-envelope read and lease release both failed",
     );
     if (envelope.encoding === "chunked-v1") {
-      await this.#authenticateEnvelope(envelope);
+      await this.#authenticateEnvelope(
+        envelope,
+        packCoverageKey(
+          packed.catalog.view.packId,
+          packed.entry.physicalOrdinal,
+        ),
+      );
     }
     return envelope;
   }
@@ -1287,6 +1388,13 @@ async function authenticateRetainedCoverage(
     for (const entry of pack.view.entries) {
       const text = recordKey(entry.kind, entry.logicalId);
       if (!mark.liveKeys.has(text)) continue;
+      if (
+        entry.kind === "content" &&
+        entry.encoding === "chunked-v1" &&
+        mark.authenticatedContents.get(entry.logicalId)?.encoding !==
+          "chunked-v1"
+      )
+        continue;
       append(text, { source: "pack", pack, entry });
     }
   }
@@ -1484,10 +1592,15 @@ function extendWithSizeTierRewrite(
   group: SizeTierRewriteGroup,
   baselineDecodedBytes: number,
   maximumCompactionObjects: number,
+  mark: MarkState,
 ): PackRewriteSelection | undefined {
   const groupedKeys = new Map<
     string,
-    { readonly key: LogicalRecordKey; readonly decodedLength: number }
+    {
+      readonly key: LogicalRecordKey;
+      readonly decodedLength: number;
+      readonly workingBytes: number;
+    }
   >();
   const requirements = new Map<string, ReadonlySet<string>>();
   for (const pack of group.packs) {
@@ -1506,7 +1619,11 @@ function extendWithSizeTierRewrite(
           `duplicate ${text} has inconsistent decoded lengths`,
         );
       }
-      groupedKeys.set(text, { key, decodedLength: entry.decodedLength });
+      groupedKeys.set(text, {
+        key,
+        decodedLength: entry.decodedLength,
+        workingBytes: compactionReadBytes(entry, mark),
+      });
     }
     requirements.set(pack.view.packId, Object.freeze(required));
   }
@@ -1521,15 +1638,15 @@ function extendWithSizeTierRewrite(
     return undefined;
   }
   let decodedBytes = baselineDecodedBytes;
-  for (const [, { decodedLength }] of additions) {
+  for (const [, { workingBytes }] of additions) {
     if (
-      !Number.isSafeInteger(decodedLength) ||
-      decodedLength < 0 ||
-      decodedLength > DEFAULT_COMPACTION_DECODED_BYTE_BUDGET - decodedBytes
+      !Number.isSafeInteger(workingBytes) ||
+      workingBytes < 0 ||
+      workingBytes > DEFAULT_COMPACTION_DECODED_BYTE_BUDGET - decodedBytes
     ) {
       return undefined;
     }
-    decodedBytes += decodedLength;
+    decodedBytes += workingBytes;
   }
 
   const replacementKeys = new Map(selection.replacementKeys);
@@ -1790,7 +1907,18 @@ function selectCompaction(
   const ownerByKey = new Map<string, string>();
   for (const [text, occurrences] of packOccurrences) {
     if (occurrences.length > 1) {
-      ownerByKey.set(text, occurrences[0]!.pack.view.packId);
+      const selected = mark.authenticatedContents.get(
+        occurrences[0]!.entry.logicalId,
+      );
+      const owner =
+        occurrences.find(
+          ({ pack, entry }) =>
+            entry.kind === "content" &&
+            selected?.source === "pack" &&
+            pack.view.packId === selected.packId &&
+            entry.physicalOrdinal === selected.physicalOrdinal,
+        ) ?? occurrences[0]!;
+      ownerByKey.set(text, owner.pack.view.packId);
     }
   }
   for (const pack of sortedPacks) {
@@ -1852,16 +1980,11 @@ async function pruneUnproductiveCrossGenerationRewrites(
     string,
     Extract<RecordEnvelope, { readonly kind: "content" }>
   >();
-  for (const dependency of compaction.physicalDependencies) {
-    const batch = compaction.batches[dependency.batchIndex];
-    const delta = batch?.records.find(
-      (record) =>
-        record.kind === "content" &&
-        record.logicalId === dependency.targetContentId &&
-        record.encoding === "delta1",
-    );
-    if (delta?.kind === "content") {
-      deltaRecords.set(dependency.targetContentId, delta);
+  for (const batch of compaction.batches) {
+    for (const record of batch.records) {
+      if (record.kind === "content" && record.encoding === "delta1") {
+        deltaRecords.set(record.logicalId, record);
+      }
     }
   }
 
@@ -1972,6 +2095,7 @@ async function boundCompactionDecodedBytes(
     readonly packs: PackCatalogInventory;
   },
   maintenance: ObjectStoreMaintenance,
+  mark: MarkState,
 ): Promise<PackRewriteSelection> {
   const lengths = new Map<string, number>();
   const updateLength = (text: string, length: number): void => {
@@ -1980,7 +2104,10 @@ async function boundCompactionDecodedBytes(
   };
   for (const pack of inventories.packs.packs) {
     for (const entry of pack.view.entries) {
-      updateLength(recordKey(entry.kind, entry.logicalId), entry.decodedLength);
+      updateLength(
+        recordKey(entry.kind, entry.logicalId),
+        compactionReadBytes(entry, mark),
+      );
     }
   }
   const keysByLogicalId = new Map<string, LogicalRecordKey[]>();
@@ -1995,7 +2122,18 @@ async function boundCompactionDecodedBytes(
     if (candidates.length === 0) continue;
     if (object.kind === "legacy-blob") {
       if (candidates.some(({ kind }) => kind === "content")) {
-        updateLength(recordKey("content", object.logicalId), object.byteLength);
+        updateLength(
+          recordKey("content", object.logicalId),
+          compactionReadBytes(
+            {
+              kind: "content",
+              logicalId: parseContentId(object.logicalId),
+              encoding: "raw",
+              decodedLength: object.byteLength,
+            },
+            mark,
+          ),
+        );
       }
       continue;
     }
@@ -2035,7 +2173,7 @@ async function boundCompactionDecodedBytes(
     }
     updateLength(
       recordKey(envelope.kind, envelope.logicalId),
-      envelope.decodedLength,
+      compactionReadBytes(envelope, mark),
     );
   }
 
@@ -2202,7 +2340,12 @@ async function planSweep(
   }
 
   let mark = await authenticateRoots(store, initialRoots, maxObjects);
-  mark = extendLiveMark(mark, materialized.liveKeys, maxObjects);
+  mark = extendLiveMark(
+    mark,
+    materialized.liveKeys,
+    maxObjects,
+    materialized.proofs,
+  );
 
   const removableObjects: MaintenanceObject[] = [];
   for (const object of inventories.objects.objects) {
@@ -2494,10 +2637,52 @@ export async function collectGarbage(
     graceMs,
     now,
   );
+  if (
+    selection.replacementKeys.size === 0 &&
+    selection.fullyDeadPackIds.size === 0 &&
+    selection.partialPackIds.size === 0 &&
+    selection.redundantPackIds.size === 0 &&
+    !inventories.objects.objects.some((object) =>
+      expired(object.modifiedAt, graceMs, now),
+    ) &&
+    !inventories.packs.incoming.some((incoming) =>
+      expired(incoming.identity.mtimeMs, graceMs, now),
+    ) &&
+    sizeTierRewriteGroups(selection, inventories.packs, mark, graceMs, now)
+      .length === 0
+  ) {
+    if (
+      !sameStrings(
+        initialRoots,
+        stableRoots(metadata.listReferencedTreeOids(maxObjects + 1)),
+      )
+    ) {
+      throw new GarbageCollectionRootDriftError();
+    }
+    try {
+      await ensureMultiPackIndex(catalog, inventories.packs, authority);
+    } catch (error) {
+      mapInfrastructureError(layout.packs, error);
+    }
+    return Object.freeze({
+      removedTrees: 0,
+      removedBlobs: 0,
+      removedTmpFiles: 0,
+      freedBytes: 0,
+      keptObjects:
+        inventories.objects.objects.filter((object) => !object.temporary)
+          .length + inventories.packs.totalIndexEntries,
+      removedRecords: 0,
+      removedPacks: 0,
+      compactedObjects: 0,
+      writtenPacks: 0,
+    });
+  }
   selection = await boundCompactionDecodedBytes(
     selection,
     inventories,
     maintenance,
+    mark,
   );
   const plannedPacksById = new Map(
     inventories.packs.packs.map((entry) => [entry.view.packId, entry]),
@@ -2521,7 +2706,12 @@ export async function collectGarbage(
     authority,
   );
   selection = omitReplacementKeys(selection, materialized.skippedContentIds);
-  mark = extendLiveMark(mark, materialized.liveKeys, maxObjects);
+  mark = extendLiveMark(
+    mark,
+    materialized.liveKeys,
+    maxObjects,
+    materialized.proofs,
+  );
   selection = extendCompactionSelection(
     selection,
     materialized.liveKeys,
@@ -2538,6 +2728,7 @@ export async function collectGarbage(
     selection,
     inventories,
     maintenance,
+    mark,
   );
   const resolver = new CompactionResolver(
     store,
@@ -2599,8 +2790,9 @@ export async function collectGarbage(
           const candidateSelection = extendWithSizeTierRewrite(
             selection,
             group,
-            compactionPlanDecodedBytes(compaction),
+            compactionPlanDecodedBytes(compaction, mark),
             maxCompactionObjects,
+            mark,
           );
           if (candidateSelection === undefined) continue;
           const candidateCompaction = await planSelection(candidateSelection);

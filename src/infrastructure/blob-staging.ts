@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  aggregateFailures,
+  primaryFailure,
+  withRetainedCleanup,
+} from "./failure-settlement.ts";
+import {
   createPrivateScratchRoot,
   PrivateScratchRootError,
   type PrivateScratchRoot,
@@ -91,58 +96,54 @@ async function writeStagedFile(
   oid: string,
   streamBlob: BlobStreamReader,
 ): Promise<Stats> {
-  let handle: FileHandle | undefined;
-  try {
-    handle = await open(
-      path,
-      constants.O_CREAT |
-        constants.O_EXCL |
-        constants.O_WRONLY |
-        (constants.O_NOFOLLOW ?? 0),
-      0o600,
-    );
-    const hash = createHash("sha256");
-    let byteLength = 0;
-    let localWriteFailure: { readonly cause: unknown } | undefined;
-    let streamed: { readonly decodedLength: number };
-    try {
-      streamed = await streamBlob(oid, async (chunk) => {
-        try {
-          await writeAll(handle!, chunk, byteLength);
-        } catch (cause) {
-          localWriteFailure = { cause };
-          throw cause;
-        }
-        hash.update(chunk);
-        byteLength += chunk.byteLength;
-      });
-    } catch (cause) {
-      if (localWriteFailure !== undefined) throw localWriteFailure.cause;
-      throw new BlobStreamSourceError(cause);
-    }
-    const digest = hash.digest("hex");
-    if (streamed.decodedLength !== byteLength || digest !== oid) {
-      throw new BlobStreamSourceError(
-        new Error("staged blob bytes do not match their content id"),
-      );
-    }
-    await handle.sync();
-    const observation = await handle.stat();
-    if (
-      !observation.isFile() ||
-      observation.nlink !== 1 ||
-      observation.size !== byteLength
-    ) {
-      throw new Error("staged blob is not a private regular file");
-    }
-    await handle.close();
-    handle = undefined;
-    return observation;
-  } finally {
-    if (handle !== undefined) {
-      await handle.close().catch(() => {});
-    }
-  }
+  const handle = await open(
+    path,
+    constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_WRONLY |
+      (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  return await withRetainedCleanup(
+    async () => {
+      const hash = createHash("sha256");
+      let byteLength = 0;
+      let localWriteFailure: { readonly cause: unknown } | undefined;
+      let streamed: { readonly decodedLength: number };
+      try {
+        streamed = await streamBlob(oid, async (chunk) => {
+          try {
+            await writeAll(handle, chunk, byteLength);
+          } catch (cause) {
+            localWriteFailure = { cause };
+            throw cause;
+          }
+          hash.update(chunk);
+          byteLength += chunk.byteLength;
+        });
+      } catch (cause) {
+        if (localWriteFailure !== undefined) throw localWriteFailure.cause;
+        throw new BlobStreamSourceError(cause);
+      }
+      const digest = hash.digest("hex");
+      if (streamed.decodedLength !== byteLength || digest !== oid) {
+        throw new BlobStreamSourceError(
+          new Error("staged blob bytes do not match their content id"),
+        );
+      }
+      const observation = await handle.stat();
+      if (
+        !observation.isFile() ||
+        observation.nlink !== 1 ||
+        observation.size !== byteLength
+      ) {
+        throw new Error("staged blob is not a private regular file");
+      }
+      return observation;
+    },
+    () => handle.close(),
+    "blob staging and file cleanup both failed",
+  );
 }
 
 function sameObservation(left: Stats, right: Stats): boolean {
@@ -166,40 +167,42 @@ async function streamStagedFile(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
   );
-  try {
-    const before = await handle.stat();
-    if (
-      !before.isFile() ||
-      before.nlink !== 1 ||
-      !sameObservation(expected, before)
-    ) {
-      throw new Error("staged blob is no longer a private regular file");
-    }
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    let decodedLength = 0;
-    while (true) {
-      const { bytesRead } = await handle.read(
-        buffer,
-        0,
-        buffer.byteLength,
-        decodedLength,
-      );
-      if (bytesRead === 0) break;
-      const chunk = buffer.subarray(0, bytesRead);
-      decodedLength += bytesRead;
-      if (decodedLength > expected.size) {
-        throw new Error("staged blob grew while it was being streamed");
+  return await withRetainedCleanup(
+    async () => {
+      const before = await handle.stat();
+      if (
+        !before.isFile() ||
+        before.nlink !== 1 ||
+        !sameObservation(expected, before)
+      ) {
+        throw new Error("staged blob is no longer a private regular file");
       }
-      await sink(chunk);
-    }
-    const after = await handle.stat();
-    if (!sameObservation(before, after) || decodedLength !== expected.size) {
-      throw new Error("staged blob changed while it was being read");
-    }
-    return { decodedLength };
-  } finally {
-    await handle.close();
-  }
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let decodedLength = 0;
+      while (true) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          0,
+          buffer.byteLength,
+          decodedLength,
+        );
+        if (bytesRead === 0) break;
+        const chunk = buffer.subarray(0, bytesRead);
+        decodedLength += bytesRead;
+        if (decodedLength > expected.size) {
+          throw new Error("staged blob grew while it was being streamed");
+        }
+        await sink(chunk);
+      }
+      const after = await handle.stat();
+      if (!sameObservation(before, after) || decodedLength !== expected.size) {
+        throw new Error("staged blob changed while it was being read");
+      }
+      return { decodedLength };
+    },
+    () => handle.close(),
+    "staged blob streaming and file cleanup both failed",
+  );
 }
 
 function stagingCreationDetail(error: unknown): string {
@@ -294,13 +297,26 @@ export async function stageBlobs(
       try {
         observation = await writeStagedFile(path, oid, streamBlob);
       } catch (error) {
-        if (error instanceof BlobStreamSourceError) throw error.cause;
-        throw new BlobStagingError(
-          `cannot stage restore blob ${oid}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-          error,
-        );
+        const primary = primaryFailure(error);
+        const failure =
+          primary instanceof BlobStreamSourceError
+            ? primary.cause
+            : new BlobStagingError(
+                `cannot stage restore blob ${oid}: ${
+                  primary instanceof Error ? primary.message : String(primary)
+                }`,
+                primary,
+              );
+        if (error instanceof AggregateError) {
+          throw new BlobStagingCleanupError(
+            failure,
+            aggregateFailures(
+              error.errors.slice(1),
+              "staged file cleanup failed",
+            ),
+          );
+        }
+        throw failure;
       }
       staged.set(oid, { path, observation });
     }
@@ -308,6 +324,12 @@ export async function stageBlobs(
     try {
       await disposeStagingRoot(scratch);
     } catch (cleanup) {
+      if (error instanceof BlobStagingCleanupError) {
+        throw new BlobStagingCleanupError(
+          error.primary,
+          aggregateFailures([error.cleanup, cleanup], "staging cleanup failed"),
+        );
+      }
       throw new BlobStagingCleanupError(error, cleanup);
     }
     throw error;

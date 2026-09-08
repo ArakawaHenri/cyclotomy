@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { importTestTrees } from "./object-store-fixture.ts";
+import type { WorkspaceWriteAuthority } from "../src/infrastructure/workspace-lock.ts";
 
 import {
   nativeObjectStoreLayout,
@@ -30,14 +32,23 @@ describe("native object layout", () => {
     const assertImportAdmission = (
       target: NativeObjectStore,
       source: NativeObjectStore,
+      writeAuthority: WorkspaceWriteAuthority,
     ): void => {
       // @ts-expect-error Runtime-native stores do not expose historical migration.
       target.upgradeTree("0".repeat(64), "future");
       // @ts-expect-error Cross-store import requires an explicit admission policy.
       target.importTreesFrom(source, []);
-      // @ts-expect-error Snapshot quota cannot be omitted from admission.
+      target.importTreesFrom(
+        source,
+        [],
+        // @ts-expect-error Snapshot quota cannot be omitted from admission.
+        { validateImportedTree: async () => ({ kind: "accepted" }) },
+        { writeAuthority },
+      );
+      // @ts-expect-error Cross-store import requires exclusive target write authority.
       target.importTreesFrom(source, [], {
         validateImportedTree: async () => ({ kind: "accepted" }),
+        maxSnapshotBytes: Number.MAX_SAFE_INTEGER,
       });
     };
     void assertGenericSurface;
@@ -99,7 +110,7 @@ describe("native object layout", () => {
       // Simulate untyped JavaScript crossing the public runtime boundary.
       const generic = { storageRoot: targetRoot } as NativeObjectStore;
       await expect(
-        target.importTreesFrom(generic, [], {
+        importTestTrees(target, generic, [], {
           validateImportedTree: async () => ({ kind: "accepted" }),
           maxSnapshotBytes: Number.MAX_SAFE_INTEGER,
         }),

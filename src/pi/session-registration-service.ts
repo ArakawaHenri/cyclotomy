@@ -227,6 +227,7 @@ interface SessionRegistrationServiceOptions {
   readonly globalConfig: CyclotomyConfig;
   readonly registrationFailure?: unknown;
   readonly runExclusively: <T>(action: () => Promise<T>) => Promise<T>;
+  readonly signal?: AbortSignal;
 }
 
 interface RegistrationTarget {
@@ -644,6 +645,7 @@ export class SessionRegistrationService {
   }
 
   #assertOpen(operation: string): void {
+    this.#options.signal?.throwIfAborted();
     if (this.#closed) {
       throw new Error(`workspace runtime closed during ${operation}`);
     }
@@ -883,7 +885,12 @@ export class SessionRegistrationService {
           },
           writeAuthority,
         ),
-      config.lock,
+      {
+        ...config.lock,
+        ...(this.#options.signal === undefined
+          ? {}
+          : { signal: this.#options.signal }),
+      },
     );
     if (migration.kind === "action-failed") {
       if (migration.cleanup.kind === "settled") throw migration.cause;
@@ -1189,6 +1196,9 @@ export class SessionRegistrationService {
       await validateTreeEntriesAgainstScope(canonical, {
         scratchParent: storeRoot,
         forbiddenRoots: [workspaceRoot],
+        ...(this.#options.signal === undefined
+          ? {}
+          : { signal: this.#options.signal }),
       });
     } catch (cause) {
       if (cause instanceof TreeScopeMismatchError) {
@@ -1314,7 +1324,12 @@ export class SessionRegistrationService {
           }))
         );
       },
-      config.lock,
+      {
+        ...config.lock,
+        ...(this.#options.signal === undefined
+          ? {}
+          : { signal: this.#options.signal }),
+      },
     );
     if (execution.kind === "action-failed") {
       if (execution.cleanup.kind === "settled") throw execution.cause;
@@ -1613,7 +1628,12 @@ export class SessionRegistrationService {
         }
         return { kind: "external", source };
       },
-      config.lock,
+      {
+        ...config.lock,
+        ...(this.#options.signal === undefined
+          ? {}
+          : { signal: this.#options.signal }),
+      },
     );
 
     if (initialExecution.kind === "action-failed") {
@@ -1704,10 +1724,23 @@ export class SessionRegistrationService {
 
     const execution = await runWithOrderedWorkspaceLocks(
       [
-        { storeRoot, options: config.lock },
+        {
+          storeRoot,
+          options: {
+            ...config.lock,
+            ...(this.#options.signal === undefined
+              ? {}
+              : { signal: this.#options.signal }),
+          },
+        },
         {
           storeRoot: authenticatedSourceStoreRoot,
-          options: sourceConfig.lock,
+          options: {
+            ...sourceConfig.lock,
+            ...(this.#options.signal === undefined
+              ? {}
+              : { signal: this.#options.signal }),
+          },
         },
       ],
       "fork-import",
@@ -1945,6 +1978,12 @@ export class SessionRegistrationService {
                 validateImportedTree: (treeOid, manifest) =>
                   this.#validateImportedManifest(treeOid, manifest),
                 maxSnapshotBytes: config.scan.maxSnapshotBytes,
+              },
+              {
+                writeAuthority: targetAuthority,
+                ...(this.#options.signal === undefined
+                  ? {}
+                  : { signal: this.#options.signal }),
               },
             );
           } catch (error) {

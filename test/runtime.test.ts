@@ -2716,6 +2716,36 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
+  it("does not commit an imported projection after its runtime is retired", async () => {
+    const fixture = await createExternalForkFixture(
+      "cyclotomy-runtime-import-retired-",
+    );
+    const { preparation, runtime } = await openExternalForkTarget(fixture);
+    const importTrees = runtime.store.importTreesFrom.bind(runtime.store);
+    vi.spyOn(runtime.store, "importTreesFrom").mockImplementation(
+      async (...args) => {
+        expect(args[3].signal).toBe(runtime.captureSignal);
+        await importTrees(...args);
+        runtime.retire();
+      },
+    );
+    try {
+      const failure = await runtime.registrations
+        .register(fixture.child, () => fixture.child, preparation)
+        .catch((error: unknown) => error);
+      expect(failure).toBe(runtime.captureSignal.reason);
+      expect(runtime.registrations.sessionIsUsable(fixture.child)).toBe(false);
+      expect(
+        readSessionProjectionResidue(
+          join(runtime.storeRoot, "state.db"),
+          fixture.child.sessionId,
+        ),
+      ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
+    } finally {
+      runtime.close();
+    }
+  });
+
   it("does not commit an imported projection after source lock ownership is lost", async (context) => {
     context.skip(
       process.platform === "win32",

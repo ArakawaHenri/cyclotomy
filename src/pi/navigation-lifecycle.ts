@@ -7,6 +7,7 @@ import type { NodeKey } from "../domain/model.ts";
 import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
 import { restorePlanHasChanges } from "../infrastructure/restore-plan.ts";
 import { gitReplayRisk } from "../infrastructure/git-replay-risk.ts";
+import { isOperationCancelled } from "../infrastructure/workspace-operation.ts";
 import {
   finalizeArrivalAfterWorkspaceExecution,
   isLockedArrivalOutcome,
@@ -280,16 +281,19 @@ export function registerNavigationLifecycle(
               }
 
               const preparationExecution = await runtime
-                .enqueueWorkspaceExecution("tree-prepare", (writeAuthority) =>
-                  prepareNavigationDepartureInWorkspaceLock(
-                    runtime,
-                    views,
-                    context,
-                    writeAuthority,
-                    view,
-                    source,
-                    target,
-                  ),
+                .enqueueWorkspaceExecution(
+                  "tree-prepare",
+                  (writeAuthority) =>
+                    prepareNavigationDepartureInWorkspaceLock(
+                      runtime,
+                      views,
+                      context,
+                      writeAuthority,
+                      view,
+                      source,
+                      target,
+                    ),
+                  runtime.captureSignal,
                 )
                 .catch((cause: unknown) => ({
                   kind: "acquisition-failed" as const,
@@ -311,6 +315,19 @@ export function registerNavigationLifecycle(
                 return undefined;
               }
               if (preparationExecution.kind === "action-failed") {
+                if (
+                  isOperationCancelled(
+                    preparationExecution.cause,
+                    runtime.captureSignal,
+                  )
+                ) {
+                  runtime.notify(
+                    context,
+                    runtime.i18n.t("captureCancelled"),
+                    "info",
+                  );
+                  return undefined;
+                }
                 await withdrawAndPresentPreparationFailure(
                   preparationExecution.cause,
                 );
@@ -318,6 +335,22 @@ export function registerNavigationLifecycle(
               }
               const prepared = preparationExecution.value;
 
+              if (prepared.kind === "capture-failed") {
+                if (prepared.failure.kind === "cancelled") {
+                  runtime.notify(
+                    context,
+                    runtime.i18n.t("captureCancelled"),
+                    "info",
+                  );
+                } else {
+                  await withdrawAndPresentPreparationFailure(
+                    new Error(
+                      formatCaptureFailure(runtime.i18n, prepared.failure),
+                    ),
+                  );
+                }
+                return undefined;
+              }
               if (prepared.kind === "scan-incomplete") {
                 const detail = runtime.i18n.formatScanProblems(
                   prepared.problems,
@@ -402,35 +435,41 @@ export function registerNavigationLifecycle(
                 runtime.setStatus(context, runtime.i18n.t("checkingWorkspace"));
               }
               const commitExecution = await runtime
-                .enqueueWorkspaceExecution("tree-commit", (writeAuthority) =>
-                  commitNavigationDepartureInWorkspaceLock(
-                    runtime,
-                    views,
-                    context,
-                    writeAuthority,
-                    view,
-                    source,
-                    target,
-                    prepared,
-                    navigationChoice,
-                  ),
+                .enqueueWorkspaceExecution(
+                  "tree-commit",
+                  (writeAuthority) =>
+                    commitNavigationDepartureInWorkspaceLock(
+                      runtime,
+                      views,
+                      context,
+                      writeAuthority,
+                      view,
+                      source,
+                      target,
+                      prepared,
+                      navigationChoice,
+                    ),
+                  runtime.captureSignal,
                 )
                 .catch((cause: unknown) => ({
                   kind: "acquisition-failed" as const,
                   cause,
                 }));
               const committed =
-                commitExecution.kind === "acquisition-failed"
-                  ? ({
-                      kind: "failed" as const,
-                      cause: commitExecution.cause,
-                    } as const)
-                  : commitExecution.kind === "action-failed"
+                commitExecution.kind === "completed"
+                  ? commitExecution.value
+                  : isOperationCancelled(
+                        commitExecution.cause,
+                        runtime.captureSignal,
+                      )
                     ? ({
+                        kind: "capture-failed",
+                        failure: { kind: "cancelled" },
+                      } as const)
+                    : ({
                         kind: "failed" as const,
                         cause: commitExecution.cause,
-                      } as const)
-                    : commitExecution.value;
+                      } as const);
               if (commitExecution.kind !== "acquisition-failed") {
                 if (commitExecution.cleanup.kind === "failed") {
                   await withdrawAndPresentPreparationFailure(
@@ -478,6 +517,14 @@ export function registerNavigationLifecycle(
                     break;
                   case "capture-failed":
                     {
+                      if (committed.failure.kind === "cancelled") {
+                        runtime.notify(
+                          context,
+                          runtime.i18n.t("captureCancelled"),
+                          "info",
+                        );
+                        break;
+                      }
                       const detail = formatCaptureFailure(
                         runtime.i18n,
                         committed.failure,
@@ -739,6 +786,7 @@ export function registerNavigationLifecycle(
                 actualAnchor,
               },
             ),
+          runtime.captureSignal,
         );
         if (locked.kind === "completed") {
           if (isLockedTreeArrivalOutcome(locked.value)) {
@@ -783,7 +831,9 @@ export function registerNavigationLifecycle(
           result = await finalizeArrivalAfterWorkspaceExecution(
             runtime.workspaceMutations,
             context,
-            { kind: "failed", cause: locked.cause },
+            isOperationCancelled(locked.cause, runtime.captureSignal)
+              ? { kind: "capture-failed", failure: { kind: "cancelled" } }
+              : { kind: "failed", cause: locked.cause },
             locked.cleanup,
             recovery,
           );
@@ -856,6 +906,14 @@ export function registerNavigationLifecycle(
           notifyNavigationDisposition(runtime, context, result.execution.kind);
           break;
         case "capture-failed":
+          if (result.execution.failure.kind === "cancelled") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("captureCancelledProtected"),
+              "info",
+            );
+            break;
+          }
           presentCaptureFailure(
             formatCaptureFailure(runtime.i18n, result.execution.failure),
           );

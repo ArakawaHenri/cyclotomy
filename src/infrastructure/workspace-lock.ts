@@ -38,6 +38,7 @@ const OWNER_FILE_MAX_BYTES = 16 * 1024;
 export interface WorkspaceLockOptions {
   /** Time to wait for another cooperative operation. Default 5 seconds. */
   readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface WorkspaceLock {
@@ -647,6 +648,7 @@ export async function acquireWorkspaceLock(
   operation: string,
   options: WorkspaceLockOptions = {},
 ): Promise<WorkspaceLock> {
+  options.signal?.throwIfAborted();
   const timeoutMs = options.timeoutMs ?? 5_000;
   validateTimingOptions(timeoutMs);
 
@@ -667,6 +669,7 @@ export async function acquireWorkspaceLock(
   let acquiredOwnerFile: ProtocolFileObservation | undefined;
   let firstAttempt = true;
   while (acquired === undefined) {
+    options.signal?.throwIfAborted();
     if (!firstAttempt) {
       const elapsed = performance.now() - monotonicStartedAt;
       if (elapsed >= timeoutMs) {

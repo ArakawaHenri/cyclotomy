@@ -85,9 +85,9 @@ async function fixture() {
 
 describe("CheckpointService capture boundary", () => {
   it("owns both current and observed capture preparation", async () => {
-    const { metadata, service, workspace } = await fixture();
+    const { metadata, service, workspace, writeAuthority } = await fixture();
     const view = sessionView(workspace, "leaf", { leaf: null });
-    const current = await service.prepareCurrent(view);
+    const current = await service.prepareCurrent(view, { writeAuthority });
     if (!current.ok) {
       throw "cause" in current.error
         ? current.error.cause
@@ -96,7 +96,9 @@ describe("CheckpointService capture boundary", () => {
     expect(current).toMatchObject({ ok: true });
 
     const snapshot = await scanWorkspace(workspace);
-    const observed = await service.prepareObserved(snapshot);
+    const observed = await service.prepareObserved(snapshot, {
+      writeAuthority,
+    });
     expect(observed.ok).toBe(true);
     metadata.close();
   });
@@ -147,7 +149,7 @@ describe("CheckpointService capture boundary", () => {
       },
       { label: "leaf" },
     );
-    const prepared = await service.prepareCurrent(view);
+    const prepared = await service.prepareCurrent(view, { writeAuthority });
     if (!prepared.ok) {
       throw "cause" in prepared.error
         ? prepared.error.cause
@@ -217,7 +219,9 @@ describe("CheckpointService capture boundary", () => {
       label: "parent",
       inactive: null,
     });
-    const arrivalPrepared = await arrival.service.prepareCurrent(arrivalView);
+    const arrivalPrepared = await arrival.service.prepareCurrent(arrivalView, {
+      writeAuthority: arrival.writeAuthority,
+    });
     if (!arrivalPrepared.ok) throw new Error(arrivalPrepared.error.kind);
     expect(
       arrival.service.commitPreparedTreeArrival(

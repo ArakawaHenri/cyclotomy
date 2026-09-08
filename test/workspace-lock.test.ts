@@ -31,7 +31,6 @@ import {
   runWithWorkspaceLock,
   runWithOrderedWorkspaceLocks,
   withWorkspaceLock,
-  type WorkspaceLockOptions,
   type OrderedWorkspaceAuthorities,
   type WorkspaceWriteAuthority,
   WorkspaceLockTimeoutError,
@@ -206,8 +205,7 @@ afterEach(async () => {
 });
 
 describe("workspace lock", () => {
-  it("keeps the public options and on-disk protocol owner-only", async () => {
-    expectTypeOf<keyof WorkspaceLockOptions>().toEqualTypeOf<"timeoutMs">();
+  it("keeps the on-disk protocol owner-only", async () => {
     const root = await storeRoot();
     const lock = await acquireWorkspaceLock(root, "protocol-test");
 
@@ -215,6 +213,21 @@ describe("workspace lock", () => {
       expect.stringMatching(/^owner-.*\.json$/u),
     ]);
     await lock.release();
+  });
+
+  it("cancels a waiter without disturbing the current owner", async () => {
+    const root = await storeRoot();
+    const first = await acquireWorkspaceLock(root, "capture");
+    const controller = new AbortController();
+    const waiting = acquireWorkspaceLock(root, "next capture", {
+      signal: controller.signal,
+    });
+    controller.abort();
+    await expect(waiting).rejects.toBe(controller.signal.reason);
+    expect(await readdir(join(root, "workspace.lock"))).toHaveLength(1);
+    await first.release();
+    const next = await acquireWorkspaceLock(root, "restore");
+    await next.release();
   });
 
   it("excludes another cooperative operation until release", async () => {

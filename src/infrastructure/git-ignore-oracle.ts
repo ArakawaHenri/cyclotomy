@@ -79,6 +79,7 @@ export interface SyntheticGitIgnoreScratchOptions {
   readonly forbiddenRoots?: readonly string[];
   /** Path limits used to authenticate scope and oracle queries. */
   readonly pathLimits?: WorkspacePathLimits;
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -767,8 +768,18 @@ export async function discoverWorkspaceScope(
       sources.push(source);
     }
   }
-  const infoPath = await gitInfoExcludePath(context);
-  const globalPath = await globalExcludePath(context);
+  const discoveryCommands = [
+    gitInfoExcludePath(context),
+    globalExcludePath(context),
+    readGitVersion(context.env),
+    gitBoolean(context, "core.ignoreCase"),
+    gitBoolean(context, "core.precomposeUnicode"),
+  ] as const;
+  const [infoPath, globalPath, gitVersion, ignoreCase, precomposeUnicode] =
+    await Promise.all(discoveryCommands).catch(async (cause: unknown) => {
+      await Promise.allSettled(discoveryCommands);
+      throw cause;
+    });
   const [infoExclude, globalExclude] = await Promise.all([
     readOptionalPolicyFile(infoPath, "Git info/exclude", true),
     globalPath === undefined
@@ -783,11 +794,6 @@ export async function discoverWorkspaceScope(
     globalExclude ?? Buffer.alloc(0),
     "Git global excludes file",
   );
-  const [gitVersion, ignoreCase, precomposeUnicode] = await Promise.all([
-    readGitVersion(context.env),
-    gitBoolean(context, "core.ignoreCase"),
-    gitBoolean(context, "core.precomposeUnicode"),
-  ]);
   const scope = canonicalizeWorkspaceScope(
     {
       kind: "git",
@@ -850,12 +856,15 @@ export async function readWorkspaceGitignoreSource(
 class AllManagedOracle implements GitIgnoreOracle {
   readonly gitVersion = null;
   readonly #pathLimits: WorkspacePathLimits;
+  readonly #signal: AbortSignal | undefined;
 
-  constructor(pathLimits: WorkspacePathLimits) {
+  constructor(pathLimits: WorkspacePathLimits, signal?: AbortSignal) {
     this.#pathLimits = pathLimits;
+    this.#signal = signal;
   }
 
   async managed(paths: readonly GitIgnorePath[]): Promise<readonly boolean[]> {
+    this.#signal?.throwIfAborted();
     for (const item of paths) {
       canonicalWorkspaceRelativePath(item.path, false, this.#pathLimits);
       if (item.kind !== "directory" && item.kind !== "non-directory") {
@@ -944,7 +953,7 @@ interface PendingQuery {
   readonly results: boolean[];
   responseBytes: number;
   readonly resolve: (result: readonly boolean[]) => void;
-  readonly reject: (error: Error) => void;
+  readonly reject: (error: unknown) => void;
   readonly timer: NodeJS.Timeout;
 }
 
@@ -1010,6 +1019,7 @@ interface ProcessGitIgnoreOracleOptions {
   readonly cleanupRoot?: SyntheticScratchRoot;
   readonly syntheticShape?: SyntheticGitDirectoryShape;
   readonly pathLimits?: WorkspacePathLimits;
+  readonly signal?: AbortSignal;
 }
 
 class ProcessGitIgnoreOracle implements GitIgnoreOracle {
@@ -1019,6 +1029,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   readonly #cleanupRoot: SyntheticScratchRoot | undefined;
   readonly #syntheticShape: SyntheticGitDirectoryShape | undefined;
   readonly #pathLimits: WorkspacePathLimits;
+  readonly #signal: AbortSignal | undefined;
   readonly #framer = new NulRecordFramer();
   #diagnostics = Buffer.alloc(0);
   #diagnosticsTruncated = false;
@@ -1026,6 +1037,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   #pending: PendingQuery | undefined;
   #tail: Promise<void> = Promise.resolve();
   #failure: GitIgnoreOracleError | undefined;
+  #cancelled = false;
   #closed = false;
   #closePromise: Promise<void> | undefined;
   readonly #exit: Promise<{
@@ -1039,6 +1051,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     this.#cleanupRoot = options.cleanupRoot;
     this.#syntheticShape = options.syntheticShape;
     this.#pathLimits = options.pathLimits ?? DEFAULT_WORKSPACE_PATH_LIMITS;
+    this.#signal = options.signal;
     this.#child = spawn(
       "git",
       [
@@ -1059,6 +1072,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     );
     this.#exit = new Promise((resolveExit) => {
       this.#child.once("close", (code, signal) => {
+        this.#signal?.removeEventListener("abort", this.#abort);
         if (!this.#closed || this.#pending !== undefined) {
           this.#fail(
             new GitIgnoreOracleError(
@@ -1083,6 +1097,8 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       );
     });
     this.#child.stderr.on("data", (chunk: Buffer) => this.#onStderr(chunk));
+    this.#signal?.addEventListener("abort", this.#abort, { once: true });
+    if (this.#signal?.aborted) this.#abort();
   }
 
   managed(paths: readonly GitIgnorePath[]): Promise<readonly boolean[]> {
@@ -1091,6 +1107,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
         new GitIgnoreOracleError("Git ignore oracle is closed"),
       );
     }
+    if (this.#cancelled) return Promise.reject(this.#signal!.reason);
     if (paths.length === 0) return Promise.resolve([]);
     if (paths.length > MAX_ORACLE_BATCH_PATHS) {
       return Promise.reject(
@@ -1142,6 +1159,8 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       );
     }
     const run = this.#tail.then(async () => {
+      if (this.#failure !== undefined) throw this.#failure;
+      this.#signal?.throwIfAborted();
       let delegatedPaths = encoded;
       let delegatedIndexes = encodedIndexes;
       if (this.#syntheticShape !== undefined) {
@@ -1167,6 +1186,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
           throw error;
         }
       }
+      this.#signal?.throwIfAborted();
       if (delegatedPaths.length === 0) return results;
       const delegated = await this.#run(delegatedPaths);
       delegated.forEach((managed, index) => {
@@ -1183,6 +1203,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
 
   #run(expectedPaths: readonly Buffer[]): Promise<readonly boolean[]> {
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
+    if (this.#cancelled) return Promise.reject(this.#signal!.reason);
     if (this.#pending !== undefined || this.#framer.hasFragment()) {
       return Promise.reject(
         new GitIgnoreOracleError("Git ignore oracle protocol is out of sync"),
@@ -1204,6 +1225,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       };
     });
     const write = this.#writeInput(expectedPaths).catch((cause: unknown) => {
+      if (this.#cancelled) throw this.#signal!.reason;
       const error =
         cause instanceof GitIgnoreOracleError
           ? cause
@@ -1245,10 +1267,15 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
 
   #writeChunk(chunk: Buffer): Promise<void> {
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
+    if (this.#cancelled) return Promise.reject(this.#signal!.reason);
     return new Promise((resolveWrite, reject) => {
       // Waiting for each write callback bounds the writable queue even when
       // Git applies backpressure; at most one protocol chunk is outstanding.
       this.#child.stdin.write(chunk, (cause) => {
+        if (this.#cancelled) {
+          reject(this.#signal!.reason);
+          return;
+        }
         if (cause !== null && cause !== undefined) {
           reject(
             new GitIgnoreOracleError("cannot write to Git ignore oracle", {
@@ -1263,7 +1290,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   }
 
   #onStdout(chunk: Buffer): void {
-    if (this.#failure !== undefined) return;
+    if (this.#failure !== undefined || this.#cancelled) return;
     const pending = this.#pending;
     if (pending === undefined) {
       this.#fail(
@@ -1343,7 +1370,7 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
   }
 
   #fail(error: GitIgnoreOracleError): void {
-    if (this.#failure !== undefined) return;
+    if (this.#failure !== undefined || this.#cancelled) return;
     this.#failure = error;
     const pending = this.#pending;
     this.#pending = undefined;
@@ -1353,6 +1380,18 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
     }
     this.#child.kill();
   }
+
+  readonly #abort = (): void => {
+    if (this.#failure !== undefined || this.#cancelled) return;
+    this.#cancelled = true;
+    const pending = this.#pending;
+    this.#pending = undefined;
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      pending.reject(this.#signal!.reason);
+    }
+    this.#child.kill();
+  };
 
   close(): Promise<void> {
     this.#closePromise ??= this.#close();
@@ -1382,12 +1421,12 @@ class ProcessGitIgnoreOracle implements GitIgnoreOracle {
       }
       const completed = result;
       if (this.#failure !== undefined) throw this.#failure;
-      if (this.#framer.hasFragment()) {
+      if (!this.#cancelled && this.#framer.hasFragment()) {
         throw new GitIgnoreOracleError(
           "Git ignore oracle ended with an incomplete record",
         );
       }
-      if (completed.code !== 0 && completed.code !== 1) {
+      if (!this.#cancelled && completed.code !== 0 && completed.code !== 1) {
         throw new GitIgnoreOracleError(
           `Git ignore oracle failed while closing (${completed.code ?? completed.signal ?? "unknown"})`,
         );
@@ -1453,10 +1492,12 @@ export async function createLiveGitIgnoreOracle(
   root: string,
   scope: WorkspaceScope,
   pathLimits: WorkspacePathLimits = DEFAULT_WORKSPACE_PATH_LIMITS,
+  signal?: AbortSignal,
 ): Promise<GitIgnoreOracle> {
+  signal?.throwIfAborted();
   const canonical = canonicalizeWorkspaceScope(scope, pathLimits);
   if (canonical.kind === "all-managed") {
-    return new AllManagedOracle(pathLimits);
+    return new AllManagedOracle(pathLimits, signal);
   }
   if (canonical.evaluator === null) {
     throw new GitIgnoreOracleError(
@@ -1464,6 +1505,7 @@ export async function createLiveGitIgnoreOracle(
     );
   }
   const context = await locateGitWorktree(root, pathLimits);
+  signal?.throwIfAborted();
   if (context === undefined) {
     throw new GitIgnoreOracleError(
       "checkpoint expects Git but workspace is not a Git worktree",
@@ -1479,6 +1521,7 @@ export async function createLiveGitIgnoreOracle(
     gitBoolean(context, "core.ignoreCase"),
     gitBoolean(context, "core.precomposeUnicode"),
   ]);
+  signal?.throwIfAborted();
   if (
     canonical.ignoreCase !== ignoreCase ||
     canonical.evaluator.version !== gitVersion ||
@@ -1494,6 +1537,7 @@ export async function createLiveGitIgnoreOracle(
     env: context.env,
     gitVersion,
     pathLimits,
+    ...(signal === undefined ? {} : { signal }),
   });
 }
 
@@ -1502,10 +1546,11 @@ export async function createSyntheticGitIgnoreOracle(
   scope: WorkspaceScope,
   options: SyntheticGitIgnoreScratchOptions = {},
 ): Promise<GitIgnoreOracle> {
+  options.signal?.throwIfAborted();
   const pathLimits = options.pathLimits ?? DEFAULT_WORKSPACE_PATH_LIMITS;
   const canonical = canonicalizeWorkspaceScope(scope, pathLimits);
   if (canonical.kind === "all-managed") {
-    return new AllManagedOracle(pathLimits);
+    return new AllManagedOracle(pathLimits, options.signal);
   }
   const policySources = canonical.gitignoreSources.map(
     ({ path, contentsBase64 }) => ({
@@ -1526,6 +1571,7 @@ export async function createSyntheticGitIgnoreOracle(
   const scratch = await createSyntheticScratchRoot(options);
   const scratchRoot = scratch.path;
   try {
+    options.signal?.throwIfAborted();
     // Keep every Cyclotomy-owned control file outside the reconstructed
     // worktree so no legal repository path can acquire an artificial type.
     const repositoryRoot = join(scratchRoot, "worktree");
@@ -1534,7 +1580,9 @@ export async function createSyntheticGitIgnoreOracle(
     await writeFile(emptyConfig, Buffer.alloc(0), { flag: "wx" });
     const env = isolatedGitEnvironment(emptyConfig);
     const gitVersion = await readGitVersion(env);
+    options.signal?.throwIfAborted();
     await runGit(["init", "-q", repositoryRoot], env);
+    options.signal?.throwIfAborted();
     const syntheticShape = new SyntheticGitDirectoryShape(
       repositoryRoot,
       policySources,
@@ -1543,6 +1591,7 @@ export async function createSyntheticGitIgnoreOracle(
       ["-C", repositoryRoot, "rev-parse", "--git-path", "info/exclude"],
       env,
     );
+    options.signal?.throwIfAborted();
     if (canonical.evaluator !== null) {
       await runGit(
         [
@@ -1560,6 +1609,7 @@ export async function createSyntheticGitIgnoreOracle(
       infoPathResult.stdout,
       "synthetic info/exclude path",
     );
+    options.signal?.throwIfAborted();
     const infoPath = isAbsolute(rawInfoPath)
       ? rawInfoPath
       : resolve(repositoryRoot, rawInfoPath);
@@ -1582,6 +1632,7 @@ export async function createSyntheticGitIgnoreOracle(
       ],
       env,
     );
+    options.signal?.throwIfAborted();
     await runGit(
       [
         "-C",
@@ -1593,6 +1644,7 @@ export async function createSyntheticGitIgnoreOracle(
       ],
       env,
     );
+    options.signal?.throwIfAborted();
     return new ProcessGitIgnoreOracle({
       repositoryRoot,
       repositoryPrefix: canonical.repositoryPrefix,
@@ -1601,6 +1653,7 @@ export async function createSyntheticGitIgnoreOracle(
       cleanupRoot: scratch,
       syntheticShape,
       pathLimits,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
   } catch (cause) {
     let cleanupFailure: unknown;
@@ -1615,6 +1668,7 @@ export async function createSyntheticGitIgnoreOracle(
         { cause: new AggregateError([cause, cleanupFailure]) },
       );
     }
+    if (options.signal?.aborted && cause === options.signal.reason) throw cause;
     if (cause instanceof GitIgnoreOracleError) throw cause;
     throw new GitIgnoreOracleError(
       "cannot create synthetic Git ignore oracle",

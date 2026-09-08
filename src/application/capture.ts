@@ -4,6 +4,10 @@ import type { ObjectStore } from "../infrastructure/object-store.ts";
 import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 import { publishSnapshot } from "../infrastructure/snapshot-publication.ts";
 import {
+  isOperationCancelled,
+  type WorkspaceProgress,
+} from "../infrastructure/workspace-operation.ts";
+import {
   scanWorkspace,
   workspaceSnapshotsEqual,
   type ScanProblem,
@@ -23,9 +27,20 @@ export interface CaptureDeps {
   readonly scanOptions?: ScanOptions;
   /** Canonical workspace identity selected before this operation. */
   readonly expectedRootPath: string;
+  readonly writeAuthority?: WorkspaceWriteAuthority;
 }
 
-/** Authority required only at the synchronous metadata commit boundary. */
+export interface CaptureProgress extends WorkspaceProgress {
+  readonly phase: "scan" | "publish" | "validate";
+}
+
+export interface CaptureOperationOptions {
+  readonly writeAuthority?: WorkspaceWriteAuthority;
+  readonly signal?: AbortSignal;
+  readonly onProgress?: (progress: CaptureProgress) => void;
+}
+
+/** Additional authority required at the synchronous metadata commit boundary. */
 export interface CaptureCommitDeps extends CaptureDeps {
   readonly metadata: Pick<
     CurrentMetadataStore,
@@ -39,6 +54,7 @@ export interface CaptureCommitDeps extends CaptureDeps {
 }
 
 export type CaptureFailure =
+  | { readonly kind: "cancelled" }
   | {
       readonly kind: "scan-incomplete";
       readonly phase: "capture" | "validation";
@@ -79,11 +95,22 @@ export interface CaptureCommitAuthority {
 
 export type MissingNodeStateIntent = "initialize-fresh" | "adopt-protected";
 
-function effectiveScanOptions(deps: CaptureDeps): ScanOptions {
+function effectiveScanOptions(
+  deps: CaptureDeps,
+  options: CaptureOperationOptions,
+  phase: "scan" | "validate",
+): ScanOptions {
   return {
     ...deps.scanOptions,
     gitIgnoreScratchParent:
       deps.scanOptions?.gitIgnoreScratchParent ?? deps.store.storageRoot,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.onProgress === undefined
+      ? {}
+      : {
+          onProgress: (progress: WorkspaceProgress) =>
+            options.onProgress!({ ...progress, phase }),
+        }),
   };
 }
 
@@ -95,7 +122,9 @@ function effectiveScanOptions(deps: CaptureDeps): ScanOptions {
 export async function prepareObservedNodeState(
   deps: CaptureDeps,
   snapshot: WorkspaceSnapshot,
+  options: CaptureOperationOptions = {},
 ): Promise<Result<CaptureSuccess, CaptureFailure>> {
+  if (options.signal?.aborted) return failure({ kind: "cancelled" });
   if (snapshot.rootPath !== deps.expectedRootPath) {
     return failure({
       kind: "workspace-changed",
@@ -112,8 +141,20 @@ export async function prepareObservedNodeState(
 
   let treeOid: TreeOid;
   try {
-    treeOid = await publishSnapshot(deps.store, snapshot);
+    const writeAuthority = options.writeAuthority ?? deps.writeAuthority;
+    treeOid = await publishSnapshot(deps.store, snapshot, {
+      ...(writeAuthority === undefined ? {} : { writeAuthority }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onProgress === undefined
+        ? {}
+        : {
+            onProgress: (progress) =>
+              options.onProgress!({ ...progress, phase: "publish" }),
+          }),
+    });
   } catch (error) {
+    if (isOperationCancelled(error, options.signal))
+      return failure({ kind: "cancelled" });
     return failure({
       kind: "publish-failed",
       cause: error,
@@ -127,15 +168,18 @@ export async function prepareObservedNodeState(
     // content and could commit an already-stale namespace boundary.
     validated = await scanWorkspace(
       snapshot.rootPath,
-      effectiveScanOptions(deps),
+      effectiveScanOptions(deps, options, "validate"),
     );
   } catch (error) {
+    if (isOperationCancelled(error, options.signal))
+      return failure({ kind: "cancelled" });
     return failure({
       kind: "scan-failed",
       phase: "validation",
       cause: error,
     });
   }
+  if (options.signal?.aborted) return failure({ kind: "cancelled" });
   if (validated.problems.length > 0) {
     return failure({
       kind: "scan-incomplete",
@@ -247,16 +291,22 @@ export function commitPreparedMissingNodeState(
 export async function prepareNodeState(
   deps: CaptureDeps,
   root: string,
+  options: CaptureOperationOptions = {},
 ): Promise<Result<CaptureSuccess, CaptureFailure>> {
   let snapshot;
   try {
-    snapshot = await scanWorkspace(root, effectiveScanOptions(deps));
+    snapshot = await scanWorkspace(
+      root,
+      effectiveScanOptions(deps, options, "scan"),
+    );
   } catch (error) {
+    if (isOperationCancelled(error, options.signal))
+      return failure({ kind: "cancelled" });
     return failure({
       kind: "scan-failed",
       phase: "capture",
       cause: error,
     });
   }
-  return prepareObservedNodeState(deps, snapshot);
+  return prepareObservedNodeState(deps, snapshot, options);
 }

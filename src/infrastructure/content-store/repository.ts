@@ -76,6 +76,14 @@ import {
 } from "./private-file.ts";
 import { decodeDelta1Program } from "./pack-delta.ts";
 import {
+  ContentPackPublication,
+  type ContentRepositoryPublication,
+} from "./publication.ts";
+export type {
+  ContentPublicationReceipt,
+  ContentRepositoryPublication,
+} from "./publication.ts";
+import {
   authenticateFullRecordPayload,
   chunkedContentRecipeId,
   createChunkedContentRecord,
@@ -96,6 +104,7 @@ const MAX_LOOSE_CONTENT_RECORD_BYTES = 512 * 1024;
 const MAX_LOOSE_RECIPE_RECORD_BYTES = 128 * 1024;
 const STREAM_BUFFER_BYTES = 64 * 1024;
 const MAX_CONTEXT_PACKS = 2;
+const MAX_PUBLICATION_PACKS = 8;
 
 export type StructuralRecordKind = "root" | "node" | "scope";
 
@@ -127,6 +136,8 @@ export type VerifiedObjectLocation =
       readonly kind: NativeLooseRecordKind;
       readonly logicalId: string;
       readonly encoding: RecordEncoding;
+      /** Present only after authenticating a chunked root's full logical content. */
+      readonly recipeId?: RecipeId;
       /** Whether this object is part of the logical graph or only this representation. */
       readonly retention: "logical";
     }
@@ -135,6 +146,8 @@ export type VerifiedObjectLocation =
       readonly kind: RecordKind;
       readonly logicalId: string;
       readonly encoding: RecordEncoding;
+      /** Present only after authenticating a chunked root's full logical content. */
+      readonly recipeId?: RecipeId;
       /** Pack-local dependencies authenticate the representation but are not roots. */
       readonly retention: "logical" | "pack-local";
       readonly packId: PackId;
@@ -718,7 +731,10 @@ class ClosureAccumulator {
 interface ResolvedLooseRecord {
   readonly source: "loose";
   readonly envelope: RecordEnvelope;
-  readonly location: VerifiedObjectLocation;
+  readonly location: Extract<
+    VerifiedObjectLocation,
+    { readonly source: "loose" }
+  >;
   readonly identity: FileIdentity;
 }
 
@@ -735,7 +751,10 @@ interface ResolvedPackRecord {
   readonly pack: CatalogPackHandle;
   readonly entry: PackIndexEntry;
   readonly envelope: RecordEnvelope;
-  readonly location: VerifiedObjectLocation;
+  readonly location: Extract<
+    VerifiedObjectLocation,
+    { readonly source: "pack" }
+  >;
   readonly identity: FileIdentity;
   readonly identityReceipt: CatalogPackIdentityReceipt;
   readonly release: () => Promise<void>;
@@ -757,10 +776,13 @@ interface LoadedPackInventory {
 }
 
 interface ResolutionContext {
+  readonly signal?: AbortSignal;
   packHint?: Promise<MultiPackIndex | undefined>;
   packInventory?: Promise<LoadedPackInventory>;
   packPool?: PackHandlePool;
   closed?: boolean;
+  /** A publication miss only chooses a new additive representation. */
+  optionalReuse?: boolean;
 }
 
 declare const CONTENT_REPOSITORY_RESOLUTION_SCOPE: unique symbol;
@@ -816,10 +838,118 @@ export class ContentRepository {
     return this.#options.maxDecodedBytes;
   }
 
-  openResolutionScope(): ContentRepositoryResolutionScope {
+  openResolutionScope(
+    options: { readonly signal?: AbortSignal } = {},
+  ): ContentRepositoryResolutionScope {
+    options.signal?.throwIfAborted();
     const scope = Object.freeze({}) as ContentRepositoryResolutionScope;
-    this.#resolutionScopes.set(scope, {});
+    this.#resolutionScopes.set(scope, { ...options });
     return scope;
+  }
+
+  beginPublication(
+    authority: WorkspaceWriteAuthority,
+    options: { readonly signal?: AbortSignal } = {},
+  ): ContentRepositoryPublication {
+    assertWorkspaceWriteAuthority(authority, this.#layout.root);
+    options.signal?.throwIfAborted();
+    const scope = this.openResolutionScope(options);
+    const context = this.#resolutionScopes.get(scope)!;
+    context.optionalReuse = true;
+    const packs = this.#catalog.beginPublication(authority);
+    return new ContentPackPublication(
+      {
+        resolutionScope: scope,
+        maxDecodedBytes: this.#options.maxDecodedBytes,
+        recipeLimits: (decodedLength) => this.#recipeLimits(decodedLength),
+        reuseContent: async (contentId, decodedLength, terminal) => {
+          const oid = parseContentId(contentId);
+          try {
+            return await this.#authenticateContentRepresentation(
+              oid,
+              decodedLength,
+              "any",
+              context,
+              !terminal,
+            );
+          } catch (error) {
+            if (!this.#isOptionalReuseFailure(error)) throw error;
+            if (
+              terminal ||
+              (error instanceof ContentRepositoryError &&
+                error.code === "missing-object")
+            ) {
+              return undefined;
+            }
+            // A failed optional pack does not authorize replacing a corrupt loose root.
+            const loose = await this.#readLooseRecord("content", oid);
+            if (loose === undefined) return undefined;
+            return await this.#authenticateContentRepresentation(
+              oid,
+              decodedLength,
+              "loose",
+              context,
+            );
+          }
+        },
+        reuseStructural: async (kind, oid, bytes) => {
+          try {
+            const existing = await this.#readStructural(
+              kind,
+              oid,
+              bytes.byteLength,
+              context,
+            );
+            if (!Buffer.from(existing).equals(bytes))
+              integrity("existing structural object has conflicting bytes");
+            return true;
+          } catch (error) {
+            if (!this.#isOptionalReuseFailure(error)) throw error;
+            if (
+              error instanceof ContentRepositoryError &&
+              error.code === "missing-object"
+            )
+              return false;
+            const loose = await readPrivateFileIfPresent(
+              nativeObjectPath(this.#layout, "tree", oid),
+              bytes.byteLength,
+            );
+            if (loose === undefined) return false;
+            if (
+              contentIdFromBytes(loose) !== oid ||
+              !Buffer.from(loose).equals(bytes)
+            ) {
+              integrity("existing structural object is corrupt");
+            }
+            return true;
+          }
+        },
+        publishPack: async (publication) => {
+          try {
+            return await packs.publishPack(publication);
+          } catch (error) {
+            this.#rethrowCatalogError(error);
+          }
+        },
+        revalidateContent: (proof, maximumBytes, checkPack) =>
+          this.#revalidatePublishedContent(
+            proof,
+            maximumBytes,
+            scope,
+            checkPack,
+          ),
+        revalidatePack: async (receipt) => {
+          try {
+            return await this.#catalog.packReceiptStillCurrent(receipt);
+          } catch (error) {
+            if (error instanceof ContentRepositoryError) throw error;
+            this.#rethrowCatalogError(error);
+          }
+        },
+        close: () => this.closeResolutionScope(scope),
+      },
+      options.signal,
+    );
   }
 
   async closeResolutionScope(
@@ -842,6 +972,7 @@ export class ContentRepository {
       if (context === undefined || context.closed === true) {
         invalid("resolution scope is closed or belongs to another repository");
       }
+      context.signal?.throwIfAborted();
       return await operation(context);
     }
 
@@ -1060,6 +1191,7 @@ export class ContentRepository {
     maximumBytes: number,
     context: ResolutionContext,
   ): Promise<Uint8Array> {
+    context.signal?.throwIfAborted();
     let firstFailure: unknown;
     try {
       const raw = await readPrivateFileIfPresent(
@@ -1148,11 +1280,29 @@ export class ContentRepository {
     });
   }
 
+  /** Check the exact dependencies read by a prior authenticated closure. */
+  async verifiedContentClosureStillCurrent(
+    closure: VerifiedContentClosure,
+  ): Promise<boolean> {
+    return await this.#identitiesStillMatch(
+      await this.#captureClosureIdentities(closure),
+    );
+  }
+
   /** Fast identity check; a drift falls back to full logical authentication. */
   async revalidatePublishedContent(
     proof: PublishedContent,
     maximumBytes: number,
     scope?: ContentRepositoryResolutionScope,
+  ): Promise<void> {
+    return await this.#revalidatePublishedContent(proof, maximumBytes, scope);
+  }
+
+  async #revalidatePublishedContent(
+    proof: PublishedContent,
+    maximumBytes: number,
+    scope?: ContentRepositoryResolutionScope,
+    checkPack?: (receipt: CatalogPackIdentityReceipt) => Promise<boolean>,
   ): Promise<void> {
     assertLimit(maximumBytes, "maximum content bytes");
     const record = publishedContentRecords.get(proof);
@@ -1168,7 +1318,7 @@ export class ContentRepository {
         "published content exceeds its revalidation limit",
       );
     }
-    if (await this.#identitiesStillMatch(record.identities)) return;
+    if (await this.#identitiesStillMatch(record.identities, checkPack)) return;
 
     const verified = await this.streamContent(
       record.contentId,
@@ -1200,6 +1350,7 @@ export class ContentRepository {
     decodedLength: number,
     rootSource: "any" | "loose",
     context: ResolutionContext,
+    allowChunked = true,
   ): Promise<PublishedContent> {
     const closure = new ClosureAccumulator();
     const plan = await this.#authenticateContentPlan(
@@ -1207,10 +1358,16 @@ export class ContentRepository {
       decodedLength,
       closure,
       context,
-      true,
+      allowChunked,
       rootSource,
     );
-    if (!(await this.#identitiesStillMatch(closure.identities()))) {
+    context.signal?.throwIfAborted();
+    // Publication revalidates shared pack receipts after all blob lanes settle.
+    const identities =
+      context.optionalReuse === true
+        ? closure.identities().filter((identity) => identity.source === "file")
+        : closure.identities();
+    if (!(await this.#identitiesStillMatch(identities))) {
       integrity("content representation changed during authentication");
     }
     if (plan.decodedLength !== decodedLength) {
@@ -1364,14 +1521,14 @@ export class ContentRepository {
 
   async #identitiesStillMatch(
     identities: readonly VerifiedDependencyIdentity[],
+    checkPack: (receipt: CatalogPackIdentityReceipt) => Promise<boolean> = (
+      receipt,
+    ) => this.#catalog.packReceiptStillCurrent(receipt),
   ): Promise<boolean> {
     for (const dependency of identities) {
       if (dependency.source === "pack") {
         try {
-          if (
-            !(await this.#catalog.packReceiptStillCurrent(dependency.receipt))
-          )
-            return false;
+          if (!(await checkPack(dependency.receipt))) return false;
         } catch (error) {
           this.#rethrowCatalogError(error);
         }
@@ -1447,7 +1604,11 @@ export class ContentRepository {
     if (!(await this.#identitiesStillMatch(identities))) {
       integrity("content representation changed before replay");
     }
-    await plan.replay(sink);
+    await plan.replay(async (bytes) => {
+      context.signal?.throwIfAborted();
+      await sink(bytes);
+    });
+    context.signal?.throwIfAborted();
     if (!(await this.#identitiesStillMatch(identities))) {
       integrity("content representation changed during replay");
     }
@@ -1462,6 +1623,7 @@ export class ContentRepository {
     allowChunked: boolean,
     rootSource: "any" | "loose",
   ): Promise<AuthenticatedContentPlan> {
+    context.signal?.throwIfAborted();
     let firstFailure: unknown;
 
     if (rootSource === "any") {
@@ -1470,7 +1632,7 @@ export class ContentRepository {
         const legacy = await streamPrivateFileIfPresent(
           legacyPath,
           maximumBytes,
-          async () => undefined,
+          async () => context.signal?.throwIfAborted(),
         );
         if (legacy !== undefined) {
           if (legacy.digest !== contentId) {
@@ -1608,12 +1770,9 @@ export class ContentRepository {
     if (record.encoding === "raw" || record.encoding === "zstd-v1") {
       let decoded: Uint8Array;
       try {
-        decoded =
-          candidate.source === "pack"
-            ? await candidate.pack.readVerified(candidate.entry)
-            : await authenticateFullRecordPayload(
-                record as SelfAuthenticatingRecord,
-              );
+        decoded = await authenticateFullRecordPayload(
+          record as SelfAuthenticatingRecord,
+        );
       } catch (error) {
         integrity("content record failed authentication", error);
       }
@@ -1703,7 +1862,7 @@ export class ContentRepository {
       integrity("reconstructed chunks do not match the logical content");
     }
     closure.add(
-      candidate.location,
+      { ...candidate.location, recipeId: rootId },
       candidate.identity,
       candidate.source === "pack" ? candidate.identityReceipt : undefined,
     );
@@ -1800,6 +1959,7 @@ export class ContentRepository {
     closure: ClosureAccumulator,
     rootSource: "any" | "loose" = "any",
   ): Promise<Uint8Array> {
+    context.signal?.throwIfAborted();
     let firstFailure: unknown;
     try {
       const loose = await this.#readLooseRecord("recipe", recipeId);
@@ -1865,12 +2025,9 @@ export class ContentRepository {
     }
     let bytes: Uint8Array;
     try {
-      bytes =
-        candidate.source === "pack"
-          ? await candidate.pack.readVerified(candidate.entry)
-          : await authenticateFullRecordPayload(
-              candidate.envelope as SelfAuthenticatingRecord,
-            );
+      bytes = await authenticateFullRecordPayload(
+        candidate.envelope as SelfAuthenticatingRecord,
+      );
     } catch (error) {
       integrity("recipe record failed authentication", error);
     }
@@ -1978,6 +2135,7 @@ export class ContentRepository {
     context: ResolutionContext,
     authenticate: (candidate: ResolvedPackRecord) => Promise<T>,
   ): Promise<T | undefined> {
+    context.signal?.throwIfAborted();
     const seen = new Set<string>();
     try {
       if (context.packInventory === undefined) {
@@ -2007,6 +2165,8 @@ export class ContentRepository {
         routing.entriesByPackId,
       );
       if (routed !== undefined) return routed;
+
+      if (context.optionalReuse === true) return undefined;
 
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const inventory = await this.#loadAuthenticatedPackInventory();
@@ -2067,7 +2227,7 @@ export class ContentRepository {
     pack: CatalogPackHandle,
     entry: PackIndexEntry,
     retention: VerifiedObjectLocation["retention"] = "logical",
-  ): VerifiedObjectLocation {
+  ): Extract<VerifiedObjectLocation, { readonly source: "pack" }> {
     return Object.freeze({
       source: "pack",
       kind: entry.kind,
@@ -2115,6 +2275,7 @@ export class ContentRepository {
     recordFailure?: (error: unknown) => void,
   ): Promise<T | undefined> {
     for (const candidate of candidates) {
+      context.signal?.throwIfAborted();
       const candidateKey = `${candidate.packId}:${candidate.physicalOrdinal}`;
       if (seen.has(candidateKey)) continue;
       seen.add(candidateKey);
@@ -2226,7 +2387,9 @@ export class ContentRepository {
     }
     context.packPool ??= new PackHandlePool(
       this.#catalog,
-      MAX_CONTEXT_PACKS,
+      context.optionalReuse === true
+        ? MAX_PUBLICATION_PACKS
+        : MAX_CONTEXT_PACKS,
       "logical-read",
     );
     return await context.packPool.acquire(packId, expectedIdentity);

@@ -9,6 +9,8 @@ export function formatCaptureFailure(
   failure: CaptureFailure,
 ): string {
   switch (failure.kind) {
+    case "cancelled":
+      return i18n.t("captureCancelled");
     case "scan-incomplete":
       return i18n.t(
         failure.phase === "capture"

@@ -54,6 +54,7 @@ function normalizeLifecycleFailure(cause: unknown, operation: string): unknown {
 export class CyclotomyEngineController<Engine, Initialization = void> {
   readonly #lifecycle: EngineLifecycle<Engine, Initialization>;
   #current: EngineRecord<Engine> | undefined;
+  #initializing: { readonly engine: Engine; retired: boolean } | undefined;
   #stopCause: unknown;
   #epoch = 0;
   #resumeAttempt: Promise<EngineResumeResult<Engine>> | undefined;
@@ -141,6 +142,15 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
     this.#stopCause = cause;
     this.#epoch += 1;
     const record = this.#detachCurrent();
+    const initializing = this.#initializing;
+    if (initializing !== undefined && !initializing.retired) {
+      initializing.retired = true;
+      try {
+        this.#lifecycle.retire(initializing.engine);
+      } catch (error) {
+        this.#stopCause = normalizeLifecycleFailure(error, "retirement");
+      }
+    }
     const retirement =
       record === undefined ? this.#retirement : this.#retire(record);
     await Promise.all([retirement, pendingResume]);
@@ -183,6 +193,8 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
       return { kind: "superseded" };
     }
 
+    const candidate = { engine, retired: false };
+    this.#initializing = candidate;
     let initializationResult: EngineInitializationResult;
     try {
       initializationResult = await this.#lifecycle.initialize(
@@ -190,7 +202,8 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
         initialization,
       );
     } catch (cause) {
-      const cleanup = await this.#disposeCandidate(engine);
+      this.#initializing = undefined;
+      const cleanup = await this.#disposeCandidate(engine, candidate.retired);
       if (this.#closed || attempt !== this.#epoch) {
         return { kind: "superseded" };
       }
@@ -207,10 +220,12 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
             );
       if (attempt === this.#epoch) this.#stopCause = failure;
       return { kind: "failed", cause: failure };
+    } finally {
+      if (this.#initializing === candidate) this.#initializing = undefined;
     }
 
     if (initializationResult.kind === "inactive") {
-      const cleanup = await this.#disposeCandidate(engine);
+      const cleanup = await this.#disposeCandidate(engine, candidate.retired);
       if (this.#closed || attempt !== this.#epoch) {
         return { kind: "superseded" };
       }
@@ -223,7 +238,7 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
     }
 
     if (this.#closed || attempt !== this.#epoch) {
-      await this.#disposeCandidate(engine);
+      await this.#disposeCandidate(engine, candidate.retired);
       return { kind: "superseded" };
     }
     const record: EngineRecord<Engine> = {
@@ -283,10 +298,11 @@ export class CyclotomyEngineController<Engine, Initialization = void> {
 
   async #disposeCandidate(
     engine: Engine,
+    retired = false,
   ): Promise<{ readonly cause: unknown } | undefined> {
     const failures: unknown[] = [];
     try {
-      this.#lifecycle.retire(engine);
+      if (!retired) this.#lifecycle.retire(engine);
     } catch (cause) {
       failures.push(normalizeLifecycleFailure(cause, "retirement"));
     }

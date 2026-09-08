@@ -22,16 +22,26 @@ export type ResolvedCyclotomyLocale = "en" | "zh-CN";
 type MessageVariables = Readonly<Record<string, string | number>>;
 
 const EN = {
-  cyclotomyCommandDescription: "Show, stop, or resume Cyclotomy",
-  cyclotomyStopCompletion: "Stop Cyclotomy",
-  cyclotomyResumeCompletion: "Resume Cyclotomy",
+  cyclotomyCommandDescription:
+    "Show status, pause or resume this instance, or set the global default",
+  cyclotomyPauseCompletion: "Pause Cyclotomy in this Pi instance",
+  cyclotomyResumeCompletion: "Resume Cyclotomy in this Pi instance",
+  cyclotomyEnableCompletion: "Enable Cyclotomy by default in new Pi instances",
+  cyclotomyDisableCompletion:
+    "Disable Cyclotomy by default in new Pi instances",
+  cyclotomyEnabled:
+    "Cyclotomy is enabled by default for new Pi instances. CYCLOTOMY_ENABLED overrides this default.",
+  cyclotomyDisabled:
+    "Cyclotomy is disabled by default for new Pi instances. CYCLOTOMY_ENABLED overrides this default.",
+  cyclotomySettingsSaveFailed:
+    "Cyclotomy could not save the global default ({{message}}).",
   cyclotomyRunning: "Cyclotomy is running.",
   cyclotomyInactive: "Cyclotomy is unavailable in this session.",
-  cyclotomyStopped:
-    "Cyclotomy is stopped. Run /cyclotomy resume to start it again.",
+  cyclotomyPaused:
+    "Cyclotomy is paused in this Pi instance. Run /cyclotomy resume to start it again.",
   cyclotomyStoppedWithError:
     "Cyclotomy stopped because of an error ({{message}}). Fix the problem, then run /cyclotomy resume.",
-  cyclotomyStopSucceeded: "Cyclotomy stopped.",
+  cyclotomyPauseSucceeded: "Cyclotomy paused in this Pi instance.",
   cyclotomyResumeSucceeded: "Cyclotomy resumed.",
   cyclotomyResumeFailed:
     "Cyclotomy could not resume ({{message}}). Fix the problem, then try again.",
@@ -54,6 +64,15 @@ const EN = {
   automaticGcFailed:
     "Automatic storage cleanup failed ({{message}}). Cyclotomy will try again later.",
   captureFailureDetail: "Details: {{message}}",
+  captureCancelled: "Checkpoint cancelled.",
+  captureCancelledProtected:
+    "Checkpoint cancelled. Automatic checkpoints are paused at this node.",
+  captureProgress:
+    "Cyclotomy · {{phase}} · {{files}} files · {{bytes}} MiB{{cancel}}",
+  captureProgressScan: "scanning",
+  captureProgressPublish: "saving",
+  captureProgressValidate: "verifying",
+  captureProgressCancel: " · Esc to cancel",
   captureScanIncomplete: "Checkpoint not saved: {{message}}",
   captureValidationIncomplete:
     "Checkpoint not saved because the workspace could not be verified: {{message}}",
@@ -272,22 +291,31 @@ const EN = {
   choiceNavigationRestore: "Navigate and restore",
   driftUsage: "Usage: /drift",
   restoreUsage: "Usage: /restore",
-  cyclotomyUsage: "Usage: /cyclotomy [stop|resume]",
+  cyclotomyUsage: "Usage: /cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy command failed: {{message}}",
 } as const;
 
 export type MessageKey = keyof typeof EN;
 
 const ZH_CN: Record<MessageKey, string> = {
-  cyclotomyCommandDescription: "查看、停止或恢复 Cyclotomy",
-  cyclotomyStopCompletion: "停止 Cyclotomy",
-  cyclotomyResumeCompletion: "恢复 Cyclotomy",
+  cyclotomyCommandDescription:
+    "查看状态、暂停或恢复当前实例，或设置全局默认开关",
+  cyclotomyPauseCompletion: "在当前 Pi 实例中暂停 Cyclotomy",
+  cyclotomyResumeCompletion: "在当前 Pi 实例中恢复 Cyclotomy",
+  cyclotomyEnableCompletion: "让新的 Pi 实例默认启用 Cyclotomy",
+  cyclotomyDisableCompletion: "让新的 Pi 实例默认禁用 Cyclotomy",
+  cyclotomyEnabled:
+    "已将全局默认值设为启用 Cyclotomy，供新的 Pi 实例使用。CYCLOTOMY_ENABLED 可覆盖此默认值。",
+  cyclotomyDisabled:
+    "已将全局默认值设为禁用 Cyclotomy，供新的 Pi 实例使用。CYCLOTOMY_ENABLED 可覆盖此默认值。",
+  cyclotomySettingsSaveFailed: "Cyclotomy 无法保存全局默认值（{{message}}）。",
   cyclotomyRunning: "Cyclotomy 正在运行。",
   cyclotomyInactive: "当前会话无法使用 Cyclotomy。",
-  cyclotomyStopped: "Cyclotomy 已停止。执行 /cyclotomy resume 可重新启动。",
+  cyclotomyPaused:
+    "Cyclotomy 已在当前 Pi 实例中暂停。执行 /cyclotomy resume 可重新启动。",
   cyclotomyStoppedWithError:
     "Cyclotomy 因错误停止（{{message}}）。修复问题后执行 /cyclotomy resume。",
-  cyclotomyStopSucceeded: "Cyclotomy 已停止。",
+  cyclotomyPauseSucceeded: "Cyclotomy 已在当前 Pi 实例中暂停。",
   cyclotomyResumeSucceeded: "Cyclotomy 已恢复。",
   cyclotomyResumeFailed: "Cyclotomy 无法恢复（{{message}}）。修复问题后重试。",
   driftCommandDescription: "显示 /restore 将执行的文件变化",
@@ -307,6 +335,14 @@ const ZH_CN: Record<MessageKey, string> = {
     "Cyclotomy 无法恢复自动检查点（{{message}}）。修复问题后执行 /cyclotomy resume。",
   automaticGcFailed: "自动清理存储失败（{{message}}）。Cyclotomy 稍后会重试。",
   captureFailureDetail: "详情：{{message}}",
+  captureCancelled: "已取消快照。",
+  captureCancelledProtected: "已取消快照，当前节点的自动检查点已暂停。",
+  captureProgress:
+    "Cyclotomy · {{phase}} · {{files}} 个文件 · {{bytes}} MiB{{cancel}}",
+  captureProgressScan: "扫描中",
+  captureProgressPublish: "保存中",
+  captureProgressValidate: "验证中",
+  captureProgressCancel: " · Esc 取消",
   captureScanIncomplete: "检查点未保存：{{message}}",
   captureValidationIncomplete: "无法确认工作区状态，检查点未保存：{{message}}",
   captureValidationFailed: "检查点未保存：{{message}}",
@@ -498,7 +534,7 @@ const ZH_CN: Record<MessageKey, string> = {
   choiceNavigationRestore: "跳转并恢复",
   driftUsage: "用法：/drift",
   restoreUsage: "用法：/restore",
-  cyclotomyUsage: "用法：/cyclotomy [stop|resume]",
+  cyclotomyUsage: "用法：/cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy 命令失败：{{message}}",
 };
 

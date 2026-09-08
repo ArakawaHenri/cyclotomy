@@ -110,18 +110,18 @@ describe("real Pi integration", () => {
     }
   });
 
-  it("stops during generation, lets the turn finish, and resumes locally once Pi is idle", async () => {
+  it("pauses during generation, lets the turn finish, and resumes locally once Pi is idle", async () => {
     const pi = await startHarness();
     const pause = pi.pauseNextModelTurn();
-    const turn = pi.turn("keep streaming while Cyclotomy stops");
+    const turn = pi.turn("keep streaming while Cyclotomy pauses");
     await pause.started;
 
     expect(pi.session.isStreaming).toBe(true);
-    await pi.command("/cyclotomy stop");
+    await pi.command("/cyclotomy pause");
     expect(pi.session.isStreaming).toBe(true);
     expect(
       pi.notifications.some(({ message }) =>
-        message.includes("Cyclotomy stopped"),
+        message.includes("Cyclotomy paused"),
       ),
     ).toBe(true);
 

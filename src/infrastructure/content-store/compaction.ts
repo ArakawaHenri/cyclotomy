@@ -6,6 +6,7 @@ import {
   parseContentId,
   parseMetadataId,
   parseRecipeId,
+  SHA256_BYTE_LENGTH,
   type ContentId,
   type MetadataId,
   type RecipeId,
@@ -44,6 +45,15 @@ export const DELTA1_MIN_SAVED_PERCENT = 35;
 export const DELTA1_MAX_LENGTH_DIFFERENCE_PERCENT = 25;
 /** Conservative decoded-byte admission budget for one maintenance plan. */
 export const DEFAULT_COMPACTION_DECODED_BYTE_BUDGET = DATA_PACK_TARGET_BYTES;
+
+/** Chunked content is already authenticated; the plan retains its recipe id. */
+export function compactionRecordWorkingBytes(
+  record: Pick<RecordEnvelope, "encoding" | "decodedLength">,
+): number {
+  return record.encoding === "chunked-v1"
+    ? SHA256_BYTE_LENGTH
+    : record.decodedLength;
+}
 
 export type LogicalRecordKey =
   | { readonly kind: "content"; readonly logicalId: ContentId }
@@ -806,9 +816,10 @@ export async function planCompaction(
       key,
       await input.read.readEnvelope(key),
     );
+    const workingBytes = compactionRecordWorkingBytes(envelope);
     if (
-      envelope.decodedLength > DEFAULT_COMPACTION_DECODED_BYTE_BUDGET ||
-      envelope.decodedLength >
+      workingBytes > DEFAULT_COMPACTION_DECODED_BYTE_BUDGET ||
+      workingBytes >
         DEFAULT_COMPACTION_DECODED_BYTE_BUDGET - admittedDecodedBytes
     ) {
       invalid(
@@ -816,7 +827,7 @@ export async function planCompaction(
         `compaction decoded bytes exceed the ${DEFAULT_COMPACTION_DECODED_BYTE_BUDGET}-byte maintenance budget`,
       );
     }
-    admittedDecodedBytes += envelope.decodedLength;
+    admittedDecodedBytes += workingBytes;
     if (envelope.kind === "content") {
       liveContentIds.add(envelope.logicalId);
     }
@@ -828,9 +839,12 @@ export async function planCompaction(
       envelopes.push(envelope);
       continue;
     }
-    const decoded = Uint8Array.from(
-      await input.read.readDecodedContent(envelope.logicalId),
-    );
+    const decoded =
+      envelope.encoding === "raw"
+        ? envelope.payload
+        : Uint8Array.from(
+            await input.read.readDecodedContent(envelope.logicalId),
+          );
     if (
       decoded.byteLength !== envelope.decodedLength ||
       contentIdFromBytes(decoded) !== envelope.logicalId

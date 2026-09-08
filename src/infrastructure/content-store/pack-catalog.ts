@@ -187,7 +187,17 @@ export interface PackCatalogReadInventory {
 export interface PublishedCatalogPack {
   readonly view: PackIndexView;
   readonly identity: CatalogFileIdentity;
+  readonly identityReceipt: CatalogPackIdentityReceipt;
   readonly disposition: "existing" | "published";
+}
+
+export interface PackCatalogPublication {
+  publishPack(publication: EncodedPack): Promise<PublishedCatalogPack>;
+}
+
+interface PackPublicationInventory extends PackCatalogReadInventory {
+  readonly incomingFiles: number;
+  readonly incomingBytes: number;
 }
 
 export type MultiPackIndexCacheRead =
@@ -1310,16 +1320,34 @@ export class PackCatalog {
     return inventory;
   }
 
+  /** Additive writes need complete capacity accounting, not old payload bytes. */
+  async #publicationInventory(): Promise<PackPublicationInventory> {
+    const before = await this.#namespaceSnapshot();
+    const collected = await this.#collectPackInventory(before, "publication");
+    const after = await this.#namespaceSnapshot();
+    if (before.fingerprint !== after.fingerprint) {
+      fail("namespace-invalid", "pack namespace changed during inventory");
+    }
+    return Object.freeze({
+      packs: Object.freeze(collected.packs),
+      views: Object.freeze(collected.packs.map(({ view }) => view)),
+      totalPackBytes: collected.totalPackBytes,
+      totalIndexEntries: collected.totalIndexEntries,
+      incomingFiles: before.incomingFiles,
+      incomingBytes: before.incomingBytes,
+    });
+  }
+
   async #collectPackInventory(
     snapshot: NamespaceSnapshot,
-    mode: "authenticated" | "logical-read",
+    mode: "authenticated" | "logical-read" | "publication",
   ): Promise<CollectedPackInventory> {
     const packs: PackCatalogReadEntry[] = [];
     const authenticatedPacks: PackCatalogEntry[] = [];
     let totalPackBytes = 0;
     let totalIndexEntries = 0;
     for (const candidate of snapshot.candidates) {
-      if (mode === "logical-read") {
+      if (mode !== "authenticated") {
         totalPackBytes += candidate.identity.size;
         if (totalPackBytes > this.#limits.maxTotalPackBytes) {
           fail(
@@ -1650,6 +1678,58 @@ export class PackCatalog {
     publication: EncodedPack,
     authority: WorkspaceWriteAuthority,
   ): Promise<PublishedCatalogPack> {
+    return await this.#publishPack(publication, authority);
+  }
+
+  /** One exclusive writer can reuse its inventory across bounded pack batches. */
+  beginPublication(authority: WorkspaceWriteAuthority): PackCatalogPublication {
+    assertWorkspaceWriteAuthority(authority, this.#layout.root);
+    let inventory: Promise<PackPublicationInventory> | undefined;
+    let tail: Promise<unknown> = Promise.resolve();
+    return Object.freeze({
+      publishPack: (
+        publication: EncodedPack,
+      ): Promise<PublishedCatalogPack> => {
+        const pending = tail.then(async () => {
+          assertWorkspaceWriteAuthority(authority, this.#layout.root);
+          inventory ??= this.#publicationInventory();
+          const before = await inventory;
+          const published = await this.#publishPack(
+            publication,
+            authority,
+            before,
+          );
+          if (published.disposition === "published") {
+            const entry: PackCatalogReadEntry = Object.freeze({
+              path: published.identity.path,
+              identity: published.identity,
+              identityReceipt: published.identityReceipt,
+              view: published.view,
+            });
+            inventory = Promise.resolve({
+              packs: [...before.packs, entry],
+              views: [...before.views, entry.view],
+              totalPackBytes: before.totalPackBytes + entry.view.byteLength,
+              totalIndexEntries:
+                before.totalIndexEntries + entry.view.entries.length,
+              incomingFiles: before.incomingFiles,
+              incomingBytes: before.incomingBytes,
+            });
+          }
+          return published;
+        });
+        tail = pending;
+        void pending.catch(() => undefined);
+        return pending;
+      },
+    });
+  }
+
+  async #publishPack(
+    publication: EncodedPack,
+    authority: WorkspaceWriteAuthority,
+    publicationInventory?: PackPublicationInventory,
+  ): Promise<PublishedCatalogPack> {
     let verified: ReturnType<typeof authenticatePackPublication>;
     try {
       verified = authenticatePackPublication(publication);
@@ -1664,7 +1744,7 @@ export class PackCatalog {
     }
     const expectedView = verified.pack.indexView();
 
-    const inventory = await this.inventory();
+    const inventory = publicationInventory ?? (await this.inventory());
     const existingView = inventory.views.find(
       ({ packId }) => packId === verified.pack.packId,
     );
@@ -1687,12 +1767,13 @@ export class PackCatalog {
       }
       await this.#syncPackReceipt(
         reopened,
-        this.#entryReceipt(existing).parents,
+        this.#packIdentityReceipt(existing.identityReceipt).parents,
         authority,
       );
       return Object.freeze({
         view: reopened.view,
         identity: reopened.identity,
+        identityReceipt: reopened.identityReceipt,
         disposition: "existing",
       });
     }
@@ -1802,6 +1883,7 @@ export class PackCatalog {
       return Object.freeze({
         view: published.view,
         identity: published.identity,
+        identityReceipt: published.identityReceipt,
         disposition: "published",
       });
     } catch (error) {

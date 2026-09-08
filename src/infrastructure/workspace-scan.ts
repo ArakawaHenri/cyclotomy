@@ -11,7 +11,12 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
+import { compareUtf8 } from "./utf8-order.ts";
+import {
+  aggregateFailures,
+  primaryFailure,
+  withRetainedCleanup,
+} from "./failure-settlement.ts";
 import {
   ABSOLUTE_MAX_TREE_ENTRIES,
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
@@ -49,6 +54,10 @@ import {
   type WorkspaceScope,
 } from "./workspace-scope.ts";
 import { openWorkspaceRegularCandidate } from "./workspace-file-open.ts";
+import {
+  isOperationCancelled,
+  type WorkspaceOperationOptions,
+} from "./workspace-operation.ts";
 
 export interface RegularWorkspaceStateEntry {
   readonly path: string;
@@ -161,7 +170,7 @@ export function summarizeScanProblems(
   }${exampleText}${suffix}`;
 }
 
-export interface ScanOptions {
+export interface ScanOptions extends WorkspaceOperationOptions {
   /** Files larger than this become a "too-large" problem. Default 50 MiB. */
   readonly maxFileBytes?: number;
   /** Cumulative snapshot quota; overflow throws ScanError. Default 2 GiB. */
@@ -189,6 +198,8 @@ export class ScanError extends Error {
   }
 }
 
+const SCAN_CONCURRENCY = 8;
+
 const DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024 ** 3;
 
@@ -196,10 +207,6 @@ const DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024 ** 3;
 
 function isGitComponent(name: string): boolean {
   return portableWorkspacePathKey(name) === ".git";
-}
-
-function comparePathBytes(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function errorDetail(cause: unknown): string {
@@ -378,6 +385,7 @@ function sameFileObservation(before: Stats, after: Stats): boolean {
 async function hashFileHandle(
   handle: FileHandle,
   maxFileBytes: number,
+  signal?: AbortSignal,
 ): Promise<
   | { readonly tooLarge: true; readonly bytesRead: number }
   | {
@@ -391,6 +399,7 @@ async function hashFileHandle(
   const buffer = Buffer.allocUnsafe(64 * 1024);
   let position = 0;
   while (true) {
+    signal?.throwIfAborted();
     const result = await handle.read(buffer, 0, buffer.byteLength, position);
     if (result.bytesRead === 0) {
       break;
@@ -408,6 +417,96 @@ async function hashFileHandle(
     byteLength: bytesRead,
     sha256: hash.digest("hex"),
   };
+}
+
+interface ScanCandidate {
+  readonly relativePath: string;
+  readonly absolutePath: string;
+  readonly stat: Stats;
+}
+
+type RegularScanResult =
+  | { readonly kind: "too-large"; readonly detail: string }
+  | {
+      readonly kind: "entry";
+      readonly entry: Extract<WorkspaceEntry, { kind: "regular" }>;
+    };
+
+async function readRegularCandidate(
+  { relativePath, absolutePath, stat }: ScanCandidate,
+  maxFileBytes: number,
+  options: WorkspaceOperationOptions,
+): Promise<RegularScanResult> {
+  options.signal?.throwIfAborted();
+  const handle = await openWorkspaceRegularCandidate(
+    absolutePath,
+    fsConstants.O_RDONLY,
+  );
+  return await withRetainedCleanup(
+    async (): Promise<RegularScanResult> => {
+      const before = await handle.stat();
+      if (!before.isFile() || !sameFileObservation(stat, before)) {
+        throw new Error("entry changed before it could be read safely");
+      }
+      if (before.size > maxFileBytes) {
+        return {
+          kind: "too-large",
+          detail: `${before.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
+        };
+      }
+
+      const hashed = await hashFileHandle(handle, maxFileBytes, options.signal);
+      if (hashed.tooLarge) {
+        return {
+          kind: "too-large",
+          detail: `more than ${maxFileBytes} bytes were read before the file limit was detected`,
+        };
+      }
+      const after = await handle.stat();
+      if (!sameFileObservation(before, after)) {
+        throw new Error("entry changed while it was being scanned");
+      }
+      return {
+        kind: "entry",
+        entry: {
+          path: relativePath,
+          kind: "regular",
+          recreationMode:
+            process.platform === "win32" ? null : after.mode & 0o7777,
+          byteLength: hashed.byteLength,
+          sha256: hashed.sha256,
+          sourcePath: absolutePath,
+        },
+      };
+    },
+    () => handle.close(),
+    `workspace entry ${relativePath} scan and cleanup both failed`,
+  );
+}
+
+function settleScanTask<T>(task: Promise<T>): Promise<PromiseSettledResult<T>> {
+  return task.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason: unknown) => ({ status: "rejected", reason }),
+  );
+}
+
+function rethrowScanBatchFailure(
+  cause: unknown,
+  results: readonly PromiseSettledResult<unknown>[],
+  signal?: AbortSignal,
+): never {
+  const failures = [
+    ...new Set([
+      cause,
+      ...results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      ),
+    ]),
+  ].filter((error) => !isOperationCancelled(error, signal));
+  if (failures.length === 0) throw cause;
+  if (failures.length === 1) throw failures[0];
+  throw aggregateFailures(failures, "workspace scan batch failed");
 }
 
 /** Capture the workspace using its current Git ignore policy. */
@@ -431,7 +530,7 @@ export async function scanWorkspaceForScope(
   return scanWorkspaceWithScope(root, options, targetScope);
 }
 
-export interface RestoreComparisonScanOptions {
+export interface RestoreComparisonScanOptions extends WorkspaceOperationOptions {
   readonly gitIgnoreScratchParent?: string;
 }
 
@@ -444,15 +543,13 @@ export async function scanWorkspaceForRestoreComparison(
   return scanWorkspaceWithScope(
     root,
     {
+      ...options,
       maxFileBytes: Number.MAX_SAFE_INTEGER,
       maxSnapshotBytes: Number.MAX_SAFE_INTEGER,
       maxEntries: ABSOLUTE_MAX_TREE_ENTRIES,
       maxManifestBytes: ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
       maxPathBytes: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_BYTES,
       maxPathComponents: ABSOLUTE_MAX_WORKSPACE_RELATIVE_PATH_COMPONENTS,
-      ...(options.gitIgnoreScratchParent === undefined
-        ? {}
-        : { gitIgnoreScratchParent: options.gitIgnoreScratchParent }),
     },
     targetScope,
   );
@@ -471,6 +568,7 @@ async function scanWorkspaceWithScope(
   options: ScanOptions,
   targetScope?: WorkspaceScope,
 ): Promise<WorkspaceSnapshot> {
+  options.signal?.throwIfAborted();
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
   const maxSnapshotBytes =
     options.maxSnapshotBytes ?? DEFAULT_MAX_SNAPSHOT_BYTES;
@@ -515,12 +613,14 @@ async function scanWorkspaceWithScope(
     // symlink.
     workspaceRoot = await realpath(requestedRoot);
   } catch (cause) {
+    if (options.signal?.aborted) throw cause;
     throw new ScanError(`workspace root is not readable: ${root}`, { cause });
   }
   let rootStat: Stats;
   try {
     rootStat = await lstat(workspaceRoot);
   } catch (cause) {
+    if (options.signal?.aborted) throw cause;
     throw new ScanError(`workspace root is not readable: ${root}`, { cause });
   }
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
@@ -544,10 +644,16 @@ async function scanWorkspaceWithScope(
       ? {}
       : { scratchParent: options.gitIgnoreScratchParent }),
     pathLimits,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   const oracle =
     targetScope === undefined
-      ? await createLiveGitIgnoreOracle(workspaceRoot, initialScope, pathLimits)
+      ? await createLiveGitIgnoreOracle(
+          workspaceRoot,
+          initialScope,
+          pathLimits,
+          options.signal,
+        )
       : await createSyntheticGitIgnoreOracle(initialScope, syntheticScratch);
 
   const entries: WorkspaceEntry[] = [];
@@ -567,6 +673,7 @@ async function scanWorkspaceWithScope(
   const liveDecisions: OracleDecision[] = [];
   let totalBytes = 0;
   let inventoryCount = 0;
+  options.onProgress?.({ files: 0, bytes: 0 });
 
   const addInventory = (): void => {
     inventoryCount += 1;
@@ -593,6 +700,7 @@ async function scanWorkspaceWithScope(
     // Keep each protocol write comfortably below the oracle's byte ceiling,
     // while retaining one long-lived Git process for the whole scan.
     for (let offset = 0; offset < queries.length; offset += 2_048) {
+      options.signal?.throwIfAborted();
       const batch = queries.slice(offset, offset + 2_048);
       const managed = await oracle.managed(batch);
       if (managed.length !== batch.length) {
@@ -618,6 +726,7 @@ async function scanWorkspaceWithScope(
     relativeDirectory: string,
     expectedDirectory: Stats,
   ): Promise<void> => {
+    options.signal?.throwIfAborted();
     const assertDirectoryStable = async (): Promise<boolean> => {
       try {
         const observed = await lstat(absoluteDirectory);
@@ -630,6 +739,7 @@ async function scanWorkspaceWithScope(
         }
         return true;
       } catch (cause) {
+        if (options.signal?.aborted) throw cause;
         problems.push({
           path: relativeDirectory === "" ? "." : relativeDirectory,
           kind: "read-failed",
@@ -671,6 +781,7 @@ async function scanWorkspaceWithScope(
       names = [];
       const directory = await opendir(absoluteDirectory);
       for await (const entry of directory) {
+        options.signal?.throwIfAborted();
         // Repository metadata is never part of the workspace inventory.
         if (isGitComponent(entry.name)) continue;
         // The root consumes one slot before walking. Every other directory,
@@ -680,6 +791,7 @@ async function scanWorkspaceWithScope(
         names.push(entry.name);
       }
     } catch (cause) {
+      if (options.signal?.aborted) throw cause;
       if (cause instanceof ScanError) throw cause;
       problems.push({
         path: relativeDirectory === "" ? "." : relativeDirectory,
@@ -691,53 +803,78 @@ async function scanWorkspaceWithScope(
     }
     // Deterministic visit order makes path-collision first-wins stable. The
     // array is bounded by the global inventory limit before each push.
-    names.sort(comparePathBytes);
+    names.sort(compareUtf8);
 
-    interface Candidate {
-      readonly relativePath: string;
-      readonly absolutePath: string;
-      readonly stat: Stats;
-    }
-    const candidates: Candidate[] = [];
-    for (const name of names) {
-      const normalizedName = name.normalize("NFC");
-      if (name !== normalizedName || name.includes("\\")) {
-        problems.push({
-          path:
-            relativeDirectory === "" ? name : `${relativeDirectory}/${name}`,
-          kind: "unsupported",
-          detail:
-            name !== normalizedName
-              ? "pathname is not NFC-normalized and cannot be restored byte-for-byte"
-              : "pathname contains a backslash and is not representable in the portable manifest",
-        });
-        continue;
-      }
-      const relativePath =
-        relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
+    const candidates: ScanCandidate[] = [];
+    for (let offset = 0; offset < names.length; offset += SCAN_CONCURRENCY) {
+      options.signal?.throwIfAborted();
+      const batch = names.slice(offset, offset + SCAN_CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(
+          async (
+            name,
+          ): Promise<
+            | { readonly candidate: ScanCandidate }
+            | { readonly problem: ScanProblem }
+          > => {
+            options.signal?.throwIfAborted();
+            const relativePath =
+              relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
+            if (name !== name.normalize("NFC") || name.includes("\\")) {
+              return {
+                problem: {
+                  path: relativePath,
+                  kind: "unsupported",
+                  detail:
+                    name !== name.normalize("NFC")
+                      ? "pathname is not NFC-normalized and cannot be restored byte-for-byte"
+                      : "pathname contains a backslash and is not representable in the portable manifest",
+                },
+              };
+            }
+            try {
+              canonicalWorkspaceRelativePath(relativePath, false, pathLimits);
+            } catch (cause) {
+              return {
+                problem: {
+                  path: relativePath,
+                  kind: "unsupported",
+                  detail: errorDetail(cause),
+                },
+              };
+            }
+            const absolutePath = join(absoluteDirectory, name);
+            try {
+              return {
+                candidate: {
+                  relativePath,
+                  absolutePath,
+                  stat: await lstat(absolutePath),
+                },
+              };
+            } catch (cause) {
+              if (options.signal?.aborted) throw cause;
+              return {
+                problem: {
+                  path: relativePath,
+                  kind: "read-failed",
+                  detail: errorDetail(cause),
+                },
+              };
+            }
+          },
+        ),
+      );
       try {
-        canonicalWorkspaceRelativePath(relativePath, false, pathLimits);
+        options.signal?.throwIfAborted();
+        for (const result of results) {
+          if (result.status === "rejected") throw result.reason;
+          if ("problem" in result.value) problems.push(result.value.problem);
+          else candidates.push(result.value.candidate);
+        }
       } catch (cause) {
-        problems.push({
-          path: relativePath,
-          kind: "unsupported",
-          detail: errorDetail(cause),
-        });
-        continue;
+        rethrowScanBatchFailure(cause, results, options.signal);
       }
-      const absolutePath = join(absoluteDirectory, name);
-      let stat: Stats;
-      try {
-        stat = await lstat(absolutePath);
-      } catch (cause) {
-        problems.push({
-          path: relativePath,
-          kind: "read-failed",
-          detail: errorDetail(cause),
-        });
-        continue;
-      }
-      candidates.push({ relativePath, absolutePath, stat });
     }
 
     const managed = await classify(
@@ -746,25 +883,109 @@ async function scanWorkspaceWithScope(
         kind: stat.isDirectory() ? "directory" : "non-directory",
       })),
     );
-    for (let index = 0; index < candidates.length; index += 1) {
-      const candidate = candidates[index]!;
-      const { relativePath, absolutePath, stat } = candidate;
-      if (!managed[index]) {
-        // Record only the first excluded namespace boundary. Git cannot
-        // re-include a child while its parent directory remains excluded.
-        excludedOccupancies.push(excludedObservation(relativePath, stat));
-        continue;
+    const pending: Array<{
+      readonly candidate: ScanCandidate;
+      readonly result: Promise<PromiseSettledResult<RegularScanResult>>;
+    }> = [];
+    const pendingPaths = new Set<string>();
+    let pendingBytes = 0;
+    const flush = async (): Promise<void> => {
+      if (pending.length === 0) return;
+      const batch = pending.splice(0);
+      const results = await Promise.all(batch.map(({ result }) => result));
+      pendingPaths.clear();
+      pendingBytes = 0;
+      try {
+        for (let index = 0; index < batch.length; index += 1) {
+          options.signal?.throwIfAborted();
+          const { relativePath } = batch[index]!.candidate;
+          const result = results[index]!;
+          if (result.status === "rejected") {
+            if (result.reason instanceof ScanError) throw result.reason;
+            problems.push({
+              path: relativePath,
+              kind: "read-failed",
+              detail: errorDetail(result.reason),
+            });
+            continue;
+          }
+          const scanned = result.value;
+          if (scanned.kind === "too-large") {
+            problems.push({
+              path: relativePath,
+              kind: "too-large",
+              detail: scanned.detail,
+            });
+            continue;
+          }
+          canonicalOwners.set(
+            portableWorkspacePathKey(relativePath),
+            relativePath,
+          );
+          entries.push(scanned.entry);
+          addBytes(scanned.entry.byteLength);
+          options.onProgress?.({ files: entries.length, bytes: totalBytes });
+        }
+        options.signal?.throwIfAborted();
+      } catch (cause) {
+        rethrowScanBatchFailure(cause, results, options.signal);
       }
+    };
+    try {
+      for (let index = 0; index < candidates.length; index += 1) {
+        options.signal?.throwIfAborted();
+        const candidate = candidates[index]!;
+        const { relativePath, absolutePath, stat } = candidate;
+        // Resolve preceding path claims before recursion or a colliding candidate.
+        if (
+          !managed[index] ||
+          !stat.isFile() ||
+          stat.dev !== rootStat.dev ||
+          stat.nlink > 1 ||
+          stat.size > maxFileBytes ||
+          pendingPaths.has(portableWorkspacePathKey(relativePath)) ||
+          stat.size > maxSnapshotBytes - totalBytes - pendingBytes
+        )
+          await flush();
+        if (!managed[index]) {
+          // Record only the first excluded namespace boundary. Git cannot
+          // re-include a child while its parent directory remains excluded.
+          excludedOccupancies.push(excludedObservation(relativePath, stat));
+          continue;
+        }
 
-      if (stat.isDirectory()) {
+        if (stat.isDirectory()) {
+          if (stat.dev !== rootStat.dev) {
+            problems.push({
+              path: relativePath,
+              kind: "cross-device",
+              detail: "directory is on a different device",
+            });
+            continue;
+          }
+          const canonical = portableWorkspacePathKey(relativePath);
+          const previous = canonicalOwners.get(canonical);
+          if (previous !== undefined) {
+            problems.push({
+              path: relativePath,
+              kind: "path-collision",
+              detail: `collides with "${previous}" after portable case normalization`,
+            });
+            continue;
+          }
+          canonicalOwners.set(canonical, relativePath);
+          await walk(absolutePath, relativePath, stat);
+          continue;
+        }
         if (stat.dev !== rootStat.dev) {
           problems.push({
             path: relativePath,
             kind: "cross-device",
-            detail: "directory is on a different device",
+            detail: "entry is on a different device",
           });
           continue;
         }
+
         const canonical = portableWorkspacePathKey(relativePath);
         const previous = canonicalOwners.get(canonical);
         if (previous !== undefined) {
@@ -775,170 +996,93 @@ async function scanWorkspaceWithScope(
           });
           continue;
         }
-        canonicalOwners.set(canonical, relativePath);
-        await walk(absolutePath, relativePath, stat);
-        continue;
-      }
-      if (stat.dev !== rootStat.dev) {
-        problems.push({
-          path: relativePath,
-          kind: "cross-device",
-          detail: "entry is on a different device",
-        });
-        continue;
-      }
 
-      const canonical = portableWorkspacePathKey(relativePath);
-      const previous = canonicalOwners.get(canonical);
-      if (previous !== undefined) {
-        problems.push({
-          path: relativePath,
-          kind: "path-collision",
-          detail: `collides with "${previous}" after portable case normalization`,
-        });
-        continue;
-      }
-
-      if (stat.isSymbolicLink()) {
-        try {
-          const targetBytes = await readlink(absolutePath, {
-            encoding: "buffer",
-          });
-          const target = targetBytes.toString("utf8");
-          if (!Buffer.from(target, "utf8").equals(targetBytes)) {
-            throw new Error(
-              "symlink target is not valid UTF-8 and cannot be restored byte-for-byte",
-            );
-          }
-          let symlinkKind: SymlinkKind | null = null;
+        if (stat.isSymbolicLink()) {
           try {
-            const targetMetadata = await statPath(absolutePath);
-            symlinkKind = targetMetadata.isDirectory() ? "directory" : "file";
-          } catch {
-            if (process.platform === "win32") {
-              problems.push({
-                path: relativePath,
-                kind: "unsupported",
-                detail:
-                  "Windows cannot portably capture a symlink whose target type is unavailable",
-              });
-              continue;
+            const targetBytes = await readlink(absolutePath, {
+              encoding: "buffer",
+            });
+            const target = targetBytes.toString("utf8");
+            if (!Buffer.from(target, "utf8").equals(targetBytes)) {
+              throw new Error(
+                "symlink target is not valid UTF-8 and cannot be restored byte-for-byte",
+              );
             }
-          }
-          canonicalOwners.set(canonical, relativePath);
-          entries.push({
-            path: relativePath,
-            kind: "symlink",
-            target,
-            symlinkKind,
-          });
-          addBytes(Buffer.byteLength(target));
-        } catch (cause) {
-          if (cause instanceof ScanError) throw cause;
-          problems.push({
-            path: relativePath,
-            kind: "read-failed",
-            detail: errorDetail(cause),
-          });
-        }
-        continue;
-      }
-
-      if (!stat.isFile()) {
-        problems.push({
-          path: relativePath,
-          kind: "unsupported",
-          detail: `${unsupportedType(stat)} entries are not part of a workspace snapshot`,
-        });
-        continue;
-      }
-      if (stat.nlink > 1) {
-        problems.push({
-          path: relativePath,
-          kind: "hardlink",
-          detail: `file has ${stat.nlink} hard links`,
-        });
-        continue;
-      }
-      if (stat.size > maxFileBytes) {
-        problems.push({
-          path: relativePath,
-          kind: "too-large",
-          detail: `${stat.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
-        });
-        continue;
-      }
-
-      try {
-        const handle = await openWorkspaceRegularCandidate(
-          absolutePath,
-          fsConstants.O_RDONLY,
-        );
-        const scanned = await withRetainedCleanup(
-          async (): Promise<
-            | { readonly kind: "too-large"; readonly detail: string }
-            | {
-                readonly kind: "entry";
-                readonly entry: Extract<WorkspaceEntry, { kind: "regular" }>;
+            let symlinkKind: SymlinkKind | null = null;
+            try {
+              const targetMetadata = await statPath(absolutePath);
+              symlinkKind = targetMetadata.isDirectory() ? "directory" : "file";
+            } catch {
+              if (process.platform === "win32") {
+                problems.push({
+                  path: relativePath,
+                  kind: "unsupported",
+                  detail:
+                    "Windows cannot portably capture a symlink whose target type is unavailable",
+                });
+                continue;
               }
-          > => {
-            const before = await handle.stat();
-            if (!before.isFile() || !sameFileObservation(stat, before)) {
-              throw new Error("entry changed before it could be read safely");
             }
-            if (before.size > maxFileBytes) {
-              return {
-                kind: "too-large",
-                detail: `${before.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
-              };
-            }
+            canonicalOwners.set(canonical, relativePath);
+            entries.push({
+              path: relativePath,
+              kind: "symlink",
+              target,
+              symlinkKind,
+            });
+            addBytes(Buffer.byteLength(target));
+            options.onProgress?.({ files: entries.length, bytes: totalBytes });
+          } catch (cause) {
+            if (options.signal?.aborted) throw cause;
+            if (cause instanceof ScanError) throw cause;
+            problems.push({
+              path: relativePath,
+              kind: "read-failed",
+              detail: errorDetail(cause),
+            });
+          }
+          continue;
+        }
 
-            const hashed = await hashFileHandle(handle, maxFileBytes);
-            if (hashed.tooLarge) {
-              return {
-                kind: "too-large",
-                detail: `more than ${maxFileBytes} bytes were read before the file limit was detected`,
-              };
-            }
-            const after = await handle.stat();
-            if (!sameFileObservation(before, after)) {
-              throw new Error("entry changed while it was being scanned");
-            }
-            return {
-              kind: "entry",
-              entry: {
-                path: relativePath,
-                kind: "regular",
-                recreationMode:
-                  process.platform === "win32" ? null : after.mode & 0o7777,
-                byteLength: hashed.byteLength,
-                sha256: hashed.sha256,
-                sourcePath: absolutePath,
-              },
-            };
-          },
-          () => handle.close(),
-          `workspace entry ${relativePath} scan and cleanup both failed`,
-        );
-        if (scanned.kind === "too-large") {
+        if (!stat.isFile()) {
           problems.push({
             path: relativePath,
-            kind: "too-large",
-            detail: scanned.detail,
+            kind: "unsupported",
+            detail: `${unsupportedType(stat)} entries are not part of a workspace snapshot`,
           });
           continue;
         }
-        canonicalOwners.set(canonical, relativePath);
-        entries.push(scanned.entry);
-        addBytes(scanned.entry.byteLength);
-      } catch (cause) {
-        if (cause instanceof ScanError) throw cause;
-        problems.push({
-          path: relativePath,
-          kind: "read-failed",
-          detail: errorDetail(cause),
+        if (stat.nlink > 1) {
+          problems.push({
+            path: relativePath,
+            kind: "hardlink",
+            detail: `file has ${stat.nlink} hard links`,
+          });
+          continue;
+        }
+        if (stat.size > maxFileBytes) {
+          problems.push({
+            path: relativePath,
+            kind: "too-large",
+            detail: `${stat.size} bytes exceeds the ${maxFileBytes}-byte file limit`,
+          });
+          continue;
+        }
+
+        pendingPaths.add(canonical);
+        pendingBytes += stat.size;
+        pending.push({
+          candidate,
+          result: settleScanTask(
+            readRegularCandidate(candidate, maxFileBytes, options),
+          ),
         });
+        if (pending.length === SCAN_CONCURRENCY) await flush();
       }
+      await flush();
+    } catch (cause) {
+      const results = await Promise.all(pending.map(({ result }) => result));
+      rethrowScanBatchFailure(cause, results, options.signal);
     }
     await assertDirectoryStable();
   };
@@ -950,13 +1094,12 @@ async function scanWorkspaceWithScope(
     () => oracle.close(),
     "workspace scan and Git oracle cleanup both failed",
   );
+  options.signal?.throwIfAborted();
 
-  entries.sort((left, right) => comparePathBytes(left.path, right.path));
-  excludedOccupancies.sort((left, right) =>
-    comparePathBytes(left.path, right.path),
-  );
+  entries.sort((left, right) => compareUtf8(left.path, right.path));
+  excludedOccupancies.sort((left, right) => compareUtf8(left.path, right.path));
   directoryObservations.sort((left, right) =>
-    comparePathBytes(left.path, right.path),
+    compareUtf8(left.path, right.path),
   );
   let scope = initialScope;
   if (discovery !== undefined) {
@@ -988,6 +1131,7 @@ async function scanWorkspaceWithScope(
         pathLimits,
       );
       for (const directory of reachedDirectories) {
+        options.signal?.throwIfAborted();
         const source = await readWorkspaceGitignoreSource(
           rediscovered,
           directory,
@@ -1042,6 +1186,7 @@ async function scanWorkspaceWithScope(
             );
           }
           for (let offset = 0; offset < liveDecisions.length; offset += 2_048) {
+            options.signal?.throwIfAborted();
             const expected = liveDecisions.slice(offset, offset + 2_048);
             const actual = await replay.managed(expected);
             if (
@@ -1074,6 +1219,7 @@ async function scanWorkspaceWithScope(
         ...pathLimits,
       });
     } catch (cause) {
+      if (options.signal?.aborted) throw cause;
       throw new ScanError(
         "workspace entries do not satisfy the current tree manifest contract",
         { cause },
@@ -1091,6 +1237,7 @@ async function scanWorkspaceWithScope(
         { maxEntries, maxManifestBytes, ...pathLimits },
       );
     } catch (cause) {
+      if (options.signal?.aborted) throw cause;
       throw new ScanError(
         "workspace comparison exceeds the current tree manifest contract",
         { cause },

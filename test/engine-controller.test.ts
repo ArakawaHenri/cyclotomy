@@ -9,6 +9,47 @@ interface Engine {
 const ready = { kind: "ready" } as const;
 
 describe("CyclotomyEngineController", () => {
+  it("retires an initializing engine before waiting for its work to drain", async () => {
+    const cancellation = new AbortController();
+    let markInitialized!: () => void;
+    const initialized = new Promise<void>((resolve) => {
+      markInitialized = resolve;
+    });
+    const calls: string[] = [];
+    const controller = new CyclotomyEngineController<Engine>({
+      create: () => ({ id: 1 }),
+      initialize: async () => {
+        markInitialized();
+        await new Promise<void>((resolve) =>
+          cancellation.signal.addEventListener("abort", () => resolve(), {
+            once: true,
+          }),
+        );
+        calls.push("cancelled");
+        return { kind: "inactive" };
+      },
+      retire: () => {
+        calls.push("retire");
+        cancellation.abort();
+      },
+      drain: () => {
+        calls.push("drain");
+      },
+      close: () => {
+        calls.push("close");
+      },
+    });
+    const starting = controller.resume(undefined);
+    await initialized;
+    const stopping = controller.stop();
+    expect(cancellation.signal.aborted).toBe(true);
+    expect(calls).toEqual(["retire"]);
+    await stopping;
+    await expect(starting).resolves.toEqual({ kind: "superseded" });
+    expect(calls).toEqual(["retire", "cancelled", "drain", "close"]);
+    expect(controller.current).toBeUndefined();
+  });
+
   it("detaches synchronously and drains acquired work before close", async () => {
     let nextId = 0;
     const calls: string[] = [];

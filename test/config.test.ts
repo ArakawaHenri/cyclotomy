@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +15,7 @@ import {
   defaultCyclotomyConfig,
   loadCyclotomyConfig,
   loadWorkspaceCyclotomyConfig,
+  setCyclotomyEnabled,
 } from "../src/config.ts";
 
 const roots: string[] = [];
@@ -40,6 +48,7 @@ describe("Cyclotomy configuration", () => {
     const config = loadCyclotomyConfig(agentDir);
 
     expect(config).toEqual({
+      enabled: true,
       globalSettingsPath: settingsPath,
       storageRootPath: join(agentDir, "cyclotomy"),
       autoGcIntervalMs: 24 * 60 * 60 * 1000,
@@ -72,6 +81,7 @@ describe("Cyclotomy configuration", () => {
   it("loads all global settings and resolves relative storage from the Pi agent directory", async () => {
     const agentDir = await createAgentDir();
     await writeSettings(join(agentDir, "cyclotomy", "settings.json"), {
+      enabled: false,
       storageDir: "stores/cyclotomy",
       maxFileMiB: 100,
       maxSnapshotMiB: 50,
@@ -88,6 +98,7 @@ describe("Cyclotomy configuration", () => {
 
     const config = loadCyclotomyConfig(agentDir);
 
+    expect(config.enabled).toBe(false);
     expect(config.storageRootPath).toBe(resolve(agentDir, "stores/cyclotomy"));
     expect(config.scan).toEqual({
       maxFileBytes: 100 * 1024 * 1024,
@@ -176,14 +187,19 @@ describe("Cyclotomy configuration", () => {
     expect(config.storageRootPath).toBe(globalConfig.storageRootPath);
   });
 
-  it.each(["storageDir", "locale"])(
+  it.each(["enabled", "storageDir", "locale"])(
     "rejects the global-only %s setting in a workspace file",
     async (setting) => {
       const agentDir = await createAgentDir();
       const globalConfig = loadCyclotomyConfig(agentDir);
       const storeRoot = join(globalConfig.storageRootPath, "workspace-hash");
       await writeSettings(join(storeRoot, "settings.json"), {
-        [setting]: setting === "storageDir" ? "/tmp/elsewhere" : "zh-CN",
+        [setting]:
+          setting === "enabled"
+            ? false
+            : setting === "storageDir"
+              ? "/tmp/elsewhere"
+              : "zh-CN",
       });
 
       expect(() =>
@@ -235,6 +251,9 @@ describe("Cyclotomy configuration", () => {
   });
 
   it.each([
+    [{ enabled: "false" }, "enabled"],
+    [{ enabled: 0 }, "enabled"],
+    [{ enabled: null }, "enabled"],
     [{ storageDir: "   " }, "storageDir"],
     [{ maxFileMiB: 0 }, "maxFileMiB"],
     [{ maxFileMiB: 1e-308 }, "maxFileMiB"],
@@ -255,6 +274,51 @@ describe("Cyclotomy configuration", () => {
 
     expect(() => loadCyclotomyConfig(agentDir)).toThrow(field);
   });
+
+  it("persists the startup default when no settings file exists", async () => {
+    const agentDir = await createAgentDir();
+
+    setCyclotomyEnabled(agentDir, false);
+    expect(loadCyclotomyConfig(agentDir).enabled).toBe(false);
+    setCyclotomyEnabled(agentDir, true);
+    expect(loadCyclotomyConfig(agentDir).enabled).toBe(true);
+  });
+
+  it("updates the fixed global file and preserves all other settings", async () => {
+    const agentDir = await createAgentDir();
+    const settingsPath = join(agentDir, "cyclotomy", "settings.json");
+    const settings = {
+      storageDir: "other-store",
+      locale: "zh-CN",
+      gc: { intervalMs: 0, extra: "preserved" },
+      unknown: { nested: [1, 2] },
+    };
+    await writeSettings(settingsPath, settings);
+
+    setCyclotomyEnabled(agentDir, false);
+
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({
+      ...settings,
+      enabled: false,
+    });
+    await expect(stat(join(agentDir, "other-store"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.each(["{", "null", "[]"])(
+    "preserves unreadable settings when updating the default: %s",
+    async (contents) => {
+      const agentDir = await createAgentDir();
+      const settingsPath = join(agentDir, "cyclotomy", "settings.json");
+      await writeSettings(settingsPath, contents);
+
+      expect(() => setCyclotomyEnabled(agentDir, false)).toThrow(
+        CyclotomyConfigError,
+      );
+      expect(await readFile(settingsPath, "utf8")).toBe(contents);
+    },
+  );
 
   it("reports the settings path on configuration errors", async () => {
     const agentDir = await createAgentDir();

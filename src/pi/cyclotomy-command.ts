@@ -1,11 +1,12 @@
 import type { CyclotomyI18n } from "./i18n.ts";
 import { messageOfUnknown } from "./unknown-error.ts";
 
-export type CyclotomyCommandAction = "status" | "stop" | "resume" | "usage";
+export type CyclotomyCommandAction =
+  "status" | "pause" | "resume" | "enable" | "disable" | "usage";
 
 export interface CyclotomyCommandCompletion {
-  readonly value: "stop" | "resume";
-  readonly label: "stop" | "resume";
+  readonly value: Exclude<CyclotomyCommandAction, "status" | "usage">;
+  readonly label: Exclude<CyclotomyCommandAction, "status" | "usage">;
   readonly description: string;
 }
 
@@ -26,16 +27,20 @@ export function parseCyclotomyCommandArguments(
   switch (argumentsText.trim()) {
     case "":
       return "status";
-    case "stop":
-      return "stop";
+    case "pause":
+      return "pause";
     case "resume":
       return "resume";
+    case "enable":
+      return "enable";
+    case "disable":
+      return "disable";
     default:
       return "usage";
   }
 }
 
-/** Complete the only two arguments accepted by `/cyclotomy`. */
+/** Complete the arguments accepted by `/cyclotomy`. */
 export function completeCyclotomyCommandArguments(
   argumentPrefix: string,
   i18n: CyclotomyI18n,
@@ -44,14 +49,24 @@ export function completeCyclotomyCommandArguments(
   if (/\s/u.test(prefix)) return null;
   const completions: readonly CyclotomyCommandCompletion[] = [
     {
-      value: "stop",
-      label: "stop",
-      description: i18n.t("cyclotomyStopCompletion"),
+      value: "pause",
+      label: "pause",
+      description: i18n.t("cyclotomyPauseCompletion"),
     },
     {
       value: "resume",
       label: "resume",
       description: i18n.t("cyclotomyResumeCompletion"),
+    },
+    {
+      value: "enable",
+      label: "enable",
+      description: i18n.t("cyclotomyEnableCompletion"),
+    },
+    {
+      value: "disable",
+      label: "disable",
+      description: i18n.t("cyclotomyDisableCompletion"),
     },
   ];
   const matches = completions.filter(({ value }) => value.startsWith(prefix));
@@ -67,7 +82,7 @@ export function presentCyclotomyStatus(
     return { message: i18n.t("cyclotomyRunning"), level: "info" };
   }
   if (!("cause" in view)) {
-    return { message: i18n.t("cyclotomyStopped"), level: "info" };
+    return { message: i18n.t("cyclotomyPaused"), level: "info" };
   }
   return {
     message: i18n.t("cyclotomyStoppedWithError", {

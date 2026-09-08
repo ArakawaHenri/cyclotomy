@@ -43,6 +43,7 @@ import { ContentRepository } from "../src/infrastructure/content-store/repositor
 import {
   nativeObjectStoreLayout,
   openObjectStore,
+  type NativeObjectStore,
 } from "../src/infrastructure/object-store.ts";
 import { validateTreeEntriesAgainstScope } from "../src/infrastructure/tree-scope-validation.ts";
 import {
@@ -73,14 +74,37 @@ let storeRoot: string;
 let mutationAuthorityRoot: string;
 let mutationWriteAuthority = Object.freeze({}) as WorkspaceWriteAuthority;
 
-function contentRecordPath(oid: string): string {
-  return join(
+async function removeTargetBlob(
+  store: NativeObjectStore,
+  treeOid: string,
+  missingOid: string,
+): Promise<void> {
+  const layout = nativeObjectStoreLayout(store, "restore corruption test");
+  const repository = new ContentRepository(layout, { maxDecodedBytes: 1024 });
+  const catalog = new PackCatalog(layout);
+  const manifest = await store.readTreeManifest(treeOid);
+  await withWorkspaceLock(
     storeRoot,
-    "objects",
-    "records",
-    "content",
-    oid.slice(0, 2),
-    oid.slice(2),
+    "remove restore test blob",
+    async (authority) => {
+      // Other blobs must remain readable even when they share the missing blob's pack.
+      for (const entry of manifest.entries) {
+        if (entry.type !== "regular" || entry.blobOid === missingOid) continue;
+        const bytes = await store.readBlob(entry.blobOid);
+        await repository.materializeLooseContent(
+          entry.blobOid,
+          bytes.byteLength,
+          async (sink) => {
+            await sink(bytes);
+          },
+          authority,
+        );
+      }
+      for (const pack of (await catalog.inventory()).packs) {
+        if (pack.view.packClass === "data")
+          await catalog.removePack(pack, authority);
+      }
+    },
   );
 }
 
@@ -512,7 +536,7 @@ describe("pure workspace restore", () => {
     );
     const blob = manifest.entries.find((entry) => entry.type === "regular");
     if (blob?.type !== "regular") throw new Error("fixture blob missing");
-    await unlink(contentRecordPath(blob.blobOid));
+    await removeTargetBlob(setup.store, setup.resolution.treeOid, blob.blobOid);
     await writeFile(join(root, "target.txt"), "current bytes");
     await writeFile(join(root, "keep.txt"), "must survive");
 
@@ -607,7 +631,11 @@ describe("pure workspace restore", () => {
       (entry) => entry.type === "regular" && entry.path === "b.txt",
     );
     if (unused?.type !== "regular") throw new Error("fixture blob missing");
-    await unlink(contentRecordPath(unused.blobOid));
+    await removeTargetBlob(
+      setup.store,
+      setup.resolution.treeOid,
+      unused.blobOid,
+    );
     await writeFile(join(root, "a.txt"), "current a");
     await writeFile(join(root, "keep.txt"), "must survive");
 
@@ -623,6 +651,10 @@ describe("pure workspace restore", () => {
 
     expect(outcome.kind).toBe("checkpoint-unreadable");
     expect(await readFile(join(root, "a.txt"), "utf8")).toBe("current a");
+    expect(stageBlobs).toHaveBeenCalledOnce();
+    await expect(
+      vi.mocked(stageBlobs).mock.results[0]!.value,
+    ).resolves.toBeDefined();
     expect(await readFile(join(root, "keep.txt"), "utf8")).toBe("must survive");
     expect(checkpointState(setup.metadata, "s", "target")).toEqual(setup.state);
     setup.metadata.close();
@@ -770,7 +802,11 @@ describe("pure workspace restore", () => {
       (entry) => entry.type === "regular" && entry.path === "b.txt",
     );
     if (missing?.type !== "regular") throw new Error("fixture blob missing");
-    await unlink(contentRecordPath(missing.blobOid));
+    await removeTargetBlob(
+      setup.store,
+      setup.resolution.treeOid,
+      missing.blobOid,
+    );
 
     const outcome = await restoreWorkspace(
       { store: setup.store },

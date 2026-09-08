@@ -211,7 +211,7 @@ async function captureSource(
               ),
             checkpointSlot: (node) => runtime.checkpoints.checkpointSlot(node),
             prepareCurrent: (current) =>
-              runtime.checkpoints.prepareCurrent(current),
+              runtime.prepareCurrentCapture(context, current, writeAuthority),
             workspaceStillBound: (cwd) =>
               runtime.registrations.workspaceStillBound(cwd),
             captureLeaseIsCurrent: (lease, current, node) =>
@@ -233,18 +233,25 @@ async function captureSource(
         );
         return sourceCaptureResult(execution, options.subject ?? "source");
       },
+      runtime.captureSignal,
     )
     .then((execution): SourceCaptureReceipt => {
       const result =
         execution.kind === "completed"
           ? execution.value
-          : ({
-              kind: "failed",
-              failure: {
-                kind: "exception",
-                cause: execution.cause,
-              },
-            } as const);
+          : runtime.captureSignal.aborted &&
+              execution.cause === runtime.captureSignal.reason
+            ? ({
+                kind: "failed",
+                failure: { kind: "capture", value: { kind: "cancelled" } },
+              } as const)
+            : ({
+                kind: "failed",
+                failure: {
+                  kind: "exception",
+                  cause: execution.cause,
+                },
+              } as const);
       return { result, workspaceLockCleanup: execution.cleanup };
     })
     .catch((cause: unknown): SourceCaptureReceipt => ({
@@ -382,6 +389,15 @@ function presentCancellableSourceCapture(
     return;
   }
 
+  if (
+    settlement.kind === "cancelled" &&
+    settlement.failure.kind === "capture" &&
+    settlement.failure.value.kind === "cancelled"
+  ) {
+    runtime.notify(context, runtime.i18n.t("captureCancelled"), "info");
+    return;
+  }
+
   const presentedCauses = new Set<unknown>();
   const primaryCause = sourceCaptureFailureCause(settlement.failure);
   if (primaryCause !== undefined) presentedCauses.add(primaryCause);
@@ -433,20 +449,35 @@ function presentObservedSourceCapture(
   const presentedCauses = new Set<unknown>();
   const primaryCause = sourceCaptureFailureCause(settlement.failure);
   if (primaryCause !== undefined) presentedCauses.add(primaryCause);
-  runtime.notify(
-    context,
-    withDetail(
+  if (
+    settlement.failure.kind === "capture" &&
+    settlement.failure.value.kind === "cancelled"
+  ) {
+    runtime.notify(
+      context,
       runtime.i18n.t(
-        runtime.activation.kind === "active"
-          ? "sourceCaptureProtected"
-          : "sourceCaptureStopped",
+        settlement.recovery.arrival.kind === "protected"
+          ? "captureCancelledProtected"
+          : "captureCancelled",
       ),
-      runtime.i18n.t("captureFailureDetail", {
-        message: formatSourceCaptureFailure(runtime.i18n, settlement.failure),
-      }),
-    ),
-    "error",
-  );
+      "info",
+    );
+  } else {
+    runtime.notify(
+      context,
+      withDetail(
+        runtime.i18n.t(
+          runtime.activation.kind === "active"
+            ? "sourceCaptureProtected"
+            : "sourceCaptureStopped",
+        ),
+        runtime.i18n.t("captureFailureDetail", {
+          message: formatSourceCaptureFailure(runtime.i18n, settlement.failure),
+        }),
+      ),
+      "error",
+    );
+  }
   notifyWorkspaceCleanupFailureOnce(
     runtime,
     context,
@@ -618,7 +649,11 @@ async function reconcileLoadedConcreteSession(
           ) {
             return { kind: "target-changed" as const };
           }
-          const prepared = await runtime.checkpoints.prepareCurrent(observed);
+          const prepared = await runtime.prepareCurrentCapture(
+            context,
+            observed,
+            writeAuthority,
+          );
           if (!prepared.ok) {
             return {
               kind: "capture-failed" as const,
@@ -719,6 +754,7 @@ async function reconcileLoadedConcreteSession(
                 arrival,
               );
         },
+        runtime.captureSignal,
       );
       const lockCleanup = locked.cleanup;
       let initialized: ArrivalReceipt<LoadedInitializationExecution>;
@@ -745,7 +781,10 @@ async function reconcileLoadedConcreteSession(
         initialized = await finalizeArrivalAfterWorkspaceExecution(
           runtime.workspaceMutations,
           context,
-          { kind: "failed", cause: locked.cause },
+          runtime.captureSignal.aborted &&
+            locked.cause === runtime.captureSignal.reason
+            ? { kind: "capture-failed", failure: { kind: "cancelled" } }
+            : { kind: "failed", cause: locked.cause },
           lockCleanup,
           recovery,
         );
@@ -802,6 +841,14 @@ async function reconcileLoadedConcreteSession(
           );
           break;
         case "capture-failed":
+          if (initializedExecution.failure.kind === "cancelled") {
+            runtime.notify(
+              context,
+              runtime.i18n.t("captureCancelledProtected"),
+              "info",
+            );
+            break;
+          }
           runtime.notifyCaptureResult(
             context,
             false,
@@ -892,6 +939,14 @@ async function reconcileLoadedConcreteSession(
       );
       break;
     case "capture-failed":
+      if (execution.failure.kind === "cancelled") {
+        runtime.notify(
+          context,
+          runtime.i18n.t("captureCancelledProtected"),
+          "info",
+        );
+        break;
+      }
       runtime.notify(
         context,
         runtime.i18n.t("restoreFailed", {

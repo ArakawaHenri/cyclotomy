@@ -7,6 +7,7 @@ import {
   type CaptureDeps,
   type CaptureFailure,
   type CaptureSuccess,
+  type CaptureOperationOptions,
   type MissingNodeStateIntent,
 } from "./capture.ts";
 import type { ResolvedNodeState } from "./resolve.ts";
@@ -142,15 +143,17 @@ export class CheckpointService {
   /** Scan and publish the service's current workspace policy. */
   prepareCurrent(
     view: CheckpointSessionView,
+    options: CaptureOperationOptions = {},
   ): Promise<Result<CaptureSuccess, CaptureFailure>> {
-    return prepareNodeState(this.#captureDeps(), view.cwd);
+    return prepareNodeState(this.#captureDeps(), view.cwd, options);
   }
 
   /** Publish an already authenticated workspace observation without metadata. */
   prepareObserved(
     snapshot: WorkspaceSnapshot,
+    options: CaptureOperationOptions = {},
   ): Promise<Result<CaptureSuccess, CaptureFailure>> {
-    return prepareObservedNodeState(this.#captureDeps(), snapshot);
+    return prepareObservedNodeState(this.#captureDeps(), snapshot, options);
   }
 
   /** Commit one prepared tree at an authenticated active-path coordinate. */

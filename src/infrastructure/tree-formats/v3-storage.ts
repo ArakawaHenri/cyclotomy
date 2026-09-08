@@ -1,3 +1,4 @@
+import { compareUtf8 } from "../utf8-order.ts";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 
@@ -194,10 +195,6 @@ function structuralByteBudget(limits: TreeManifestLimits): number {
     limits.maxManifestBytes * TREE_V3_STRUCTURAL_BUDGET_MULTIPLIER +
     TREE_V3_STRUCTURAL_BUDGET_FIXED_BYTES
   );
-}
-
-function compareKeys(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function isSafeNonnegativeInteger(value: unknown): value is number {
@@ -772,7 +769,7 @@ function parseScopeSourceChildren(
   });
   for (let index = 1; index < children.length; index += 1) {
     if (
-      compareKeys(children[index - 1]!.highKey, children[index]!.highKey) >= 0
+      compareUtf8(children[index - 1]!.highKey, children[index]!.highKey) >= 0
     ) {
       return integrity(
         "tree v3 scope-source child high keys are not strictly byte-sorted",
@@ -812,7 +809,7 @@ function parseScopeSourceNode(content: Uint8Array): V3ScopeSourceNodeDocument {
       parseGitignoreReference(source, `Git ignore source ${index}`),
     );
     for (let index = 1; index < sources.length; index += 1) {
-      if (compareKeys(sources[index - 1]!.path, sources[index]!.path) >= 0) {
+      if (compareUtf8(sources[index - 1]!.path, sources[index]!.path) >= 0) {
         return integrity(
           "tree v3 scope-source leaf keys are not strictly byte-sorted",
         );
@@ -1030,7 +1027,7 @@ async function readScope(
   }
   for (let index = 1; index < references.length; index += 1) {
     if (
-      compareKeys(references[index - 1]!.path, references[index]!.path) >= 0
+      compareUtf8(references[index - 1]!.path, references[index]!.path) >= 0
     ) {
       return integrity(
         "tree v3 scope-source keys are not strictly byte-sorted",
@@ -1151,7 +1148,7 @@ function parseLeafEntries(value: unknown): readonly V3LeafEntry[] {
       : parseSymlinkLeaf(record);
   });
   for (let index = 1; index < entries.length; index += 1) {
-    if (compareKeys(entries[index - 1]!.path, entries[index]!.path) >= 0) {
+    if (compareUtf8(entries[index - 1]!.path, entries[index]!.path) >= 0) {
       return integrity("tree v3 leaf keys are not strictly byte-sorted");
     }
   }
@@ -1187,7 +1184,7 @@ function parseChildren(value: unknown): readonly V3ChildReference[] {
   });
   for (let index = 1; index < children.length; index += 1) {
     if (
-      compareKeys(children[index - 1]!.highKey, children[index]!.highKey) >= 0
+      compareUtf8(children[index - 1]!.highKey, children[index]!.highKey) >= 0
     ) {
       return integrity("tree v3 child high keys are not strictly byte-sorted");
     }

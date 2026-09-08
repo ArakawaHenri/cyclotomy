@@ -110,11 +110,13 @@ async function dataPack(text: string): Promise<EncodedPack> {
 
 async function fileHandlePrototype(root: string): Promise<{
   readonly stat: FileHandle["stat"];
+  readonly read: FileHandle["read"];
 }> {
   const path = join(root, `file-handle-probe-${randomUUID()}`);
   const probe = await open(path, "w");
   const prototype = Object.getPrototypeOf(probe) as {
     readonly stat: FileHandle["stat"];
+    readonly read: FileHandle["read"];
   };
   await probe.close();
   await unlink(path);
@@ -151,6 +153,131 @@ afterEach(async () => {
 });
 
 describe("pack catalog", () => {
+  it("appends a small pack without reading unrelated historical payloads", async () => {
+    const layout = await createLayout();
+    const catalog = new PackCatalog(layout);
+    const previous = await dataPack("h".repeat(256 * 1024));
+    const fresh = await dataPack("new independent object");
+    await withAuthority(layout, (authority) =>
+      catalog.publishPack(previous, authority),
+    );
+    const reads = vi.spyOn(await fileHandlePrototype(layout.root), "read");
+    await withAuthority(layout, (authority) =>
+      catalog.beginPublication(authority).publishPack(fresh),
+    );
+    const results = await Promise.all(
+      reads.mock.results.map(({ value }) => value),
+    );
+    const bytesRead = results.reduce(
+      (sum, result) => sum + result.bytesRead,
+      0,
+    );
+    expect(bytesRead).toBeLessThan(previous.bytes.byteLength / 8);
+  });
+
+  it("appends beside damaged payloads without authorizing their reuse", async () => {
+    const layout = await createLayout();
+    const catalog = new PackCatalog(layout);
+    const previous = await dataPack("historical object ".repeat(100));
+    const fresh = await dataPack("new independent object");
+    await withAuthority(layout, (authority) =>
+      catalog.publishPack(previous, authority),
+    );
+    const entry = previous.pack.entries[0]!;
+    const handle = await open(
+      nativePackPath(layout, previous.pack.packId),
+      "r+",
+    );
+    await handle.write(
+      Buffer.from([0xff]),
+      0,
+      1,
+      entry.offset + entry.length - 1,
+    );
+    await handle.close();
+
+    await withAuthority(layout, async (authority) => {
+      const publication = catalog.beginPublication(authority);
+      const published = await publication.publishPack(fresh);
+      expect(published.disposition).toBe("published");
+      await expect(publication.publishPack(previous)).rejects.toMatchObject({
+        code: "pack-integrity",
+      });
+    });
+    const reopened = await catalog.openPackForRead(previous.pack.packId);
+    expect(reopened).toBeDefined();
+    try {
+      await expect(reopened!.readVerified(entry)).rejects.toBeDefined();
+    } finally {
+      await reopened!.close();
+    }
+    await expect(catalog.inventory()).rejects.toMatchObject({
+      code: "pack-integrity",
+    });
+  });
+
+  it("rejects an unreadable historical index during additive publication", async () => {
+    const layout = await createLayout();
+    const catalog = new PackCatalog(layout);
+    const previous = await dataPack("historical index");
+    await withAuthority(layout, (authority) =>
+      catalog.publishPack(previous, authority),
+    );
+    const handle = await open(
+      nativePackPath(layout, previous.pack.packId),
+      "r+",
+    );
+    await handle.write(Buffer.from([0xff]), 0, 1, 0);
+    await handle.close();
+    const fresh = await dataPack("new independent object");
+    await expect(
+      withAuthority(layout, (authority) =>
+        catalog.beginPublication(authority).publishPack(fresh),
+      ),
+    ).rejects.toMatchObject({ code: "pack-integrity" });
+    await expect(
+      readFile(nativePackPath(layout, fresh.pack.packId)),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.each(["packs", "bytes", "entries"] as const)(
+    "counts damaged historical payloads toward publication %s limits",
+    async (limit) => {
+      const layout = await createLayout();
+      const previous = await dataPack("historical capacity ".repeat(100));
+      await withAuthority(layout, (authority) =>
+        new PackCatalog(layout).publishPack(previous, authority),
+      );
+      const entry = previous.pack.entries[0]!;
+      const handle = await open(
+        nativePackPath(layout, previous.pack.packId),
+        "r+",
+      );
+      await handle.write(
+        Buffer.from([0xff]),
+        0,
+        1,
+        entry.offset + entry.length - 1,
+      );
+      await handle.close();
+      const catalog = new PackCatalog(layout, {
+        ...(limit === "packs" ? { maxPacks: 1 } : {}),
+        ...(limit === "bytes"
+          ? { maxTotalPackBytes: previous.bytes.byteLength }
+          : {}),
+        ...(limit === "entries" ? { maxIndexEntries: 1 } : {}),
+      });
+      const fresh = await dataPack("new independent object");
+      await expect(
+        withAuthority(layout, (authority) =>
+          catalog.beginPublication(authority).publishPack(fresh),
+        ),
+      ).rejects.toMatchObject({ code: "limit-exceeded" });
+    },
+  );
+
   it("checks mutation authority before pack or MIDX staging writes", async () => {
     const layout = await createLayout();
     const catalog = new PackCatalog(layout);
@@ -233,11 +360,9 @@ describe("pack catalog", () => {
     );
     expect(published.disposition).toBe("published");
     expect(published.view.packId).toBe(encoded.pack.packId);
-    expect(Object.keys(published).sort()).toEqual([
-      "disposition",
-      "identity",
-      "view",
-    ]);
+    expect(
+      await catalog.packReceiptStillCurrent(published.identityReceipt),
+    ).toBe(true);
     const reopen = vi.spyOn(catalog, "openPack");
     const existing = await withAuthority(layout, (authority) =>
       catalog.publishPack(encoded, authority),

@@ -22,9 +22,11 @@ executable on `PATH`.
 pi install npm:cyclotomy
 ```
 
-Cyclotomy starts automatically in saved Pi sessions unless
-`CYCLOTOMY_ENABLED=0` is set. `--no-session` and in-memory sessions are not
-supported.
+Cyclotomy starts automatically in saved Pi sessions by default.
+`/cyclotomy disable` turns off this global startup default;
+`/cyclotomy enable` turns it back on. `CYCLOTOMY_ENABLED=0` or `1` overrides
+the global default for a Pi instance. `--no-session` and in-memory sessions
+are not supported.
 
 ```bash
 pi update npm:cyclotomy
@@ -37,14 +39,23 @@ pi remove npm:cyclotomy
 
 ## Commands
 
-| Command                     | Purpose                                                                                                    |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `/tree`                     | Move through Pi's session tree. If the destination differs, Cyclotomy previews it and asks how to proceed. |
-| `/drift`                    | Check what running `/restore` right now would change. Read-only.                                           |
-| `/restore`                  | Reapply the current node's exact or inherited checkpoint.                                                  |
-| `/cyclotomy [stop\|resume]` | Show status, stop Cyclotomy, or resume it.                                                                 |
+| Command                         | Purpose                                                                                                    |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `/tree`                         | Move through Pi's session tree. If the destination differs, Cyclotomy previews it and asks how to proceed. |
+| `/drift`                        | Check what running `/restore` right now would change. Read-only.                                           |
+| `/restore`                      | Reapply the current node's exact or inherited checkpoint.                                                  |
+| `/cyclotomy`                    | Show the current instance’s status.                                                                        |
+| `/cyclotomy pause` / `resume`   | Pause or resume Cyclotomy in the current Pi instance.                                                      |
+| `/cyclotomy enable` / `disable` | Persist the global startup default for new Pi instances.                                                   |
 
 `/tree` belongs to Pi.
+
+`pause` and `resume` do not change global settings or affect other Pi
+instances. `enable` and `disable` update the global default without changing
+current participation. New instances and extension reloads read that default;
+`CYCLOTOMY_ENABLED` takes precedence (`0` disables startup, any other set value
+enables it). An explicit `resume` starts Cyclotomy in the current instance
+even when its startup default is disabled.
 
 Before a restore changes files, Cyclotomy shows the same preview:
 
@@ -67,6 +78,10 @@ session.
 Cyclotomy records a checkpoint only after reading a complete, stable workspace.
 If it cannot do that, it stops and reports the problem instead of saving a
 partial checkpoint.
+
+While saving a checkpoint, the TUI shows scanning, writing, and verification
+progress with file and byte counts. Press Escape to cancel the capture; an
+unfinished capture never replaces a saved checkpoint.
 
 When `/tree` moves to another point, Cyclotomy checks the destination and asks
 how to proceed if files differ. If the session tree or workspace changes while
@@ -147,6 +162,7 @@ Configuration is optional. Global settings live at
 
 ```json
 {
+  "enabled": true,
   "maxFileMiB": 50,
   "maxSnapshotMiB": 2048,
   "maxEntries": 100000,
@@ -163,6 +179,7 @@ Configuration is optional. Global settings live at
 
 | Setting             | Scope            |                 Default | Meaning                                                                                                                             |
 | ------------------- | ---------------- | ----------------------: | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`           | global           |                  `true` | Whether Cyclotomy starts automatically. Set with `/cyclotomy enable` or `/cyclotomy disable`; `CYCLOTOMY_ENABLED` overrides it.     |
 | `storageDir`        | global           | `<agent-dir>/cyclotomy` | Parent of the hashed workspace stores. Relative paths resolve from the Pi agent directory; `~` and `~/...` from the home directory. |
 | `maxFileMiB`        | global/workspace |                    `50` | Maximum size of one regular file.                                                                                                   |
 | `maxSnapshotMiB`    | global/workspace |                  `2048` | Maximum total managed file bytes in one checkpoint.                                                                                 |
@@ -175,13 +192,13 @@ Configuration is optional. Global settings live at
 | `locale`            | global           |                  `auto` | `auto`, `en`, or `zh-CN`.                                                                                                           |
 
 Per-workspace overrides live at
-`<storageDir>/<sha256(realpath(workspace))>/settings.json`; `storageDir` and
+`<storageDir>/<sha256(realpath(workspace))>/settings.json`; `enabled`, `storageDir`, and
 `locale` are global-only.
 
 Settings files are JSON. Unknown properties are ignored. An invalid recognized
 setting stops Cyclotomy and reports the problem. Fix it, then run
-`/cyclotomy resume`. To apply settings while Cyclotomy is running, stop and
-resume it.
+`/cyclotomy resume`. To apply other settings while Cyclotomy is running, use
+`/cyclotomy pause` followed by `/cyclotomy resume`.
 
 Checkpoint limits apply when saving a new checkpoint or importing history.
 Lowering them does not make an existing checkpoint unreadable or unrestorable.

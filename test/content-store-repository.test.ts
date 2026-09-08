@@ -27,6 +27,7 @@ import {
 } from "../src/infrastructure/content-store/chunk-recipe.ts";
 import { chunkFastCdcV1 } from "../src/infrastructure/content-store/fastcdc.ts";
 import {
+  CatalogPackHandle,
   PackCatalog,
   PackCatalogError,
 } from "../src/infrastructure/content-store/pack-catalog.ts";
@@ -45,6 +46,7 @@ import {
 } from "../src/infrastructure/content-store/repository.ts";
 import {
   chunkedContentRecipeId,
+  createContentRecord,
   type ChunkedContentRecord,
 } from "../src/infrastructure/content-store/representation.ts";
 import type { RecordEnvelope } from "../src/infrastructure/content-store/record.ts";
@@ -186,6 +188,146 @@ afterEach(async () => {
 });
 
 describe("content repository", () => {
+  it.each(["raw", "zstd-v1"] as const)(
+    "reads a packed %s content frame once and gives each reader independent bytes",
+    async (encoding) => {
+      const { layout, repository } = await setupRepository();
+      const bytes =
+        encoding === "raw"
+          ? Buffer.from("independent raw content")
+          : Buffer.from("independent compressed content".repeat(100));
+      const record = await createContentRecord(bytes);
+      expect(record.encoding).toBe(encoding);
+      const packed = await encodePack({ packClass: "data", records: [record] });
+      await publishPackFile(layout, packed);
+      await publishCurrentMultiPackIndex(layout);
+      const entry = packed.pack.entries[0]!;
+      const reads = vi.spyOn(await fileHandlePrototype(layout.root), "read");
+      const frameReads = () =>
+        reads.mock.calls.filter(
+          ([, , length, position]: readonly unknown[]) =>
+            position === entry.offset && length === entry.length,
+        ).length;
+
+      await repository.streamContent(
+        record.logicalId,
+        bytes.byteLength,
+        async (chunk) => {
+          expect(Buffer.from(chunk)).toEqual(bytes);
+          chunk.fill(0);
+        },
+      );
+      expect(frameReads()).toBe(1);
+      expect(
+        await collect(repository, record.logicalId, bytes.byteLength),
+      ).toEqual(bytes);
+      expect(frameReads()).toBe(2);
+
+      const path = nativePackPath(layout, packed.pack.packId);
+      const damageOffset = entry.offset + entry.length - 1;
+      const handle = await open(path, "r+");
+      await handle.write(
+        Buffer.from([packed.bytes[damageOffset]! ^ 0xff]),
+        0,
+        1,
+        damageOffset,
+      );
+      await handle.close();
+      const sink = vi.fn(async () => undefined);
+      await expect(
+        repository.streamContent(record.logicalId, bytes.byteLength, sink),
+      ).rejects.toMatchObject({ code: "object-integrity" });
+      expect(sink).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reads each packed recipe frame once and authenticates it before emitting content", async () => {
+    const { layout, repository } = await setupRepository();
+    const bytes = deterministicContent(300 * 1024);
+    const contentId = contentIdFromBytes(bytes);
+    await withAuthority(layout, async (authority) => {
+      const publication = repository.beginPublication(authority);
+      try {
+        await publication.ensureRawContent(contentId, bytes);
+        await publication.flush();
+      } finally {
+        await publication.close();
+      }
+    });
+    await publishCurrentMultiPackIndex(layout);
+    const inventory = await new PackCatalog(layout).inventory();
+    const recipes = inventory.packs.flatMap((pack) =>
+      pack.view.entries
+        .filter((entry) => entry.kind === "recipe")
+        .map((entry) => ({ path: pack.path, entry })),
+    );
+    expect(recipes.length).toBeGreaterThan(0);
+    const reads = vi.spyOn(await fileHandlePrototype(layout.root), "read");
+    expect(await collect(repository, contentId, bytes.byteLength)).toEqual(
+      bytes,
+    );
+    for (const { entry } of recipes)
+      expect(
+        reads.mock.calls.filter(
+          ([, , length, position]: readonly unknown[]) =>
+            position === entry.offset && length === entry.length,
+        ),
+      ).toHaveLength(1);
+
+    const { path, entry } = recipes[0]!;
+    const damageOffset = entry.offset + entry.length - 1;
+    const packedBytes = await readFile(path);
+    const handle = await open(path, "r+");
+    await handle.write(
+      Buffer.from([packedBytes[damageOffset]! ^ 0xff]),
+      0,
+      1,
+      damageOffset,
+    );
+    await handle.close();
+    const sink = vi.fn(async () => undefined);
+    await expect(
+      repository.streamContent(contentId, bytes.byteLength, sink),
+    ).rejects.toMatchObject({ code: "object-integrity" });
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it.each(["before-replay", "during-replay"] as const)(
+    "rejects a packed content identity change %s",
+    async (stage) => {
+      const { layout, repository } = await setupRepository();
+      const bytes = Buffer.from("bound packed content".repeat(100));
+      const record = await createContentRecord(bytes);
+      const packed = await encodePack({ packClass: "data", records: [record] });
+      await publishPackFile(layout, packed);
+      await publishCurrentMultiPackIndex(layout);
+      const path = nativePackPath(layout, packed.pack.packId);
+      const changeIdentity = async () => {
+        await unlink(path);
+        await writeFile(path, packed.bytes);
+      };
+      if (stage === "before-replay") {
+        const readEnvelope = CatalogPackHandle.prototype.readEnvelope;
+        vi.spyOn(
+          CatalogPackHandle.prototype,
+          "readEnvelope",
+        ).mockImplementation(async function (this: CatalogPackHandle, entry) {
+          const envelope = await readEnvelope.call(this, entry);
+          await changeIdentity();
+          return envelope;
+        });
+      }
+      const sink = vi.fn(async (chunk: Uint8Array) => {
+        expect(Buffer.from(chunk)).toEqual(bytes);
+        if (stage === "during-replay") await changeIdentity();
+      });
+      await expect(
+        repository.streamContent(record.logicalId, bytes.byteLength, sink),
+      ).rejects.toMatchObject({ code: "object-integrity" });
+      expect(sink).toHaveBeenCalledTimes(stage === "before-replay" ? 0 : 1);
+    },
+  );
+
   it("checks materialization authority before its first loose write", async () => {
     const { layout, repository } = await setupRepository();
     const bytes = Buffer.from("legacy materialization authority", "utf8");

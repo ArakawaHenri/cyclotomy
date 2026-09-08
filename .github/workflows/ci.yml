@@ -80,7 +80,7 @@ jobs:
 
   minimum-pi:
     if: github.event_name != 'schedule'
-    name: Minimum Pi 0.84.0 compatibility
+    name: Minimum Pi and TUI 0.84.0 compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -97,11 +97,13 @@ jobs:
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
 
-      - name: Replace the host with the minimum supported Pi
-        run: npm install --no-save --package-lock=false --ignore-scripts @earendil-works/pi-coding-agent@0.84.0
+      - name: Replace the host with the minimum supported Pi and TUI
+        run: npm install --no-save --package-lock=false --ignore-scripts @earendil-works/pi-coding-agent@0.84.0 @earendil-works/pi-tui@0.84.0
 
-      - name: Verify the minimum host version
-        run: test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "0.84.0"
+      - name: Verify the minimum host versions
+        run: |
+          test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "0.84.0"
+          test "$(node -p "require('./node_modules/@earendil-works/pi-tui/package.json').version")" = "0.84.0"
 
       - name: Type-check against the minimum host
         run: npm run check

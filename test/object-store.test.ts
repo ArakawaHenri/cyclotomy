@@ -56,6 +56,7 @@ import {
 } from "../src/infrastructure/workspace-store.ts";
 import { withWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import {
+  importTestTrees,
   publishTestBlob,
   publishTestBlobInPublication,
   publishTestTree,
@@ -1562,7 +1563,8 @@ describe("cross-store tree import", () => {
       );
       const validated: string[] = [];
 
-      await target.importTreesFrom(
+      await importTestTrees(
+        target,
         source,
         [firstTree, secondTree, firstTree],
         importAdmission({
@@ -1623,7 +1625,8 @@ describe("cross-store tree import", () => {
 
       await expect(limitedSource.readTree(treeOid)).resolves.toBeDefined();
       await expect(
-        target.importTreesFrom(
+        importTestTrees(
+          target,
           limitedSource,
           [treeOid],
           DEFAULT_IMPORT_ADMISSION,
@@ -1663,7 +1666,8 @@ describe("cross-store tree import", () => {
         }),
       );
 
-      await target.importTreesFrom(
+      await importTestTrees(
+        target,
         source,
         [treeOid],
         importAdmission({
@@ -1753,9 +1757,12 @@ describe("cross-store tree import", () => {
         return originalSync.call(this);
       });
 
-      const rejection = await target
-        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
-        .catch((error: unknown) => error);
+      const rejection = await importTestTrees(
+        target,
+        source,
+        [treeOid],
+        DEFAULT_IMPORT_ADMISSION,
+      ).catch((error: unknown) => error);
 
       expect(rejection).toBeInstanceOf(TreeImportSourceError);
       expect(rejection).not.toBeInstanceOf(TreeImportAdmissionError);
@@ -1804,9 +1811,12 @@ describe("cross-store tree import", () => {
       await rm(targetContentRoot, { recursive: true });
       await writeFile(targetContentRoot, "blocks target publication");
 
-      const rejection = await target
-        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
-        .catch((error: unknown) => error);
+      const rejection = await importTestTrees(
+        target,
+        source,
+        [treeOid],
+        DEFAULT_IMPORT_ADMISSION,
+      ).catch((error: unknown) => error);
 
       expect(rejection).toMatchObject({ code: "storage-failure" });
       expect(rejection).not.toBeInstanceOf(TreeImportAdmissionError);
@@ -1824,7 +1834,6 @@ describe("cross-store tree import", () => {
     const targetRoot = await mkdtemp(
       join(tmpdir(), "cyclotomy-import-target-"),
     );
-    let syncSpy: ReturnType<typeof vi.spyOn> | undefined;
     const originalHasInstance = Object.getOwnPropertyDescriptor(
       TreeImportSourceError,
       Symbol.hasInstance,
@@ -1835,8 +1844,8 @@ describe("cross-store tree import", () => {
       const source = await openObjectStore(sourceRoot);
       const target = await openObjectStore(targetRoot);
       const { treeOid } = await publishTwoBlobTree(source);
-      const prototype = await fileHandlePrototype();
-      const originalSync = prototype.sync;
+      const repository = nativeObjectStoreRepository(target, "test");
+      const begin = repository.beginPublication.bind(repository);
       const sourceFailure = new TreeImportSourceError(
         new Error("source lane failed first"),
       );
@@ -1871,32 +1880,31 @@ describe("cross-store tree import", () => {
         },
       });
       hasInstanceOverridden = true;
-      let regularFileSyncs = 0;
-      syncSpy = vi.spyOn(prototype, "sync").mockImplementation(async function (
-        this: FileHandle,
-      ) {
-        if (!(await this.stat()).isFile()) {
-          return originalSync.call(this);
-        }
-        regularFileSyncs += 1;
-        if (regularFileSyncs === 1) {
-          events.push("source-thrown");
-          throw sourceFailure;
-        }
-        if (regularFileSyncs === 2) {
-          await sourceClassified;
-          // Let runPool retain the classified source failure before the
-          // already-active second lane reports the target failure.
-          await new Promise<void>((resolve) => setImmediate(resolve));
-          events.push("target-thrown");
-          throw targetFailure;
-        }
-        return originalSync.call(this);
+      vi.spyOn(repository, "beginPublication").mockImplementation((...args) => {
+        const publication = begin(...args);
+        let lanes = 0;
+        vi.spyOn(publication, "publishContentFromStream").mockImplementation(
+          async () => {
+            lanes += 1;
+            if (lanes === 1) {
+              events.push("source-thrown");
+              throw sourceFailure;
+            }
+            await sourceClassified;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            events.push("target-thrown");
+            throw targetFailure;
+          },
+        );
+        return publication;
       });
 
-      const rejection = await target
-        .importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION)
-        .catch((error: unknown) => error);
+      const rejection = await importTestTrees(
+        target,
+        source,
+        [treeOid],
+        DEFAULT_IMPORT_ADMISSION,
+      ).catch((error: unknown) => error);
 
       expect(events).toEqual([
         "source-thrown",
@@ -1907,7 +1915,7 @@ describe("cross-store tree import", () => {
       expect(rejection).not.toBeInstanceOf(TreeImportSourceError);
     } finally {
       clearTimeout(sourceClassifiedTimer);
-      syncSpy?.mockRestore();
+      vi.restoreAllMocks();
       if (hasInstanceOverridden) {
         if (originalHasInstance === undefined) {
           Reflect.deleteProperty(TreeImportSourceError, Symbol.hasInstance);
@@ -1960,7 +1968,7 @@ describe("cross-store tree import", () => {
       await truncate(contentRecordPath(sourceRoot, corruptBlobOid), 1);
 
       await expect(
-        target.importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION),
+        importTestTrees(target, source, [treeOid], DEFAULT_IMPORT_ADMISSION),
       ).rejects.toMatchObject({ code: "object-integrity" });
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
     } finally {
@@ -2000,7 +2008,7 @@ describe("cross-store tree import", () => {
         completeScope,
       );
       await expect(
-        target.importTreesFrom(source, [fileTree], DEFAULT_IMPORT_ADMISSION),
+        importTestTrees(target, source, [fileTree], DEFAULT_IMPORT_ADMISSION),
       ).rejects.toThrow(/target file limit/u);
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
 
@@ -2032,7 +2040,8 @@ describe("cross-store tree import", () => {
         maxFileBytes: 16,
       });
       await expect(
-        snapshotTarget.importTreesFrom(
+        importTestTrees(
+          snapshotTarget,
           source,
           [snapshotTree],
           importAdmission({ maxSnapshotBytes: 20 }),
@@ -2083,7 +2092,7 @@ describe("cross-store tree import", () => {
       );
 
       await expect(
-        target.importTreesFrom(source, [treeOid], DEFAULT_IMPORT_ADMISSION),
+        importTestTrees(target, source, [treeOid], DEFAULT_IMPORT_ADMISSION),
       ).rejects.toThrow(/target file limit/u);
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
     } finally {
@@ -2121,7 +2130,8 @@ describe("cross-store tree import", () => {
       );
 
       await expect(
-        target.importTreesFrom(
+        importTestTrees(
+          target,
           source,
           [validTree, invalidTree],
           DEFAULT_IMPORT_ADMISSION,
@@ -2172,34 +2182,32 @@ describe("cross-store tree import", () => {
       );
 
       const operationalFailure = new Error("policy evaluator unavailable");
-      const operational = await target
-        .importTreesFrom(
-          source,
-          [firstTree, rejectedTree],
-          importAdmission({
-            validateImportedTree: async () => {
-              throw operationalFailure;
-            },
-          }),
-        )
-        .catch((error: unknown) => error);
+      const operational = await importTestTrees(
+        target,
+        source,
+        [firstTree, rejectedTree],
+        importAdmission({
+          validateImportedTree: async () => {
+            throw operationalFailure;
+          },
+        }),
+      ).catch((error: unknown) => error);
       expect(operational).toBe(operationalFailure);
       expect(operational).not.toBeInstanceOf(TreeImportAdmissionError);
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
 
-      const rejection = await target
-        .importTreesFrom(
-          source,
-          [firstTree, rejectedTree],
-          importAdmission({
-            validateImportedTree: async (treeOid) => {
-              return treeOid === rejectedTree
-                ? { kind: "rejected", cause: new Error("policy rejected") }
-                : { kind: "accepted" };
-            },
-          }),
-        )
-        .catch((error: unknown) => error);
+      const rejection = await importTestTrees(
+        target,
+        source,
+        [firstTree, rejectedTree],
+        importAdmission({
+          validateImportedTree: async (treeOid) => {
+            return treeOid === rejectedTree
+              ? { kind: "rejected", cause: new Error("policy rejected") }
+              : { kind: "accepted" };
+          },
+        }),
+      ).catch((error: unknown) => error);
       expect(rejection).toBeInstanceOf(TreeImportAdmissionError);
       expect(rejection).toMatchObject({ code: "storage-failure" });
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
@@ -2207,18 +2215,17 @@ describe("cross-store tree import", () => {
       const sourceShapedCause = new TreeImportSourceError(
         new Error("policy diagnostic resembles a source failure"),
       );
-      const taggedRejection = await target
-        .importTreesFrom(
-          source,
-          [rejectedTree],
-          importAdmission({
-            validateImportedTree: async () => ({
-              kind: "rejected",
-              cause: sourceShapedCause,
-            }),
+      const taggedRejection = await importTestTrees(
+        target,
+        source,
+        [rejectedTree],
+        importAdmission({
+          validateImportedTree: async () => ({
+            kind: "rejected",
+            cause: sourceShapedCause,
           }),
-        )
-        .catch((error: unknown) => error);
+        }),
+      ).catch((error: unknown) => error);
       expect(taggedRejection).toBeInstanceOf(TreeImportAdmissionError);
       expect(taggedRejection).not.toBeInstanceOf(TreeImportSourceError);
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
@@ -2240,31 +2247,30 @@ describe("cross-store tree import", () => {
       const target = await openObjectStore(targetRoot);
       const treeOid = await publishTestTree(source, [], completeScope);
       const rejectionCause = new Error("policy rejected imported tree");
-      const cleanupFailure = new Error("injected target scope close failure");
+      const cleanupFailure = new Error("injected source scope close failure");
       const targetRepository = nativeObjectStoreRepository(target, "test");
       const sourceRepository = nativeObjectStoreRepository(source, "test");
-      const closeTargetScope =
-        targetRepository.closeResolutionScope.bind(targetRepository);
-      const targetClose = vi
-        .spyOn(targetRepository, "closeResolutionScope")
+      const closeSourceScope =
+        sourceRepository.closeResolutionScope.bind(sourceRepository);
+      const sourceClose = vi
+        .spyOn(sourceRepository, "closeResolutionScope")
         .mockImplementationOnce(async (scope) => {
-          await closeTargetScope(scope);
+          await closeSourceScope(scope);
           throw cleanupFailure;
         });
-      const sourceClose = vi.spyOn(sourceRepository, "closeResolutionScope");
+      const targetClose = vi.spyOn(targetRepository, "closeResolutionScope");
 
-      const failure = await target
-        .importTreesFrom(
-          source,
-          [treeOid],
-          importAdmission({
-            validateImportedTree: async () => ({
-              kind: "rejected",
-              cause: rejectionCause,
-            }),
+      const failure = await importTestTrees(
+        target,
+        source,
+        [treeOid],
+        importAdmission({
+          validateImportedTree: async () => ({
+            kind: "rejected",
+            cause: rejectionCause,
           }),
-        )
-        .catch((error: unknown) => error);
+        }),
+      ).catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(TreeImportAdmissionError);
       expect(failure).not.toBeInstanceOf(AggregateError);
@@ -2277,7 +2283,7 @@ describe("cross-store tree import", () => {
       expect(retained.errors).toHaveLength(2);
       expect(retained.errors[0]).toBeInstanceOf(TreeImportAdmissionError);
       expect(retained.errors[1]).toBe(cleanupFailure);
-      expect(targetClose).toHaveBeenCalledTimes(1);
+      expect(targetClose).not.toHaveBeenCalled();
       expect(sourceClose).toHaveBeenCalledTimes(1);
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
     } finally {
@@ -2330,7 +2336,8 @@ describe("cross-store tree import", () => {
       );
 
       await expect(
-        target.importTreesFrom(
+        importTestTrees(
+          target,
           source,
           [firstTree, oversizedTree],
           importAdmission({
@@ -2382,7 +2389,8 @@ describe("cross-store tree import", () => {
       );
 
       await expect(
-        target.importTreesFrom(
+        importTestTrees(
+          target,
           source,
           [treeOid],
           importAdmission({ maxSnapshotBytes: 16 }),
@@ -2391,7 +2399,8 @@ describe("cross-store tree import", () => {
       expect(await publishedObjectPaths(targetRoot)).toEqual([]);
 
       await expect(
-        target.importTreesFrom(
+        importTestTrees(
+          target,
           source,
           [treeOid],
           importAdmission({ maxSnapshotBytes: 17 }),
@@ -2437,7 +2446,7 @@ describe("targeted blob verification", () => {
     });
   });
 
-  it("authenticates each shared pack once per tree read, publication, and import side", async () => {
+  it("reuses pack handles across tree reads, publication, and import", async () => {
     const contents = [
       Buffer.from("packed alpha\n", "utf8"),
       Buffer.from("packed beta\n", "utf8"),
@@ -2587,7 +2596,7 @@ describe("targeted blob verification", () => {
       );
 
       openPack.mockClear();
-      await target.importTreesFrom(store, [treeOid], DEFAULT_IMPORT_ADMISSION);
+      await importTestTrees(target, store, [treeOid], DEFAULT_IMPORT_ADMISSION);
       expect(
         openPack.mock.calls.filter(
           ([packId]) => packId === dataPack.pack.packId,
@@ -2597,7 +2606,7 @@ describe("targeted blob verification", () => {
         openPack.mock.calls.filter(
           ([packId]) => packId === metadataPack.pack.packId,
         ),
-      ).toHaveLength(2);
+      ).toHaveLength(3);
     } finally {
       await rm(targetRoot, { recursive: true, force: true });
     }

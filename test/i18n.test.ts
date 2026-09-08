@@ -24,8 +24,12 @@ describe("Cyclotomy Pi localization", () => {
     expect(zh.t("restoreUsage")).toBe("用法：/restore");
     expect(en.t("driftUsage")).toBe("Usage: /drift");
     expect(zh.t("driftUsage")).toBe("用法：/drift");
-    expect(en.t("cyclotomyUsage")).toBe("Usage: /cyclotomy [stop|resume]");
-    expect(zh.t("cyclotomyUsage")).toBe("用法：/cyclotomy [stop|resume]");
+    expect(en.t("cyclotomyUsage")).toBe(
+      "Usage: /cyclotomy [pause|resume|enable|disable]",
+    );
+    expect(zh.t("cyclotomyUsage")).toBe(
+      "用法：/cyclotomy [pause|resume|enable|disable]",
+    );
     expect(en.t("restoreCommandDescription")).toContain("checkpoint");
     expect(zh.t("driftCommandDescription")).toContain("/restore");
     expect(en.t("cyclotomyCommandDescription")).toContain("resume");

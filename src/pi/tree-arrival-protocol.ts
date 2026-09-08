@@ -9,7 +9,6 @@ import {
   workspaceSnapshotAsManifest,
 } from "../infrastructure/restore-plan.ts";
 import { sameGitOracleVersion } from "../infrastructure/git-replay-risk.ts";
-import type { WorkspaceSnapshot } from "../infrastructure/workspace-scan.ts";
 import { checkpointInitializationDispositionConflict } from "./post-mutation.ts";
 import { settleCheckpointInitialization } from "./checkpoint-initialization-protocol.ts";
 import type { ArrivalAttempt } from "./checkpoint-admission.ts";
@@ -236,20 +235,13 @@ export async function executeTreeArrivalInWorkspaceLock(
       return { kind: "target-changed" };
     }
 
-    let targetCurrent: WorkspaceSnapshot;
-    try {
-      // This is deliberately a fresh current-policy observation. Host work
-      // between before_tree and session_tree belongs to the newly arrived,
-      // previously unknown location.
-      targetCurrent = await runtime.scanCurrentWorkspace(expectedView.cwd);
-    } catch (error) {
-      return { kind: "scan-failed", cause: error };
-    }
-    if (targetCurrent.problems.length > 0) {
-      return { kind: "scan-incomplete", problems: targetCurrent.problems };
-    }
-    const preparedTarget =
-      await runtime.checkpoints.prepareObserved(targetCurrent);
+    // Host work after before_tree belongs to the newly arrived, previously
+    // unknown location, so capture it through the current workspace policy.
+    const preparedTarget = await runtime.prepareCurrentCapture(
+      context,
+      expectedView,
+      writeAuthority,
+    );
     if (!preparedTarget.ok) {
       return { kind: "capture-failed", failure: preparedTarget.error };
     }
@@ -358,15 +350,16 @@ export async function executeTreeArrivalInWorkspaceLock(
     return { kind: "target-changed" };
   }
 
-  let restoreCurrent: WorkspaceSnapshot;
-  try {
-    restoreCurrent = await runtime.scanCurrentWorkspaceForScope(
-      expectedView.cwd,
-      previewSnapshot.scope,
-    );
-  } catch (error) {
-    return { kind: "scan-failed", cause: error };
+  const restoreObservation = await runtime.prepareWorkspaceObservation(
+    context,
+    expectedView.cwd,
+    writeAuthority,
+    previewSnapshot.scope,
+  );
+  if (!restoreObservation.ok) {
+    return { kind: "capture-failed", failure: restoreObservation.error };
   }
+  const restoreCurrent = restoreObservation.value;
   if (restoreCurrent.problems.length > 0) {
     return { kind: "scan-incomplete", problems: restoreCurrent.problems };
   }

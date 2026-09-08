@@ -1,6 +1,13 @@
-import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   ABSOLUTE_MAX_TREE_ENTRIES,
@@ -18,6 +25,8 @@ import {
 export type CyclotomyLocale = "auto" | "en" | "zh-CN";
 
 export interface CyclotomyConfig {
+  /** Global default for automatic startup; explicit instance commands override it. */
+  readonly enabled: boolean;
   /** Fixed user-level settings file under Pi's agent directory. */
   readonly globalSettingsPath: string;
   /** Root containing the per-workspace hash directories. */
@@ -57,6 +66,7 @@ export class CyclotomyConfigError extends Error {
 }
 
 interface ConfigOverrides {
+  readonly enabled?: boolean;
   readonly storageDir?: string;
   readonly maxFileBytes?: number;
   readonly maxSnapshotBytes?: number;
@@ -156,6 +166,9 @@ function parseSettings(
   scope: SettingsScope,
 ): ConfigOverrides {
   const root = objectValue(value, settingsPath, "settings");
+  if (scope === "workspace" && Object.hasOwn(root, "enabled")) {
+    configError(settingsPath, "enabled is only allowed in global settings");
+  }
   if (scope === "workspace" && Object.hasOwn(root, "storageDir")) {
     configError(settingsPath, "storageDir is only allowed in global settings");
   }
@@ -164,6 +177,7 @@ function parseSettings(
   }
 
   const parsed: {
+    enabled?: boolean;
     storageDir?: string;
     maxFileBytes?: number;
     maxSnapshotBytes?: number;
@@ -176,6 +190,12 @@ function parseSettings(
     locale?: CyclotomyLocale;
   } = {};
 
+  if (Object.hasOwn(root, "enabled")) {
+    if (typeof root.enabled !== "boolean") {
+      configError(settingsPath, "enabled must be a boolean");
+    }
+    parsed.enabled = root.enabled;
+  }
   if (Object.hasOwn(root, "storageDir")) {
     if (typeof root.storageDir !== "string" || root.storageDir.trim() === "") {
       configError(settingsPath, "storageDir must be a non-empty string");
@@ -259,10 +279,7 @@ function parseSettings(
   return parsed;
 }
 
-function readSettings(
-  settingsPath: string,
-  scope: SettingsScope,
-): ConfigOverrides {
+function readSettings(settingsPath: string): Record<string, unknown> {
   let bytes: Buffer;
   try {
     bytes = readFileSync(settingsPath);
@@ -284,7 +301,7 @@ function readSettings(
   } catch (cause) {
     return configError(settingsPath, "settings file is not valid JSON", cause);
   }
-  return parseSettings(value, settingsPath, scope);
+  return objectValue(value, settingsPath, "settings");
 }
 
 function resolveStorageRoot(
@@ -323,6 +340,7 @@ function applyOverrides(
   storageRootPath = base.storageRootPath,
 ): CyclotomyConfig {
   return {
+    enabled: overrides.enabled ?? base.enabled,
     globalSettingsPath: base.globalSettingsPath,
     storageRootPath,
     scan: {
@@ -352,6 +370,7 @@ function applyOverrides(
 export function defaultCyclotomyConfig(agentDir: string): CyclotomyConfig {
   const settingsRoot = resolve(agentDir, "cyclotomy");
   return {
+    enabled: true,
     globalSettingsPath: join(settingsRoot, SETTINGS_FILE),
     storageRootPath: settingsRoot,
     scan: {
@@ -374,7 +393,11 @@ export function defaultCyclotomyConfig(agentDir: string): CyclotomyConfig {
 export function loadCyclotomyConfig(agentDir: string): CyclotomyConfig {
   const base = defaultCyclotomyConfig(agentDir);
   const settingsPath = base.globalSettingsPath;
-  const overrides = readSettings(settingsPath, "global");
+  const overrides = parseSettings(
+    readSettings(settingsPath),
+    settingsPath,
+    "global",
+  );
   const storageRootPath = resolveStorageRoot(
     agentDir,
     overrides.storageDir,
@@ -389,6 +412,28 @@ export function loadWorkspaceCyclotomyConfig(
   storeRoot: string,
 ): CyclotomyConfig {
   const settingsPath = join(storeRoot, SETTINGS_FILE);
-  const overrides = readSettings(settingsPath, "workspace");
+  const overrides = parseSettings(
+    readSettings(settingsPath),
+    settingsPath,
+    "workspace",
+  );
   return applyOverrides(globalConfig, overrides);
+}
+
+/** Atomically update the global startup default while preserving other settings. */
+export function setCyclotomyEnabled(agentDir: string, enabled: boolean): void {
+  const settingsPath = defaultCyclotomyConfig(agentDir).globalSettingsPath;
+  const settings = { ...readSettings(settingsPath), enabled };
+  mkdirSync(dirname(settingsPath), { recursive: true });
+  const temporary = `${settingsPath}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+      flush: true,
+    });
+    renameSync(temporary, settingsPath);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
