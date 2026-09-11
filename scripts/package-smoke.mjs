@@ -213,19 +213,29 @@ try {
 
   // Load the native dependency from the installed artifact with scripts and
   // peers omitted, and exercise the compiled module's actual lock entry.
+  // A child process lets Windows unmap the native binary before cleanup.
   const nativeStore = join(sandbox, "native-store");
   await mkdir(nativeStore);
-  const installedLock = await import(
-    pathToFileURL(
-      join(installedRoot, "dist", "infrastructure", "workspace-lock.js"),
-    ).href
-  );
-  await installedLock.withWorkspaceLock(
-    nativeStore,
-    "installed package smoke",
-    async (authority) => {
-      installedLock.assertWorkspaceWriteAuthority(authority, nativeStore);
-    },
+  await execFileAsync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `const lock = await import(process.argv[1]);
+       const storeRoot = process.argv[2];
+       await lock.withWorkspaceLock(
+         storeRoot,
+         "installed package smoke",
+         async (authority) => {
+           lock.assertWorkspaceWriteAuthority(authority, storeRoot);
+         },
+       );`,
+      pathToFileURL(
+        join(installedRoot, "dist", "infrastructure", "workspace-lock.js"),
+      ).href,
+      nativeStore,
+    ],
+    { cwd: workspace },
   );
 
   console.log("Package smoke passed: npm tarball installed and loaded by Pi.");
