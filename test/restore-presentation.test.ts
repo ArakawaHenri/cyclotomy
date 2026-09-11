@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
-import { CyclotomyI18n } from "../src/pi/i18n.ts";
+import { CyclotomyI18n } from "../src/presentation/i18n.ts";
 import {
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
@@ -10,7 +10,7 @@ import {
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
 } from "../src/pi/restore-notifications.ts";
-import { formatUiDetail } from "../src/pi/restore-presentation.ts";
+import { formatUiDetail } from "../src/presentation/restore-presentation.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 
 function plan(
@@ -30,6 +30,17 @@ function plan(
 function preview(value: WorkspaceRestorePlan): string {
   return new CyclotomyI18n("en").formatRestorePreview(value);
 }
+
+/**
+ * A presentation-only stub holds no session generation, but the presenters that
+ * report a retired one must still be answered. Nothing here can retire, so the
+ * recognizer always declines.
+ */
+const NO_HISTORY: Pick<CyclotomyRuntime, "historyReset" | "noteHistoryReset"> =
+  {
+    historyReset: undefined,
+    noteHistoryReset: () => false,
+  };
 
 const exactArrival = {
   kind: "protected",
@@ -55,6 +66,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyCheckpointInitializationConflict(runtime, {} as never, {
@@ -79,6 +91,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyCheckpointInitializationConflict(runtime, {} as never, {
@@ -104,6 +117,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyCheckpointInitializationConflict(runtime, {} as never, {
@@ -125,6 +139,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyCheckpointInitializationConflict(runtime, {} as never, {
@@ -154,6 +169,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
@@ -192,6 +208,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestorePreparationConflict(runtime, {} as never, {
@@ -213,6 +230,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestorePreparationConflict(runtime, {} as never, {
@@ -235,6 +253,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestorePreparationConflict(runtime, {} as never, {
@@ -256,6 +275,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestorePreparationConflict(runtime, {} as never, {
@@ -281,6 +301,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestoreProtocolOutcome(runtime, {} as never, {
@@ -319,6 +340,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestoreProtocolOutcome(runtime, {} as never, {
@@ -363,6 +385,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyRestoreProtocolOutcome(runtime, {} as never, {
@@ -410,6 +433,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
@@ -463,6 +487,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyArrivalDispositionFailure(runtime, {} as never, {
@@ -485,6 +510,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
     const report = {
       created: [],
@@ -532,6 +558,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyArrivalDispositionFailure(runtime, {} as never, {
@@ -672,6 +699,7 @@ describe("restore presentation", () => {
         message: string,
         level: "info" | "warning" | "error",
       ) => notifications.push({ message, level }),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {
@@ -719,6 +747,7 @@ describe("restore presentation", () => {
       i18n: new CyclotomyI18n("en"),
       notify: (_context: unknown, message: string) =>
         notifications.push(message),
+      ...NO_HISTORY,
     } as unknown as CyclotomyRuntime;
 
     notifyPostMutationConflict(runtime, {} as never, {

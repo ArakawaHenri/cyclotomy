@@ -82,7 +82,7 @@ import {
   type CaptureProtocolResult,
 } from "./capture-protocol.ts";
 import { PiHostAdapter } from "./pi-host-adapter.ts";
-import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
 import {
   type ArrivalRecoverySettlement,
   type ArrivalReceipt,
@@ -401,6 +401,9 @@ function presentCancellableSourceCapture(
   const presentedCauses = new Set<unknown>();
   const primaryCause = sourceCaptureFailureCause(settlement.failure);
   if (primaryCause !== undefined) presentedCauses.add(primaryCause);
+  // Record a retired generation before the arrival outcome is presented, so
+  // the failure it caused is reported once, as this capture failure.
+  runtime.noteHistoryReset(primaryCause);
   runtime.notify(
     context,
     withDetail(
@@ -449,6 +452,9 @@ function presentObservedSourceCapture(
   const presentedCauses = new Set<unknown>();
   const primaryCause = sourceCaptureFailureCause(settlement.failure);
   if (primaryCause !== undefined) presentedCauses.add(primaryCause);
+  // See presentCancellableSourceCapture: a retired generation is reported as
+  // this capture failure, not again as the protection failure it caused.
+  runtime.noteHistoryReset(primaryCause);
   if (
     settlement.failure.kind === "capture" &&
     settlement.failure.value.kind === "cancelled"
@@ -1357,6 +1363,7 @@ export function registerCyclotomyLifecycle(
   pi.on("agent_start", (event) => runtime.observeAgentRun(event));
   pi.on("agent_settled", (event) => runtime.observeAgentRun(event));
   let automaticGcFailureNotified = false;
+  let automaticGcBudgetNotified = false;
   const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
     if (!runtime.isActive) return;
     try {
@@ -1364,6 +1371,20 @@ export function registerCyclotomyLifecycle(
       notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
       if (execution.kind === "action-failed") throw execution.cause;
       automaticGcFailureNotified = false;
+      // Notify once across consecutive partial passes; further maintenance
+      // belongs in a window that can outlast the interactive budget.
+      if (execution.value?.stopped === "budget-exceeded") {
+        if (!automaticGcBudgetNotified) {
+          automaticGcBudgetNotified = true;
+          runtime.notify(
+            context,
+            runtime.i18n.t("automaticGcBudgetExceeded"),
+            "info",
+          );
+        }
+      } else {
+        automaticGcBudgetNotified = false;
+      }
     } catch (error) {
       if (automaticGcFailureNotified) return;
       automaticGcFailureNotified = true;
@@ -1668,6 +1689,16 @@ export function registerCyclotomyLifecycle(
         return;
       }
       runtime.markSessionActive();
+      if (registration.historyReset) {
+        // This registration adopted the generation a forget already assigned
+        // and completed its pending reset with protection rows only. Say so:
+        // nothing was re-imported, and new work starts a fresh history.
+        runtime.notify(
+          context,
+          runtime.i18n.t("sessionHistoryResetAttached"),
+          "info",
+        );
+      }
       if (registration.advisory !== undefined) {
         notifyWorkspaceLockCleanupFailure(runtime, context, {
           kind: "failed",

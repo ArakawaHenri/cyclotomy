@@ -10,13 +10,9 @@ import {
   type TreeManifestLimits,
 } from "./manifest-codec.ts";
 
-/**
- * One node in the on-disk format history. A node knows only its immediate
- * predecessor, so adding a format never requires editing an old-format table.
- */
-export interface TreeFormatNode<Format extends string = string> {
+/** One published format and its conversion from the preceding table entry. */
+export interface TreeFormat<Format extends string = string> {
   readonly format: Format;
-  readonly previous?: TreeFormatNode;
   /** Construct canonical semantics for this format node. */
   readonly create: (
     entries: unknown,
@@ -44,7 +40,8 @@ export interface TreeFormatNode<Format extends string = string> {
 }
 
 export interface TreeFormatEngine {
-  readonly current: TreeFormatNode;
+  readonly formats: readonly TreeFormat[];
+  readonly current: TreeFormat;
   parse(content: Uint8Array): TreeManifest;
   upgradeTo(
     manifest: TreeManifest,
@@ -54,71 +51,42 @@ export interface TreeFormatEngine {
   referencedBlobOids(manifest: TreeManifest): readonly string[];
 }
 
-/** Authenticate and expose one immutable oldest-to-current format history. */
-export function treeFormatChain(
-  current: TreeFormatNode,
-): readonly TreeFormatNode[] {
-  const newestFirst: TreeFormatNode[] = [];
-  const byFormat = new Map<string, TreeFormatNode>();
-  const seen = new Set<TreeFormatNode>();
-  let cursor: TreeFormatNode | undefined = current;
-  while (cursor !== undefined) {
-    if (seen.has(cursor)) {
-      throw new Error("tree format history contains a cycle");
-    }
-    if (cursor.format.length === 0 || byFormat.has(cursor.format)) {
+/** Build direct format lookup from an oldest-to-current version table. */
+export function createTreeFormatEngine(
+  definitions: readonly TreeFormat[],
+): TreeFormatEngine {
+  if (definitions.length === 0)
+    throw new Error("tree formats must not be empty");
+  const byFormat = new Map<string, number>();
+  for (const [index, node] of definitions.entries()) {
+    if (node.format.length === 0 || byFormat.has(node.format)) {
       throw new Error("tree format history contains an invalid format id");
     }
-    if (
-      cursor.previous !== undefined &&
-      cursor.upgradeFromPrevious === undefined
-    ) {
-      throw new Error(
-        `tree format ${cursor.format} omits its adjacent upgrade`,
-      );
+    if (index > 0 && node.upgradeFromPrevious === undefined) {
+      throw new Error(`tree format ${node.format} omits its adjacent upgrade`);
     }
-    if (
-      cursor.previous === undefined &&
-      cursor.upgradeFromPrevious !== undefined
-    ) {
+    if (index === 0 && node.upgradeFromPrevious !== undefined) {
       throw new Error("first tree format cannot have an adjacent upgrade");
     }
-    if ((cursor.decode === undefined) !== (cursor.encode === undefined)) {
+    if ((node.decode === undefined) !== (node.encode === undefined)) {
       throw new Error(
-        `tree format ${cursor.format} must define both inline codecs or neither`,
+        `tree format ${node.format} must define both inline codecs or neither`,
       );
     }
-    seen.add(cursor);
-    newestFirst.push(cursor);
-    byFormat.set(cursor.format, cursor);
-    cursor = cursor.previous;
+    byFormat.set(node.format, index);
   }
-  // The lookup and metadata tree-format marker must describe the same history
-  // for the engine's whole lifetime. Freeze caller-defined successor nodes as
-  // part of construction instead of relying on TypeScript's erased readonly.
-  for (const node of newestFirst) Object.freeze(node);
-  return Object.freeze(newestFirst.reverse());
-}
+  const formats = Object.freeze(definitions.map((node) => Object.freeze(node)));
+  const current = formats.at(-1)!;
 
-/** Build parser lookup solely from the authenticated adjacent format chain. */
-export function createTreeFormatEngine(
-  current: TreeFormatNode,
-): TreeFormatEngine {
-  const oldestFirst = treeFormatChain(current);
-  const newestFirst = [...oldestFirst].reverse();
-  const byFormat = new Map(
-    oldestFirst.map((node) => [node.format, node] as const),
-  );
-
-  const nodeFor = (manifest: TreeManifest): TreeFormatNode => {
-    const node = byFormat.get(manifest.format);
-    if (node === undefined) {
+  const nodeFor = (manifest: TreeManifest): TreeFormat => {
+    const index = byFormat.get(manifest.format);
+    if (index === undefined) {
       throw new TreeManifestError(
         "invalid-tree-manifest",
         "tree manifest format is outside the supported history",
       );
     }
-    return node;
+    return formats[index]!;
   };
 
   const upgradeTo = (
@@ -127,27 +95,25 @@ export function createTreeFormatEngine(
     pathLimits: WorkspacePathLimits,
   ): TreeManifest => {
     const source = nodeFor(manifest);
-    const target = byFormat.get(targetFormat);
-    if (target === undefined) {
+    const targetIndex = byFormat.get(targetFormat);
+    if (targetIndex === undefined) {
       throw new TreeManifestError(
         "format-incompatible",
         `target tree format ${JSON.stringify(targetFormat)} is outside the supported history`,
       );
     }
-    if (source === target) return freezeTreeManifest(manifest);
-
-    const sourceIndex = newestFirst.indexOf(source);
-    const targetIndex = newestFirst.indexOf(target);
-    if (targetIndex > sourceIndex) {
+    const sourceIndex = byFormat.get(source.format)!;
+    if (sourceIndex === targetIndex) return freezeTreeManifest(manifest);
+    if (targetIndex < sourceIndex) {
       throw new TreeManifestError(
         "format-incompatible",
-        `tree format ${source.format} cannot be downgraded to ${target.format}`,
+        `tree format ${source.format} cannot be downgraded to ${targetFormat}`,
       );
     }
 
     let upgraded = manifest;
-    for (let index = sourceIndex - 1; index >= targetIndex; index -= 1) {
-      const node = newestFirst[index]!;
+    for (let index = sourceIndex + 1; index <= targetIndex; index += 1) {
+      const node = formats[index]!;
       const upgrade = node.upgradeFromPrevious;
       if (upgrade === undefined) {
         throw new Error(`tree format ${node.format} has no adjacent upgrade`);
@@ -165,6 +131,7 @@ export function createTreeFormatEngine(
 
   return Object.freeze<TreeFormatEngine>({
     current,
+    formats,
     parse(content) {
       if (content.byteLength > ABSOLUTE_MAX_TREE_MANIFEST_BYTES) {
         throw new TreeManifestError(
@@ -195,17 +162,18 @@ export function createTreeFormatEngine(
         );
       }
       const candidate = parsed as Record<string, unknown>;
-      const node =
+      const index =
         typeof candidate.format === "string"
           ? byFormat.get(candidate.format)
           : undefined;
-      if (node === undefined) {
+      if (index === undefined) {
         throw new TreeManifestError(
           "object-integrity",
           "tree object has an unsupported manifest format",
         );
       }
 
+      const node = formats[index]!;
       let manifest: TreeManifest;
       try {
         if (node.decode === undefined || node.encode === undefined) {

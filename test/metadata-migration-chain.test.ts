@@ -1,3 +1,5 @@
+import { readSessionHistoryFingerprint } from "../src/infrastructure/metadata/history.ts";
+import { MetadataFingerprintChangedError } from "../src/infrastructure/metadata-error.ts";
 import { renameSync } from "node:fs";
 import { lstat, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +14,7 @@ import {
 } from "../src/infrastructure/metadata.ts";
 import {
   CURRENT_METADATA_VERSION,
+  METADATA_VERSIONS,
   validateMetadataTreeFormatComposition,
 } from "../src/infrastructure/metadata/current.ts";
 import { migrateMetadataToCurrent as migrateMetadataToCurrentWithAuthority } from "../src/infrastructure/metadata/migration-engine.ts";
@@ -25,10 +28,11 @@ import {
 } from "../src/infrastructure/metadata/schema.ts";
 import {
   defineMetadataVersion,
+  defineMetadataVersions,
   defineSynchronousMetadataUpgrade,
   defineTreeFormatMetadataUpgrade,
   type PreparedMetadataTreeUpgrade,
-  type MetadataVersionNode,
+  type MetadataVersion,
   validateMetadataVersion,
 } from "../src/infrastructure/metadata/version.ts";
 import {
@@ -62,7 +66,7 @@ const SYNTHETIC_SUCCESSOR_TREE_FORMAT = "cyclotomy-tree-successor-test";
 async function migrateTestMetadataToCurrent(
   db: DatabaseSync,
   dependencies: Parameters<typeof migrateMetadataToCurrentWithAuthority>[1],
-  current: MetadataVersionNode,
+  current: MetadataVersion,
 ): Promise<void> {
   const storeRoot = await mkdtemp(
     join(tmpdir(), "cyclotomy-migration-engine-"),
@@ -74,7 +78,9 @@ async function migrateTestMetadataToCurrent(
     dependencies,
     authority,
     storeRoot,
-    current,
+    current.version <= CURRENT_METADATA_VERSION.version
+      ? METADATA_VERSIONS.slice(0, current.version)
+      : defineMetadataVersions([...METADATA_VERSIONS, current]),
   );
 }
 
@@ -148,13 +154,13 @@ function initializeSyntheticSuccessor(db: DatabaseSync): void {
 
 function syntheticSuccessor(
   apply: (db: DatabaseSync) => void,
-): MetadataVersionNode {
+): MetadataVersion {
   const tables = CURRENT_METADATA_VERSION.schema.fencedTables;
   return defineMetadataVersion({
     version: SUCCESSOR_METADATA_VERSION,
     treeFormat: CURRENT_METADATA_VERSION.treeFormat,
     schema: syntheticSuccessorSchema(),
-    previous: CURRENT_METADATA_VERSION,
+
     upgradeFromPrevious: defineSynchronousMetadataUpgrade((db) => {
       db.exec(writerFenceSql(tables, SUCCESSOR_METADATA_VERSION).join(";\n"));
       apply(db);
@@ -177,13 +183,13 @@ function syntheticTreeFormatSuccessor(
       update.run(target, source);
     }
   },
-): MetadataVersionNode {
+): MetadataVersion {
   const tables = CURRENT_METADATA_VERSION.schema.fencedTables;
   return defineMetadataVersion({
     version: SUCCESSOR_METADATA_VERSION,
     treeFormat: SYNTHETIC_SUCCESSOR_TREE_FORMAT,
     schema: syntheticSuccessorSchema(),
-    previous: CURRENT_METADATA_VERSION,
+
     upgradeFromPrevious: defineTreeFormatMetadataUpgrade((db, prepared) => {
       db.exec(writerFenceSql(tables, SUCCESSOR_METADATA_VERSION).join(";\n"));
       replaceRoots(db, prepared);
@@ -201,7 +207,7 @@ afterEach(async () => {
   );
 });
 
-describe("metadata adjacent-version chain", () => {
+describe("metadata adjacent-version migration", () => {
   it("creates no database or sidecars after its lease is already displaced", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-open-lease-"));
     roots.push(root);
@@ -333,25 +339,6 @@ describe("metadata adjacent-version chain", () => {
     }
   });
 
-  it("represents the chain root without a predecessor", () => {
-    const rootSchema = metadataSchemaSpec({
-      version: 7,
-      errorLabel: "synthetic root",
-      objects: {},
-      fencedTables: [],
-    });
-    const root = defineMetadataVersion({
-      version: 7,
-      treeFormat: "synthetic-tree-root",
-      schema: rootSchema,
-      initializeWithinTransaction: () => {},
-      referencedTreeOids: () => [],
-      matchSessionIdentity: () => "absent",
-    });
-
-    expect(root.previous).toBeUndefined();
-  });
-
   it("rejects a successor whose schema identity has not advanced", () => {
     expect(() =>
       defineMetadataVersion({
@@ -361,7 +348,7 @@ describe("metadata adjacent-version chain", () => {
           ...CURRENT_METADATA_VERSION.schema,
           version: SUCCESSOR_METADATA_VERSION,
         }),
-        previous: CURRENT_METADATA_VERSION,
+
         upgradeFromPrevious: defineSynchronousMetadataUpgrade(() => {}),
         initializeWithinTransaction: () => {},
         referencedTreeOids: () => [],
@@ -392,16 +379,19 @@ describe("metadata adjacent-version chain", () => {
 
   it("requires a metadata successor edge when the durable tree format changes", () => {
     expect(() =>
-      defineMetadataVersion({
-        version: SUCCESSOR_METADATA_VERSION,
-        treeFormat: SYNTHETIC_SUCCESSOR_TREE_FORMAT,
-        schema: syntheticSuccessorSchema(),
-        previous: CURRENT_METADATA_VERSION,
-        upgradeFromPrevious: defineSynchronousMetadataUpgrade(() => {}),
-        initializeWithinTransaction: initializeSyntheticSuccessor,
-        referencedTreeOids: CURRENT_METADATA_VERSION.referencedTreeOids,
-        matchSessionIdentity: CURRENT_METADATA_VERSION.matchSessionIdentity,
-      }),
+      defineMetadataVersions([
+        ...METADATA_VERSIONS,
+        defineMetadataVersion({
+          version: SUCCESSOR_METADATA_VERSION,
+          treeFormat: SYNTHETIC_SUCCESSOR_TREE_FORMAT,
+          schema: syntheticSuccessorSchema(),
+
+          upgradeFromPrevious: defineSynchronousMetadataUpgrade(() => {}),
+          initializeWithinTransaction: initializeSyntheticSuccessor,
+          referencedTreeOids: CURRENT_METADATA_VERSION.referencedTreeOids,
+          matchSessionIdentity: CURRENT_METADATA_VERSION.matchSessionIdentity,
+        }),
+      ]),
     ).toThrow(
       "tree-format change requires an externally prepared adjacent edge",
     );
@@ -412,7 +402,7 @@ describe("metadata adjacent-version chain", () => {
       version: SUCCESSOR_METADATA_VERSION,
       treeFormat: "outside-tree-history",
       schema: syntheticSuccessorSchema(),
-      previous: CURRENT_METADATA_VERSION,
+
       upgradeFromPrevious: defineTreeFormatMetadataUpgrade(() => {}),
       initializeWithinTransaction: initializeSyntheticSuccessor,
       referencedTreeOids: CURRENT_METADATA_VERSION.referencedTreeOids,
@@ -421,8 +411,8 @@ describe("metadata adjacent-version chain", () => {
 
     expect(() =>
       validateMetadataTreeFormatComposition(
-        outside,
-        TREE_FORMAT_REGISTRY.current,
+        [...METADATA_VERSIONS, outside],
+        TREE_FORMAT_REGISTRY.formats,
       ),
     ).toThrow("outside the supported history");
   });
@@ -432,7 +422,7 @@ describe("metadata adjacent-version chain", () => {
       version: SUCCESSOR_METADATA_VERSION,
       treeFormat: TREE_MANIFEST_FORMAT_V1,
       schema: syntheticSuccessorSchema(),
-      previous: CURRENT_METADATA_VERSION,
+
       upgradeFromPrevious: defineTreeFormatMetadataUpgrade(() => {}),
       initializeWithinTransaction: initializeSyntheticSuccessor,
       referencedTreeOids: CURRENT_METADATA_VERSION.referencedTreeOids,
@@ -441,8 +431,8 @@ describe("metadata adjacent-version chain", () => {
 
     expect(() =>
       validateMetadataTreeFormatComposition(
-        backwards,
-        TREE_FORMAT_REGISTRY.current,
+        [...METADATA_VERSIONS, backwards],
+        TREE_FORMAT_REGISTRY.formats,
       ),
     ).toThrow("moves its durable tree format backwards");
   });
@@ -864,6 +854,123 @@ describe("metadata adjacent-version chain", () => {
     });
     db.close();
   });
+
+  it.each(["changed-before", "changed-during", "wrong-cutover", "many-to-one"])(
+    "authenticates the full session mapping through migration: %s",
+    async (scenario) => {
+      const db = new DatabaseSync(":memory:");
+      let protocol = CURRENT_METADATA_SCHEMA_VERSION;
+      db.function(
+        METADATA_WRITER_PROTOCOL_FUNCTION,
+        { deterministic: true, directOnly: false },
+        () => protocol,
+      );
+      db.exec("BEGIN IMMEDIATE");
+      CURRENT_METADATA_VERSION.initializeWithinTransaction(db);
+      db.prepare(
+        "INSERT INTO session_registry VALUES ('session', '/session.jsonl', 'verified')",
+      ).run();
+      db.prepare("INSERT INTO session_history VALUES ('session', 0, 0)").run();
+      const first = "1".repeat(64),
+        second = "2".repeat(64),
+        target = "3".repeat(64);
+      const insert = db.prepare(
+        "INSERT INTO checkpoint_slot VALUES ('session', ?, ?, 'open')",
+      );
+      insert.run("a", first);
+      insert.run("b", first);
+      insert.run("c", second);
+      const history = {
+        sessionId: "session",
+        fingerprint: readSessionHistoryFingerprint(
+          db,
+          CURRENT_METADATA_SCHEMA_VERSION,
+          "session",
+        )!,
+      };
+      const originalFingerprint = history.fingerprint;
+      db.exec("COMMIT");
+      const changeMapping = () =>
+        db
+          .prepare(
+            "UPDATE checkpoint_slot SET tree_oid = ? WHERE entry_id = 'a'",
+          )
+          .run(second);
+      if (scenario === "changed-before") changeMapping();
+      const prepareTreeOidUpgrades = vi.fn(async () => {
+        if (scenario === "changed-during") changeMapping();
+        protocol = SUCCESSOR_METADATA_VERSION;
+        return scenario === "many-to-one"
+          ? new Map([
+              [first, target],
+              [second, target],
+            ])
+          : new Map([
+              [first, first],
+              [second, second],
+            ]);
+      });
+      const successor = syntheticTreeFormatSuccessor((connection, prepared) => {
+        if (scenario === "wrong-cutover") {
+          changeMapping();
+          return;
+        }
+        for (const { source, target: mapped } of prepared.replacements)
+          connection
+            .prepare(
+              "UPDATE checkpoint_slot SET tree_oid = ? WHERE tree_oid = ?",
+            )
+            .run(mapped, source);
+      });
+      try {
+        const migration = migrateTestMetadataToCurrent(
+          db,
+          { history, prepareTreeOidUpgrades },
+          successor,
+        );
+        if (scenario === "many-to-one") {
+          await migration;
+          db.exec("BEGIN");
+          expect(
+            readSessionHistoryFingerprint(
+              db,
+              SUCCESSOR_METADATA_VERSION,
+              "session",
+            ),
+          ).toBe(history.fingerprint);
+          db.exec("COMMIT");
+          expect(history.fingerprint).not.toBe(originalFingerprint);
+          expect(
+            db
+              .prepare(
+                "SELECT count(*) AS count FROM checkpoint_slot WHERE tree_oid = ?",
+              )
+              .get(target),
+          ).toEqual({ count: 3 });
+        } else {
+          await expect(migration).rejects.toThrow(
+            MetadataFingerprintChangedError,
+          );
+          expect(history.fingerprint).toBe(originalFingerprint);
+          expect(db.prepare("PRAGMA user_version").get()).toEqual({
+            user_version: CURRENT_METADATA_SCHEMA_VERSION,
+          });
+          if (scenario === "changed-before")
+            expect(prepareTreeOidUpgrades).not.toHaveBeenCalled();
+          if (scenario === "wrong-cutover")
+            expect(
+              db
+                .prepare(
+                  "SELECT tree_oid FROM checkpoint_slot WHERE entry_id = 'a'",
+                )
+                .get(),
+            ).toEqual({ tree_oid: first });
+        }
+      } finally {
+        db.close();
+      }
+    },
+  );
 
   it("retries a future tree-format edge when its source root set drifts", async () => {
     const db = new DatabaseSync(":memory:");

@@ -42,12 +42,29 @@ import {
   testMetadataWriteAuthority,
 } from "./metadata-fixture.ts";
 import {
+  LOCK_PROTOCOL_MARKER_FILE,
+  WORKSPACE_LOCK_FILE,
+} from "../src/infrastructure/workspace-lock.ts";
+import {
   holdTestWorkspaceWriteAuthority,
   releaseTestWorkspaceWriteAuthorities,
 } from "./workspace-write-authority-fixture.ts";
 
 const roots: string[] = [];
 const CHILD_PROCESS_WATCHDOG_MS = 30_000;
+// Shape and fence assertions describe whichever layout is current, so adding a
+// version must not require editing every rejection expectation.
+const CURRENT_LAYOUT_MISMATCH = new RegExp(
+  `does not match the metadata v${CURRENT_METADATA_VERSION.version} layout`,
+  "u",
+);
+const CURRENT_TRIGGER_COUNT = Object.values(
+  CURRENT_METADATA_VERSION.schema.objects,
+).filter((object) => object.type === "trigger").length;
+const CURRENT_TABLES = Object.values(CURRENT_METADATA_VERSION.schema.objects)
+  .filter((object) => object.type === "table")
+  .map((object) => object.table)
+  .sort();
 const metadataOpenFixture = fileURLToPath(
   new URL("./fixtures/metadata-open-child.ts", import.meta.url),
 );
@@ -344,12 +361,17 @@ function openPublishedV2Metadata(path: string): DatabaseSync {
   return db;
 }
 
+/** The persistent lock file and its protocol marker are store infrastructure, not metadata sidecars. */
+function isWorkspaceLockProtocolEntry(name: string): boolean {
+  return name === WORKSPACE_LOCK_FILE || name === LOCK_PROTOCOL_MARKER_FILE;
+}
+
 async function snapshotDirectory(root: string): Promise<{
   readonly names: readonly string[];
   readonly contents: Readonly<Record<string, string>>;
 }> {
   const names = (await readdir(root))
-    .filter((name) => name !== "workspace.lock")
+    .filter((name) => !isWorkspaceLockProtocolEntry(name))
     .sort();
   const contents = Object.fromEntries(
     await Promise.all(
@@ -370,7 +392,7 @@ afterEach(async () => {
 });
 
 describe("checkpoint slot metadata", () => {
-  it("creates fresh stores directly at the current v4 schema", async () => {
+  it("creates fresh stores directly at the current schema", async () => {
     const { path, store } = await createStore();
     store.close();
     const db = new DatabaseSync(path);
@@ -382,11 +404,7 @@ describe("checkpoint slot metadata", () => {
       )
       .all()
       .map((row) => String(row.name));
-    expect(tables).toEqual([
-      "checkpoint_slot",
-      "session_capture_barrier",
-      "session_registry",
-    ]);
+    expect(tables).toEqual(CURRENT_TABLES);
     expect(
       Number(
         (db.prepare("PRAGMA user_version").get() as { user_version: number })
@@ -407,7 +425,7 @@ describe("checkpoint slot metadata", () => {
              AND name GLOB 'cyclotomy_writer_fence_*'`,
         )
         .get(),
-    ).toEqual({ count: 9 });
+    ).toEqual({ count: CURRENT_TRIGGER_COUNT });
     db.close();
   });
 
@@ -609,7 +627,7 @@ describe("checkpoint slot metadata", () => {
         // interpret a new-registration seed.
         seed: { kind: "fresh" },
       }),
-    ).toEqual({ kind: "existing" });
+    ).toEqual({ kind: "existing", historyReset: false });
     expect(current.getCheckpointSlot("s", "open")).toEqual({
       kind: "open-checkpoint",
       treeOid: "a".repeat(64),
@@ -637,7 +655,7 @@ describe("checkpoint slot metadata", () => {
         activeAncestryEntryIds: ["open", "unclassified"],
         seed: { kind: "untrusted-parent" },
       }),
-    ).toEqual({ kind: "existing" });
+    ).toEqual({ kind: "existing", historyReset: false });
     current.close();
   });
 
@@ -664,7 +682,7 @@ describe("checkpoint slot metadata", () => {
         activeAncestryEntryIds: ["known", "unclassified"],
         seed: { kind: "fresh" },
       }),
-    ).toEqual({ kind: "existing" });
+    ).toEqual({ kind: "existing", historyReset: false });
     expect(current.getCheckpointSlot("s", "known")).toEqual({
       kind: "open-checkpoint",
       treeOid,
@@ -777,7 +795,7 @@ describe("checkpoint slot metadata", () => {
         activeAncestryEntryIds: ["known", "parent-only"],
         seed: { kind: "fresh" },
       }),
-    ).toEqual({ kind: "existing" });
+    ).toEqual({ kind: "existing", historyReset: false });
     expect(checkpointState(current, "child", "known")).toEqual({
       treeOid: "a".repeat(64),
     });
@@ -1001,6 +1019,7 @@ describe("checkpoint slot metadata", () => {
       testMetadataWriteAuthority(store),
       dirname(path),
     );
+    registerTestSession(concurrent, "s", sessionFile, ["root"]);
     expect(
       concurrent.commitCapture(testMetadataWriteAuthority(concurrent), {
         identity: { sessionId: "s", sessionFile },
@@ -1367,7 +1386,7 @@ describe("checkpoint slot metadata", () => {
         retainedEntryIds: ["root", "leaf"],
         activeAncestryEntryIds: ["root", "leaf"],
       }),
-    ).toEqual({ kind: "registered" });
+    ).toEqual({ kind: "registered", historyReset: false });
     expect(store.getCheckpointSlot("child", "root")).toEqual({
       kind: "blocked-missing",
     });
@@ -1678,7 +1697,7 @@ describe("checkpoint slot metadata", () => {
         activeAncestryEntryIds: ["entry"],
         seed: { kind: "fresh" },
       }),
-    ).toEqual({ kind: "existing" });
+    ).toEqual({ kind: "existing", historyReset: false });
     expect(
       protectTestLocation(
         current,
@@ -1850,6 +1869,9 @@ describe("checkpoint slot metadata", () => {
       const root = await mkdtemp(join(tmpdir(), "cyclotomy-metadata-race-"));
       roots.push(root);
       const path = join(root, "state.db");
+      // The child processes acquire the real workspace lock, so the store root
+      // must already carry the completed lock protocol before they start.
+
       const gate =
         startingSchema === "published-v1"
           ? openPublishedV1Metadata(path)
@@ -2386,6 +2408,7 @@ describe("checkpoint slot metadata", () => {
       testMetadataWriteAuthority(store),
       dirname(path),
     );
+    registerTestSession(second, "s", sessionFile);
     expect(
       second.reconcileSessionBarrier(
         testMetadataWriteAuthority(second),
@@ -2604,7 +2627,7 @@ describe("checkpoint slot metadata", () => {
 
     await expect(
       createTestCurrentMetadataStore(path, dirname(path)),
-    ).rejects.toThrow(/does not match the metadata v4 layout/u);
+    ).rejects.toThrow(CURRENT_LAYOUT_MISMATCH);
   });
 
   it("authenticates string literals in the current schema exactly", async () => {
@@ -2630,7 +2653,7 @@ describe("checkpoint slot metadata", () => {
 
     expect(() =>
       createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
-    ).toThrow(/does not match the metadata v4 layout/u);
+    ).toThrow(CURRENT_LAYOUT_MISMATCH);
   });
 
   it("does not normalize whitespace inside schema string literals", async () => {
@@ -2652,11 +2675,11 @@ describe("checkpoint slot metadata", () => {
       .run();
     forged.exec("PRAGMA writable_schema = OFF");
     forged.close();
-    expect(Number(changed.changes)).toBe(9);
+    expect(Number(changed.changes)).toBe(CURRENT_TRIGGER_COUNT);
 
     expect(() =>
       createCurrentMetadataStore(path, testMetadataWriteAuthority(store)),
-    ).toThrow(/does not match the metadata v4 layout/u);
+    ).toThrow(CURRENT_LAYOUT_MISMATCH);
   });
 
   it("rejects a non-public claimed v1 before making migration changes", async () => {
@@ -2804,7 +2827,11 @@ describe("checkpoint slot metadata", () => {
       { value: "preserve me" },
     ]);
     check.close();
-    expect((await readdir(root)).sort()).toEqual(["state.db"]);
+    expect(
+      (await readdir(root))
+        .filter((name) => !isWorkspaceLockProtocolEntry(name))
+        .sort(),
+    ).toEqual(["state.db"]);
   });
 
   it.each([
@@ -2835,7 +2862,7 @@ describe("checkpoint slot metadata", () => {
 
       await expect(
         createTestCurrentMetadataStore(path, dirname(path)),
-      ).rejects.toThrow(/does not match the metadata v4 layout/u);
+      ).rejects.toThrow(CURRENT_LAYOUT_MISMATCH);
     },
   );
 
@@ -2872,7 +2899,7 @@ describe("checkpoint slot metadata", () => {
 
     await expect(
       createTestCurrentMetadataStore(path, dirname(path)),
-    ).rejects.toThrow(/does not match the metadata v4 layout/u);
+    ).rejects.toThrow(CURRENT_LAYOUT_MISMATCH);
   });
 
   it("refuses a newer schema before preparing migrations or mutating it", async () => {

@@ -1,3 +1,5 @@
+import type { CleanupSettlement } from "../domain/cleanup-settlement.ts";
+
 /** Return the first actionable failure retained by nested AggregateErrors. */
 export function primaryFailure(error: unknown): unknown {
   let primary = error;
@@ -136,4 +138,22 @@ export async function withRetainedCleanup<T>(
   if (failed) throw await retainCleanupFailure(failure, cleanup, message);
   await cleanup();
   return result as T;
+}
+
+/** Preserve each independently owned cleanup failure in release order. */
+export function combineCleanupSettlements(
+  ...settlements: readonly CleanupSettlement[]
+): CleanupSettlement {
+  const failures = settlements.flatMap((settlement) =>
+    settlement.kind === "failed" ? [settlement.cause] : [],
+  );
+  return failures.length === 0
+    ? { kind: "settled" }
+    : {
+        kind: "failed",
+        cause:
+          failures.length === 1
+            ? failures[0]
+            : aggregateFailures(failures, "resource cleanup failed"),
+      };
 }

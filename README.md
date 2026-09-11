@@ -134,18 +134,24 @@ default agent directory:
     ... checkpoint data
 ```
 
-Do not edit the store while Cyclotomy is running. An unexpected exit can leave
-`workspace.lock` behind. If Cyclotomy reports an abandoned lock, first close
-every Pi process using that workspace. Then rename the exact lock directory
-shown in the error to a sibling such as `workspace.lock.stale-<timestamp>` and
-try again. Keep the renamed directory for diagnosis. Do not delete a lock that
-may still be active or remove a broader storage directory.
+Do not edit the store while Cyclotomy is running. `workspace.lock` is a
+persistent file whose lifetime is not the operation's lifetime: an operating
+system lock, not the file's existence, decides who owns the store, so an
+interrupted operation leaves nothing to clear by hand.
+
+Cyclotomy 0.2.4 and earlier used a lock directory at that path. On the first
+writable open, Cyclotomy waits for any existing holder to release it, then
+switches to the native file lock automatically. If an old process died leaving
+its directory behind, stop every process that may use that workspace, then run
+`cyclotomy lock recover --offline`. The command previews the move and needs
+`--apply <token>` to perform it. It moves the abandoned directory aside for
+diagnosis. Never delete a lock that may still be active.
 
 Cyclotomy verifies stored data before using it. If it reports a corrupt pack,
 do not delete or rename that file to continue. Stop Cyclotomy, copy the store,
 then restore it from a trusted backup. Alternatively, choose a new `storageDir`
-and accept losing the old checkpoint history. There is currently no offline
-repair command.
+and accept losing the old checkpoint history. The command-line tools below can
+diagnose, upgrade, and clean a store, but no command repairs a damaged pack.
 
 Automatic cleanup reclaims data no checkpoint uses. There is no cumulative
 size quota or automatic session retirement, so long-lived or deleted sessions
@@ -153,6 +159,37 @@ may continue to use storage. Monitor the volume or choose another `storageDir`
 when needed.
 
 Uninstalling or reinstalling Cyclotomy does not delete checkpoints.
+
+## Maintenance
+
+The `cyclotomy` command inspects and maintains a store without Pi:
+
+| Command                            | What it does                                                 |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `cyclotomy doctor`                 | Report the store format, lock state, and capacity hints.     |
+| `cyclotomy history`                | List sessions with checkpoint counts and history epoch.      |
+| `cyclotomy inventory`              | Report what occupies the store, optionally for one session.  |
+| `cyclotomy gc`                     | Collect unreferenced objects under the workspace write lock. |
+| `cyclotomy lock recover --offline` | Move an abandoned 0.2.4 lock directory aside.                |
+| `cyclotomy history forget <id>`    | Preview or apply dropping one session's checkpoint history.  |
+
+Every command writes either a human report or, with `--json`, one JSON document
+(`schemaVersion: 1`); progress and logs go to stderr. Read commands never create
+or migrate a store. Write commands refuse a store on a filesystem they can prove
+is a network share. All commands accept `--workspace <path>` and
+`--locale auto|en|zh-CN`.
+
+Automatic cleanup has a cooperative time budget of about a second. It checks
+the budget while reading and planning, and between completed publication and
+deletion batches. An in-progress filesystem operation may finish after that
+budget. A partial pass reports its completed work and can leave additional
+objects or packs for the next pass; it authenticates the complete rooted object set before
+any deletion. Run `cyclotomy gc` in a maintenance window when automatic cleanup
+cannot finish.
+
+Garbage collection holds the workspace write lock for the whole pass and needs
+memory proportional to the store's history. A rooted graph beyond the supported
+per-pass limit is refused; `cyclotomy history forget` can reduce it.
 
 ## Configuration
 
@@ -220,11 +257,22 @@ saved checkpoint; use a compatible Cyclotomy release or start with a new
 `storageDir`. After 0.2.x upgrades a store, 0.1.x can no longer open it. A store
 created by a newer Cyclotomy release is rejected rather than modified.
 
+Lock and metadata formats upgrade automatically during a writable open. New
+stores initialize at the current versions; read-only maintenance commands and
+history-deletion previews do not migrate a store. A history-deletion apply
+checks the preview under the lock before performing any required migration.
+
+`workspace.lock` is now a persistent regular file guarded by an operating-system
+lock. The old directory protocol and new file protocol exclude each other during
+handover. After the switch, 0.2.4 cannot acquire the lock. Metadata V5 also cannot
+be opened by 0.2.4, so rollback requires a consistent backup of the whole store.
+A metadata-only backup cannot reconstruct objects removed by later cleanup.
+
 | Area            | Supported contract                                                                                                   |
 | --------------- | -------------------------------------------------------------------------------------------------------------------- |
 | Node.js         | `>=24.15.0`                                                                                                          |
 | Pi Coding Agent | `>=0.84.0`                                                                                                           |
-| Platforms       | Linux, macOS, and Windows.                                                                                           |
+| Platforms       | glibc-based Linux, macOS, and Windows.                                                                               |
 | Filesystems     | Local filesystems. Network or shared stores, hard links, and workspace mount points are outside the supported scope. |
 
 ## Development

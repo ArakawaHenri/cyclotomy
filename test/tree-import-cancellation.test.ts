@@ -1,3 +1,4 @@
+import { assertTestWorkspaceLockReleased } from "./workspace-lock-fixture.ts";
 import { mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import {
   publishTestBlob,
   publishTestTree,
 } from "./object-store-fixture.ts";
+import { inspectWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
 const roots: string[] = [];
@@ -36,6 +38,7 @@ async function setup() {
   roots.push(root);
   const source = await openObjectStore(join(root, "source"));
   const target = await openObjectStore(join(root, "target"));
+
   const bytes = Buffer.alloc(512 * 1024, 0x41);
   const oid = await publishTestBlob(source, bytes);
   const treeOid = await publishTestTree(
@@ -106,9 +109,7 @@ describe("tree import cancellation and source verification", () => {
           ).inventory()
         ).packs,
       ).toEqual([]);
-      await expect(
-        readdir(join(target.storageRoot, "workspace.lock")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      await assertTestWorkspaceLockReleased(target.storageRoot);
     },
   );
 
@@ -225,11 +226,10 @@ describe("tree import cancellation and source verification", () => {
       });
     await Promise.resolve();
     expect(settled).toBe(false);
-    await Promise.all(
-      [source, target].map((store) =>
-        readdir(join(store.storageRoot, "workspace.lock")),
-      ),
-    );
+    for (const store of [source, target])
+      await expect(
+        inspectWorkspaceLock(store.storageRoot),
+      ).resolves.toMatchObject({ kind: "native-busy" });
     release();
     const failure = await outcome;
     expect(isOperationCancelled(failure, controller.signal)).toBe(true);
@@ -240,9 +240,7 @@ describe("tree import cancellation and source verification", () => {
       code: "missing-object",
     });
     for (const store of [source, target])
-      await expect(
-        readdir(join(store.storageRoot, "workspace.lock")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      await assertTestWorkspaceLockReleased(store.storageRoot);
   });
 
   it("rejects a blob pack changed while the imported tree is being published", async () => {

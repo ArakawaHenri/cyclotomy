@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { isTreeOid, type TreeOid } from "../../domain/model.ts";
-import type { TreeFormatEngine, TreeFormatNode } from "./chain.ts";
+import type { TreeFormatEngine, TreeFormat } from "./chain.ts";
 import {
   ABSOLUTE_MAX_TREE_MANIFEST_BYTES,
   ABSOLUTE_TREE_MANIFEST_LIMITS,
@@ -93,7 +93,7 @@ export function authenticateStoredObject(
 
 /** Wrap a v1/v2 self-contained canonical JSON object in the async contract. */
 export function inlineStoredTreeFormatAdapter(
-  node: TreeFormatNode,
+  node: TreeFormat,
   engine: TreeFormatEngine,
 ): StoredTreeFormatAdapter {
   if (node.decode === undefined || node.encode === undefined) {

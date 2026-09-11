@@ -1,3 +1,4 @@
+import { readSessionHistoryFingerprint } from "./metadata/history.ts";
 import {
   closeSync,
   constants as fsConstants,
@@ -18,6 +19,7 @@ import {
   captureCheckpointSlot,
   checkpointSlotIsBlocked,
   checkpointSlotsEqual,
+  checkpointSlotTreeOid,
   releaseCheckpointSlot,
   type BlockedCheckpointSlot,
   type CheckpointSlot,
@@ -26,8 +28,14 @@ import {
   reduceCheckpointLineage,
   type ReducedCheckpointLineage,
 } from "../domain/checkpoint-lineage.ts";
-import { MetadataError } from "./metadata-error.ts";
+import {
+  MetadataError,
+  MetadataFingerprintChangedError,
+  MetadataHistoryResetError,
+  MetadataUnavailableError,
+} from "./metadata-error.ts";
 import { systemErrorCode } from "./system-error.ts";
+import { storedHistoryPresent } from "./store-presence.ts";
 import {
   assertWorkspaceWriteAuthority,
   type WorkspaceWriteAuthority,
@@ -37,21 +45,28 @@ import {
   metadataSchemaVersion,
   validateUninitializedMetadataDatabase,
 } from "./metadata/schema.ts";
-import { CURRENT_METADATA_VERSION } from "./metadata/current.ts";
+import {
+  CURRENT_METADATA_VERSION,
+  METADATA_VERSIONS,
+} from "./metadata/current.ts";
 import {
   initializeMetadataVersionWithinTransaction,
   migrateMetadataToCurrent,
 } from "./metadata/migration-engine.ts";
 import {
-  findMetadataVersion,
   type MetadataMigrationDependencies,
   type MetadataSessionIdentityMatch,
-  type MetadataVersionNode,
+  type MetadataVersion,
   requireMetadataVersion,
   validateMetadataVersion,
 } from "./metadata/version.ts";
 
-export { MetadataError } from "./metadata-error.ts";
+export {
+  MetadataError,
+  MetadataFingerprintChangedError,
+  MetadataHistoryResetError,
+  MetadataUnavailableError,
+} from "./metadata-error.ts";
 
 const OPEN_BUSY_RETRY_MS = 5_000;
 const OPEN_BUSY_POLL_MS = 10;
@@ -202,6 +217,12 @@ export interface AdoptBlockedMissingInput {
 
 export interface FinalizeSessionRegistrationReport {
   readonly kind: "registered" | "existing";
+  /**
+   * True when this registration completed a pending history reset, which means
+   * inherited tree references were dropped: the session starts from its
+   * protection state and only new work produces checkpoints.
+   */
+  readonly historyReset: boolean;
 }
 
 export interface FinalizeSessionProjectionInput {
@@ -260,6 +281,38 @@ interface SessionRegistrationRow {
   readonly registration_state: unknown;
 }
 
+interface SessionHistoryRow {
+  readonly history_epoch: unknown;
+  readonly reset_pending: unknown;
+}
+
+const READ_SESSION_HISTORY_SQL = `SELECT history_epoch, reset_pending
+  FROM session_history WHERE session_id = ?`;
+// A session that has no history row has never been through an authorized
+// forget, so its generation is truthfully zero. Writing the row is idempotent
+// because only the first registration of a session creates it.
+const ENSURE_SESSION_HISTORY_SQL = `INSERT INTO session_history(
+    session_id, history_epoch, reset_pending
+  ) VALUES (?, 0, 0)
+  ON CONFLICT(session_id) DO NOTHING`;
+
+function sessionHistoryIn(
+  db: DatabaseSync,
+  sessionId: string,
+): { readonly epoch: number; readonly resetPending: boolean } {
+  const row = db.prepare(READ_SESSION_HISTORY_SQL).get(sessionId) as
+    SessionHistoryRow | undefined;
+  if (row === undefined) return { epoch: 0, resetPending: false };
+  const epoch = Number(row.history_epoch);
+  if (!Number.isSafeInteger(epoch) || epoch < 0) {
+    throw new MetadataError("invalid session history epoch");
+  }
+  if (row.reset_pending !== 0 && row.reset_pending !== 1) {
+    throw new MetadataError("invalid session history reset marker");
+  }
+  return { epoch, resetPending: row.reset_pending === 1 };
+}
+
 interface MetadataSidecarSet {
   readonly journal: boolean;
   readonly shm: boolean;
@@ -269,7 +322,7 @@ interface MetadataSidecarSet {
 interface MetadataIdentityProofDetails {
   readonly canonicalPath: string;
   readonly observation: BigIntStats;
-  readonly metadataVersion: MetadataVersionNode;
+  readonly metadataVersion: MetadataVersion;
   readonly sessionId: string;
   readonly sessionFile: string;
 }
@@ -281,6 +334,7 @@ const metadataIdentityProofDetails = new WeakMap<
 
 interface MetadataStoreOpenOptions {
   readonly migrationCandidate: boolean;
+  readonly initialization: "explicit" | "empty-store" | "never";
   readonly authenticatedProof?: MetadataIdentityProof;
   readonly writeAuthority: WorkspaceWriteAuthority;
 }
@@ -418,7 +472,10 @@ function prepareExistingMetadataPath(path: string): {
  * a post-open inode check; the containing control directory remains a trusted
  * same-user boundary against an active replacement race.
  */
-function prepareMetadataPath(path: string): {
+function prepareMetadataPath(
+  path: string,
+  initialization: MetadataStoreOpenOptions["initialization"],
+): {
   readonly canonicalPath: string;
   readonly observation: BigIntStats;
 } {
@@ -439,6 +496,14 @@ function prepareMetadataPath(path: string): {
   }
 
   if (!pathExists) {
+    if (
+      initialization === "never" ||
+      (initialization === "empty-store" &&
+        (storedHistoryPresent(dirname(canonicalPath)) ||
+          Object.values(metadataSidecars(canonicalPath)).some(Boolean)))
+    ) {
+      throw new MetadataUnavailableError(canonicalPath, "missing");
+    }
     let descriptor: number | undefined;
     try {
       descriptor = openSync(
@@ -659,7 +724,7 @@ export function inspectMetadataSessionIdentity(
         }
       | {
           readonly kind: "exact";
-          readonly metadataVersion: MetadataVersionNode;
+          readonly metadataVersion: MetadataVersion;
         }
       | undefined;
     try {
@@ -672,10 +737,7 @@ export function inspectMetadataSessionIdentity(
           supportedVersion: CURRENT_METADATA_VERSION.version,
         };
       } else {
-        const metadataVersion = findMetadataVersion(
-          CURRENT_METADATA_VERSION,
-          observedVersion,
-        );
+        const metadataVersion = METADATA_VERSIONS[observedVersion - 1];
         if (metadataVersion === undefined) {
           inspection = { kind: "unrecognized" };
         } else {
@@ -798,6 +860,30 @@ function requireVerifiedSessionIn(
   ) {
     throw new MetadataError(
       `session ${JSON.stringify(sessionId)} is not verified for metadata writes`,
+    );
+  }
+}
+
+/**
+ * Maintenance operations act on a session that no live runtime owns, so they
+ * require the exact registered identity without requiring a verified runtime
+ * registration state.
+ */
+function requireRegisteredSessionIn(
+  db: DatabaseSync,
+  sessionId: string,
+  expectedSessionFile: string,
+): void {
+  const row = db
+    .prepare(`SELECT session_file FROM session_registry WHERE session_id = ?`)
+    .get(sessionId) as { readonly session_file: unknown } | undefined;
+  const registeredFile =
+    row === undefined
+      ? undefined
+      : requireNonEmpty(row.session_file, "session file");
+  if (registeredFile !== requireNonEmpty(expectedSessionFile, "session file")) {
+    throw new MetadataError(
+      `session ${JSON.stringify(sessionId)} is not registered for history maintenance`,
     );
   }
 }
@@ -1055,6 +1141,52 @@ function validateSessionCoordinatesRetainedIn(
   return { stateIds, guardedIds };
 }
 
+/**
+ * Re-establish protection at the first stable attach after a forget. Only
+ * protection rows are written: the coordinate set may be rebuilt, but no tree
+ * reference may return, so the forgotten history cannot be revived. Coordinates
+ * that already carry state from the new generation are left untouched.
+ */
+function protectForgottenSessionIn(
+  db: DatabaseSync,
+  registration: SessionRegistration,
+  retained: ReadonlySet<string>,
+  active: readonly string[],
+): void {
+  const { stateIds, guardedIds } = validateSessionCoordinatesRetainedIn(
+    db,
+    registration,
+    retained,
+    "verified",
+  );
+  const openLeaf = active.at(-1);
+  const writeSlot = checkpointSlotWriter(db);
+  for (const entryId of retained) {
+    if (stateIds.has(entryId) || guardedIds.has(entryId)) continue;
+    writeSlot(registration.sessionId, entryId, {
+      kind: entryId === openLeaf ? "open-missing" : "blocked-missing",
+    });
+  }
+}
+
+function completeHistoryResetIn(
+  db: DatabaseSync,
+  sessionId: string,
+  epoch: number,
+): void {
+  const cleared = db
+    .prepare(
+      `UPDATE session_history SET reset_pending = 0
+       WHERE session_id = ? AND history_epoch = ? AND reset_pending = 1`,
+    )
+    .run(sessionId, epoch);
+  if (Number(cleared.changes) !== 1) {
+    throw new MetadataError(
+      "pending session history reset changed while completing",
+    );
+  }
+}
+
 function verifyPendingRegistrationIn(
   db: DatabaseSync,
   registration: SessionRegistration,
@@ -1148,6 +1280,45 @@ function exportForkProjectionIn(
   };
 }
 
+/**
+ * The durable history identity of one session. `epoch` advances exactly once
+ * per authorized whole-session forget; `resetPending` is the treeless tombstone
+ * that a stable attach must complete before ordinary writes resume.
+ */
+export interface SessionHistoryState {
+  readonly sessionId: string;
+  readonly epoch: number;
+  readonly resetPending: boolean;
+}
+
+/** Everything a maintenance preview needs to describe and later re-authenticate one session's history. */
+export interface SessionHistorySnapshot extends SessionHistoryState {
+  readonly fingerprint: string;
+  readonly sessionFile: string;
+  readonly registrationState: "pending" | "verified";
+  readonly slotCount: number;
+  readonly checkpointCount: number;
+  readonly blockedCount: number;
+  readonly hasCaptureBarrier: boolean;
+  /** Canonical, unique and sorted, so a preview token is comparison-stable. */
+  readonly treeOids: readonly TreeOid[];
+}
+
+export interface ForgetSessionHistoryInput {
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  /**
+   * The fingerprinted state a preview authenticated. Deletion happens only if
+   * the stored history still matches it exactly.
+   */
+  readonly expectedFingerprint: string;
+}
+
+export interface ForgetSessionHistoryReport extends SessionHistoryState {
+  readonly removedSlots: number;
+  readonly removedCaptureBarrier: boolean;
+}
+
 /** Operations available only after the database is at the current schema. */
 export interface CurrentMetadataStore {
   getCheckpointSlot(sessionId: string, entryId: string): CheckpointSlot;
@@ -1185,6 +1356,11 @@ export interface CurrentMetadataStore {
     sessionId: string,
     sessionFile: string,
   ): MetadataSessionIdentityMatch;
+  describeSessionHistory(sessionId: string): SessionHistorySnapshot | undefined;
+  forgetSessionHistory(
+    authority: WorkspaceWriteAuthority,
+    input: ForgetSessionHistoryInput,
+  ): ForgetSessionHistoryReport;
   exportForkProjection(
     input: ExportForkProjectionInput,
   ): ForkCheckpointProjection | undefined;
@@ -1203,6 +1379,13 @@ export interface CurrentMetadataStore {
 class SqliteMetadataConnection implements CurrentMetadataStore {
   readonly #db: DatabaseSync;
   readonly #canonicalPath: string;
+  /**
+   * History generation this connection adopted for each session it has
+   * touched. Once adopted it is verified inside every writer transaction, so a
+   * runtime holding a session across a forget cannot commit under the retired
+   * generation. A pending reset is never adopted implicitly.
+   */
+  readonly #historyEpoch = new Map<string, number>();
   #phase: "historical" | "current" = "historical";
   #closed = false;
 
@@ -1223,7 +1406,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     try {
       const prepared =
         authenticated === undefined
-          ? prepareMetadataPath(path)
+          ? prepareMetadataPath(path, options.initialization)
           : prepareExistingMetadataPath(path);
       this.#canonicalPath = prepared.canonicalPath;
       metadataSidecars(prepared.canonicalPath);
@@ -1273,13 +1456,20 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         }
         const observedVersion = metadataSchemaVersion(snapshot);
         if (observedVersion === 0) {
+          if (
+            options.initialization === "never" ||
+            (options.initialization === "empty-store" &&
+              storedHistoryPresent(dirname(prepared.canonicalPath)))
+          ) {
+            throw new MetadataUnavailableError(
+              prepared.canonicalPath,
+              "uninitialized",
+            );
+          }
           validateUninitializedMetadataDatabase(snapshot);
           return;
         }
-        const observed = requireMetadataVersion(
-          CURRENT_METADATA_VERSION,
-          snapshot,
-        );
+        const observed = requireMetadataVersion(METADATA_VERSIONS, snapshot);
         validateMetadataVersion(snapshot, observed);
         if (
           observed !== CURRENT_METADATA_VERSION &&
@@ -1338,10 +1528,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
             );
             return "current";
           } else {
-            const observed = requireMetadataVersion(
-              CURRENT_METADATA_VERSION,
-              locked,
-            );
+            const observed = requireMetadataVersion(METADATA_VERSIONS, locked);
             validateMetadataVersion(locked, observed);
             if (
               observed !== CURRENT_METADATA_VERSION &&
@@ -1358,10 +1545,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         });
       } else {
         phase = inReadTransaction(db, (snapshot) => {
-          const observed = requireMetadataVersion(
-            CURRENT_METADATA_VERSION,
-            snapshot,
-          );
+          const observed = requireMetadataVersion(METADATA_VERSIONS, snapshot);
           validateMetadataVersion(snapshot, observed);
           if (
             observed !== CURRENT_METADATA_VERSION &&
@@ -1399,7 +1583,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       dependencies,
       authority,
       dirname(this.#canonicalPath),
-      CURRENT_METADATA_VERSION,
+      METADATA_VERSIONS,
     );
     inReadTransaction(db, (snapshot) => {
       validateMetadataVersion(snapshot, CURRENT_METADATA_VERSION);
@@ -1451,7 +1635,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       );
     }
     const treeOid = requireTreeOid(input.treeOid, "captured checkpoint");
-    return this.#writeTransaction(authority, (db) => {
+    return this.#sessionWriteTransaction(authority, sessionId, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (
         reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile) ===
@@ -1508,7 +1692,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
             "expected protected resolution",
           )
         : undefined;
-    return this.#writeTransaction(authority, (db) => {
+    return this.#sessionWriteTransaction(authority, sessionId, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       const hasBarrier = sessionHasBarrierIn(db, sessionId);
       const { resolution: actualResolution, targetSlot: current } =
@@ -1558,7 +1742,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       ancestry,
       "expected admitted resolution",
     );
-    return this.#writeTransaction(authority, (db) => {
+    return this.#sessionWriteTransaction(authority, sessionId, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
       const { resolution: resolved, targetSlot: current } = resolveCheckpointIn(
@@ -1595,7 +1779,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     );
     const entryId = requireNonEmpty(input.entryId, "entry id");
     const treeOid = requireTreeOid(input.treeOid, "adopted checkpoint");
-    return this.#writeTransaction(authority, (db) => {
+    return this.#sessionWriteTransaction(authority, sessionId, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       if (sessionHasBarrierIn(db, sessionId)) return "slot-changed";
       const transition = adoptBlockedMissingSlot(
@@ -1614,7 +1798,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
   ): boolean {
     const sessionId = requireNonEmpty(identity.sessionId, "session id");
     const sessionFile = requireNonEmpty(identity.sessionFile, "session file");
-    return this.#writeTransaction(authority, (db) => {
+    return this.#sessionWriteTransaction(authority, sessionId, (db) => {
       requireVerifiedSessionIn(db, sessionId, sessionFile);
       db.prepare(
         `INSERT OR IGNORE INTO session_capture_barrier(session_id) VALUES (?)`,
@@ -1671,7 +1855,7 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         "session barrier cannot be reconciled without a stable ancestry",
       );
     }
-    const result = this.#writeTransaction(authority, (db) =>
+    const result = this.#sessionWriteTransaction(authority, sessionId, (db) =>
       reconcileSessionBarrierIn(db, sessionId, ancestry, sessionFile),
     );
     return result;
@@ -1748,16 +1932,35 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
         "source workspace write authority is only valid for a fork projection",
       );
     }
-    return this.#writeTransaction(authority, (db) => {
-      if (sourceAuthority !== undefined) {
-        assertWorkspaceWriteAuthority(
-          sourceAuthority.authority,
-          sourceAuthority.storeRoot,
-        );
-      }
-      const matches = db
-        .prepare(
-          `SELECT registry.session_id, registry.session_file,
+    const { historyEpoch, ...report } = this.#writeTransaction(
+      authority,
+      (db): FinalizeSessionRegistrationReport & { historyEpoch: number } => {
+        if (sourceAuthority !== undefined) {
+          assertWorkspaceWriteAuthority(
+            sourceAuthority.authority,
+            sourceAuthority.storeRoot,
+          );
+        }
+        // Registration is the stable host boundary at which a session adopts the
+        // history generation currently stored, so this is where a pending reset
+        // is completed. A session without a registration row can only have a
+        // pending reset through a topology this build never creates.
+        const history = sessionHistoryIn(db, targetSessionId);
+        if (history.resetPending) {
+          const registered = db
+            .prepare(
+              `SELECT 1 AS present FROM session_registry WHERE session_id = ?`,
+            )
+            .get(targetSessionId);
+          if (registered === undefined) {
+            throw new MetadataError(
+              "session history reset requires an existing registration",
+            );
+          }
+        }
+        const matches = db
+          .prepare(
+            `SELECT registry.session_id, registry.session_file,
                   registry.registration_state,
                   EXISTS(
                     SELECT 1 FROM session_capture_barrier AS barrier
@@ -1765,136 +1968,279 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
                   ) AS capture_barrier
            FROM session_registry AS registry
            WHERE registry.session_id = ? OR registry.session_file = ?`,
-        )
-        .all(
-          targetSessionId,
-          targetSessionFile,
-        ) as unknown as SessionRegistrationRow[];
-      if (matches.length > 0) {
-        if (matches.length !== 1) {
-          throw new MetadataError(
-            "session identity conflicts with registered metadata",
-          );
+          )
+          .all(
+            targetSessionId,
+            targetSessionFile,
+          ) as unknown as SessionRegistrationRow[];
+        if (matches.length > 0) {
+          if (matches.length !== 1) {
+            throw new MetadataError(
+              "session identity conflicts with registered metadata",
+            );
+          }
+          const registration = sessionRegistrationFromRow(matches[0]!);
+          if (
+            registration.sessionId !== targetSessionId ||
+            registration.sessionFile !== targetSessionFile
+          ) {
+            throw new MetadataError(
+              "session identity conflicts with registered metadata",
+            );
+          }
+          if (registration.registrationState === "pending") {
+            verifyPendingRegistrationIn(db, registration, retained, active);
+          } else if (history.resetPending) {
+            protectForgottenSessionIn(db, registration, retained, active);
+          } else {
+            validateSessionCoordinatesRetainedIn(
+              db,
+              registration,
+              retained,
+              "verified",
+            );
+          }
+          if (history.resetPending)
+            completeHistoryResetIn(db, targetSessionId, history.epoch);
+          return {
+            kind: "existing",
+            historyReset: history.resetPending,
+            historyEpoch: history.epoch,
+          };
         }
-        const registration = sessionRegistrationFromRow(matches[0]!);
-        if (
-          registration.sessionId !== targetSessionId ||
-          registration.sessionFile !== targetSessionFile
-        ) {
-          throw new MetadataError(
-            "session identity conflicts with registered metadata",
-          );
-        }
-        if (registration.registrationState === "pending") {
-          verifyPendingRegistrationIn(db, registration, retained, active);
-        } else {
-          validateSessionCoordinatesRetainedIn(
-            db,
-            registration,
-            retained,
-            "verified",
-          );
-        }
-        return { kind: "existing" };
-      }
 
-      // Published v1/v2 schemas and write APIs did not enforce registry/slot
-      // coupling. Claim that schema-valid recovery shape conservatively: the
-      // trusted graph must contain every old coordinate, every unclassified
-      // retained coordinate is blocked, and the verified registry row is
-      // committed (or rolled back) as one unit.
-      const orphaned = db
-        .prepare(
-          `SELECT EXISTS(
+        // Published v1/v2 schemas and write APIs did not enforce registry/slot
+        // coupling. Claim that schema-valid recovery shape conservatively: the
+        // trusted graph must contain every old coordinate, every unclassified
+        // retained coordinate is blocked, and the verified registry row is
+        // committed (or rolled back) as one unit.
+        const orphaned = db
+          .prepare(
+            `SELECT EXISTS(
              SELECT 1 FROM checkpoint_slot WHERE session_id = ?
            ) AS has_slot,
            EXISTS(
              SELECT 1 FROM session_capture_barrier WHERE session_id = ?
            ) AS has_barrier`,
-        )
-        .get(targetSessionId, targetSessionId) as {
-        readonly has_barrier: unknown;
-        readonly has_slot: unknown;
-      };
-      const hasOrphanedSlot = Number(orphaned.has_slot);
-      const hasOrphanedBarrier = Number(orphaned.has_barrier);
-      if (
-        (hasOrphanedSlot !== 0 && hasOrphanedSlot !== 1) ||
-        (hasOrphanedBarrier !== 0 && hasOrphanedBarrier !== 1)
-      ) {
-        throw new MetadataError("invalid orphaned session metadata state");
-      }
-      if (hasOrphanedSlot === 1 || hasOrphanedBarrier === 1) {
-        db.prepare(
-          `INSERT INTO session_registry(
+          )
+          .get(targetSessionId, targetSessionId) as {
+          readonly has_barrier: unknown;
+          readonly has_slot: unknown;
+        };
+        const hasOrphanedSlot = Number(orphaned.has_slot);
+        const hasOrphanedBarrier = Number(orphaned.has_barrier);
+        if (
+          (hasOrphanedSlot !== 0 && hasOrphanedSlot !== 1) ||
+          (hasOrphanedBarrier !== 0 && hasOrphanedBarrier !== 1)
+        ) {
+          throw new MetadataError("invalid orphaned session metadata state");
+        }
+        if (hasOrphanedSlot === 1 || hasOrphanedBarrier === 1) {
+          db.prepare(
+            `INSERT INTO session_registry(
            session_id, session_file, registration_state
            ) VALUES (?, ?, 'pending')`,
-        ).run(targetSessionId, targetSessionFile);
-        verifyPendingRegistrationIn(
-          db,
-          {
-            sessionId: targetSessionId,
-            sessionFile: targetSessionFile,
-            captureBarrier: hasOrphanedBarrier === 1,
-            registrationState: "pending",
-          },
-          retained,
-          active,
-        );
-        return { kind: "existing" };
-      }
+          ).run(targetSessionId, targetSessionFile);
+          verifyPendingRegistrationIn(
+            db,
+            {
+              sessionId: targetSessionId,
+              sessionFile: targetSessionFile,
+              captureBarrier: hasOrphanedBarrier === 1,
+              registrationState: "pending",
+            },
+            retained,
+            active,
+          );
+          db.prepare(ENSURE_SESSION_HISTORY_SQL).run(targetSessionId);
+          return {
+            kind: "existing",
+            historyReset: false,
+            historyEpoch: history.epoch,
+          };
+        }
 
-      let projection: ReturnType<typeof checkedForkProjection> | undefined;
-      let openLeaf: string | undefined;
-      let raiseBarrier = false;
-      if (typeof input.seed !== "object" || input.seed === null) {
-        throw new MetadataError("session registration seed is invalid");
-      }
-      switch (input.seed.kind) {
-        case "fresh":
-          openLeaf = active.at(-1);
-          break;
-        case "untrusted-parent":
-          raiseBarrier = true;
-          break;
-        case "fork":
-          projection = checkedForkProjection(input.seed.projection, retained);
-          if (projection === undefined) {
-            throw new MetadataError("fork registration projection is missing");
-          }
-          if (projection.sourceSessionId === targetSessionId) {
-            throw new MetadataError(
-              "fork source and target session ids must differ",
-            );
-          }
-          raiseBarrier = projection.barrier;
-          break;
-        default:
+        let projection: ReturnType<typeof checkedForkProjection> | undefined;
+        let openLeaf: string | undefined;
+        let raiseBarrier = false;
+        if (typeof input.seed !== "object" || input.seed === null) {
           throw new MetadataError("session registration seed is invalid");
-      }
+        }
+        switch (input.seed.kind) {
+          case "fresh":
+            openLeaf = active.at(-1);
+            break;
+          case "untrusted-parent":
+            raiseBarrier = true;
+            break;
+          case "fork":
+            projection = checkedForkProjection(input.seed.projection, retained);
+            if (projection === undefined) {
+              throw new MetadataError(
+                "fork registration projection is missing",
+              );
+            }
+            if (projection.sourceSessionId === targetSessionId) {
+              throw new MetadataError(
+                "fork source and target session ids must differ",
+              );
+            }
+            raiseBarrier = projection.barrier;
+            break;
+          default:
+            throw new MetadataError("session registration seed is invalid");
+        }
 
-      db.prepare(
-        `INSERT INTO session_registry(
+        db.prepare(
+          `INSERT INTO session_registry(
          session_id, session_file, registration_state
          ) VALUES (?, ?, 'verified')`,
-      ).run(targetSessionId, targetSessionFile);
+        ).run(targetSessionId, targetSessionFile);
+        db.prepare(ENSURE_SESSION_HISTORY_SQL).run(targetSessionId);
 
-      const writeSlot = checkpointSlotWriter(db);
-      for (const entryId of retained) {
-        const projected = projection?.slots.get(entryId);
-        const slot =
-          projected ??
-          (entryId === openLeaf
-            ? ({ kind: "open-missing" } as const)
-            : ({ kind: "blocked-missing" } as const));
-        writeSlot(targetSessionId, entryId, slot);
+        const writeSlot = checkpointSlotWriter(db);
+        for (const entryId of retained) {
+          const projected = projection?.slots.get(entryId);
+          const slot =
+            projected ??
+            (entryId === openLeaf
+              ? ({ kind: "open-missing" } as const)
+              : ({ kind: "blocked-missing" } as const));
+          writeSlot(targetSessionId, entryId, slot);
+        }
+        if (raiseBarrier) {
+          db.prepare(
+            `INSERT INTO session_capture_barrier(session_id) VALUES (?)`,
+          ).run(targetSessionId);
+        }
+        return {
+          kind: "registered",
+          historyReset: false,
+          historyEpoch: history.epoch,
+        };
+      },
+    );
+    this.#historyEpoch.set(targetSessionId, historyEpoch);
+    return report;
+  }
+
+  /** Read one session's durable history identity and scale counts. */
+  describeSessionHistory(
+    sessionId: string,
+  ): SessionHistorySnapshot | undefined {
+    const checkedSessionId = requireNonEmpty(sessionId, "session id");
+    return this.#readTransaction((db) => {
+      const registration = db
+        .prepare(
+          `SELECT session_id, session_file, registration_state
+           FROM session_registry WHERE session_id = ?`,
+        )
+        .get(checkedSessionId) as
+        | {
+            readonly session_file: unknown;
+            readonly registration_state: unknown;
+          }
+        | undefined;
+      if (registration === undefined) return undefined;
+      const history = sessionHistoryIn(db, checkedSessionId);
+      let slotCount = 0;
+      let checkpointCount = 0;
+      let blockedCount = 0;
+      const treeOids = new Set<TreeOid>();
+      const rows = db
+        .prepare(
+          `SELECT tree_oid, capture_state FROM checkpoint_slot
+           WHERE session_id = ?`,
+        )
+        .iterate(checkedSessionId) as unknown as Iterable<CheckpointSlotRow>;
+      for (const row of rows) {
+        const slot = checkpointSlotFromRow(row, "session history slot");
+        slotCount += 1;
+        if (checkpointSlotIsBlocked(slot)) blockedCount += 1;
+        const treeOid = checkpointSlotTreeOid(slot);
+        if (treeOid === undefined) continue;
+        checkpointCount += 1;
+        treeOids.add(treeOid);
       }
-      if (raiseBarrier) {
-        db.prepare(
-          `INSERT INTO session_capture_barrier(session_id) VALUES (?)`,
-        ).run(targetSessionId);
+      return {
+        fingerprint: readSessionHistoryFingerprint(
+          db,
+          CURRENT_METADATA_VERSION.version,
+          checkedSessionId,
+        )!,
+        sessionId: checkedSessionId,
+        sessionFile: requireNonEmpty(registration.session_file, "session file"),
+        registrationState: sessionRegistrationStateFrom(
+          registration.registration_state,
+        ),
+        epoch: history.epoch,
+        resetPending: history.resetPending,
+        slotCount,
+        checkpointCount,
+        blockedCount,
+        hasCaptureBarrier: sessionHasBarrierIn(db, checkedSessionId),
+        treeOids: Object.freeze([...treeOids].sort()),
+      };
+    });
+  }
+
+  /**
+   * Remove one session's history references in a single transaction: every
+   * slot, the capture barrier, and the treeless reset tombstone that keeps the
+   * advanced epoch visible. Physical objects are reclaimed separately by GC,
+   * which is why this reports counts rather than bytes.
+   */
+  forgetSessionHistory(
+    authority: WorkspaceWriteAuthority,
+    input: ForgetSessionHistoryInput,
+  ): ForgetSessionHistoryReport {
+    const sessionId = requireNonEmpty(input.sessionId, "session id");
+    const sessionFile = requireNonEmpty(input.sessionFile, "session file");
+    return this.#writeTransaction(authority, (db) => {
+      requireRegisteredSessionIn(db, sessionId, sessionFile);
+      if (
+        readSessionHistoryFingerprint(
+          db,
+          CURRENT_METADATA_VERSION.version,
+          sessionId,
+        ) !== input.expectedFingerprint
+      ) {
+        throw new MetadataFingerprintChangedError(
+          "the checkpoint mapping or session identity differs",
+        );
       }
-      return { kind: "registered" };
+      const expectedEpoch = sessionHistoryIn(db, sessionId).epoch;
+
+      const removedSlots = Number(
+        db
+          .prepare(`DELETE FROM checkpoint_slot WHERE session_id = ?`)
+          .run(sessionId).changes,
+      );
+      const removedCaptureBarrier =
+        Number(
+          db
+            .prepare(`DELETE FROM session_capture_barrier WHERE session_id = ?`)
+            .run(sessionId).changes,
+        ) === 1;
+      const advanced = db
+        .prepare(
+          `UPDATE session_history
+           SET history_epoch = history_epoch + 1, reset_pending = 1
+           WHERE session_id = ? AND history_epoch = ?`,
+        )
+        .run(sessionId, expectedEpoch);
+      if (Number(advanced.changes) !== 1) {
+        throw new MetadataError(
+          "session history epoch changed while forgetting",
+        );
+      }
+      return {
+        sessionId,
+        epoch: expectedEpoch + 1,
+        resetPending: true,
+        removedSlots,
+        removedCaptureBarrier,
+      };
     });
   }
 
@@ -1927,6 +2273,52 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
       assertWorkspaceWriteAuthority(authority, dirname(this.#canonicalPath));
       return operation(db);
     });
+  }
+
+  /**
+   * A business write may only commit under the history generation this
+   * connection attached to. The check runs inside the writer transaction, so a
+   * forget that lands between two statements cannot slip an old-generation
+   * write through afterwards.
+   */
+  #sessionWriteTransaction<T>(
+    authority: WorkspaceWriteAuthority,
+    sessionId: string,
+    operation: (db: DatabaseSync) => T,
+  ): T {
+    return this.#writeTransaction(authority, (db) => {
+      this.#requireSessionHistoryReady(db, sessionId);
+      return operation(db);
+    });
+  }
+
+  /**
+   * Only a committed registration adopts a history generation. Failed writes
+   * retain the old generation, so retrying after another connection attaches
+   * cannot restore this connection's authority.
+   */
+  #requireSessionHistoryReady(db: DatabaseSync, sessionId: string): void {
+    const observed = sessionHistoryIn(db, sessionId);
+    const attached = this.#historyEpoch.get(sessionId);
+    if (attached !== undefined && attached !== observed.epoch) {
+      throw new MetadataHistoryResetError(
+        "epoch-changed",
+        attached,
+        observed.epoch,
+      );
+    }
+    if (observed.resetPending) {
+      throw new MetadataHistoryResetError(
+        "reset-pending",
+        attached ?? observed.epoch,
+        observed.epoch,
+      );
+    }
+    if (attached === undefined) {
+      throw new MetadataError(
+        "session history generation is not verified by a committed registration",
+      );
+    }
   }
 
   #runTransaction<T>(
@@ -1986,10 +2378,12 @@ function openMetadataMigrationCandidate(
   path: string,
   authority: WorkspaceWriteAuthority,
   proof?: MetadataIdentityProof,
+  initialization: "empty-store" | "never" = "empty-store",
 ): MetadataMigrationCandidate {
   let store: SqliteMetadataConnection | undefined =
     new SqliteMetadataConnection(path, {
       migrationCandidate: true,
+      initialization,
       writeAuthority: authority,
       ...(proof === undefined ? {} : { authenticatedProof: proof }),
     });
@@ -2043,6 +2437,7 @@ export function createCurrentMetadataStore(
 ): CurrentMetadataStore {
   return new SqliteMetadataConnection(path, {
     migrationCandidate: false,
+    initialization: "explicit",
     writeAuthority: authority,
   });
 }
@@ -2053,8 +2448,22 @@ export function openCurrentMetadataStore(
   dependencies: MetadataMigrationDependencies,
   authority: WorkspaceWriteAuthority,
 ): Promise<CurrentMetadataStore> {
+  dependencies.signal?.throwIfAborted();
   return finishOpeningCurrentMetadataStore(
     openMetadataMigrationCandidate(path, authority),
+    dependencies,
+  );
+}
+
+/** Maintenance may upgrade an existing database, but cannot create root authority. */
+export function openExistingMetadataStore(
+  path: string,
+  dependencies: MetadataMigrationDependencies,
+  authority: WorkspaceWriteAuthority,
+): Promise<CurrentMetadataStore> {
+  dependencies.signal?.throwIfAborted();
+  return finishOpeningCurrentMetadataStore(
+    openMetadataMigrationCandidate(path, authority, undefined, "never"),
     dependencies,
   );
 }
@@ -2065,12 +2474,18 @@ export function openAuthenticatedCurrentMetadataStore(
   dependencies: MetadataMigrationDependencies,
   authority: WorkspaceWriteAuthority,
 ): Promise<CurrentMetadataStore> {
+  dependencies.signal?.throwIfAborted();
   const details = metadataIdentityProofDetails.get(proof);
   if (details === undefined) {
     throw new MetadataError("metadata identity proof is invalid or expired");
   }
   return finishOpeningCurrentMetadataStore(
-    openMetadataMigrationCandidate(details.canonicalPath, authority, proof),
+    openMetadataMigrationCandidate(
+      details.canonicalPath,
+      authority,
+      proof,
+      "never",
+    ),
     dependencies,
   );
 }

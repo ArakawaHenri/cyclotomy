@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { notifyArrivalRecovery } from "./restore-notifications.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
-import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
 
 /** Retire checkpoint authority after an established store binding fails. */
 export async function withdrawAfterStoreBindingFailure(

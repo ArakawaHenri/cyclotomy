@@ -63,6 +63,8 @@ const EN = {
     "Cyclotomy could not resume automatic checkpoints ({{message}}). Fix the problem, then run /cyclotomy resume.",
   automaticGcFailed:
     "Automatic storage cleanup failed ({{message}}). Cyclotomy will try again later.",
+  automaticGcBudgetExceeded:
+    "Automatic storage cleanup reached its time budget. Run `cyclotomy gc` when convenient to continue.",
   captureFailureDetail: "Details: {{message}}",
   captureCancelled: "Checkpoint cancelled.",
   captureCancelledProtected:
@@ -81,6 +83,12 @@ const EN = {
   captureEligibilityChanged:
     "The node changed before the checkpoint could be saved.",
   captureWriteProtected: "Automatic checkpoints are paused at this node.",
+  captureHistoryReset:
+    "This session's checkpoint history was cleaned up, so the checkpoint was not kept. Run /cyclotomy resume to continue; new checkpoints start from your next work.",
+  historyReset:
+    "This session's checkpoint history was cleaned up. Cyclotomy stopped using the old history; run /cyclotomy resume to continue. New checkpoints start from your next work.",
+  sessionHistoryResetAttached:
+    "This session's earlier checkpoints were cleaned up. New checkpoints start from your next work; old coordinates were not restored.",
   captureRootChanged:
     "The workspace location changed while the checkpoint was being saved.",
   captureContentsChanged:
@@ -293,6 +301,93 @@ const EN = {
   restoreUsage: "Usage: /restore",
   cyclotomyUsage: "Usage: /cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy command failed: {{message}}",
+  cliUsage: `Usage: cyclotomy <command> [options]
+
+Commands:
+  doctor                  Diagnose the store without changing it
+  history                 List per-session scale statistics
+  history forget <id>     Preview or apply removing one session's history
+  inventory               Report store space and scale observations
+  lock recover --offline  Preview or quarantine a legacy directory lock
+  gc                      Reclaim unreferenced objects
+
+Options:
+  --workspace <path>      Workspace to inspect (default: current directory)
+  --locale <auto|en|zh-CN>
+  --json                  Write one JSON document to stdout
+  --apply <token>         Apply a previously previewed plan
+  --session <id>          Session selected by inventory
+  --page-size <n>         History page size (1-500)
+  --cursor <token>        History continuation cursor
+  --offline               Assert that every accessing process has stopped
+  --help                  Show this message`,
+  cliCancelled: "cancelled",
+  cliGcProgress: "gc · {{phase}}{{detail}}",
+  cliGcCancelled:
+    "stopped on request; the pass completed only the removals it already made",
+  cliGcBudgetExceeded:
+    "stopped at a safe boundary after reaching its time budget; completed work is reported above",
+  cliGcGraphLimit:
+    "the rooted object graph is larger than one collection may authenticate, so nothing was removed; drop history with `cyclotomy history forget <session>` and run gc again",
+  cliUsageError: "usage error: {{message}}",
+  cliConfigurationError: "configuration error: {{detail}}",
+  cliWorkspaceUnresolved: "the workspace {{path}} cannot be resolved",
+  cliStoreAbsentRefusal:
+    "the store does not exist; nothing was created or changed",
+  cliNetworkRefusal:
+    "write commands refuse a store on a network filesystem ({{filesystem}})",
+  cliSummary: "cyclotomy {{command}} · {{status}}",
+  cliStatusOk: "ok",
+  cliStatusObservational: "observational",
+  cliStatusPartial: "partial",
+  cliStatusBusy: "busy",
+  cliStatusUnavailable: "unavailable",
+  cliStatusUnsupported: "unsupported",
+  cliStatusBlocked: "blocked",
+  cliStatusPreview: "preview",
+  cliStatusApplied: "applied",
+  cliStatusError: "error",
+  cliLabelWorkspace: "workspace",
+  cliLabelStore: "store",
+  cliLabelMetadata: "metadata",
+  cliLabelLock: "lock",
+  cliLabelFilesystem: "filesystem",
+  cliLabelIssues: "issues",
+  cliLabelNone: "none",
+  cliLabelSessions: "sessions",
+  cliLabelSlots: "slots",
+  cliLabelCheckpointed: "checkpointed",
+  cliLabelBlockedSlots: "blocked",
+  cliLabelTrees: "trees",
+  cliLabelEpoch: "history epoch",
+  cliLabelResetPending: "reset pending",
+  cliLabelSession: "session",
+  cliLabelPlanToken: "plan token",
+  cliLabelApplyHint: "apply with --apply {{token}}",
+  cliLabelRecoverable: "recoverable",
+  cliLabelNothingToRecover: "nothing to recover",
+  cliLabelQuarantined: "quarantined at {{path}}",
+  cliLabelObjects: "objects",
+  cliLabelCapacity: "capacity",
+  cliLabelFacts: "facts",
+  cliLabelFiles: "files",
+  cliLabelRemovedSlots: "removed slots",
+  cliLabelUnknown: "unknown",
+  cliLabelYes: "yes",
+  cliLabelNo: "no",
+  cliLabelComplete: "complete",
+  cliLabelIncomplete: "incomplete",
+  cliLabelPresent: "present",
+  cliLabelAbsent: "absent",
+  cliLabelCapacityWithin: "within",
+  cliLabelBytes: "bytes",
+  cliLabelRemoved: "removed",
+  cliLabelFreed: "reclaimed",
+  cliLabelKept: "kept",
+  cliLabelStopped: "stopped",
+  cliLabelSchema: "schema",
+  cliLabelNextCursor: "next cursor",
+  cliLabelTotals: "totals",
 } as const;
 
 export type MessageKey = keyof typeof EN;
@@ -334,6 +429,8 @@ const ZH_CN: Record<MessageKey, string> = {
   arrivalAdmissionStopped:
     "Cyclotomy 无法恢复自动检查点（{{message}}）。修复问题后执行 /cyclotomy resume。",
   automaticGcFailed: "自动清理存储失败（{{message}}）。Cyclotomy 稍后会重试。",
+  automaticGcBudgetExceeded:
+    "自动清理已达到时间预算。方便时请运行 `cyclotomy gc` 继续清理。",
   captureFailureDetail: "详情：{{message}}",
   captureCancelled: "已取消快照。",
   captureCancelledProtected: "已取消快照，当前节点的自动检查点已暂停。",
@@ -349,6 +446,12 @@ const ZH_CN: Record<MessageKey, string> = {
   captureCheckpointChanged: "保存期间，检查点发生了变化。",
   captureEligibilityChanged: "保存检查点前，当前节点发生了变化。",
   captureWriteProtected: "当前节点的自动检查点已暂停。",
+  captureHistoryReset:
+    "此会话的检查点历史已被清理，因此未保留本次检查点。执行 /cyclotomy resume 继续；新检查点将从之后的新工作开始。",
+  historyReset:
+    "此会话的检查点历史已被清理。Cyclotomy 已停止使用旧历史；执行 /cyclotomy resume 继续。新检查点将从之后的新工作开始。",
+  sessionHistoryResetAttached:
+    "此会话的既有检查点已被清理。新检查点将从之后的新工作开始；旧坐标未被恢复。",
   captureRootChanged: "保存检查点期间，工作区位置发生了变化。",
   captureContentsChanged: "保存检查点期间，工作区发生了变化。",
   sourceCaptureFailed: "Cyclotomy 无法保存当前工作区，因此已取消本次操作。",
@@ -536,6 +639,90 @@ const ZH_CN: Record<MessageKey, string> = {
   restoreUsage: "用法：/restore",
   cyclotomyUsage: "用法：/cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy 命令失败：{{message}}",
+  cliUsage: `用法：cyclotomy <命令> [选项]
+
+命令：
+  doctor                  只读诊断存储，不做迁移或修复
+  history                 分页列出各会话的规模统计
+  history forget <id>     预览或执行单个会话的历史清理
+  inventory               报告存储空间与规模观测
+  lock recover --offline  预览或隔离旧目录锁
+  gc                      回收无引用对象
+
+选项：
+  --workspace <路径>      要检查的工作区（缺省为当前目录）
+  --locale <auto|en|zh-CN>
+  --json                  只向 stdout 写一个 JSON 文档
+  --apply <token>         执行已预览的计划
+  --session <id>          inventory 指定的会话
+  --page-size <n>         history 每页条数（1-500）
+  --cursor <token>        history 续页游标
+  --offline               声明所有访问进程都已停止
+  --help                  显示本说明`,
+  cliCancelled: "已取消",
+  cliGcProgress: "gc · {{phase}}{{detail}}",
+  cliGcCancelled: "已按要求停止；本次仅完成了已经执行的删除",
+  cliGcBudgetExceeded: "已达到时间预算，在安全边界停止；已完成的工作见上述计数",
+  cliGcGraphLimit:
+    "有根对象图超出单次回收可认证的范围，未删除任何内容；请先用 `cyclotomy history forget <会话>` 删除历史，再重新运行 gc",
+  cliUsageError: "用法错误：{{message}}",
+  cliConfigurationError: "配置错误：{{detail}}",
+  cliWorkspaceUnresolved: "无法解析工作区 {{path}}",
+  cliStoreAbsentRefusal: "存储不存在；未创建或修改任何内容",
+  cliNetworkRefusal:
+    "写命令拒绝在存储所在的网络文件系统上执行（{{filesystem}}）",
+  cliSummary: "cyclotomy {{command}} · {{status}}",
+  cliStatusOk: "正常",
+  cliStatusObservational: "观测结果",
+  cliStatusPartial: "不完整",
+  cliStatusBusy: "忙碌",
+  cliStatusUnavailable: "未检查",
+  cliStatusUnsupported: "不支持",
+  cliStatusBlocked: "已阻止",
+  cliStatusPreview: "预览",
+  cliStatusApplied: "已执行",
+  cliStatusError: "错误",
+  cliLabelWorkspace: "工作区",
+  cliLabelStore: "存储",
+  cliLabelMetadata: "元数据",
+  cliLabelLock: "锁",
+  cliLabelFilesystem: "文件系统",
+  cliLabelIssues: "问题",
+  cliLabelNone: "无",
+  cliLabelSessions: "会话",
+  cliLabelSlots: "slot",
+  cliLabelCheckpointed: "有检查点",
+  cliLabelBlockedSlots: "blocked",
+  cliLabelTrees: "tree",
+  cliLabelEpoch: "历史代次",
+  cliLabelResetPending: "等待重开",
+  cliLabelSession: "会话",
+  cliLabelPlanToken: "计划 token",
+  cliLabelApplyHint: "可用 --apply {{token}} 执行",
+  cliLabelRecoverable: "可恢复",
+  cliLabelNothingToRecover: "无须恢复",
+  cliLabelQuarantined: "已隔离到 {{path}}",
+  cliLabelObjects: "对象",
+  cliLabelCapacity: "容量",
+  cliLabelFacts: "事实",
+  cliLabelFiles: "文件",
+  cliLabelRemovedSlots: "已删除 slot",
+  cliLabelUnknown: "未知",
+  cliLabelYes: "是",
+  cliLabelNo: "否",
+  cliLabelComplete: "完整",
+  cliLabelIncomplete: "不完整",
+  cliLabelPresent: "存在",
+  cliLabelAbsent: "不存在",
+  cliLabelCapacityWithin: "未达阈值",
+  cliLabelBytes: "字节",
+  cliLabelRemoved: "已删除",
+  cliLabelFreed: "已回收",
+  cliLabelKept: "保留",
+  cliLabelStopped: "已停止",
+  cliLabelSchema: "schema",
+  cliLabelNextCursor: "下一页游标",
+  cliLabelTotals: "总计",
 };
 
 function looksChinese(locale: string | undefined): boolean {

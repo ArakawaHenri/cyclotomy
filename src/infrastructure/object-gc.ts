@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { isOperationCancelled } from "./workspace-operation.ts";
 import { MAX_RECIPE_DEPTH } from "./content-store/chunk-recipe.ts";
 import {
   DEFAULT_COMPACTION_DECODED_BYTE_BUDGET,
@@ -92,11 +94,31 @@ export interface GcReport {
   readonly removedBlobs: number;
   readonly removedTmpFiles: number;
   readonly freedBytes: number;
-  readonly keptObjects: number;
+  /** Null when the pass stopped before a complete retained inventory. */
+  readonly keptObjects: number | null;
   readonly removedRecords?: number;
   readonly removedPacks?: number;
   readonly compactedObjects?: number;
   readonly writtenPacks?: number;
+  /**
+   * Present only when the pass ended early. Every counter then describes the
+   * work this pass actually completed, so a script can read it as a partial
+   * result instead of mistaking it for a finished one.
+   */
+  readonly stopped?: GcStopReason;
+}
+
+/** A stopped pass reports completed work; additive replacements may remain. */
+export type GcStopReason = "budget-exceeded" | "cancelled";
+
+/** The coarse stages a pass reports progress for. */
+export type GcPhase = "mark" | "inventory" | "plan" | "compaction" | "sweep";
+
+export interface GcProgress {
+  readonly phase: GcPhase;
+  readonly done: number;
+  readonly total: number | null;
+  readonly freedBytes: number;
 }
 
 export interface GarbageCollectionOptions {
@@ -106,6 +128,12 @@ export interface GarbageCollectionOptions {
   readonly maxObjects?: number;
   /** Bounds one maintenance pass without adding persistent cursor state. */
   readonly maxCompactionObjects?: number;
+  /** Cooperative budget for the whole pass, checked at safe work boundaries. */
+  readonly budgetMs?: number;
+  /** Cooperative cancellation; see {@link GcStopReason}. */
+  readonly signal?: AbortSignal;
+  /** Coarse progress for long passes; every callback is O(1). */
+  readonly onProgress?: (progress: GcProgress) => void;
 }
 
 // A maximum-size v3 snapshot can contain one content object per entry plus
@@ -157,7 +185,132 @@ export class GarbageCollectionRootDriftError extends Error {
   }
 }
 
-class GarbageCollectionLimitError extends RangeError {}
+/**
+ * The rooted graph is larger than one pass may authenticate. Nothing is
+ * removed: the operator's lever is dropping history, not retrying.
+ */
+export class GarbageCollectionLimitError extends RangeError {}
+
+/** Completed publications and removals survive an interruption between batches. */
+class GarbageCollectionStopError extends Error {
+  readonly reason: GcStopReason;
+
+  constructor(reason: GcStopReason) {
+    super(`garbage collection stopped: ${reason}`);
+    this.name = "GarbageCollectionStopError";
+    this.reason = reason;
+  }
+}
+
+// Progress callbacks stay O(1) per object without running per object: the
+// emitter reports on a stride, and phase boundaries always report.
+const GC_PROGRESS_STRIDE = 256;
+
+/** Cancellation reaches readers; durable batches finish before the next check. */
+class GarbageCollectionControl {
+  readonly signal: AbortSignal;
+  readonly #deadline: number | undefined;
+  readonly #requestedSignal: AbortSignal | undefined;
+  readonly #controller = new AbortController();
+  readonly #onProgress: ((progress: GcProgress) => void) | undefined;
+  readonly #timer: ReturnType<typeof setTimeout> | undefined;
+  #freedBytes = 0;
+
+  constructor(options: GarbageCollectionOptions) {
+    if (
+      options.budgetMs !== undefined &&
+      (!Number.isFinite(options.budgetMs) || options.budgetMs < 0)
+    ) {
+      throw new RangeError(
+        "garbage-collection budget must be finite and non-negative",
+      );
+    }
+    this.#deadline =
+      options.budgetMs === undefined
+        ? undefined
+        : performance.now() + options.budgetMs;
+    this.#requestedSignal = options.signal;
+    this.signal =
+      options.signal === undefined
+        ? this.#controller.signal
+        : AbortSignal.any([options.signal, this.#controller.signal]);
+    this.#onProgress = options.onProgress;
+    if (options.budgetMs !== undefined) {
+      this.#timer = setTimeout(
+        () => {
+          this.#controller.abort(
+            new GarbageCollectionStopError("budget-exceeded"),
+          );
+        },
+        Math.min(Math.ceil(options.budgetMs), 2_147_483_647),
+      );
+      this.#timer.unref();
+    }
+  }
+
+  reason(): GcStopReason | undefined {
+    if (this.#requestedSignal?.aborted === true) return "cancelled";
+    if (
+      this.#controller.signal.aborted ||
+      (this.#deadline !== undefined && performance.now() >= this.#deadline)
+    ) {
+      this.#controller.abort(new GarbageCollectionStopError("budget-exceeded"));
+      return "budget-exceeded";
+    }
+    return undefined;
+  }
+
+  check(): void {
+    const reason = this.reason();
+    if (reason !== undefined) throw new GarbageCollectionStopError(reason);
+  }
+
+  assertCanStart(phase: GcPhase): void {
+    this.check();
+    this.progress(phase, 0, null);
+    this.check();
+  }
+
+  dispose(): void {
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+  }
+
+  /** Reports progress on a stride so a per-object loop stays cheap. */
+  progress(phase: GcPhase, done: number, total: number | null): void {
+    if (this.#onProgress === undefined) return;
+    if (done % GC_PROGRESS_STRIDE !== 0 && done !== total) return;
+    this.#emit(phase, done, total);
+  }
+
+  /** Reports a phase boundary that must always be visible. */
+  phase(phase: GcPhase, done: number, total: number | null): void {
+    this.#emit(phase, done, total);
+  }
+
+  recordFreed(bytes: number): void {
+    this.#freedBytes += bytes;
+  }
+
+  #emit(phase: GcPhase, done: number, total: number | null): void {
+    this.#onProgress?.(
+      Object.freeze({ phase, done, total, freedBytes: this.#freedBytes }),
+    );
+  }
+}
+
+function initialGcReport(): MutableReport {
+  return {
+    removedTrees: 0,
+    removedBlobs: 0,
+    removedTmpFiles: 0,
+    freedBytes: 0,
+    keptObjects: 0,
+    removedRecords: 0,
+    removedPacks: 0,
+    compactedObjects: 0,
+    writtenPacks: 0,
+  };
+}
 
 function rethrowGarbageCollectionPrimary(failure: unknown): never {
   const primary = primaryFailure(failure);
@@ -229,7 +382,12 @@ function rememberChunkedContent(
 }
 
 interface MarkState {
-  readonly liveKeys: ReadonlyMap<string, LogicalRecordKey>;
+  /**
+   * Every live logical record as `recordKey` text. The mark is the one
+   * structure that grows with the whole history, so it holds the encoded key
+   * alone: a structured twin per record would double the largest term.
+   */
+  readonly liveKeys: ReadonlySet<string>;
   readonly structuralKinds: ReadonlyMap<
     string,
     ReadonlySet<StoredTreeStructuralKind>
@@ -240,6 +398,16 @@ interface MarkState {
   readonly authenticatedChunked: ReadonlyMap<string, MarkedChunkedContent>;
   readonly authenticatedContents: ReadonlyMap<string, VerifiedObjectLocation>;
 }
+
+/** A mark with nothing in it, for releasing a finished one explicitly. */
+const EMPTY_MARK: MarkState = Object.freeze({
+  liveKeys: Object.freeze(new Set<string>()),
+  structuralKinds: Object.freeze(new Map()),
+  occurrences: Object.freeze([]),
+  authenticatedCoverage: Object.freeze(new Set<string>()),
+  authenticatedChunked: Object.freeze(new Map()),
+  authenticatedContents: Object.freeze(new Map()),
+});
 
 interface PackRewriteSelection {
   readonly fullyDeadPackIds: ReadonlySet<string>;
@@ -293,6 +461,7 @@ interface SweepResources {
   readonly catalog: PackCatalog;
   readonly metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">;
   readonly layout: ReturnType<typeof nativeObjectStoreLayout>;
+  readonly control: GarbageCollectionControl;
 }
 
 interface SweepFence {
@@ -377,6 +546,14 @@ function structuralRecordKind(kind: StoredTreeStructuralKind): RecordKind {
   }
 }
 
+/** The pooled instance of `text`, adding it to `pool` when it is new. */
+function intern<T extends string>(pool: Map<string, T>, text: T): T {
+  const pooled = pool.get(text);
+  if (pooled !== undefined) return pooled;
+  pool.set(text, text);
+  return text;
+}
+
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -396,11 +573,11 @@ function sameStrings(
 }
 
 function addLiveKey(
-  keys: Map<string, LogicalRecordKey>,
+  keys: Set<string>,
   key: LogicalRecordKey,
   maximum: number,
 ): void {
-  keys.set(recordKey(key.kind, key.logicalId), key);
+  keys.add(recordKey(key.kind, key.logicalId));
   if (keys.size > maximum) {
     throw new GarbageCollectionLimitError(
       `refusing to sweep because the rooted object graph exceeds the ${maximum}-object limit`,
@@ -414,7 +591,7 @@ function extendLiveMark(
   maximum: number,
   proofs: readonly PublishedContent[] = [],
 ): MarkState {
-  const liveKeys = new Map(mark.liveKeys);
+  const liveKeys = new Set(mark.liveKeys);
   for (const key of additions.values()) addLiveKey(liveKeys, key, maximum);
   const authenticatedChunked = new Map(mark.authenticatedChunked);
   const authenticatedContents = new Map(mark.authenticatedContents);
@@ -515,12 +692,20 @@ async function authenticateRoots(
   store: NativeObjectStore,
   roots: readonly string[],
   maximumObjects: number,
+  control: GarbageCollectionControl,
 ): Promise<MarkState> {
   const repository = nativeObjectStoreRepository(store, "garbage collection");
-  const reads = openNativeObjectStoreReadScope(store, "garbage collection");
-  const liveKeys = new Map<string, LogicalRecordKey>();
+  const reads = openNativeObjectStoreReadScope(store, "garbage collection", {
+    signal: control.signal,
+  });
+  const liveKeys = new Set<string>();
   const structuralKinds = new Map<string, Set<StoredTreeStructuralKind>>();
   const occurrences: ContentPathOccurrence[] = [];
+  // Consecutive roots repeat nearly every path and much of the content. Each
+  // decoded entry carries fresh strings, so pool them: one occurrence list can
+  // otherwise hold a copy of every path once per root.
+  const paths = new Map<string, string>();
+  const contentIds = new Map<string, ContentId>();
   const authenticatedContent = new Set<string>();
   const authenticatedCoverage = new Set<string>();
   const authenticatedChunked = new Map<string, MarkedChunkedContent>();
@@ -529,10 +714,14 @@ async function authenticateRoots(
   try {
     return await withRetainedCleanup(
       async () => {
-        for (const treeOid of roots) {
+        for (const [index, treeOid] of roots.entries()) {
+          control.assertCanStart("mark");
+          control.progress("mark", index, roots.length);
           try {
             const closure = await reads.readTreeClosure(treeOid);
+            let visited = 0;
             for (const object of closure.structuralObjects) {
+              if ((visited++ & 255) === 0) control.check();
               const kind = structuralRecordKind(object.kind);
               addLiveKey(
                 liveKeys,
@@ -544,19 +733,23 @@ async function authenticateRoots(
               structuralKinds.set(object.oid, kinds);
             }
             for (const entry of closure.manifest.entries) {
+              if ((visited++ & 255) === 0) control.check();
               if (
                 entry.type === "regular" &&
                 occurrences.length < maximumObjects
               ) {
+                const path = intern(paths, entry.path);
+                const contentId = intern(
+                  contentIds,
+                  parseContentId(entry.blobOid),
+                );
                 occurrences.push(
-                  Object.freeze({
-                    canonicalPath: entry.path,
-                    contentId: parseContentId(entry.blobOid),
-                  }),
+                  Object.freeze({ canonicalPath: path, contentId }),
                 );
               }
             }
             for (const contentId of closure.contentIds) {
+              control.check();
               addLiveKey(
                 liveKeys,
                 logicalKey("content", contentId),
@@ -582,9 +775,11 @@ async function authenticateRoots(
             }
           } catch (error) {
             if (error instanceof GarbageCollectionLimitError) throw error;
+            if (error instanceof GarbageCollectionStopError) throw error;
             throw new GarbageCollectionMarkError(treeOid, error);
           }
         }
+        control.phase("mark", roots.length, roots.length);
 
         return Object.freeze({
           liveKeys,
@@ -865,10 +1060,15 @@ async function strictInventories(
   maintenance: ObjectStoreMaintenance,
   catalog: PackCatalog,
   maximumObjects: number,
+  control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
-    const objects = await maintenance.inventory(maximumObjects);
-    const packs = await catalog.inventory();
+    control.check();
+    const objects = await maintenance.inventory(maximumObjects, {
+      signal: control.signal,
+    });
+    control.check();
+    const packs = await catalog.inventory({ signal: control.signal });
     const inventories = { objects, packs };
     assertInventoryCapacity(inventories, maximumObjects);
     return inventories;
@@ -892,10 +1092,14 @@ async function refreshObjectInventory(
   inventories: GarbageCollectionInventories,
   maintenance: ObjectStoreMaintenance,
   maximumObjects: number,
+  control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
+    control.check();
     const refreshed = {
-      objects: await maintenance.inventory(maximumObjects),
+      objects: await maintenance.inventory(maximumObjects, {
+        signal: control.signal,
+      }),
       packs: inventories.packs,
     };
     assertInventoryCapacity(refreshed, maximumObjects);
@@ -910,11 +1114,13 @@ async function refreshPackInventory(
   catalog: PackCatalog,
   maximumObjects: number,
   packsPath: string,
+  control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
+    control.check();
     const refreshed = {
       objects: inventories.objects,
-      packs: await catalog.inventory(),
+      packs: await catalog.inventory({ signal: control.signal }),
     };
     assertInventoryCapacity(refreshed, maximumObjects);
     return refreshed;
@@ -941,6 +1147,7 @@ class CompactionResolver {
   readonly #verifiedChunked = new Set<string>();
   readonly #markedChunked: ReadonlyMap<string, MarkedChunkedContent>;
   readonly #markedContents: ReadonlyMap<string, VerifiedObjectLocation>;
+  readonly #control: GarbageCollectionControl;
 
   constructor(
     store: NativeObjectStore,
@@ -949,7 +1156,10 @@ class CompactionResolver {
     catalog: PackCatalog,
     packInventory: PackCatalogInventory,
     mark: MarkState,
+    control: GarbageCollectionControl,
   ) {
+    control.check();
+    this.#control = control;
     this.#repository = nativeObjectStoreRepository(store, "compaction");
     this.#maintenance = maintenance;
     this.#objectInventory = objectInventory;
@@ -961,7 +1171,9 @@ class CompactionResolver {
       MAX_RESOLVER_PACKS,
       "logical-read",
     );
+    let visited = 0;
     for (const object of objectInventory.objects) {
+      if ((visited++ & 255) === 0) control.check();
       for (const key of maintenanceObjectKeys(object, mark)) {
         const text = recordKey(key.kind, key.logicalId);
         const candidates = this.#objectsByKey.get(text) ?? [];
@@ -971,6 +1183,7 @@ class CompactionResolver {
     }
     for (const catalogEntry of packInventory.packs) {
       for (const entry of catalogEntry.view.entries) {
+        if ((visited++ & 255) === 0) control.check();
         const text = recordKey(entry.kind, entry.logicalId);
         const candidates = this.#packEntriesByKey.get(text) ?? [];
         candidates.push({ catalog: catalogEntry, entry });
@@ -984,18 +1197,28 @@ class CompactionResolver {
           left.entry.physicalOrdinal - right.entry.physicalOrdinal,
       );
     }
-    this.#repositoryScope = this.#repository.openResolutionScope();
+    control.check();
+    this.#repositoryScope = this.#repository.openResolutionScope({
+      signal: control.signal,
+    });
   }
 
   readEnvelope(key: LogicalRecordKey): Promise<RecordEnvelope> {
+    this.#control.check();
     return this.#readEnvelope(key);
   }
 
   readDecodedContent(contentId: ContentId): Promise<Uint8Array> {
+    this.#control.check();
     return this.#readDecodedContent(contentId);
   }
 
   async dispose(): Promise<void> {
+    // The per-key indexes mirror one pass's inventory and mark. Release them
+    // before awaiting the handles: a caller that finishes with the resolver is
+    // often about to build a fresh one over a re-authenticated mark.
+    this.#objectsByKey.clear();
+    this.#packEntriesByKey.clear();
     const settled = await Promise.allSettled([
       this.#packPool.close(),
       this.#repository.closeResolutionScope(this.#repositoryScope),
@@ -1071,6 +1294,7 @@ class CompactionResolver {
   }
 
   objectCoverageStillCurrent(object: MaintenanceObject): Promise<boolean> {
+    this.#control.check();
     return this.#maintenance.objectIdentityStillCurrent(
       this.#objectInventory,
       object,
@@ -1109,6 +1333,7 @@ class CompactionResolver {
   }
 
   packCoverageStillCurrent(pack: PackCatalogEntry): Promise<boolean> {
+    this.#control.check();
     return this.#catalog.packIdentityStillCurrent(pack);
   }
 
@@ -1366,6 +1591,7 @@ async function authenticateRetainedCoverage(
   removablePackIds: ReadonlySet<string>,
   replacementPackIds: ReadonlySet<string>,
   authenticatedCoverage: ReadonlySet<string>,
+  control: GarbageCollectionControl,
 ): Promise<void> {
   const candidates = new Map<string, RetainedCoverage[]>();
   const currentCoverage = new Map<string, Promise<boolean>>();
@@ -1399,16 +1625,18 @@ async function authenticateRetainedCoverage(
     }
   }
 
-  for (const [text, key] of [...mark.liveKeys].sort(([left], [right]) =>
-    compareText(left, right),
-  )) {
+  for (const text of [...mark.liveKeys].sort(compareText)) {
+    control.check();
+    const separator = text.indexOf(":");
+    const kind = text.slice(0, separator) as RecordKind;
+    const logicalId = text.slice(separator + 1);
     const coverageKey = (coverage: RetainedCoverage): string =>
       coverage.source === "pack"
         ? packCoverageKey(
             coverage.pack.view.packId,
             coverage.entry.physicalOrdinal,
           )
-        : objectCoverageKey(coverage.object.kind, key.kind, key.logicalId);
+        : objectCoverageKey(coverage.object.kind, kind, logicalId);
     const rank = (coverage: RetainedCoverage): number => {
       if (
         coverage.source === "pack" &&
@@ -1474,6 +1702,7 @@ async function authenticateRetainedCoverage(
       }
       continue;
     }
+    const key = logicalKey(kind, logicalId);
     try {
       if (retained.source === "object") {
         await resolver.verifyObjectCoverage(retained.object, key);
@@ -2096,7 +2325,10 @@ async function boundCompactionDecodedBytes(
   },
   maintenance: ObjectStoreMaintenance,
   mark: MarkState,
+  control: GarbageCollectionControl,
 ): Promise<PackRewriteSelection> {
+  control.check();
+  let visited = 0;
   const lengths = new Map<string, number>();
   const updateLength = (text: string, length: number): void => {
     if (!selection.replacementKeys.has(text)) return;
@@ -2104,6 +2336,7 @@ async function boundCompactionDecodedBytes(
   };
   for (const pack of inventories.packs.packs) {
     for (const entry of pack.view.entries) {
+      if ((visited++ & 255) === 0) control.check();
       updateLength(
         recordKey(entry.kind, entry.logicalId),
         compactionReadBytes(entry, mark),
@@ -2117,6 +2350,7 @@ async function boundCompactionDecodedBytes(
     keysByLogicalId.set(key.logicalId, candidates);
   }
   for (const object of inventories.objects.objects) {
+    if ((visited++ & 255) === 0) control.check();
     if (object.temporary || object.logicalId === undefined) continue;
     const candidates = keysByLogicalId.get(object.logicalId) ?? [];
     if (candidates.length === 0) continue;
@@ -2216,6 +2450,7 @@ async function ensureLargeLegacyRepresentations(
   maximumNewLooseObjects: number,
   maximumNewReplacementKeys: number,
   authority: WorkspaceWriteAuthority,
+  control: GarbageCollectionControl,
 ): Promise<MaterializedContent> {
   const proofs: PublishedContent[] = [];
   const liveKeys = new Map<string, LogicalRecordKey>();
@@ -2249,20 +2484,29 @@ async function ensureLargeLegacyRepresentations(
       skippedContentIds.add(contentId);
       continue;
     }
-    const materialized = await repository.materializeLooseContent(
-      contentId,
-      object.byteLength,
-      async (sink) => {
-        const source = await repository.streamContent(
+    control.check();
+    const scope = repository.openResolutionScope({ signal: control.signal });
+    const materialized = await withRetainedCleanup(
+      () =>
+        repository.materializeLooseContent(
           contentId,
           object.byteLength,
-          sink,
-        );
-        if (source.decodedLength !== object.byteLength) {
-          throw new Error("legacy content changed during lazy migration");
-        }
-      },
-      authority,
+          async (sink) => {
+            const source = await repository.streamContent(
+              contentId,
+              object.byteLength,
+              sink,
+              scope,
+            );
+            if (source.decodedLength !== object.byteLength) {
+              throw new Error("legacy content changed during lazy migration");
+            }
+          },
+          authority,
+          scope,
+        ),
+      () => repository.closeResolutionScope(scope),
+      "legacy content materialization and cleanup both failed",
     );
     const { proof } = materialized;
     if (materialized.disposition === "published") {
@@ -2324,7 +2568,7 @@ async function planSweep(
     readonly now: number;
   },
 ): Promise<SweepPlan> {
-  const { store, repository, metadata } = resources;
+  const { store, repository, metadata, control } = resources;
   const { initialRoots, maxObjects, replacementPackIds } = fence;
   const rootsBeforeVerification = stableRoots(
     metadata.listReferencedTreeOids(maxObjects + 1),
@@ -2339,7 +2583,7 @@ async function planSweep(
     );
   }
 
-  let mark = await authenticateRoots(store, initialRoots, maxObjects);
+  let mark = await authenticateRoots(store, initialRoots, maxObjects, control);
   mark = extendLiveMark(
     mark,
     materialized.liveKeys,
@@ -2423,8 +2667,9 @@ async function authorizeSweep(
   fence: SweepFence,
   plan: SweepPlan,
 ): Promise<void> {
-  const { authority, store, maintenance, catalog, metadata, layout } =
+  const { authority, store, maintenance, catalog, metadata, layout, control } =
     resources;
+  control.check();
   const { initialRoots, maxObjects, replacementPackIds } = fence;
   const coverageResolver = new CompactionResolver(
     store,
@@ -2433,6 +2678,7 @@ async function authorizeSweep(
     catalog,
     plan.inventories.packs,
     plan.mark,
+    control,
   );
   try {
     await withRetainedCleanup(
@@ -2445,6 +2691,7 @@ async function authorizeSweep(
           plan.removablePackIds,
           replacementPackIds,
           plan.mark.authenticatedCoverage,
+          control,
         ),
       () => coverageResolver.dispose(),
       "retained-coverage authentication and cleanup both failed",
@@ -2455,6 +2702,7 @@ async function authorizeSweep(
 
   try {
     for (const object of plan.removableObjects) {
+      control.check();
       if (
         !(await maintenance.objectIdentityStillCurrent(
           plan.inventories.objects,
@@ -2468,6 +2716,7 @@ async function authorizeSweep(
       }
     }
     for (const pack of plan.removablePacks) {
+      control.check();
       if (!(await catalog.packIdentityStillCurrent(pack))) {
         throw new GarbageCollectionNamespaceError(
           pack.path,
@@ -2492,6 +2741,7 @@ async function authorizeSweep(
   if (!sameStrings(initialRoots, rootsAtCutover)) {
     throw new GarbageCollectionRootDriftError();
   }
+  control.check();
   assertWorkspaceWriteAuthority(authority, layout.root);
 }
 
@@ -2501,9 +2751,27 @@ async function executeSweep(
   report: MutableReport,
   maxObjects: number,
 ): Promise<GcReport> {
-  const { maintenance, catalog, authority, layout } = resources;
+  const { maintenance, catalog, authority, layout, control } = resources;
+  const total =
+    plan.removableObjects.length +
+    plan.removablePacks.length +
+    plan.removableIncoming.length;
+  control.phase("sweep", 0, total);
+  let removedObjects = 0;
+  let removedPacks = 0;
+  let removedIncoming = 0;
+  let packNamespaceChanged = false;
+  const swept = (): number => removedObjects + removedPacks + removedIncoming;
+  // Each removal is independently safe, so a cancelled sweep stops where it is
+  // instead of unwinding: the counters below describe exactly what it removed.
+  let stopped: GcStopReason | undefined;
   try {
     for (const object of plan.removableObjects) {
+      const reason = control.reason();
+      if (reason !== undefined) {
+        stopped = reason;
+        break;
+      }
       const wasLive = objectIsLive(object, plan.mark);
       const bytes = await maintenance.removeObject(
         plan.inventories.objects,
@@ -2511,6 +2779,7 @@ async function executeSweep(
         authority,
       );
       report.freedBytes += bytes;
+      control.recordFreed(bytes);
       if (object.temporary) {
         report.removedTmpFiles += 1;
       } else {
@@ -2525,6 +2794,8 @@ async function executeSweep(
           report.removedBlobs += 1;
         }
       }
+      removedObjects += 1;
+      control.progress("sweep", swept(), total);
     }
   } catch (error) {
     mapInfrastructureError(layout.objects, error);
@@ -2532,32 +2803,56 @@ async function executeSweep(
 
   try {
     for (const pack of plan.removablePacks) {
+      const reason = stopped ?? control.reason();
+      if (reason !== undefined) {
+        stopped = reason;
+        break;
+      }
       await catalog.removePack(pack, authority);
+      packNamespaceChanged = true;
       report.removedPacks += 1;
       report.freedBytes += pack.identity.size;
+      control.recordFreed(pack.identity.size);
       for (const entry of pack.view.entries) {
         if (!plan.mark.liveKeys.has(recordKey(entry.kind, entry.logicalId))) {
           countRemovedRecord(report, entry.kind);
         }
       }
+      removedPacks += 1;
+      control.progress("sweep", swept(), total);
     }
     for (const incoming of plan.removableIncoming) {
+      const reason = stopped ?? control.reason();
+      if (reason !== undefined) {
+        stopped = reason;
+        break;
+      }
       await catalog.removeIncoming(incoming, authority);
+      packNamespaceChanged = true;
       report.removedTmpFiles += 1;
       report.freedBytes += incoming.identity.size;
+      control.recordFreed(incoming.identity.size);
+      removedIncoming += 1;
+      control.progress("sweep", swept(), total);
     }
-    let packInventory = plan.inventories.packs;
-    if (plan.removablePacks.length > 0 || plan.removableIncoming.length > 0) {
-      packInventory = (
+    // A cancelled pass leaves the lookup cache stale; it is a validated hint,
+    // so the next reader rebuilds it rather than trusting a missing pack.
+    if (
+      packNamespaceChanged &&
+      stopped === undefined &&
+      control.reason() === undefined
+    ) {
+      const packInventory = (
         await refreshPackInventory(
           plan.inventories,
           catalog,
           maxObjects,
           layout.packs,
+          control,
         )
       ).packs;
+      await ensureMultiPackIndex(catalog, packInventory, authority);
     }
-    await ensureMultiPackIndex(catalog, packInventory, authority);
   } catch (error) {
     mapInfrastructureError(layout.packs, error);
   }
@@ -2568,7 +2863,20 @@ async function executeSweep(
   report.keptObjects += plan.inventories.packs.packs
     .filter(({ view }) => !plan.removablePackIds.has(view.packId))
     .reduce((count, pack) => count + pack.view.entries.length, 0);
-  return Object.freeze({ ...report });
+  if (stopped !== undefined) {
+    // A stopped sweep leaves the planned but unvisited removals in place; they
+    // survived this pass, so the report must not imply the plan was completed.
+    report.keptObjects += plan.removableObjects
+      .slice(removedObjects)
+      .filter((object) => !object.temporary).length;
+    report.keptObjects += plan.removablePacks
+      .slice(removedPacks)
+      .reduce((count, pack) => count + pack.view.entries.length, 0);
+  }
+  return Object.freeze({
+    ...report,
+    ...(stopped === undefined ? {} : { stopped }),
+  });
 }
 
 /**
@@ -2583,8 +2891,44 @@ export async function collectGarbage(
   metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
   options: GarbageCollectionOptions = {},
 ): Promise<GcReport> {
-  const graceMs = options.graceMs ?? 3_600_000;
   const now = options.now ?? Date.now();
+  const control = new GarbageCollectionControl(options);
+  const report = initialGcReport();
+  try {
+    return await runGarbageCollection(
+      authority,
+      store,
+      metadata,
+      options,
+      now,
+      control,
+      report,
+    );
+  } catch (error) {
+    const stopped =
+      error instanceof GarbageCollectionStopError && error.cause === undefined
+        ? error.reason
+        : isOperationCancelled(error, control.signal)
+          ? control.reason()
+          : undefined;
+    if (stopped !== undefined)
+      return Object.freeze({ ...report, keptObjects: null, stopped });
+    throw error;
+  } finally {
+    control.dispose();
+  }
+}
+
+async function runGarbageCollection(
+  authority: WorkspaceWriteAuthority,
+  store: NativeObjectStore,
+  metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
+  options: GarbageCollectionOptions,
+  now: number,
+  control: GarbageCollectionControl,
+  report: MutableReport,
+): Promise<GcReport> {
+  const graceMs = options.graceMs ?? 3_600_000;
   const maxObjects = options.maxObjects ?? ABSOLUTE_MAX_GC_OBJECTS;
   const maxCompactionObjects =
     options.maxCompactionObjects ??
@@ -2605,6 +2949,7 @@ export async function collectGarbage(
       `garbage-collection options are outside their supported range (maximum ${ABSOLUTE_MAX_GC_OBJECTS} objects)`,
     );
   }
+  control.assertCanStart("inventory");
 
   const layout = nativeObjectStoreLayout(store, "garbage collection");
   const repository = nativeObjectStoreRepository(store, "garbage collection");
@@ -2627,8 +2972,16 @@ export async function collectGarbage(
       `refusing to sweep because the rooted object graph exceeds the ${maxObjects}-object limit`,
     );
   }
-  let mark = await authenticateRoots(store, initialRoots, maxObjects);
-  let inventories = await strictInventories(maintenance, catalog, maxObjects);
+  control.assertCanStart("mark");
+  let mark = await authenticateRoots(store, initialRoots, maxObjects, control);
+  control.assertCanStart("inventory");
+  let inventories = await strictInventories(
+    maintenance,
+    catalog,
+    maxObjects,
+    control,
+  );
+  control.assertCanStart("plan");
   let selection = selectCompaction(
     inventories.objects,
     inventories.packs,
@@ -2659,6 +3012,7 @@ export async function collectGarbage(
     ) {
       throw new GarbageCollectionRootDriftError();
     }
+    control.assertCanStart("plan");
     try {
       await ensureMultiPackIndex(catalog, inventories.packs, authority);
     } catch (error) {
@@ -2678,11 +3032,13 @@ export async function collectGarbage(
       writtenPacks: 0,
     });
   }
+  control.assertCanStart("compaction");
   selection = await boundCompactionDecodedBytes(
     selection,
     inventories,
     maintenance,
     mark,
+    control,
   );
   const plannedPacksById = new Map(
     inventories.packs.packs.map((entry) => [entry.view.packId, entry]),
@@ -2691,6 +3047,7 @@ export async function collectGarbage(
   // Large legacy files first become a normal chunk graph. This is additive;
   // an interruption leaves the still-rooted legacy bytes plus harmless loose
   // duplicates and the next pass resumes without persistent migration state.
+  control.check();
   const initialHeadroom = maxObjects - inventoryObjectCount(inventories);
   const existingReplacementReservation = selection.replacementKeys.size * 2;
   const maximumNewLooseObjects = Math.floor(
@@ -2704,7 +3061,9 @@ export async function collectGarbage(
     maximumNewLooseObjects,
     Math.max(0, maxCompactionObjects - selection.replacementKeys.size),
     authority,
+    control,
   );
+  control.check();
   selection = omitReplacementKeys(selection, materialized.skippedContentIds);
   mark = extendLiveMark(
     mark,
@@ -2722,6 +3081,7 @@ export async function collectGarbage(
       inventories,
       maintenance,
       maxObjects,
+      control,
     );
   }
   selection = await boundCompactionDecodedBytes(
@@ -2729,6 +3089,7 @@ export async function collectGarbage(
     inventories,
     maintenance,
     mark,
+    control,
   );
   const resolver = new CompactionResolver(
     store,
@@ -2737,8 +3098,8 @@ export async function collectGarbage(
     catalog,
     inventories.packs,
     mark,
+    control,
   );
-  let report!: MutableReport;
   const replacementPackIds = new Set<string>();
   try {
     await withRetainedCleanup(
@@ -2746,6 +3107,7 @@ export async function collectGarbage(
         const planSelection = async (
           selected: PackRewriteSelection,
         ): Promise<CompactionPlan> => {
+          control.check();
           const replacementContent = new Set(
             [...selected.replacementKeys.values()]
               .filter((key) => key.kind === "content")
@@ -2853,6 +3215,7 @@ export async function collectGarbage(
 
         let encodedBatches: Array<Awaited<ReturnType<typeof encodePack>>> = [];
         for (const batch of compaction.batches) {
+          control.check();
           encodedBatches.push(
             await encodePack(batch, {
               verifyMetadataId: (_kind, id, decoded) =>
@@ -2916,20 +3279,12 @@ export async function collectGarbage(
           }
         }
 
-        report = {
-          removedTrees: 0,
-          removedBlobs: 0,
-          removedTmpFiles: 0,
-          freedBytes: 0,
-          keptObjects: 0,
-          removedRecords: 0,
-          removedPacks: 0,
-          compactedObjects: 0,
-          writtenPacks: 0,
-        };
         try {
           for (const encoded of encodedBatches) {
-            const published = await catalog.publishPack(encoded, authority);
+            control.check();
+            const published = await catalog.publishPack(encoded, authority, {
+              signal: control.signal,
+            });
             replacementPackIds.add(published.view.packId);
             if (published.disposition === "published") report.writtenPacks += 1;
           }
@@ -2939,6 +3294,7 @@ export async function collectGarbage(
               catalog,
               maxObjects,
               layout.packs,
+              control,
             );
           }
           const publishedPackIds = new Set<string>(
@@ -2952,6 +3308,7 @@ export async function collectGarbage(
               );
             }
           }
+          control.check();
           await ensureMultiPackIndex(catalog, inventories.packs, authority);
         } catch (error) {
           mapInfrastructureError(layout.packs, error);
@@ -2972,12 +3329,17 @@ export async function collectGarbage(
     catalog,
     metadata,
     layout,
+    control,
   };
   const sweepFence: SweepFence = {
     initialRoots,
     maxObjects,
     replacementPackIds,
   };
+  // The sweep re-authenticates the rooted set under its own fence, so the
+  // planning mark and its occurrence list are finished. Release them before
+  // the fresh mark is built rather than holding two whole histories at once.
+  mark = EMPTY_MARK;
   const sweep = await planSweep(sweepResources, sweepFence, {
     materialized,
     inventories,

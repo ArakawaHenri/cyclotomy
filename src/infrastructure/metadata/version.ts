@@ -1,7 +1,11 @@
 import { type DatabaseSync } from "node:sqlite";
 
 import { isTreeOid, type TreeOid } from "../../domain/model.ts";
-import { MetadataError } from "../metadata-error.ts";
+import {
+  MetadataError,
+  MetadataVersionUnsupportedError,
+} from "../metadata-error.ts";
+import type { SessionHistoryExpectation } from "./history.ts";
 import {
   isDefinedMetadataSchema,
   metadataSchemaVersion,
@@ -12,6 +16,8 @@ import {
 export type MetadataSessionIdentityMatch = "absent" | "conflict" | "exact";
 
 export interface MetadataMigrationDependencies {
+  readonly history?: SessionHistoryExpectation | undefined;
+  readonly signal?: AbortSignal | undefined;
   /**
    * Publish the requested-format equivalent of every supplied rooted tree.
    * The result is total: unchanged roots map to themselves.
@@ -80,12 +86,11 @@ export function defineTreeFormatMetadataUpgrade(
   });
 }
 
-export interface MetadataVersionNode {
+export interface MetadataVersion {
   readonly version: number;
   /** Tree format durably rooted by this metadata generation. */
   readonly treeFormat: string;
   readonly schema: Readonly<MetadataSchemaSpec>;
-  readonly previous?: MetadataVersionNode;
   readonly upgradeFromPrevious?: AdjacentMetadataUpgrade;
   readonly initializeWithinTransaction: (db: DatabaseSync) => void;
   readonly referencedTreeOids: (
@@ -99,10 +104,10 @@ export interface MetadataVersionNode {
   ) => MetadataSessionIdentityMatch;
 }
 
-/** Validate and freeze one caller-defined node before it joins the history. */
+/** Define one published schema and its upgrade from the preceding version. */
 export function defineMetadataVersion(
-  definition: MetadataVersionNode,
-): MetadataVersionNode {
+  definition: MetadataVersion,
+): MetadataVersion {
   if (
     !isDefinedMetadataSchema(definition.schema) ||
     !Number.isSafeInteger(definition.version) ||
@@ -114,98 +119,69 @@ export function defineMetadataVersion(
   if (definition.treeFormat.length === 0) {
     throw new TypeError("metadata tree format identity must be non-empty");
   }
-  if (definition.previous === undefined) {
-    if (definition.upgradeFromPrevious !== undefined) {
-      throw new TypeError("first metadata version cannot have an upgrade edge");
+  return Object.freeze(definition);
+}
+
+/** Version n occupies index n - 1; only adjacent upgrades can be registered. */
+export function defineMetadataVersions(
+  definitions: readonly MetadataVersion[],
+): readonly MetadataVersion[] {
+  if (definitions.length === 0)
+    throw new TypeError("metadata versions must not be empty");
+  for (const [index, definition] of definitions.entries()) {
+    if (definition.version !== index + 1) {
+      throw new TypeError(
+        "metadata versions must be consecutive starting at one",
+      );
     }
-  } else {
-    if (definition.version !== definition.previous.version + 1) {
-      throw new TypeError("metadata versions must be adjacent");
+    const previous = definitions[index - 1];
+    const edge = definition.upgradeFromPrevious;
+    if (previous === undefined) {
+      if (edge !== undefined)
+        throw new TypeError(
+          "first metadata version cannot have an upgrade edge",
+        );
+      continue;
     }
-    if (definition.upgradeFromPrevious === undefined) {
+    if (edge === undefined)
       throw new TypeError("metadata successor requires an adjacent upgrade");
-    }
     if (
-      definition.previous.schema.writerProtocol !== undefined &&
+      previous.schema.writerProtocol !== undefined &&
       definition.schema.writerProtocol === undefined
     ) {
       throw new TypeError(
         "metadata successor cannot remove writer-fence protection",
       );
     }
-    const changesTreeFormat =
-      definition.treeFormat !== definition.previous.treeFormat;
-    if (
-      changesTreeFormat &&
-      definition.upgradeFromPrevious.kind !== "tree-format"
-    ) {
+    const changesTreeFormat = definition.treeFormat !== previous.treeFormat;
+    if (changesTreeFormat && edge.kind !== "tree-format") {
       throw new TypeError(
         "metadata tree-format change requires an externally prepared adjacent edge",
       );
     }
-    if (
-      !changesTreeFormat &&
-      definition.upgradeFromPrevious.kind === "tree-format"
-    ) {
+    if (!changesTreeFormat && edge.kind === "tree-format") {
       throw new TypeError(
         "metadata tree-format edge must change the durable tree format",
       );
     }
   }
-  return Object.freeze(definition);
-}
-
-export function metadataVersionChain(
-  current: MetadataVersionNode,
-): readonly MetadataVersionNode[] {
-  const newestToOldest: MetadataVersionNode[] = [];
-  const seen = new Set<MetadataVersionNode>();
-  for (
-    let candidate: MetadataVersionNode | undefined = current;
-    candidate !== undefined;
-    candidate = candidate.previous
-  ) {
-    if (seen.has(candidate)) {
-      throw new TypeError("metadata version chain contains a cycle");
-    }
-    seen.add(candidate);
-    newestToOldest.push(candidate);
-  }
-  return Object.freeze(newestToOldest.reverse());
-}
-
-export function findMetadataVersion(
-  current: MetadataVersionNode,
-  version: number,
-): MetadataVersionNode | undefined {
-  for (
-    let candidate: MetadataVersionNode | undefined = current;
-    candidate !== undefined;
-    candidate = candidate.previous
-  ) {
-    if (candidate.version === version) return candidate;
-  }
-  return undefined;
+  return Object.freeze([...definitions]);
 }
 
 export function requireMetadataVersion(
-  current: MetadataVersionNode,
+  versions: readonly MetadataVersion[],
   db: DatabaseSync,
-): MetadataVersionNode {
+): MetadataVersion {
   const observed = metadataSchemaVersion(db);
-  const version = findMetadataVersion(current, observed);
+  const version = versions[observed - 1];
   if (version !== undefined) return version;
-  if (observed > current.version) {
-    throw new MetadataError(
-      `metadata schema version ${observed} is newer than supported version ${current.version}`,
-    );
-  }
-  throw new MetadataError(`metadata schema version ${observed} is unsupported`);
+  const current = versions.at(-1)!;
+  throw new MetadataVersionUnsupportedError(observed, current.version);
 }
 
 export function validateMetadataVersion(
   db: DatabaseSync,
-  version: MetadataVersionNode,
+  version: MetadataVersion,
 ): void {
   validateMetadataSchema(db, version.schema);
 }

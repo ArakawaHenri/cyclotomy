@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   lstat,
@@ -42,7 +42,7 @@ import {
   nativeLooseRecordPath,
   nativeObjectLayout,
 } from "../src/infrastructure/workspace-store.ts";
-import { CyclotomyI18n } from "../src/pi/i18n.ts";
+import { CyclotomyI18n } from "../src/presentation/i18n.ts";
 import { SessionRegistrationService } from "../src/pi/session-registration-service.ts";
 import { projectStableGraph } from "../src/pi/extension-boundary.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
@@ -79,9 +79,14 @@ function objectPath(
   return join(root, "objects", kind, oid.slice(0, 2), oid.slice(2));
 }
 
+/**
+ * Replace the acquired native lock file with a directory so release
+ * re-verification observes an exact identity mismatch and fails closed.
+ */
 function makeCurrentWorkspaceLockReleaseFail(storeRoot: string): void {
   const lockPath = join(storeRoot, "workspace.lock");
-  writeFileSync(join(lockPath, "unexpected-entry"), "preserve");
+  unlinkSync(lockPath);
+  mkdirSync(lockPath);
 }
 
 async function seedCompatiblePublishedV1Store(
@@ -135,10 +140,9 @@ async function createRuntime() {
   const workspace = join(parent, "workspace");
   const home = join(parent, "home");
   await Promise.all([mkdir(workspace), mkdir(home)]);
-  const runtime = new CyclotomyRuntime(
-    loadCyclotomyConfig(home),
-    new CyclotomyI18n("en"),
-  );
+  const globalConfig = loadCyclotomyConfig(home);
+
+  const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
   expect(await runtime.ensureStore(workspace)).toBe(true);
   return { parent, workspace, home, runtime };
 }
@@ -424,8 +428,9 @@ function activeRegistration<
 ): {
   readonly kind: "active";
   readonly disposition: { readonly kind: Kind };
+  readonly historyReset: false;
 } {
-  return { kind: "active", disposition: { kind } };
+  return { kind: "active", disposition: { kind }, historyReset: false };
 }
 
 function readSessionProjectionResidue(
@@ -540,6 +545,7 @@ describe("Cyclotomy runtime", () => {
     const home = join(parent, "home");
     await Promise.all([mkdir(workspace), mkdir(home)]);
     const storeRoot = await seedCompatiblePublishedV1Store(home, workspace);
+
     const runtime = new CyclotomyRuntime(
       loadCyclotomyConfig(home),
       new CyclotomyI18n("en"),
@@ -573,6 +579,7 @@ describe("Cyclotomy runtime", () => {
     const home = join(parent, "home");
     await Promise.all([mkdir(workspace), mkdir(home)]);
     const storeRoot = await seedCompatiblePublishedV1Store(home, workspace);
+
     const originalPublish = ContentRepository.prototype.publishStructural;
     const publish = vi
       .spyOn(ContentRepository.prototype, "publishStructural")
@@ -685,6 +692,7 @@ describe("Cyclotomy runtime", () => {
       .digest("hex");
     const storeRoot = join(globalConfig.storageRootPath, hash);
     await mkdir(storeRoot, { recursive: true });
+
     await writeFile(
       join(storeRoot, "settings.json"),
       JSON.stringify({
@@ -721,10 +729,9 @@ describe("Cyclotomy runtime", () => {
       join(workspace, "saved.bin"),
       new Uint8Array(1024 * 1024 + 1),
     );
-    const runtime = new CyclotomyRuntime(
-      loadCyclotomyConfig(home),
-      new CyclotomyI18n("en"),
-    );
+    const globalConfig = loadCyclotomyConfig(home);
+
+    const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
 
     expect(await runtime.ensureStore(workspace)).toBe(true);
     const capture = await runtime.scanCurrentWorkspace(workspace);
@@ -762,6 +769,7 @@ describe("Cyclotomy runtime", () => {
     const storeRoot = join(home, "cyclotomy", hash);
     const settingsPath = join(storeRoot, "settings.json");
     await mkdir(storeRoot, { recursive: true });
+
     await writeFile(settingsPath, JSON.stringify({ maxFileMiB: 2 }));
     const globalConfig = loadCyclotomyConfig(home);
     const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
@@ -792,6 +800,7 @@ describe("Cyclotomy runtime", () => {
     const storeRoot = join(home, "cyclotomy", hash);
     const settingsPath = join(storeRoot, "settings.json");
     await mkdir(storeRoot, { recursive: true });
+
     await writeFile(settingsPath, "{");
     const runtime = new CyclotomyRuntime(
       loadCyclotomyConfig(home),
@@ -934,6 +943,7 @@ describe("Cyclotomy runtime", () => {
       kind: "fork",
       previousSessionFile: parentFile,
     });
+
     expect(
       await runtime.ensureRegistrationStore(targetWorkspace, preparation),
     ).toBe(true);
@@ -1004,6 +1014,7 @@ describe("Cyclotomy runtime", () => {
       previousSessionFile: parentFile,
     });
     expect(preparation.kind).toBe("observed");
+
     expect(
       await runtime.ensureRegistrationStore(targetWorkspace, preparation),
     ).toBe(true);
@@ -1048,6 +1059,7 @@ describe("Cyclotomy runtime", () => {
       kind: "fork",
       previousSessionFile: parentFile,
     });
+
     expect(await runtime.ensureRegistrationStore(workspace, preparation)).toBe(
       true,
     );
@@ -1942,14 +1954,22 @@ describe("Cyclotomy runtime", () => {
       runWithWorkspaceLock(
         runtime.storeRoot,
         "runtime metadata concurrency test",
-        async (authority) =>
-          concurrent.commitCapture(authority, {
+        async (authority) => {
+          concurrent.finalizeSessionProjection(authority, {
+            targetSessionId: rootView.sessionId,
+            targetSessionFile: sessionFile,
+            retainedEntryIds: ["root", "leaf"],
+            activeAncestryEntryIds: ["root", "leaf"],
+            seed: { kind: "fresh" },
+          });
+          return concurrent.commitCapture(authority, {
             identity: { sessionId: rootView.sessionId, sessionFile },
             entryId: "root",
             activeAncestryEntryIds: ["root"],
             treeOid: after,
             expectedSlot: { kind: "open-checkpoint", treeOid: before },
-          }),
+          });
+        },
       ),
     ).resolves.toMatchObject({ kind: "completed", value: "committed" });
     concurrent.close();
@@ -2026,6 +2046,7 @@ describe("Cyclotomy runtime", () => {
       previousSessionFile: parentFile,
     });
     expect(preparation.kind).toBe("observed");
+
     expect(
       await runtime.ensureRegistrationStore(targetWorkspace, preparation),
     ).toBe(true);
@@ -2097,6 +2118,7 @@ describe("Cyclotomy runtime", () => {
       kind: "fork",
       previousSessionFile: parentFile,
     });
+
     expect(await runtime.ensureRegistrationStore(workspace, preparation)).toBe(
       true,
     );
@@ -2681,7 +2703,7 @@ describe("Cyclotomy runtime", () => {
   it("does not commit an imported projection after target lock ownership is lost", async (context) => {
     context.skip(
       process.platform === "win32",
-      "Windows does not rename a live workspace lock directory reliably",
+      "Windows does not replace a live workspace lock path reliably",
     );
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-target-lock-replaced-",
@@ -2749,7 +2771,7 @@ describe("Cyclotomy runtime", () => {
   it("does not commit an imported projection after source lock ownership is lost", async (context) => {
     context.skip(
       process.platform === "win32",
-      "Windows does not rename a live workspace lock directory reliably",
+      "Windows does not replace a live workspace lock path reliably",
     );
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-source-lock-replaced-",
@@ -2817,11 +2839,10 @@ describe("Cyclotomy runtime", () => {
     ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
     runtime.close();
 
+    // The native lock is a persistent regular file and is never deleted on
+    // release, so the displaced store is intact apart from the replacement
+    // directory created during the failed import.
     await rm(fixture.sourceStoreRoot, { recursive: true });
-    await rm(join(displaced, "workspace.lock"), {
-      recursive: true,
-      force: true,
-    });
     await rename(displaced, fixture.sourceStoreRoot);
     await expectExternalForkInheritance(fixture);
   });
@@ -2945,6 +2966,7 @@ describe("Cyclotomy runtime", () => {
       previousSessionFile: parentFile,
     });
     expect(preparation.kind).toBe("rejected");
+
     expect(
       await runtime.ensureRegistrationStore(targetWorkspace, preparation),
     ).toBe(true);
@@ -3048,6 +3070,7 @@ describe("Cyclotomy runtime", () => {
 
     expect(await firstRuntime.ensureStore(first)).toBe(false);
     expect(await readdir(secondRoot)).toEqual([]);
+
     expect(await secondRuntime.ensureStore(second)).toBe(true);
     await expect(firstRuntime.ensureStore(first)).resolves.toBe(false);
     firstRuntime.close();
@@ -3121,10 +3144,9 @@ describe("Cyclotomy runtime", () => {
     const second = join(parent, "second");
     const home = join(parent, "home");
     await Promise.all([mkdir(first), mkdir(second), mkdir(home)]);
-    const runtime = new CyclotomyRuntime(
-      loadCyclotomyConfig(home),
-      new CyclotomyI18n("en"),
-    );
+    const globalConfig = loadCyclotomyConfig(home);
+
+    const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
     expect(await runtime.ensureStore(first)).toBe(true);
     const firstRoot = runtime.storeRoot;
     await mutateRuntimeMetadata(runtime, () =>
@@ -3203,10 +3225,9 @@ describe("Cyclotomy runtime", () => {
     const home = join(parent, "home");
     await Promise.all([mkdir(first), mkdir(second), mkdir(home)]);
     await symlink(first, link);
-    const runtime = new CyclotomyRuntime(
-      loadCyclotomyConfig(home),
-      new CyclotomyI18n("en"),
-    );
+    const globalConfig = loadCyclotomyConfig(home);
+
+    const runtime = new CyclotomyRuntime(globalConfig, new CyclotomyI18n("en"));
     expect(await runtime.ensureStore(link)).toBe(true);
     expect(runtime.workspaceRoot).toBe(await realpath(first));
     await rm(link);

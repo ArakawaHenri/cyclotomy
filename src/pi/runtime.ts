@@ -20,9 +20,14 @@ import {
 } from "../application/checkpoint-service.ts";
 import { CyclotomyConfigError, type CyclotomyConfig } from "../config.ts";
 import { collectCyclotomyGarbage } from "../application/gc.ts";
+import type { GcReport } from "../infrastructure/object-gc.ts";
 import type { NodeKey, Result } from "../domain/model.ts";
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
+import {
+  metadataHistoryResetIn,
+  type MetadataHistoryResetError,
+} from "../infrastructure/metadata-error.ts";
 import type { NativeObjectStore } from "../infrastructure/object-store.ts";
 import {
   readLastAutomaticGcAt,
@@ -48,7 +53,7 @@ import {
   type WorkspaceOperationOptions,
   type WorkspaceProgress,
 } from "../infrastructure/workspace-operation.ts";
-import { CyclotomyI18n } from "./i18n.ts";
+import { CyclotomyI18n } from "../presentation/i18n.ts";
 import {
   CheckpointAdmission,
   type ArrivalAttempt,
@@ -56,9 +61,12 @@ import {
 import type { PendingNavigation } from "./navigation-plan.ts";
 import type { SessionActivation } from "./pi-host-adapter.ts";
 import type { ArrivalRecoverySettlement } from "./workspace-receipt.ts";
-import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
+import {
+  formatUiDetail,
+  formatUiPath,
+} from "../presentation/restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
-import { messageOfUnknown } from "./unknown-error.ts";
+import { messageOfUnknown } from "../presentation/unknown-error.ts";
 import {
   SessionRegistrationService,
   type SessionRegistrationPreparation,
@@ -67,6 +75,8 @@ import { WorkspaceMutationAuthority } from "./workspace-mutation-authority.ts";
 
 const GC_STATE_FILE = "gc-state.json";
 const GC_OBJECT_GRACE_MS = 3_600_000;
+// Automatic maintenance yields at safe batch boundaries when its budget ends.
+const GC_AUTOMATIC_BUDGET_MS = 1_000;
 
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
@@ -88,6 +98,7 @@ export class CyclotomyRuntime {
   #agentRunActive = false;
   #initFailureNotified = false;
   #captureFailureNotified = false;
+  #historyReset: MetadataHistoryResetError | undefined;
   #initFailureDetail: string | undefined;
   #activation: SessionActivation = {
     kind: "unavailable",
@@ -218,6 +229,46 @@ export class CyclotomyRuntime {
   markSessionUnavailable(cause: unknown): void {
     this.#admission.reset();
     this.#activation = { kind: "unavailable", cause };
+  }
+
+  /**
+   * The retired-generation report this engine withdrew for, if any. Callers
+   * use it to report the one deliberate maintenance outcome instead of every
+   * protection failure it caused.
+   */
+  get historyReset(): MetadataHistoryResetError | undefined {
+    return this.#historyReset;
+  }
+
+  /**
+   * Withdraw when the store reports that this session's history generation was
+   * retired. Every write under a retired generation is refused durably, so
+   * retrying cannot succeed: this engine stops participating and the next
+   * stable registration adopts the current generation. Returns whether the
+   * cause was such a report.
+   */
+  noteHistoryReset(cause: unknown): boolean {
+    const reset = metadataHistoryResetIn(cause);
+    if (reset === undefined) return false;
+    this.#historyReset = reset;
+    if (this.#activation.kind !== "closed") {
+      this.markSessionUnavailable(reset);
+    }
+    return true;
+  }
+
+  /**
+   * A capture that could not commit because the generation was retired retires
+   * this engine's participation in the same step, so the caller only has to
+   * report the failure.
+   */
+  #settleCaptureResult(
+    result: Result<CaptureSuccess, CaptureFailure>,
+  ): Result<CaptureSuccess, CaptureFailure> {
+    if (!result.ok && result.error.kind === "history-reset") {
+      this.noteHistoryReset(result.error.cause);
+    }
+    return result;
   }
 
   /**
@@ -583,7 +634,9 @@ export class CyclotomyRuntime {
     return snapshot;
   }
 
-  async maybeRunAutomaticGc(): Promise<WorkspaceLockExecution<void>> {
+  async maybeRunAutomaticGc(): Promise<
+    WorkspaceLockExecution<GcReport | undefined>
+  > {
     const intervalMs = this.config.autoGcIntervalMs;
     if (intervalMs <= 0) {
       return {
@@ -604,12 +657,22 @@ export class CyclotomyRuntime {
     return this.enqueueWorkspaceExecution("auto-gc", async (writeAuthority) => {
       const startedAt = Date.now();
       if (startedAt - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
-        return;
+        return undefined;
       }
-      await collectCyclotomyGarbage(writeAuthority, this.store, this.metadata, {
-        objectGraceMs: GC_OBJECT_GRACE_MS,
-      });
+      // Record partial passes too: a store that needs a maintenance window
+      // must not consume the same interactive budget on every turn.
+      const report = await collectCyclotomyGarbage(
+        writeAuthority,
+        this.store,
+        this.metadata,
+        {
+          objectGraceMs: GC_OBJECT_GRACE_MS,
+          budgetMs: GC_AUTOMATIC_BUDGET_MS,
+          signal: this.captureSignal,
+        },
+      );
       await writeLastAutomaticGcAt(statePath, startedAt, writeAuthority);
+      return report;
     });
   }
 
@@ -630,12 +693,14 @@ export class CyclotomyRuntime {
     prepared: CaptureSuccess,
     expectedSlot: CheckpointSlot,
   ): Result<CaptureSuccess, CaptureFailure> {
-    return this.checkpoints.commitPrepared(
-      view,
-      node,
-      prepared,
-      expectedSlot,
-      this.#captureCommitAuthority(writeAuthority),
+    return this.#settleCaptureResult(
+      this.checkpoints.commitPrepared(
+        view,
+        node,
+        prepared,
+        expectedSlot,
+        this.#captureCommitAuthority(writeAuthority),
+      ),
     );
   }
 
@@ -646,12 +711,14 @@ export class CyclotomyRuntime {
     prepared: CaptureSuccess,
     intent: MissingNodeStateIntent,
   ): Result<CaptureSuccess, CaptureFailure> {
-    return this.checkpoints.commitMissing(
-      view,
-      node,
-      prepared,
-      intent,
-      this.#captureCommitAuthority(writeAuthority),
+    return this.#settleCaptureResult(
+      this.checkpoints.commitMissing(
+        view,
+        node,
+        prepared,
+        intent,
+        this.#captureCommitAuthority(writeAuthority),
+      ),
     );
   }
 
@@ -666,12 +733,14 @@ export class CyclotomyRuntime {
     if (!this.#workspaceMutations.treeArrivalCanProceed(arrival, view, node)) {
       throw new Error("tree arrival authority changed before capture commit");
     }
-    return this.checkpoints.commitPreparedTreeArrival(
-      view,
-      node,
-      prepared,
-      expectedSlot,
-      this.#captureCommitAuthority(writeAuthority),
+    return this.#settleCaptureResult(
+      this.checkpoints.commitPreparedTreeArrival(
+        view,
+        node,
+        prepared,
+        expectedSlot,
+        this.#captureCommitAuthority(writeAuthority),
+      ),
     );
   }
 

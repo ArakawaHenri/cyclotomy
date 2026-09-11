@@ -7,7 +7,6 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  readdir,
   readFile,
   realpath,
   rm,
@@ -37,15 +36,18 @@ import { compareDirectoryBindings } from "../src/infrastructure/directory-bindin
 import {
   acquireWorkspaceLock,
   runWithWorkspaceLock,
+  type WorkspaceLock,
   type WorkspaceWriteAuthority,
 } from "../src/infrastructure/workspace-lock.ts";
+import { inspectWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
+import type { GcReport } from "../src/infrastructure/object-gc.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import {
   createDriftCommandHandler,
   createRestoreCommandHandler,
 } from "../src/pi/commands.ts";
-import { CyclotomyI18n, type MessageKey } from "../src/pi/i18n.ts";
+import { CyclotomyI18n, type MessageKey } from "../src/presentation/i18n.ts";
 import { registerCyclotomyLifecycle } from "../src/pi/lifecycle.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { WorkspaceMutationAuthority } from "../src/pi/workspace-mutation-authority.ts";
@@ -104,11 +106,28 @@ async function metadata(): Promise<CurrentMetadataStore> {
   return createTestCurrentMetadataStore(metadataPath(), storeRoot);
 }
 
-async function mutateMetadata<T>(
+function attachPiSessionMetadata(
   store: CurrentMetadataStore,
+  pi: FakePi,
+): void {
+  registerTestSession(
+    store,
+    pi.manager.sessionId,
+    pi.manager.getSessionFile()!,
+    pi.manager.getEntries().map(({ id }) => id),
+    pi.manager.getBranch().map(({ id }) => id),
+  );
+}
+
+async function mutateSessionMetadata<T>(
+  store: CurrentMetadataStore,
+  pi: FakePi,
   operation: () => T,
 ): Promise<T> {
-  return withTestMetadataWriteAuthority(storeRoot, store, operation);
+  return withTestMetadataWriteAuthority(storeRoot, store, () => {
+    attachPiSessionMetadata(store, pi);
+    return operation();
+  });
 }
 
 function metadataPath(): string {
@@ -149,6 +168,7 @@ function registerPreparedRuntime(
 
 async function metadataFor(cwd: string): Promise<CurrentMetadataStore> {
   const path = await metadataPathFor(cwd);
+
   return createTestCurrentMetadataStore(path, dirname(path));
 }
 
@@ -399,6 +419,57 @@ describe("checkpoint authority lifecycle", () => {
         expect(failureCount()).toBe(1);
         await pi.endTurn(0);
         expect(failureCount()).toBe(2);
+      } finally {
+        maybeRunAutomaticGc.mockRestore();
+      }
+    });
+
+    it("reports an automatic GC that ran out of budget once per streak", async () => {
+      const budgetStopped: GcReport = {
+        removedTrees: 0,
+        removedBlobs: 0,
+        removedTmpFiles: 0,
+        freedBytes: 0,
+        keptObjects: 0,
+        stopped: "budget-exceeded",
+      };
+      const completed: GcReport = {
+        removedTrees: 0,
+        removedBlobs: 0,
+        removedTmpFiles: 0,
+        freedBytes: 0,
+        keptObjects: 3,
+      };
+      const settled = (value: GcReport) => ({
+        kind: "completed" as const,
+        value,
+        cleanup: { kind: "settled" as const },
+      });
+      const maybeRunAutomaticGc = vi
+        .spyOn(CyclotomyRuntime.prototype, "maybeRunAutomaticGc")
+        .mockResolvedValueOnce(settled(budgetStopped))
+        .mockResolvedValueOnce(settled(budgetStopped))
+        .mockResolvedValueOnce(settled(completed))
+        .mockResolvedValueOnce(settled(budgetStopped));
+      try {
+        const pi = new FakePi(workspace);
+        registerCyclotomy(pi.api);
+        pi.manager.appendEntry();
+        const budgetCount = (): number =>
+          pi.notifications.filter(({ message }) =>
+            message.includes(messageFor("automaticGcBudgetExceeded")),
+          ).length;
+
+        await pi.startSession("startup");
+        expect(budgetCount()).toBe(1);
+        // The next pass is short again: the operator already knows.
+        await pi.endTurn(0);
+        expect(budgetCount()).toBe(1);
+        // A pass that finished clears the streak, so a later short pass is news.
+        await pi.endTurn(0);
+        expect(budgetCount()).toBe(1);
+        await pi.endTurn(0);
+        expect(budgetCount()).toBe(2);
       } finally {
         maybeRunAutomaticGc.mockRestore();
       }
@@ -677,11 +748,14 @@ describe("checkpoint authority lifecycle", () => {
         runWithWorkspaceLock(
           storeRoot,
           "barrier projection test",
-          async (authority) =>
-            before.raiseSessionBarrier(authority, {
+          async (authority) => {
+            bindTestMetadataWriteAuthority(before, authority, storeRoot);
+            attachPiSessionMetadata(before, pi);
+            return before.raiseSessionBarrier(authority, {
               sessionId: pi.manager.sessionId,
               sessionFile,
-            }),
+            });
+          },
         ),
       ).resolves.toMatchObject({ kind: "completed", value: true });
       before.close();
@@ -735,6 +809,7 @@ describe("checkpoint authority lifecycle", () => {
             authority,
           );
           bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
+          attachPiSessionMetadata(concurrent, pi);
           try {
             commitTestNodeState(
               concurrent,
@@ -785,6 +860,7 @@ describe("checkpoint authority lifecycle", () => {
             authority,
           );
           bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
+          attachPiSessionMetadata(concurrent, pi);
           try {
             expect(
               protectTestLocation(
@@ -1046,6 +1122,7 @@ describe("checkpoint authority lifecycle", () => {
             authority,
           );
           bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
+          attachPiSessionMetadata(concurrent, pi);
           try {
             expect(
               protectTestLocation(concurrent, input.identity, input.entryId)
@@ -1403,6 +1480,8 @@ describe("checkpoint authority lifecycle", () => {
     });
 
     it("does not materialize malformed startup ancestry", async () => {
+      // Deliberately the base host: registration is rejected before any store
+      // binding, and the test proves the store was never created.
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const first = pi.manager.appendEntry();
@@ -1423,6 +1502,8 @@ describe("checkpoint authority lifecycle", () => {
     });
 
     it("does not accept metadata ancestry that references an unknown entry", async () => {
+      // Deliberately the base host: registration is rejected before any store
+      // binding, and the test proves the store was never created.
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
       const leaf = pi.manager.appendEntry();
@@ -1760,7 +1841,7 @@ describe("checkpoint authority lifecycle", () => {
       );
       await rm(targetPath);
       const db = await metadata();
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         commitTestNodeState(
           db,
           pi.manager.sessionId,
@@ -1836,7 +1917,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.startSession("startup");
       const db = await metadata();
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         protectTestLocation(
           db,
           {
@@ -1902,7 +1983,7 @@ describe("checkpoint authority lifecycle", () => {
         }),
       );
       const db = await metadata();
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         commitTestNodeState(
           db,
           pi.manager.sessionId,
@@ -3286,7 +3367,7 @@ describe("checkpoint authority lifecycle", () => {
       db.close();
       pi.selectHook = async () => {
         const concurrent = await metadata();
-        await mutateMetadata(concurrent, () =>
+        await mutateSessionMetadata(concurrent, pi, () =>
           commitTestNodeState(
             concurrent,
             pi.manager.sessionId,
@@ -3707,7 +3788,7 @@ describe("checkpoint authority lifecycle", () => {
       expect(checkpointIsBlocked(db, pi.manager.sessionId, target.id)).toBe(
         true,
       );
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         commitTestNodeState(
           db,
           pi.manager.sessionId,
@@ -3947,7 +4028,7 @@ describe("checkpoint authority lifecycle", () => {
         gitScope({ globalExclude: "X\n" }),
       );
       const db = await metadata();
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         commitTestNodeState(
           db,
           pi.manager.sessionId,
@@ -4105,7 +4186,7 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "previewed-source");
       pi.selectHook = async () => {
         const concurrent = await metadata();
-        await mutateMetadata(concurrent, () =>
+        await mutateSessionMetadata(concurrent, pi, () =>
           commitTestNodeState(
             concurrent,
             pi.manager.sessionId,
@@ -4161,6 +4242,7 @@ describe("checkpoint authority lifecycle", () => {
               authority,
             );
             bindTestMetadataWriteAuthority(concurrent, authority, storeRoot);
+            attachPiSessionMetadata(concurrent, pi);
             commitTestNodeState(
               concurrent,
               pi.manager.sessionId,
@@ -4684,7 +4766,7 @@ describe("checkpoint authority lifecycle", () => {
       pi.selectionOverride = messageFor("choiceNavigationDetach");
       pi.beforeTreeCommit = async () => {
         const concurrent = await metadata();
-        await mutateMetadata(concurrent, () =>
+        await mutateSessionMetadata(concurrent, pi, () =>
           commitTestNodeState(
             concurrent,
             pi.manager.sessionId,
@@ -5625,8 +5707,9 @@ describe("checkpoint authority lifecycle", () => {
         lateArrival,
       )!;
       expect(
-        await mutateMetadata(
+        await mutateSessionMetadata(
           db,
+          pi,
           () =>
             protectTestLocation(
               db,
@@ -5759,7 +5842,7 @@ describe("checkpoint authority lifecycle", () => {
       registerCyclotomy(pi.api);
       const { first, second } = await twoStates(pi);
       const db = await metadata();
-      await mutateMetadata(db, () =>
+      await mutateSessionMetadata(db, pi, () =>
         commitTestNodeState(
           db,
           pi.manager.sessionId,
@@ -7187,7 +7270,7 @@ describe("checkpoint authority lifecycle", () => {
       const originalOid = "a".repeat(64);
       const originalSessionFile = join(home, "original.jsonl");
       let db = await metadata();
-      await mutateMetadata(db, () => {
+      await withTestMetadataWriteAuthority(storeRoot, db, () => {
         registerTestSession(db, "shared-session", originalSessionFile, [
           leaf.id,
         ]);
@@ -7331,7 +7414,7 @@ describe("checkpoint authority lifecycle", () => {
         join(tmpdir(), "cyclotomy-pi-fork-locked-target-"),
       );
       const parentFile = join(home, "locked-parent.jsonl");
-      const sourceLock = join(storeRoot, "workspace.lock");
+      let sourceLock: WorkspaceLock | undefined;
       try {
         await writeFile(
           parentFile,
@@ -7359,7 +7442,12 @@ describe("checkpoint authority lifecycle", () => {
           retained,
         )!.treeOid;
         sourceMetadata.close();
-        await writeFile(sourceLock, "blocks source locking");
+        // Hold the source store's real native lock so the import must time out
+        // instead of acquiring the source; releasing it must let a retry work.
+        sourceLock = await acquireWorkspaceLock(
+          storeRoot,
+          "test-hold-locked-parent-source",
+        );
 
         await writeFile(join(targetWorkspace, "state.txt"), "target state");
         const child = new FakePi(targetWorkspace);
@@ -7391,7 +7479,8 @@ describe("checkpoint authority lifecycle", () => {
         ).toBeUndefined();
         targetMetadata.close();
 
-        await rm(sourceLock);
+        await sourceLock.release();
+        sourceLock = undefined;
         child.notifications.length = 0;
         await child.replaceRuntime(registerCyclotomy, "reload");
 
@@ -7403,7 +7492,7 @@ describe("checkpoint authority lifecycle", () => {
         ).toBe(sourceOid);
         targetMetadata.close();
       } finally {
-        await rm(sourceLock, { force: true });
+        await sourceLock?.release().catch(() => {});
         await rm(targetWorkspace, { recursive: true, force: true });
       }
     });
@@ -7609,46 +7698,17 @@ describe("checkpoint authority lifecycle", () => {
         );
         const starting = child.startSession("fork", parentFile);
         try {
-          const firstLockPath = join(targetStoreRoot, "workspace.lock");
+          // The native lock keeps no owner record, so observe the target lock
+          // being held while the ordered import waits on the source.
           let importLockObserved = false;
           for (let attempt = 0; attempt < 800; attempt += 1) {
-            try {
-              const names = await readdir(firstLockPath);
-              for (const name of names) {
-                if (!name.startsWith("owner-") || !name.endsWith(".json")) {
-                  continue;
-                }
-                let record: { operation?: unknown };
-                try {
-                  record = JSON.parse(
-                    await readFile(join(firstLockPath, name), "utf8"),
-                  ) as { operation?: unknown };
-                } catch (error) {
-                  if (error instanceof SyntaxError) {
-                    // The owner pathname can be observed while its one bounded
-                    // write is still publishing. The polling deadline remains
-                    // the fail-closed bound for a persistently malformed owner.
-                    continue;
-                  }
-                  throw error;
-                }
-                if (record.operation === "fork-import") {
-                  importLockObserved = true;
-                  break;
-                }
-              }
-            } catch (error) {
-              if (
-                typeof error !== "object" ||
-                error === null ||
-                !["ENOENT", "ENOTDIR"].includes(
-                  String(Reflect.get(error, "code")),
-                )
-              ) {
-                throw error;
-              }
+            if (
+              (await inspectWorkspaceLock(targetStoreRoot)).kind ===
+              "native-busy"
+            ) {
+              importLockObserved = true;
+              break;
             }
-            if (importLockObserved) break;
             await new Promise<void>((resolveWait) =>
               setTimeout(resolveWait, 5),
             );
@@ -7977,6 +8037,9 @@ describe("checkpoint authority lifecycle", () => {
             cwd: workspace,
           })}\n`,
         );
+        // Deliberately the base host: the configured store root lies inside
+        // the authenticated parent workspace, so binding must fail before any
+        // store path exists.
         const child = new FakePi(targetWorkspace);
         child.manager = new FakeSessionManager(
           "overlap-child",

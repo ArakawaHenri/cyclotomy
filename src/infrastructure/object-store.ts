@@ -252,6 +252,7 @@ interface NativeObjectAccess {
   upgradeStoredTree(
     treeOid: string,
     targetFormat: string,
+    options: { readonly signal?: AbortSignal | undefined },
   ): Promise<TreeFormatUpgradeResult>;
 }
 
@@ -458,11 +459,12 @@ export function upgradeStoredTree(
   store: NativeObjectStore,
   treeOid: string,
   targetFormat: string,
+  options: { readonly signal?: AbortSignal | undefined } = {},
 ): Promise<TreeFormatUpgradeResult> {
   const native = requireNativeObjectStore(store, "tree migration");
   return nativeObjectRecords
     .get(native)!
-    .access.upgradeStoredTree(treeOid, targetFormat);
+    .access.upgradeStoredTree(treeOid, targetFormat, options);
 }
 
 function sha256(content: Uint8Array): string {
@@ -778,8 +780,8 @@ class FileObjectStore implements NativeObjectStore {
 
   readonly #nativeObjectAccess: NativeObjectAccess = {
     openReadScope: (options) => this.#openNativeReadScope(options),
-    upgradeStoredTree: (treeOid, targetFormat) =>
-      this.#upgradeStoredTree(treeOid, targetFormat),
+    upgradeStoredTree: (treeOid, targetFormat, options) =>
+      this.#upgradeStoredTree(treeOid, targetFormat, options),
   };
 
   #openNativeReadScope(
@@ -1245,10 +1247,17 @@ class FileObjectStore implements NativeObjectStore {
   async #publishAuthenticatedTreeManifest(
     manifest: TreeManifest,
     limits: TreeManifestLimits,
+    options: { readonly signal?: AbortSignal } = {},
   ): Promise<string> {
     try {
-      return await this.#withResolutionScope((scope) =>
-        publishStoredTree(manifest, this.#storedTreeWriteAccess(scope), limits),
+      return await this.#withResolutionScope(
+        (scope) =>
+          publishStoredTree(
+            manifest,
+            this.#storedTreeWriteAccess(scope),
+            limits,
+          ),
+        options,
       );
     } catch (error) {
       throw asStoreError("tree publication", error);
@@ -1344,14 +1353,23 @@ class FileObjectStore implements NativeObjectStore {
   async #upgradeStoredTree(
     treeOid: string,
     targetFormat: string,
+    options: { readonly signal?: AbortSignal | undefined },
   ): Promise<TreeFormatUpgradeResult> {
+    options.signal?.throwIfAborted();
     assertOid(treeOid);
     try {
       // Authenticate both the historical manifest and its complete blob
       // closure before publishing an object that metadata may later root.
-      const source = await this.#readAuthenticatedStoredTree(
-        treeOid,
-        DURABLE_BLOB_VERIFICATION_CEILING,
+      const readOptions =
+        options.signal === undefined ? {} : { signal: options.signal };
+      const source = await this.#withResolutionScope(
+        (scope) =>
+          this.#readAuthenticatedStoredTree(
+            treeOid,
+            DURABLE_BLOB_VERIFICATION_CEILING,
+            scope,
+          ),
+        readOptions,
       );
       if (source.format === targetFormat) {
         return { kind: "already-target", treeOid };
@@ -1381,13 +1399,20 @@ class FileObjectStore implements NativeObjectStore {
         throw error;
       }
 
+      options.signal?.throwIfAborted();
       const upgradedOid = await this.#publishAuthenticatedTreeManifest(
         target,
         ABSOLUTE_TREE_MANIFEST_LIMITS,
+        readOptions,
       );
-      const verified = await this.#readAuthenticatedStoredTree(
-        upgradedOid,
-        DURABLE_BLOB_VERIFICATION_CEILING,
+      const verified = await this.#withResolutionScope(
+        (scope) =>
+          this.#readAuthenticatedStoredTree(
+            upgradedOid,
+            DURABLE_BLOB_VERIFICATION_CEILING,
+            scope,
+          ),
+        readOptions,
       );
       if (verified.format !== targetFormat) {
         throw new ObjectStoreError(

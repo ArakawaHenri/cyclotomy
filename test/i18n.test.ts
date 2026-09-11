@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { CyclotomyI18n, resolveCyclotomyLocale } from "../src/pi/i18n.ts";
+import {
+  CyclotomyI18n,
+  resolveCyclotomyLocale,
+} from "../src/presentation/i18n.ts";
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 
 function plan(

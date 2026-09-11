@@ -87,11 +87,7 @@ async function withDisplacedAuthority<T>(
       const displaced = join(layout.root, "displaced-workspace-lock");
       await rename(lockPath, displaced);
       try {
-        return await withWorkspaceLock(
-          layout.root,
-          "content repository successor test",
-          async () => await action(authority),
-        );
+        return await action(authority);
       } finally {
         await rename(displaced, lockPath);
       }

@@ -1,4 +1,8 @@
-import { collectGarbage, type GcReport } from "../infrastructure/object-gc.ts";
+import {
+  collectGarbage,
+  type GcProgress,
+  type GcReport,
+} from "../infrastructure/object-gc.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
 import type { NativeObjectStore } from "../infrastructure/object-store.ts";
 import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
@@ -6,6 +10,10 @@ import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.t
 export interface CyclotomyGcOptions {
   readonly now?: number;
   readonly objectGraceMs?: number;
+  /** Wall-clock budget for the decision phase; see `GarbageCollectionOptions`. */
+  readonly budgetMs?: number;
+  readonly signal?: AbortSignal;
+  readonly onProgress?: (progress: GcProgress) => void;
 }
 
 /**
@@ -28,6 +36,11 @@ export async function collectCyclotomyGarbage(
     ...(options.objectGraceMs === undefined
       ? {}
       : { graceMs: options.objectGraceMs }),
+    ...(options.budgetMs === undefined ? {} : { budgetMs: options.budgetMs }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.onProgress === undefined
+      ? {}
+      : { onProgress: options.onProgress }),
     now: options.now ?? Date.now(),
   });
 }

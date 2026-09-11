@@ -1,12 +1,15 @@
 import { type DatabaseSync } from "node:sqlite";
 
 import { isTreeOid, type TreeOid } from "../../domain/model.ts";
-import { MetadataError } from "../metadata-error.ts";
+import {
+  MetadataError,
+  MetadataFingerprintChangedError,
+} from "../metadata-error.ts";
 import {
   assertWorkspaceWriteAuthority,
   type WorkspaceWriteAuthority,
 } from "../workspace-lock.ts";
-import { CURRENT_METADATA_VERSION } from "./current.ts";
+import { CURRENT_METADATA_VERSION, METADATA_VERSIONS } from "./current.ts";
 import {
   dropWriterFences,
   metadataSchemaVersion,
@@ -14,14 +17,17 @@ import {
 } from "./schema.ts";
 import {
   type AdjacentMetadataUpgrade,
-  findMetadataVersion,
-  metadataVersionChain,
   type MetadataMigrationDependencies,
   type PreparedMetadataTreeUpgrade,
-  type MetadataVersionNode,
+  type MetadataVersion,
   requireMetadataVersion,
   validateMetadataVersion,
 } from "./version.ts";
+
+import {
+  assertSessionHistoryExpectation,
+  readSessionHistoryFingerprint,
+} from "./history.ts";
 
 type OrdinaryMetadataUpgrade = Extract<
   AdjacentMetadataUpgrade,
@@ -36,14 +42,14 @@ type TreeFormatMetadataUpgrade = Extract<
 type CapturedAdjacentUpgrade =
   | {
       readonly kind: "ordinary";
-      readonly source: MetadataVersionNode;
-      readonly successor: MetadataVersionNode;
+      readonly source: MetadataVersion;
+      readonly successor: MetadataVersion;
       readonly edge: OrdinaryMetadataUpgrade;
     }
   | {
       readonly kind: "tree-format";
-      readonly source: MetadataVersionNode;
-      readonly successor: MetadataVersionNode;
+      readonly source: MetadataVersion;
+      readonly successor: MetadataVersion;
       readonly edge: TreeFormatMetadataUpgrade;
       readonly sourceRoots: readonly TreeOid[];
     };
@@ -51,14 +57,14 @@ type CapturedAdjacentUpgrade =
 type PreparedAdjacentUpgrade =
   | {
       readonly kind: "ordinary";
-      readonly source: MetadataVersionNode;
-      readonly successor: MetadataVersionNode;
+      readonly source: MetadataVersion;
+      readonly successor: MetadataVersion;
       readonly edge: OrdinaryMetadataUpgrade;
     }
   | {
       readonly kind: "tree-format";
-      readonly source: MetadataVersionNode;
-      readonly successor: MetadataVersionNode;
+      readonly source: MetadataVersion;
+      readonly successor: MetadataVersion;
       readonly edge: TreeFormatMetadataUpgrade;
       readonly prepared: PreparedMetadataTreeUpgrade;
     };
@@ -78,26 +84,6 @@ function rollbackPreservingPrimary(db: DatabaseSync): void {
   } catch {
     // Preserve the operation failure.
   }
-}
-
-function successorOf(
-  current: MetadataVersionNode,
-  source: MetadataVersionNode,
-): MetadataVersionNode {
-  const chain = metadataVersionChain(current);
-  const sourceIndex = chain.indexOf(source);
-  const successor = chain[sourceIndex + 1];
-  if (
-    sourceIndex < 0 ||
-    successor === undefined ||
-    successor.previous !== source ||
-    successor.upgradeFromPrevious === undefined
-  ) {
-    throw new MetadataError(
-      `metadata schema has no adjacent migration from version ${source.version}`,
-    );
-  }
-  return successor;
 }
 
 function canonicalTreeRoots(roots: readonly TreeOid[]): readonly TreeOid[] {
@@ -160,7 +146,7 @@ function prepareTotalTreeUpgrade(
 
 export function initializeMetadataVersionWithinTransaction(
   db: DatabaseSync,
-  current: MetadataVersionNode = CURRENT_METADATA_VERSION,
+  current: MetadataVersion = CURRENT_METADATA_VERSION,
 ): void {
   if (!db.isTransaction) {
     throw new MetadataError(
@@ -174,7 +160,7 @@ export function initializeMetadataVersionWithinTransaction(
 
 async function captureAndPrepareNextUpgrade(
   db: DatabaseSync,
-  current: MetadataVersionNode,
+  versions: readonly MetadataVersion[],
   dependencies: MetadataMigrationDependencies,
 ): Promise<
   | { readonly kind: "current" }
@@ -183,16 +169,18 @@ async function captureAndPrepareNextUpgrade(
       readonly upgrade: PreparedAdjacentUpgrade;
     }
 > {
+  dependencies.signal?.throwIfAborted();
   db.exec("BEGIN");
   let capturedUpgrade: CapturedAdjacentUpgrade;
   try {
-    const source = requireMetadataVersion(current, db);
+    const source = requireMetadataVersion(versions, db);
     validateMetadataVersion(db, source);
-    if (source === current) {
+    assertSessionHistoryExpectation(db, source.version, dependencies.history);
+    if (source === versions.at(-1)) {
       db.exec("COMMIT");
       return { kind: "current" };
     }
-    const successor = successorOf(current, source);
+    const successor = versions[source.version]!;
     const edge = successor.upgradeFromPrevious;
     if (edge === undefined) {
       throw new MetadataError(
@@ -253,28 +241,34 @@ async function captureAndPrepareNextUpgrade(
 
 function applyPreparedUpgrade(
   db: DatabaseSync,
-  current: MetadataVersionNode,
+  versions: readonly MetadataVersion[],
   authority: WorkspaceWriteAuthority,
   storeRoot: string,
   prepared: Extract<
     Awaited<ReturnType<typeof captureAndPrepareNextUpgrade>>,
     { readonly kind: "prepared" }
   >,
+  dependencies: MetadataMigrationDependencies,
 ): ApplyPreparedUpgradeResult {
+  const { signal, history } = dependencies;
+  signal?.throwIfAborted();
   const upgrade = prepared.upgrade;
   db.exec("BEGIN IMMEDIATE");
   try {
     const observed = metadataSchemaVersion(db);
     if (observed !== upgrade.source.version) {
+      if (history !== undefined)
+        throw new MetadataFingerprintChangedError(
+          "metadata version changed during history migration",
+        );
       // Another process advanced while external immutable objects were being
       // prepared. Re-discover the next edge from the committed version.
       db.exec("ROLLBACK");
-      if (findMetadataVersion(current, observed) === undefined) {
-        requireMetadataVersion(current, db);
-      }
+      requireMetadataVersion(versions, db);
       return "version-changed";
     }
     validateMetadataVersion(db, upgrade.source);
+    assertSessionHistoryExpectation(db, observed, history);
     if (
       upgrade.kind === "tree-format" &&
       !treeRootsAreEqual(
@@ -288,6 +282,23 @@ function applyPreparedUpgrade(
       return "tree-roots-changed";
     }
 
+    const successorFingerprint =
+      history === undefined
+        ? undefined
+        : readSessionHistoryFingerprint(
+            db,
+            observed,
+            history.sessionId,
+            upgrade.kind === "tree-format"
+              ? new Map(
+                  upgrade.prepared.replacements.map(({ source, target }) => [
+                    source,
+                    target,
+                  ]),
+                )
+              : undefined,
+          );
+    signal?.throwIfAborted();
     assertWorkspaceWriteAuthority(authority, storeRoot);
     dropWriterFences(db, upgrade.source.schema);
     if (upgrade.kind === "tree-format") {
@@ -308,7 +319,20 @@ function applyPreparedUpgrade(
         "tree-format migration did not preserve the exact mapped root set",
       );
     }
+    if (
+      history !== undefined &&
+      readSessionHistoryFingerprint(
+        db,
+        upgrade.successor.version,
+        history.sessionId,
+      ) !== successorFingerprint
+    ) {
+      throw new MetadataFingerprintChangedError(
+        "migration did not preserve the mapped checkpoint history",
+      );
+    }
     db.exec("COMMIT");
+    if (history !== undefined) history.fingerprint = successorFingerprint!;
     return "applied";
   } catch (error) {
     rollbackPreservingPrimary(db);
@@ -325,10 +349,12 @@ export async function migrateMetadataToCurrent(
   dependencies: MetadataMigrationDependencies,
   authority: WorkspaceWriteAuthority,
   storeRoot: string,
-  current: MetadataVersionNode = CURRENT_METADATA_VERSION,
+  versions: readonly MetadataVersion[] = METADATA_VERSIONS,
 ): Promise<void> {
+  const current = versions.at(-1)!;
   let consecutiveTreeRootDriftRetries = 0;
   while (true) {
+    dependencies.signal?.throwIfAborted();
     if (metadataSchemaVersion(db) === 0) {
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -346,14 +372,15 @@ export async function migrateMetadataToCurrent(
       continue;
     }
 
-    const next = await captureAndPrepareNextUpgrade(db, current, dependencies);
+    const next = await captureAndPrepareNextUpgrade(db, versions, dependencies);
     if (next.kind === "current") return;
     const result = applyPreparedUpgrade(
       db,
-      current,
+      versions,
       authority,
       storeRoot,
       next,
+      dependencies,
     );
     if (result === "tree-roots-changed") {
       consecutiveTreeRootDriftRetries += 1;

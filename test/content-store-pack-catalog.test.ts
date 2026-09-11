@@ -78,11 +78,7 @@ async function withDisplacedAuthority<T>(
       );
       await rename(lockPath, displaced);
       try {
-        return await withWorkspaceLock(
-          layout.root,
-          "pack catalog successor test",
-          async () => await action(authority),
-        );
+        return await action(authority);
       } finally {
         await rename(displaced, lockPath);
       }

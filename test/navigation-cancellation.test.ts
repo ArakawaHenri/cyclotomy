@@ -1,6 +1,6 @@
+import { assertTestWorkspaceLockReleased } from "./workspace-lock-fixture.ts";
 import { createHash } from "node:crypto";
 import {
-  access,
   mkdtemp,
   mkdir,
   readFile,
@@ -21,6 +21,7 @@ import {
   checkpointState,
   createTestCurrentMetadataStore,
 } from "./metadata-fixture.ts";
+import {} from "../src/infrastructure/workspace-lock.ts";
 
 let workspace: string;
 let agentDir: string;
@@ -46,6 +47,9 @@ beforeEach(async () => {
       .update(await realpath(workspace))
       .digest("hex"),
   );
+  // Test stores model an upgraded installation: the one-time native lock
+  // protocol switch completes before any runtime binds the store.
+  await mkdir(storeRoot, { recursive: true });
 });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -170,9 +174,9 @@ it.each([
       });
       expect(pi.terminalInputHandlers.size).toBe(0);
       expect(pi.statuses.has("cyclotomy")).toBe(false);
-      await expect(
-        access(join(storeRoot, "workspace.lock")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      // The persistent lock file remains; the cancelled operation must have
+      // released its exclusive native lock.
+      await assertTestWorkspaceLockReleased(storeRoot);
     } finally {
       db.close();
     }

@@ -20,7 +20,6 @@ import {
   SESSION_CAPTURE_BARRIER_V3_SCHEMA_SQL,
   SESSION_REGISTRY_V3_SCHEMA_SQL,
   V3_METADATA_SCHEMA,
-  V3_METADATA_VERSION,
 } from "./v3.ts";
 
 export const V4_METADATA_WRITER_PROTOCOL = 4;
@@ -116,7 +115,6 @@ export const V4_METADATA_VERSION = defineMetadataVersion({
   version: 4,
   treeFormat: TREE_MANIFEST_FORMAT_V3,
   schema: V4_METADATA_SCHEMA,
-  previous: V3_METADATA_VERSION,
   upgradeFromPrevious: V3_TO_V4_METADATA_UPGRADE,
   initializeWithinTransaction: initializeV4,
   referencedTreeOids: (db, limit) => readTreeOids(db, "checkpoint_slot", limit),

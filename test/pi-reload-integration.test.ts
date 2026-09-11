@@ -79,6 +79,7 @@ describe("Pi runtime replacement", () => {
       }),
     );
     const pi = new FakePi(workspace, registerCyclotomy);
+
     await pi.startSession("startup");
     await writeFile(
       settingsPath,
@@ -139,6 +140,7 @@ describe("Pi runtime replacement", () => {
       settingsPath,
       JSON.stringify({ locale: "zh-CN", gc: { intervalMs: 0 } }),
     );
+
     await pi.reloadExtension();
     expect(pi.factoryLoads).toBe(2);
     // Recovery may inspect existing checkpoints, but never captures or restores.
@@ -157,6 +159,7 @@ describe("Pi runtime replacement", () => {
 
   it("keeps a declined node write-protected across reload and cold start", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
+
     await pi.startSession("startup");
     await writeFile(join(workspace, "a.txt"), "saved");
     await pi.endTurn();
@@ -211,6 +214,7 @@ describe("Pi runtime replacement", () => {
   it("does not trust a reload handoff through a disabled runtime", async () => {
     const settingsPath = join(home, "cyclotomy", "settings.json");
     const pi = new FakePi(workspace, registerCyclotomy);
+
     await pi.startSession("startup");
     await writeFile(join(workspace, "a.txt"), "saved");
     await pi.endTurn();
@@ -274,6 +278,7 @@ describe("Pi runtime replacement", () => {
 
   it("preserves a guarded missing historical node across a real fork replacement", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
+
     await pi.startSession("startup");
     const ancestor = pi.manager.appendEntry();
     const descendant = pi.manager.appendEntry();
@@ -310,6 +315,7 @@ describe("Pi runtime replacement", () => {
 
   it("captures the source and restores confirmed resume targets across runtime replacement", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
+
     await pi.startSession("startup");
     await writeFile(join(workspace, "a.txt"), "session-one");
     await pi.endTurn();
@@ -341,6 +347,7 @@ describe("Pi runtime replacement", () => {
     );
     try {
       const pi = new FakePi(workspace, registerCyclotomy);
+
       await pi.startSession("startup");
       await writeFile(join(workspace, "a.txt"), "session-a");
       await pi.endTurn();

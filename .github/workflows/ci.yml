@@ -49,8 +49,45 @@ jobs:
       - name: Test
         run: npm test
 
+      # The package smoke installs `npm pack --ignore-scripts`, so dist must
+      # already exist: the published CLI is built here, not by prepack.
+      - name: Build the CLI bundle
+        run: npm run build
+
       - name: Verify installed package loads through Pi
         run: npm run test:package
+
+  lock-protocol:
+    if: github.event_name != 'schedule'
+    name: Lock handover 0.2.4 ↔ current · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # The matrix fetches the published 0.2.4 artifact and drives real
+      # cross-process contention against it, so the handover contract is
+      # accepted on all three platforms rather than on the maintainer's host.
+      - name: Run the lock transition matrix
+        run: npm run test:lock-protocol
 
   zstd-host-regression:
     if: github.event_name != 'schedule'
@@ -111,6 +148,9 @@ jobs:
       - name: Run real-Pi integration against the minimum host
         run: npm run test:real-pi
 
+      - name: Build the CLI bundle
+        run: npm run build
+
       - name: Verify the package loads through the minimum host
         run: npm run test:package
 
@@ -156,6 +196,9 @@ jobs:
 
       - name: Probe real-Pi integration
         run: npm run test:real-pi
+
+      - name: Build the CLI bundle
+        run: npm run build
 
       - name: Verify the package loads through the latest host
         run: npm run test:package

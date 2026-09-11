@@ -1,5 +1,10 @@
-import type { CaptureFailure, CaptureSuccess } from "../application/capture.ts";
+import {
+  metadataWriteFailure,
+  type CaptureFailure,
+  type CaptureSuccess,
+} from "../application/capture.ts";
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
+import { metadataHistoryResetIn } from "../infrastructure/metadata-error.ts";
 import type { NodeKey, Result } from "../domain/model.ts";
 import type { AdmissionLease } from "./checkpoint-admission.ts";
 import { isExactUsableSessionView, type SessionView } from "./session-view.ts";
@@ -136,6 +141,11 @@ export async function runCaptureProtocol(
     }
     return { kind: "capture-failed", failure: committed.error };
   } catch (cause) {
-    return { kind: "failed", cause };
+    // A retired history generation raised while settling the capture boundary
+    // is a capture outcome, not an unknown protocol exception: the store
+    // deliberately refused the write and every caller must report it that way.
+    return metadataHistoryResetIn(cause) === undefined
+      ? { kind: "failed", cause }
+      : { kind: "capture-failed", failure: metadataWriteFailure(cause) };
   }
 }

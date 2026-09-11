@@ -3,8 +3,7 @@ import {
   canonicalizeTreeManifest,
   TreeManifestError,
 } from "./manifest-codec.ts";
-import type { TreeFormatNode } from "./chain.ts";
-import { TREE_FORMAT_V2 } from "./v2.ts";
+import type { TreeFormat } from "./chain.ts";
 import {
   TREE_FORMAT_V3_CURRENT,
   TREE_MANIFEST_FORMAT_V3,
@@ -17,10 +16,9 @@ export { TREE_MANIFEST_FORMAT_V3 };
  * semantics while their canonical representation becomes a Prolly DAG.
  */
 export const TREE_FORMAT_V3 = Object.freeze<
-  TreeFormatNode<typeof TREE_MANIFEST_FORMAT_V3>
+  TreeFormat<typeof TREE_MANIFEST_FORMAT_V3>
 >({
   ...TREE_FORMAT_V3_CURRENT,
-  previous: TREE_FORMAT_V2,
   upgradeFromPrevious(previous, pathLimits) {
     try {
       // V1/v2 never recorded the external Git evaluator. Migration must be

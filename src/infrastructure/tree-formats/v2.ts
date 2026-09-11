@@ -7,9 +7,8 @@ import {
   TreeManifestError,
   type TreeManifestLimits,
 } from "./manifest-codec.ts";
-import type { TreeFormatNode } from "./chain.ts";
+import type { TreeFormat } from "./chain.ts";
 import { referencedTreeBlobOids } from "./references.ts";
-import { TREE_FORMAT_V1 } from "./v1.ts";
 import type { WorkspaceScope } from "../workspace-scope.ts";
 import { canonicalizeV2WorkspaceScope } from "./v2-workspace-scope.ts";
 
@@ -105,10 +104,9 @@ function encodeV2TreeManifest(
 }
 
 export const TREE_FORMAT_V2 = Object.freeze<
-  TreeFormatNode<typeof TREE_MANIFEST_FORMAT_V2>
+  TreeFormat<typeof TREE_MANIFEST_FORMAT_V2>
 >({
   format: TREE_MANIFEST_FORMAT_V2,
-  previous: TREE_FORMAT_V1,
   create(entries, scope, limits) {
     const canonical = canonicalizeV2TreeManifest(entries, scope, limits, true);
     return { format: TREE_MANIFEST_FORMAT_V2, ...canonical };

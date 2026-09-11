@@ -17,7 +17,6 @@ import {
 import {
   NODE_STATE_V1_SCHEMA_SQL,
   SESSION_REGISTRY_MISSING_V1_INDEX_SQL,
-  V1_METADATA_VERSION,
 } from "./v1.ts";
 import { TREE_MANIFEST_FORMAT_V2 } from "../../tree-formats/v2.ts";
 
@@ -136,7 +135,6 @@ export const V2_METADATA_VERSION = defineMetadataVersion({
   version: 2,
   treeFormat: TREE_MANIFEST_FORMAT_V2,
   schema: V2_METADATA_SCHEMA,
-  previous: V1_METADATA_VERSION,
   upgradeFromPrevious: V1_TO_V2_METADATA_UPGRADE,
   initializeWithinTransaction: initializeV2,
   referencedTreeOids: (db, limit) => readTreeOids(db, "node_state", limit),

@@ -125,12 +125,7 @@ describe("object-store maintenance", () => {
           const displaced = join(layout.root, "displaced-workspace-lock");
           await rename(lockPath, displaced);
           try {
-            return await withWorkspaceLock(
-              layout.root,
-              "maintenance successor test",
-              async () =>
-                await maintenance.removeObject(inventory, object, authority),
-            );
+            return await maintenance.removeObject(inventory, object, authority);
           } finally {
             await rename(displaced, lockPath);
           }

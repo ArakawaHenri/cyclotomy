@@ -166,7 +166,9 @@ async function assertDirectoryIdentity(
 async function directoryNames(
   path: string,
   maximum: number,
+  signal?: AbortSignal,
 ): Promise<readonly string[]> {
+  signal?.throwIfAborted();
   const before = await observeDirectory(path);
   const names: string[] = [];
   try {
@@ -174,6 +176,7 @@ async function directoryNames(
     await withDeterministicCleanup(
       async () => {
         for await (const entry of directory) {
+          signal?.throwIfAborted();
           if (names.length >= maximum) {
             fail(
               "limit-exceeded",
@@ -294,7 +297,11 @@ export class ObjectStoreMaintenance {
     this.#layout = layout;
   }
 
-  async inventory(maximumObjects: number): Promise<MaintenanceInventory> {
+  async inventory(
+    maximumObjects: number,
+    options: { readonly signal?: AbortSignal | undefined } = {},
+  ): Promise<MaintenanceInventory> {
+    options.signal?.throwIfAborted();
     if (!Number.isSafeInteger(maximumObjects) || maximumObjects <= 0) {
       fail("invalid-input", "maximum object count must be positive");
     }
@@ -303,7 +310,11 @@ export class ObjectStoreMaintenance {
     if (objects.dev !== root.dev) {
       fail("namespace-invalid", "objects directory crosses a device boundary");
     }
-    const objectNames = await directoryNames(this.#layout.objects, 5);
+    const objectNames = await directoryNames(
+      this.#layout.objects,
+      5,
+      options.signal,
+    );
     const expectedObjectNames = ["blobs", "packs", "records", "trees"];
     if (
       objectNames.length !== expectedObjectNames.length ||
@@ -318,7 +329,11 @@ export class ObjectStoreMaintenance {
     if (records.dev !== objects.dev) {
       fail("namespace-invalid", "records directory crosses a device boundary");
     }
-    const recordNames = await directoryNames(this.#layout.records, 3);
+    const recordNames = await directoryNames(
+      this.#layout.records,
+      3,
+      options.signal,
+    );
     if (
       recordNames.length !== 2 ||
       recordNames[0] !== "content" ||
@@ -341,6 +356,7 @@ export class ObjectStoreMaintenance {
       namespacePath: string,
       shardPath: (shard: string) => string,
     ): Promise<void> => {
+      options.signal?.throwIfAborted();
       const namespace = await observeDirectory(namespacePath);
       if (namespace.dev !== objects.dev) {
         fail("namespace-invalid", `${namespacePath} crosses a device boundary`);
@@ -352,7 +368,11 @@ export class ObjectStoreMaintenance {
           : []),
         directoryIdentity(namespacePath, namespace),
       ];
-      for (const shard of await directoryNames(namespacePath, 257)) {
+      for (const shard of await directoryNames(
+        namespacePath,
+        257,
+        options.signal,
+      )) {
         if (!isNativeObjectShard(shard)) {
           fail("namespace-invalid", `unexpected shard ${shard}`);
         }
@@ -378,7 +398,9 @@ export class ObjectStoreMaintenance {
         for (const name of await directoryNames(
           shardDirectory,
           remaining + 1,
+          options.signal,
         )) {
+          options.signal?.throwIfAborted();
           if (found.length >= maximumObjects) {
             fail(
               "limit-exceeded",

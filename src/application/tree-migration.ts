@@ -46,12 +46,20 @@ export async function prepareTreeOidUpgrades(
   store: NativeObjectStore,
   roots: readonly TreeOid[],
   targetFormat: string,
+  options: { readonly signal?: AbortSignal | undefined } = {},
 ): Promise<ReadonlyMap<TreeOid, TreeOid>> {
+  options.signal?.throwIfAborted();
   const upgraded = new Map<TreeOid, TreeOid>();
   const incompatibleTrees: TreeFormatUpgradeBlocker[] = [];
 
   for (const treeOid of roots) {
-    const result = await upgradeStoredTree(store, treeOid, targetFormat);
+    options.signal?.throwIfAborted();
+    const result = await upgradeStoredTree(
+      store,
+      treeOid,
+      targetFormat,
+      options,
+    );
     switch (result.kind) {
       case "already-target":
         upgraded.set(treeOid, result.treeOid);
@@ -65,6 +73,7 @@ export async function prepareTreeOidUpgrades(
     }
   }
 
+  options.signal?.throwIfAborted();
   if (incompatibleTrees.length > 0) {
     throw new TreeFormatUpgradeBlockedError(targetFormat, incompatibleTrees);
   }

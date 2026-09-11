@@ -1,8 +1,8 @@
 import type { CaptureFailure } from "../application/capture.ts";
 import { assertNever } from "./assert-never.ts";
 import { formatCaptureFailure } from "./capture-failure.ts";
-import type { CyclotomyI18n } from "./i18n.ts";
-import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import type { CyclotomyI18n } from "../presentation/i18n.ts";
+import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
 
 export type SourceCaptureFailure =
   | {
@@ -32,6 +32,7 @@ export function sourceCaptureFailureImpact(
         case "scan-incomplete":
         case "scan-failed":
         case "publish-failed":
+        case "history-reset":
         case "metadata-failed":
           return "withdraw-participation";
         case "workspace-changed":
@@ -76,6 +77,7 @@ export function sourceCaptureFailureCause(
     failure.kind === "capture" &&
     (failure.value.kind === "scan-failed" ||
       failure.value.kind === "publish-failed" ||
+      failure.value.kind === "history-reset" ||
       failure.value.kind === "metadata-failed")
   ) {
     return failure.value.cause;

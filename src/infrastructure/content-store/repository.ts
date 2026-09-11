@@ -1389,6 +1389,7 @@ export class ContentRepository {
     context: ResolutionContext,
     authority?: WorkspaceWriteAuthority,
   ): Promise<void> {
+    context.signal?.throwIfAborted();
     if (decodedLength < CHUNKED_CONTENT_MIN_BYTES) {
       const bytes = Buffer.allocUnsafe(decodedLength);
       let offset = 0;
@@ -1405,6 +1406,7 @@ export class ContentRepository {
       ) {
         integrity("content source does not match its declared id and length");
       }
+      context.signal?.throwIfAborted();
       await this.#publishLooseRecord(
         await createContentRecord(bytes),
         authority,
@@ -1419,18 +1421,22 @@ export class ContentRepository {
       this.#recipeLimits(decodedLength),
       {
         content: async (chunk) => {
+          context.signal?.throwIfAborted();
           const record = await createContentRecord(chunk.bytes);
           if (record.logicalId !== chunk.contentId) {
             integrity("chunk record identity changed during encoding");
           }
+          context.signal?.throwIfAborted();
           await this.#publishLooseRecord(record, authority);
           publishedChunks.set(chunk.contentId, chunk.length);
         },
         recipe: async (object) => {
+          context.signal?.throwIfAborted();
           const record = await createRecipeRecord(object.bytes);
           if (record.logicalId !== object.recipeId) {
             integrity("recipe record identity changed during encoding");
           }
+          context.signal?.throwIfAborted();
           await this.#publishLooseRecord(record, authority);
           publishedRecipes.add(object.recipeId);
         },
@@ -1481,6 +1487,7 @@ export class ContentRepository {
     ) {
       integrity("published chunked representation lost a dependency receipt");
     }
+    context.signal?.throwIfAborted();
     await this.#publishLooseRecord(
       createChunkedContentRecord(expectedId, decodedLength, plan.rootId),
       authority,
@@ -2154,7 +2161,7 @@ export class ContentRepository {
         }
       }
 
-      context.packInventory ??= this.#loadPackInventory();
+      context.packInventory ??= this.#loadPackInventory(context.signal);
       const routing = await context.packInventory;
       const routed = await this.#tryPackCandidates(
         routing.index,
@@ -2169,7 +2176,9 @@ export class ContentRepository {
       if (context.optionalReuse === true) return undefined;
 
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const inventory = await this.#loadAuthenticatedPackInventory();
+        const inventory = await this.#loadAuthenticatedPackInventory(
+          context.signal,
+        );
         let authoritativeFailure: unknown;
         const authenticated = await this.#tryPackCandidates(
           inventory.index,
@@ -2186,7 +2195,11 @@ export class ContentRepository {
           },
         );
         if (authenticated !== undefined) return authenticated;
-        if (await this.#catalog.inventoryStillCurrent(inventory.inventory)) {
+        if (
+          await this.#catalog.inventoryStillCurrent(inventory.inventory, {
+            signal: context.signal,
+          })
+        ) {
           if (authoritativeFailure !== undefined) throw authoritativeFailure;
           return undefined;
         }
@@ -2257,12 +2270,16 @@ export class ContentRepository {
     };
   }
 
-  async #loadPackInventory(): Promise<LoadedPackInventory> {
-    return this.#indexPackInventory(await this.#catalog.readInventory());
+  async #loadPackInventory(signal?: AbortSignal): Promise<LoadedPackInventory> {
+    return this.#indexPackInventory(
+      await this.#catalog.readInventory({ signal }),
+    );
   }
 
-  async #loadAuthenticatedPackInventory(): Promise<LoadedPackInventory> {
-    return this.#indexPackInventory(await this.#catalog.inventory());
+  async #loadAuthenticatedPackInventory(
+    signal?: AbortSignal,
+  ): Promise<LoadedPackInventory> {
+    return this.#indexPackInventory(await this.#catalog.inventory({ signal }));
   }
 
   async #tryPackCandidates<T>(

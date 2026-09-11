@@ -37,6 +37,7 @@ import {
 let harness: RealPiHarness | undefined;
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await harness?.dispose();
   harness = undefined;
 });

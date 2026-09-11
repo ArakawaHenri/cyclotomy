@@ -50,6 +50,7 @@ async function mixedPack() {
   await mkdir(workspace);
   await mkdir(storeRoot);
   const store = await openObjectStore(storeRoot);
+
   const large = Buffer.alloc(LARGE_FILE_BYTES, 0x41);
   const contentId = createHash("sha256").update(large).digest("hex");
   await writeFile(join(workspace, "large.bin"), large);

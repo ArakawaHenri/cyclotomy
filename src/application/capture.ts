@@ -1,5 +1,10 @@
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
+import {
+  metadataHistoryResetIn,
+  type MetadataHistoryResetError,
+  type MetadataHistoryResetReason,
+} from "../infrastructure/metadata-error.ts";
 import type { ObjectStore } from "../infrastructure/object-store.ts";
 import type { WorkspaceWriteAuthority } from "../infrastructure/workspace-lock.ts";
 import { publishSnapshot } from "../infrastructure/snapshot-publication.ts";
@@ -66,6 +71,17 @@ export type CaptureFailure =
       readonly cause: unknown;
     }
   | { readonly kind: "publish-failed"; readonly cause: unknown }
+  /**
+   * The session's stored history generation was retired (another instance
+   * forgot it, or this one is still awaiting its next attach). The write could
+   * not commit under any generation this engine can reach, so the failure is
+   * reported separately from an internal metadata fault.
+   */
+  | {
+      readonly kind: "history-reset";
+      readonly reason: MetadataHistoryResetReason;
+      readonly cause: MetadataHistoryResetError;
+    }
   | { readonly kind: "metadata-failed"; readonly cause: unknown }
   | {
       readonly kind: "state-changed";
@@ -94,6 +110,20 @@ export interface CaptureCommitAuthority {
 }
 
 export type MissingNodeStateIntent = "initialize-fresh" | "adopt-protected";
+
+/**
+ * A retired history generation is not an internal metadata fault: the store
+ * deliberately refused the write, and the session can only continue by
+ * attaching the current generation at a stable host boundary. Callers outside
+ * this module use the same classification for metadata exceptions raised by
+ * their own steps.
+ */
+export function metadataWriteFailure(cause: unknown): CaptureFailure {
+  const reset = metadataHistoryResetIn(cause);
+  return reset === undefined
+    ? { kind: "metadata-failed", cause }
+    : { kind: "history-reset", reason: reset.reason, cause: reset };
+}
 
 function effectiveScanOptions(
   deps: CaptureDeps,
@@ -234,10 +264,7 @@ export function commitPreparedNodeState(
       });
     }
   } catch (error) {
-    return failure({
-      kind: "metadata-failed",
-      cause: error,
-    });
+    return failure(metadataWriteFailure(error));
   }
   return success(prepared);
 }
@@ -282,7 +309,7 @@ export function commitPreparedMissingNodeState(
       });
     }
   } catch (error) {
-    return failure({ kind: "metadata-failed", cause: error });
+    return failure(metadataWriteFailure(error));
   }
   return success(prepared);
 }

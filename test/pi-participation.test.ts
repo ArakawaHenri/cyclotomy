@@ -1,3 +1,4 @@
+import { assertTestWorkspaceLockReleased } from "./workspace-lock-fixture.ts";
 import { createHash } from "node:crypto";
 import {
   access,
@@ -22,6 +23,7 @@ import {
   checkpointState,
   createTestCurrentMetadataStore,
 } from "./metadata-fixture.ts";
+import {} from "../src/infrastructure/workspace-lock.ts";
 
 let workspace: string;
 let agentDir: string;
@@ -97,6 +99,7 @@ async function expectPiPreparationPasses(pi: FakePi): Promise<void> {
 async function startTwoNodeSession(pi: FakePi): Promise<string> {
   const target = pi.manager.appendEntry().id;
   pi.manager.appendEntry();
+
   await pi.startSession("startup");
   return target;
 }
@@ -108,6 +111,7 @@ describe("Cyclotomy participation boundary", () => {
       const pi = new FakePi(workspace, registerCyclotomy);
       const node = pi.manager.appendEntry().id;
       await writeFile(join(workspace, "state.txt"), "original");
+
       await pi.startSession("startup");
       const db = await createTestCurrentMetadataStore(
         join(storeRoot, "state.db"),
@@ -153,9 +157,9 @@ describe("Cyclotomy participation boundary", () => {
       });
       expect(pi.statuses.has("cyclotomy")).toBe(false);
       expect(pi.terminalInputHandlers.size).toBe(0);
-      await expect(
-        access(join(storeRoot, "workspace.lock")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      // The persistent lock file remains; the cancelled operation must have
+      // released its exclusive native lock.
+      await assertTestWorkspaceLockReleased(storeRoot);
       db.close();
     },
   );
@@ -218,6 +222,7 @@ describe("Cyclotomy participation boundary", () => {
         return { ok: false, error: { kind: "cancelled" } };
       },
     );
+
     const starting = pi.startSession("startup");
     await started;
     const stopping = pi.runCommand("cyclotomy", "pause");
@@ -254,6 +259,7 @@ describe("Cyclotomy participation boundary", () => {
         return { ok: false, error: { kind: "cancelled" } };
       },
     );
+
     await pi.startSession("startup");
 
     const progress = statuses.mock.calls
@@ -332,6 +338,7 @@ describe("Cyclotomy participation boundary", () => {
     const settingsPath = join(agentDir, "cyclotomy", "settings.json");
     const first = new FakePi(workspace, registerCyclotomy);
     first.manager.appendEntry();
+
     await first.startSession("startup");
 
     await first.runCommand("cyclotomy", "disable");
@@ -349,6 +356,7 @@ describe("Cyclotomy participation boundary", () => {
 
     const secondWorkspace = join(workspace, "second");
     await mkdir(secondWorkspace);
+
     const second = new FakePi(secondWorkspace, registerCyclotomy);
     second.manager.appendEntry();
     await second.startSession("startup");
@@ -370,6 +378,7 @@ describe("Cyclotomy participation boundary", () => {
 
     const thirdWorkspace = join(workspace, "third");
     await mkdir(thirdWorkspace);
+
     const third = new FakePi(thirdWorkspace, registerCyclotomy);
     third.manager.appendEntry();
     await third.startSession("startup");
@@ -401,6 +410,7 @@ describe("Cyclotomy participation boundary", () => {
   it("reports a settings write failure without changing active participation", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
     pi.manager.appendEntry();
+
     await pi.startSession("startup");
     const settingsPath = join(agentDir, "cyclotomy", "settings.json");
     await rm(settingsPath);
@@ -428,7 +438,9 @@ describe("Cyclotomy participation boundary", () => {
       const pi = new FakePi(workspace, registerCyclotomy);
       pi.manager.appendEntry();
       await pi.startSession("startup");
-      if (resume) await pi.runCommand("cyclotomy", "resume");
+      if (resume) {
+        await pi.runCommand("cyclotomy", "resume");
+      }
 
       pi.notifications.length = 0;
       await pi.emitMalformedSessionStart("reload");
@@ -445,6 +457,7 @@ describe("Cyclotomy participation boundary", () => {
     const pi = new FakePi(workspace, registerCyclotomy);
     const target = pi.manager.appendEntry().id;
     await writeFile(join(workspace, "state.txt"), "checkpoint");
+
     await pi.startSession("startup");
     await pi.endTurn(0);
     const before = await createTestCurrentMetadataStore(
@@ -580,6 +593,7 @@ describe("Cyclotomy participation boundary", () => {
     const pi = new FakePi(workspace, factory);
     const leaf = pi.manager.appendEntry().id;
     await writeFile(join(workspace, "state.txt"), "checkpoint");
+
     await pi.startSession("startup");
     const before = await createTestCurrentMetadataStore(
       join(storeRoot, "state.db"),
@@ -625,6 +639,7 @@ describe("Cyclotomy participation boundary", () => {
     await expectPiPreparationPasses(pi);
 
     await writeSettings({ locale: "en", gc: { intervalMs: 0 } });
+
     await pi.runCommand("cyclotomy", "resume");
 
     expect(pi.factoryLoads).toBe(1);

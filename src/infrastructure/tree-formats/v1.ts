@@ -2,7 +2,7 @@ import {
   canonicalizeV1TreeManifest,
   encodeV1TreeManifest,
 } from "./v1-manifest-codec.ts";
-import type { TreeFormatNode } from "./chain.ts";
+import type { TreeFormat } from "./chain.ts";
 import { exactKeys, invalidManifest } from "./manifest-codec.ts";
 import { referencedTreeBlobOids } from "./references.ts";
 
@@ -10,7 +10,7 @@ import { referencedTreeBlobOids } from "./references.ts";
 export const TREE_MANIFEST_FORMAT_V1 = "cyclotomy-tree-v1";
 
 export const TREE_FORMAT_V1 = Object.freeze<
-  TreeFormatNode<typeof TREE_MANIFEST_FORMAT_V1>
+  TreeFormat<typeof TREE_MANIFEST_FORMAT_V1>
 >({
   format: TREE_MANIFEST_FORMAT_V1,
   create(entries, scope, limits) {

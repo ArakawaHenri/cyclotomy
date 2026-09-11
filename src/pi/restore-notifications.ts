@@ -7,12 +7,13 @@ import type {
   PostMutationConflict,
   RestorePreparationConflict,
 } from "./post-mutation.ts";
+import { metadataHistoryResetIn } from "../infrastructure/metadata-error.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import { assertNever } from "./assert-never.ts";
-import type { MessageKey } from "./i18n.ts";
-import { formatUiDetail } from "./restore-presentation.ts";
+import type { MessageKey } from "../presentation/i18n.ts";
+import { formatUiDetail } from "../presentation/restore-presentation.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
-import { messageOfUnknown as messageOf } from "./unknown-error.ts";
+import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
 import type { RestoreProtocolOutcome } from "./workspace-mutation-protocol.ts";
 import type {
   ArrivalReceipt,
@@ -49,6 +50,21 @@ export function notifyArrivalDispositionFailure(
   context: ExtensionContext,
   disposition: ArrivalDisposition,
 ): void {
+  const failureCause = arrivalFailureCause(disposition);
+  if (failureCause !== undefined) {
+    const reported = runtime.historyReset !== undefined;
+    if (runtime.noteHistoryReset(failureCause)) {
+      // The protection write was refused because the generation is gone. That
+      // is a deliberate maintenance outcome with its own statement, and this
+      // engine has already withdrawn from the session. A protection failure
+      // that follows an already reported reset is its consequence, not a
+      // second fact, so it is not repeated here.
+      if (!reported) {
+        runtime.notify(context, runtime.i18n.t("historyReset"), "error");
+      }
+      return;
+    }
+  }
   if (disposition.kind === "unsettled") {
     const key = runtime.isActive
       ? "arrivalProtectionUnavailable"
@@ -158,6 +174,8 @@ export function notifyRestoreOutcome(
   outcome: RestoreOutcome,
   options: { readonly announceSuccess?: boolean } = {},
 ): void {
+  const failureCause = restoreOutcomeFailureCause(outcome);
+  if (failureCause !== undefined) runtime.noteHistoryReset(failureCause);
   switch (outcome.kind) {
     case "restored":
       if (options.announceSuccess !== false) {
@@ -207,13 +225,15 @@ export function notifyRestoreOutcome(
         "warning",
       );
       break;
-    case "failed":
+    case "failed": {
+      const detail =
+        metadataHistoryResetIn(outcome.cause) === undefined
+          ? messageOf(outcome.cause)
+          : runtime.i18n.t("historyReset");
       if (outcome.stage === "current-scan" || outcome.stage === "staging") {
         runtime.notify(
           context,
-          runtime.i18n.t("restoreNotStarted", {
-            message: messageOf(outcome.cause),
-          }),
+          runtime.i18n.t("restoreNotStarted", { message: detail }),
           "warning",
         );
         break;
@@ -221,12 +241,13 @@ export function notifyRestoreOutcome(
       runtime.notify(
         context,
         runtime.i18n.t("restoreExecutionFailed", {
-          message: messageOf(outcome.cause),
+          message: detail,
           continuation: restoreContinuationGuidance(runtime, false),
         }),
         "error",
       );
       break;
+    }
     default:
       assertNever(outcome, "unhandled restore outcome");
   }

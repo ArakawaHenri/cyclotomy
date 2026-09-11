@@ -565,7 +565,9 @@ async function readDirectoryNames(
   path: string,
   maximumEntries: number,
   expected?: CatalogDirectoryIdentity,
+  signal?: AbortSignal,
 ): Promise<readonly string[]> {
+  signal?.throwIfAborted();
   const before = await observeDirectory(path);
   if (expected !== undefined && !sameDirectoryIdentity(expected, before)) {
     fail("namespace-invalid", `${path} changed before it was inventoried`);
@@ -576,6 +578,7 @@ async function readDirectoryNames(
     await withDeterministicCleanup(
       async () => {
         for await (const entry of directory) {
+          signal?.throwIfAborted();
           if (names.length >= maximumEntries) {
             fail(
               "limit-exceeded",
@@ -644,6 +647,7 @@ class StableCatalogPackReader implements PackPositionalReader {
   readonly #observation: Stats;
   readonly #identity: CatalogFileIdentity;
   readonly #parents: CatalogDirectoryChain;
+  readonly #signal: AbortSignal | undefined;
   #closePromise: Promise<void> | undefined;
   #closed = false;
 
@@ -655,16 +659,19 @@ class StableCatalogPackReader implements PackPositionalReader {
     readonly observation: Stats;
     readonly identity: CatalogFileIdentity;
     readonly parents: CatalogDirectoryChain;
+    readonly signal?: AbortSignal | undefined;
   }) {
     this.#path = input.path;
     this.#handle = input.handle;
     this.#observation = input.observation;
     this.#identity = input.identity;
     this.#parents = input.parents;
+    this.#signal = input.signal;
     this.byteLength = input.observation.size;
   }
 
   async readExactly(position: number, length: number): Promise<Uint8Array> {
+    this.#signal?.throwIfAborted();
     if (this.#closed) {
       fail("invalid-input", "catalog pack handle is closed");
     }
@@ -685,6 +692,7 @@ class StableCatalogPackReader implements PackPositionalReader {
     let offset = 0;
     try {
       while (offset < length) {
+        this.#signal?.throwIfAborted();
         const result = await this.#handle.read(
           bytes,
           offset,
@@ -1278,10 +1286,17 @@ export class PackCatalog {
     return this.#limits;
   }
 
-  async inventory(): Promise<PackCatalogInventory> {
-    const before = await this.#namespaceSnapshot();
-    const collected = await this.#collectPackInventory(before, "authenticated");
-    const after = await this.#namespaceSnapshot();
+  async inventory(
+    options: { readonly signal?: AbortSignal | undefined } = {},
+  ): Promise<PackCatalogInventory> {
+    options.signal?.throwIfAborted();
+    const before = await this.#namespaceSnapshot(options.signal);
+    const collected = await this.#collectPackInventory(
+      before,
+      "authenticated",
+      options.signal,
+    );
+    const after = await this.#namespaceSnapshot(options.signal);
     if (before.fingerprint !== after.fingerprint) {
       fail("namespace-invalid", "pack namespace changed during inventory");
     }
@@ -1313,10 +1328,17 @@ export class PackCatalog {
    * must use a fully authenticated inventory before concluding that an object
    * is absent.
    */
-  async readInventory(): Promise<PackCatalogReadInventory> {
-    const before = await this.#namespaceSnapshot();
-    const collected = await this.#collectPackInventory(before, "logical-read");
-    const after = await this.#namespaceSnapshot();
+  async readInventory(
+    options: { readonly signal?: AbortSignal | undefined } = {},
+  ): Promise<PackCatalogReadInventory> {
+    options.signal?.throwIfAborted();
+    const before = await this.#namespaceSnapshot(options.signal);
+    const collected = await this.#collectPackInventory(
+      before,
+      "logical-read",
+      options.signal,
+    );
+    const after = await this.#namespaceSnapshot(options.signal);
     if (before.fingerprint !== after.fingerprint) {
       fail("namespace-invalid", "pack namespace changed during inventory");
     }
@@ -1351,12 +1373,14 @@ export class PackCatalog {
   async #collectPackInventory(
     snapshot: NamespaceSnapshot,
     mode: "authenticated" | "logical-read" | "publication",
+    signal?: AbortSignal,
   ): Promise<CollectedPackInventory> {
     const packs: PackCatalogReadEntry[] = [];
     const authenticatedPacks: PackCatalogEntry[] = [];
     let totalPackBytes = 0;
     let totalIndexEntries = 0;
     for (const candidate of snapshot.candidates) {
+      signal?.throwIfAborted();
       if (mode !== "authenticated") {
         totalPackBytes += candidate.identity.size;
         if (totalPackBytes > this.#limits.maxTotalPackBytes) {
@@ -1374,11 +1398,13 @@ export class PackCatalog {
           candidate.identity,
           candidate.parents,
           mode === "authenticated",
+          signal,
         );
       } catch (error) {
         const primary = primaryFailure(error);
         if (
           mode === "logical-read" &&
+          !signal?.aborted &&
           !hasRetainedCleanupFailure(error) &&
           primary instanceof PackCatalogError &&
           primary.code !== "invalid-input"
@@ -1453,9 +1479,13 @@ export class PackCatalog {
   /** Recheck namespace identities without retaining or decoding pack payloads. */
   async inventoryStillCurrent(
     inventory: PackCatalogInventory | PackCatalogReadInventory,
+    options: { readonly signal?: AbortSignal | undefined } = {},
   ): Promise<boolean> {
     const expected = this.#inventoryFingerprint(inventory);
-    return (await this.#namespaceSnapshot()).packFingerprint === expected;
+    return (
+      (await this.#namespaceSnapshot(options.signal)).packFingerprint ===
+      expected
+    );
   }
 
   /** Recheck one discovered pathname before a caller relies on its identity. */
@@ -1690,8 +1720,14 @@ export class PackCatalog {
   async publishPack(
     publication: EncodedPack,
     authority: WorkspaceWriteAuthority,
+    options: { readonly signal?: AbortSignal } = {},
   ): Promise<PublishedCatalogPack> {
-    return await this.#publishPack(publication, authority);
+    return await this.#publishPack(
+      publication,
+      authority,
+      undefined,
+      options.signal,
+    );
   }
 
   /** One exclusive writer can reuse its inventory across bounded pack batches. */
@@ -1742,7 +1778,9 @@ export class PackCatalog {
     publication: EncodedPack,
     authority: WorkspaceWriteAuthority,
     publicationInventory?: PackPublicationInventory,
+    signal?: AbortSignal,
   ): Promise<PublishedCatalogPack> {
+    signal?.throwIfAborted();
     let verified: ReturnType<typeof authenticatePackPublication>;
     try {
       verified = authenticatePackPublication(publication);
@@ -1757,7 +1795,9 @@ export class PackCatalog {
     }
     const expectedView = verified.pack.indexView();
 
-    const inventory = publicationInventory ?? (await this.inventory());
+    const inventory =
+      publicationInventory ?? (await this.inventory({ signal }));
+    signal?.throwIfAborted();
     const existingView = inventory.views.find(
       ({ packId }) => packId === verified.pack.packId,
     );
@@ -1778,6 +1818,7 @@ export class PackCatalog {
           `existing pack ${verified.pack.packId} disappeared during reauthentication`,
         );
       }
+      signal?.throwIfAborted();
       await this.#syncPackReceipt(
         reopened,
         this.#packIdentityReceipt(existing.identityReceipt).parents,
@@ -1816,6 +1857,8 @@ export class PackCatalog {
       fail("limit-exceeded", "pack publication exceeds incoming-file limits");
     }
 
+    // From the first namespace write onward, finish this durable publication.
+    signal?.throwIfAborted();
     const shard = verified.pack.packId.slice(0, 2);
     const targetParents = await ensureShardDirectory(
       this.#layout,
@@ -2141,7 +2184,9 @@ export class PackCatalog {
     expected: CatalogFileIdentity,
     parents: CatalogDirectoryChain,
     authenticateWholePack = true,
+    signal?: AbortSignal,
   ): Promise<CatalogPackHandle> {
+    signal?.throwIfAborted();
     if (expected.size > this.#limits.maxSinglePackBytes) {
       fail(
         "limit-exceeded",
@@ -2165,6 +2210,7 @@ export class PackCatalog {
       observation: opened.observation,
       identity: opened.identity,
       parents,
+      signal,
     });
     try {
       await source.assertCurrent();
@@ -2264,7 +2310,8 @@ export class PackCatalog {
     return record;
   }
 
-  async #namespaceSnapshot(): Promise<NamespaceSnapshot> {
+  async #namespaceSnapshot(signal?: AbortSignal): Promise<NamespaceSnapshot> {
+    signal?.throwIfAborted();
     const namespace = await observePackNamespaceChain(this.#layout);
     const packsIdentity = namespace.at(-1);
     if (packsIdentity === undefined) {
@@ -2274,6 +2321,7 @@ export class PackCatalog {
       this.#layout.packs,
       PACK_ROOT_MAX_ENTRIES,
       packsIdentity,
+      signal,
     );
     const candidates: FileCandidate[] = [];
     const incoming: IncomingCandidate[] = [];
@@ -2287,6 +2335,7 @@ export class PackCatalog {
     let incomingBytes = 0;
 
     for (const name of rootNames) {
+      signal?.throwIfAborted();
       const path = join(this.#layout.packs, name);
       if (name === "incoming") {
         sawIncoming = true;
@@ -2305,8 +2354,10 @@ export class PackCatalog {
           this.#layout.incomingPacks,
           this.#limits.maxIncomingFiles,
           incomingIdentity,
+          signal,
         );
         for (const incomingName of incomingNames) {
+          signal?.throwIfAborted();
           const isPack = PACK_TEMPORARY.test(incomingName);
           const isMidx = MIDX_TEMPORARY.test(incomingName);
           if (!isPack && !isMidx) {
@@ -2372,8 +2423,10 @@ export class PackCatalog {
         shardPath,
         this.#limits.maxPacks + 1,
         shardIdentity,
+        signal,
       );
       for (const packedName of packedNames) {
+        signal?.throwIfAborted();
         if (!PACK_FILE.test(packedName)) {
           fail(
             "namespace-invalid",

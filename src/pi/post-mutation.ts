@@ -13,7 +13,7 @@ import {
   type ArrivalRecoverySettlement,
   type LockedArrivalOutcome,
 } from "./workspace-receipt.ts";
-import { messageOfUnknown } from "./unknown-error.ts";
+import { messageOfUnknown } from "../presentation/unknown-error.ts";
 
 type WorkspaceLockScope =
   | {

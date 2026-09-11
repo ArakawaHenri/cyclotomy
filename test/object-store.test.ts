@@ -1728,10 +1728,11 @@ describe("cross-store tree import", () => {
     const targetRoot = await mkdtemp(
       join(tmpdir(), "cyclotomy-import-target-"),
     );
-    let syncSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let publicationSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const source = await openObjectStore(sourceRoot);
       const target = await openObjectStore(targetRoot);
+
       const blobOid = await publishTestBlob(source, Buffer.from("source"));
       const treeOid = await publishTestTree(
         source,
@@ -1745,18 +1746,19 @@ describe("cross-store tree import", () => {
         ],
         completeScope,
       );
-      const prototype = await fileHandlePrototype();
-      const originalSync = prototype.sync;
-      let removed = false;
-      syncSpy = vi.spyOn(prototype, "sync").mockImplementation(async function (
-        this: FileHandle,
-      ) {
-        if (!removed && (await this.stat()).isFile()) {
-          removed = true;
-          await unlink(physicalObjectPath(sourceRoot, "trees", treeOid));
-        }
-        return originalSync.call(this);
-      });
+      const repository = nativeObjectStoreRepository(target, "test");
+      const begin = repository.beginPublication.bind(repository);
+      publicationSpy = vi
+        .spyOn(repository, "beginPublication")
+        .mockImplementation((...args) => {
+          const publication = begin(...args);
+          const flush = publication.flush.bind(publication);
+          vi.spyOn(publication, "flush").mockImplementationOnce(async () => {
+            await flush();
+            await unlink(physicalObjectPath(sourceRoot, "trees", treeOid));
+          });
+          return publication;
+        });
 
       const rejection = await importTestTrees(
         target,
@@ -1774,7 +1776,7 @@ describe("cross-store tree import", () => {
         code: "missing-object",
       });
     } finally {
-      syncSpy?.mockRestore();
+      publicationSpy?.mockRestore();
       await rm(sourceRoot, { recursive: true, force: true });
       await rm(targetRoot, { recursive: true, force: true });
     }

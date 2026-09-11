@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { messageOfUnknown } from "../src/pi/unknown-error.ts";
+import { messageOfUnknown } from "../src/presentation/unknown-error.ts";
 
 describe("unknown error presentation", () => {
   it("preserves ordinary error messages", () => {

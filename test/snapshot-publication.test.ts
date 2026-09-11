@@ -50,6 +50,12 @@ afterEach(async () => {
   );
 });
 
+async function openTempStore(prefix: string): Promise<ObjectStore> {
+  const store = await openObjectStore(await tempRoot(prefix));
+
+  return store;
+}
+
 async function scanTempWorkspace(): Promise<WorkspaceSnapshot> {
   const root = await tempRoot("cyclotomy-publish-workspace-");
   await mkdir(join(root, "src"));
@@ -68,9 +74,7 @@ describe("snapshot publication", () => {
     const scanned = await scanWorkspace(
       await tempRoot("cyclotomy-publish-evaluator-workspace-"),
     );
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-evaluator-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-evaluator-objects-");
     const begin = vi.spyOn(store, "beginSnapshotPublication");
 
     await expect(
@@ -91,9 +95,7 @@ describe("snapshot publication", () => {
   });
 
   it("does not let a direct snapshot publication create unattested v3", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-evaluator-direct-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-evaluator-direct-");
     const publication = store.beginSnapshotPublication();
 
     await expect(
@@ -105,9 +107,7 @@ describe("snapshot publication", () => {
   });
 
   it("preserves both a tree failure and resolution cleanup failure", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-cleanup-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-cleanup-");
     const cleanupFailure = new Error("resolution cleanup failed");
     vi.spyOn(
       ContentRepository.prototype,
@@ -140,8 +140,8 @@ describe("snapshot publication", () => {
     const snapshot = await scanWorkspace(
       await tempRoot("cyclotomy-publish-native-cleanup-workspace-"),
     );
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-native-cleanup-objects-"),
+    const store = await openTempStore(
+      "cyclotomy-publish-native-cleanup-objects-",
     );
     const primary = new Error("tree publication failed");
     const cleanup = new Error("resolution cleanup failed");
@@ -176,9 +176,7 @@ describe("snapshot publication", () => {
       await tempRoot("cyclotomy-publish-undefined-"),
     );
     const cleanupFailure = new Error("outer cleanup failed");
-    const base = await openObjectStore(
-      await tempRoot("cyclotomy-publish-undefined-objects-"),
-    );
+    const base = await openTempStore("cyclotomy-publish-undefined-objects-");
     const store: ObjectStore = {
       storageRoot: base.storageRoot,
       beginSnapshotPublication: () => ({
@@ -207,9 +205,7 @@ describe("snapshot publication", () => {
   });
 
   it("allows an archived policy source that Git excluded from the managed tree", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const workspace = await tempRoot("cyclotomy-publish-workspace-");
     const scanned = await scanWorkspace(workspace);
     const snapshot: WorkspaceSnapshot = {
@@ -231,9 +227,7 @@ describe("snapshot publication", () => {
   });
 
   it("refuses scope policy whose .gitignore bytes differ from the entry", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const workspace = await tempRoot("cyclotomy-publish-workspace-");
     await writeFile(join(workspace, ".gitignore"), "other\n");
     const scanned = await scanWorkspace(workspace);
@@ -251,9 +245,7 @@ describe("snapshot publication", () => {
   });
 
   it("refuses to publish a snapshot with unresolved scan problems", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const workspace = await tempRoot("cyclotomy-publish-workspace-");
     const scanned = await scanWorkspace(workspace);
     const incomplete: WorkspaceSnapshot = {
@@ -280,9 +272,7 @@ describe("snapshot publication", () => {
 
   it("publishes blobs and a tree that reads back with the same entries and bytes", async () => {
     const snapshot = await scanTempWorkspace();
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
 
     const treeOid = await publishSnapshot(store, snapshot);
     expect(treeOid).toMatch(/^[0-9a-f]{64}$/u);
@@ -320,9 +310,7 @@ describe("snapshot publication", () => {
 
   it("is idempotent: republishing the same snapshot returns the same tree oid", async () => {
     const snapshot = await scanTempWorkspace();
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
 
     const first = await publishSnapshot(store, snapshot);
     const second = await publishSnapshot(store, snapshot);
@@ -334,9 +322,7 @@ describe("snapshot publication", () => {
 
   it("does not immediately rehash the closure after publishing every blob", async () => {
     const snapshot = await scanTempWorkspace();
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const deepVerification = vi.spyOn(store, "verifyBlobs");
 
     const treeOid = await publishSnapshot(store, snapshot);
@@ -350,9 +336,7 @@ describe("snapshot publication", () => {
     await writeFile(join(workspace, "one.txt"), "same bytes");
     await writeFile(join(workspace, "two.txt"), "same bytes");
     const snapshot = await scanWorkspace(workspace);
-    const baseStore = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const baseStore = await openTempStore("cyclotomy-publish-objects-");
     let streamedPublications = 0;
     const store: ObjectStore = {
       storageRoot: baseStore.storageRoot,
@@ -392,9 +376,7 @@ describe("snapshot publication", () => {
       ),
     );
     const snapshot = await scanWorkspace(workspace);
-    const baseStore = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const baseStore = await openTempStore("cyclotomy-publish-objects-");
     let active = 0;
     let maxActive = 0;
     let completed = 0;
@@ -450,9 +432,7 @@ describe("snapshot publication", () => {
       writeFile(join(workspace, "second.txt"), "second"),
     ]);
     const snapshot = await scanWorkspace(workspace);
-    const baseStore = await openObjectStore(
-      await tempRoot("cyclotomy-publish-fail-objects-"),
-    );
+    const baseStore = await openTempStore("cyclotomy-publish-fail-objects-");
     let treePublications = 0;
     const close = vi.fn(() => Promise.resolve());
     const store: ObjectStore = {
@@ -493,9 +473,7 @@ describe("snapshot publication", () => {
     await writeFile(path, "before");
     const snapshot = await scanWorkspace(workspace);
     await writeFile(path, "after!");
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
 
     await expect(publishSnapshot(store, snapshot)).rejects.toMatchObject({
       code: "invalid-blob",
@@ -518,9 +496,7 @@ describe("snapshot publication", () => {
       ...scanned,
       entries: [{ ...regular, sourcePath: join(outside, "file.txt") }],
     };
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
 
     await expect(publishSnapshot(store, forged)).rejects.toThrow(
       /outside its scanned path/u,
@@ -529,9 +505,7 @@ describe("snapshot publication", () => {
 
   it("throws when the store returns a blob id that is not the content digest", async () => {
     const snapshot = await scanTempWorkspace();
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const broken: ObjectStore = {
       storageRoot: store.storageRoot,
       beginSnapshotPublication() {
@@ -555,9 +529,7 @@ describe("snapshot publication", () => {
   });
 
   it("leaves duplicate path rejection to the store's canonical validation", async () => {
-    const store = await openObjectStore(
-      await tempRoot("cyclotomy-publish-objects-"),
-    );
+    const store = await openTempStore("cyclotomy-publish-objects-");
     const workspace = await tempRoot("cyclotomy-publish-workspace-");
     await writeFile(join(workspace, "dup"), "x");
     const scanned = await scanWorkspace(workspace);

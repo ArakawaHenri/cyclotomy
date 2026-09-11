@@ -14,7 +14,6 @@ import {
   matchRegisteredSession,
   readTreeOids,
 } from "../version.ts";
-import { V2_METADATA_VERSION } from "./v2.ts";
 import { TREE_MANIFEST_FORMAT_V2 } from "../../tree-formats/v2.ts";
 
 export const V3_METADATA_WRITER_PROTOCOL = 3;
@@ -52,7 +51,27 @@ export const V3_FENCED_TABLES = Object.freeze([
   "session_registry",
 ]);
 
-function validateV3TableShape(db: DatabaseSync): void {
+export interface MetadataTableColumn {
+  readonly name: string;
+  readonly type: string;
+  readonly notnull: number;
+  readonly pk: number;
+}
+
+export interface MetadataTableLayout {
+  readonly name: string;
+  readonly columns: readonly MetadataTableColumn[];
+}
+
+/**
+ * Authenticate the physical shape of one version's tables. Schema specs pin
+ * the SQL text, so this guards the properties text comparison cannot see:
+ * STRICT/WITHOUT ROWID options and the real column order with its nullability.
+ */
+export function validateMetadataTableLayout(
+  db: DatabaseSync,
+  expectedTables: readonly MetadataTableLayout[],
+): void {
   const tables = (
     db.prepare("PRAGMA table_list").all() as unknown as {
       readonly name: unknown;
@@ -65,16 +84,14 @@ function validateV3TableShape(db: DatabaseSync): void {
       (row) => row.type === "table" && !String(row.name).startsWith("sqlite_"),
     )
     .sort((left, right) => String(left.name).localeCompare(String(right.name)));
-  const expectedTables = [
-    "checkpoint_slot",
-    "session_capture_barrier",
-    "session_registry",
-  ];
+  const wanted = [...expectedTables].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
   if (
-    tables.length !== expectedTables.length ||
+    tables.length !== wanted.length ||
     tables.some(
       (table, index) =>
-        String(table.name) !== expectedTables[index] ||
+        String(table.name) !== wanted[index]?.name ||
         Number(table.wr) !== 1 ||
         Number(table.strict) !== 1,
     )
@@ -84,18 +101,9 @@ function validateV3TableShape(db: DatabaseSync): void {
     );
   }
 
-  type Column = {
-    readonly name: string;
-    readonly type: string;
-    readonly notnull: number;
-    readonly pk: number;
-  };
-  const validateColumns = (
-    table: string,
-    expected: readonly Column[],
-  ): void => {
+  for (const expected of expectedTables) {
     const actual = db
-      .prepare(`PRAGMA table_info(${table})`)
+      .prepare(`PRAGMA table_info(${expected.name})`)
       .all()
       .map((row) => ({
         name: String(row.name),
@@ -104,9 +112,9 @@ function validateV3TableShape(db: DatabaseSync): void {
         pk: Number(row.pk),
       }));
     if (
-      actual.length !== expected.length ||
+      actual.length !== expected.columns.length ||
       actual.some((column, index) => {
-        const wanted = expected[index];
+        const wanted = expected.columns[index];
         return (
           wanted === undefined ||
           column.name !== wanted.name ||
@@ -117,26 +125,13 @@ function validateV3TableShape(db: DatabaseSync): void {
       })
     ) {
       throw new MetadataError(
-        `metadata table ${table} has an unexpected column layout`,
+        `metadata table ${expected.name} has an unexpected column layout`,
       );
     }
-  };
+  }
+}
 
-  validateColumns("checkpoint_slot", [
-    { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-    { name: "entry_id", type: "TEXT", notnull: 1, pk: 2 },
-    { name: "tree_oid", type: "TEXT", notnull: 0, pk: 0 },
-    { name: "capture_state", type: "TEXT", notnull: 1, pk: 0 },
-  ]);
-  validateColumns("session_capture_barrier", [
-    { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-  ]);
-  validateColumns("session_registry", [
-    { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
-    { name: "session_file", type: "TEXT", notnull: 1, pk: 0 },
-    { name: "registration_state", type: "TEXT", notnull: 1, pk: 0 },
-  ]);
-
+export function validateSessionRegistryIndexLayout(db: DatabaseSync): void {
   const indexes = db.prepare("PRAGMA index_list(session_registry)").all();
   const uniqueSessionFile = indexes.find((row) => {
     if (Number(row.unique) !== 1 || row.origin !== "u") return false;
@@ -149,6 +144,44 @@ function validateV3TableShape(db: DatabaseSync): void {
   ) {
     throw new MetadataError("metadata schema has unexpected indexes");
   }
+}
+
+export const CHECKPOINT_SLOT_TABLE_LAYOUT: MetadataTableLayout = Object.freeze({
+  name: "checkpoint_slot",
+  columns: Object.freeze([
+    { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
+    { name: "entry_id", type: "TEXT", notnull: 1, pk: 2 },
+    { name: "tree_oid", type: "TEXT", notnull: 0, pk: 0 },
+    { name: "capture_state", type: "TEXT", notnull: 1, pk: 0 },
+  ]),
+});
+
+export const SESSION_CAPTURE_BARRIER_TABLE_LAYOUT: MetadataTableLayout =
+  Object.freeze({
+    name: "session_capture_barrier",
+    columns: Object.freeze([
+      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
+    ]),
+  });
+
+export const SESSION_REGISTRY_TABLE_LAYOUT: MetadataTableLayout = Object.freeze(
+  {
+    name: "session_registry",
+    columns: Object.freeze([
+      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
+      { name: "session_file", type: "TEXT", notnull: 1, pk: 0 },
+      { name: "registration_state", type: "TEXT", notnull: 1, pk: 0 },
+    ]),
+  },
+);
+
+function validateV3TableShape(db: DatabaseSync): void {
+  validateMetadataTableLayout(db, [
+    CHECKPOINT_SLOT_TABLE_LAYOUT,
+    SESSION_CAPTURE_BARRIER_TABLE_LAYOUT,
+    SESSION_REGISTRY_TABLE_LAYOUT,
+  ]);
+  validateSessionRegistryIndexLayout(db);
 }
 
 export const V3_METADATA_SCHEMA = metadataSchemaSpec({
@@ -247,7 +280,6 @@ export const V3_METADATA_VERSION = defineMetadataVersion({
   version: 3,
   treeFormat: TREE_MANIFEST_FORMAT_V2,
   schema: V3_METADATA_SCHEMA,
-  previous: V2_METADATA_VERSION,
   upgradeFromPrevious: V2_TO_V3_METADATA_UPGRADE,
   initializeWithinTransaction: initializeV3,
   referencedTreeOids: (db, limit) => readTreeOids(db, "checkpoint_slot", limit),

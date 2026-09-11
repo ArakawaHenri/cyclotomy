@@ -29,13 +29,13 @@ import {
   type CyclotomyLifecycleEventType,
 } from "./cyclotomy-engine.ts";
 import { CyclotomyEngineController } from "./engine-controller.ts";
-import { createCyclotomyI18n } from "./i18n.ts";
+import { createCyclotomyI18n } from "../presentation/i18n.ts";
 import {
   notifyArrivalDispositionFailure,
   notifyWorkspaceLockCleanupFailure,
 } from "./restore-notifications.ts";
 import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
-import { messageOfUnknown } from "./unknown-error.ts";
+import { messageOfUnknown } from "../presentation/unknown-error.ts";
 
 type CyclotomyRuntimeEvent = Exclude<
   Extract<ExtensionEvent, { readonly type: CyclotomyLifecycleEventType }>,

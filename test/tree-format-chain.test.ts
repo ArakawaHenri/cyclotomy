@@ -2,8 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createTreeFormatEngine,
-  treeFormatChain,
-  type TreeFormatNode,
+  type TreeFormat,
 } from "../src/infrastructure/tree-formats/chain.ts";
 import {
   canonicalizeTreeManifest,
@@ -35,9 +34,9 @@ function expectFrozenManifestGraph(manifest: TreeManifest): void {
   }
 }
 
-describe("tree format chain", () => {
-  it("freezes published nodes and the derived engine", () => {
-    const engine = createTreeFormatEngine(TREE_FORMAT_V2);
+describe("tree format version table", () => {
+  it("freezes published formats and the derived engine", () => {
+    const engine = createTreeFormatEngine([TREE_FORMAT_V1, TREE_FORMAT_V2]);
 
     expect(Object.isFrozen(TREE_FORMAT_V1)).toBe(true);
     expect(Object.isFrozen(TREE_FORMAT_V2)).toBe(true);
@@ -46,20 +45,20 @@ describe("tree format chain", () => {
     expect(engine.current.format).toBe(TREE_FORMAT_V2.format);
   });
 
-  it("derives parser lookup and multi-hop upgrades from a synthetic current node", () => {
+  it("derives parser lookup and multi-hop upgrades from the registered formats", () => {
     const upgrades: string[] = [];
     const v3Format = "cyclotomy-tree-v3-test";
-    const v2: TreeFormatNode = {
+    const v2: TreeFormat = {
       ...TREE_FORMAT_V2,
-      previous: TREE_FORMAT_V1,
+
       upgradeFromPrevious(previous, limits) {
         upgrades.push("v1->v2");
         return TREE_FORMAT_V2.upgradeFromPrevious!(previous, limits);
       },
     };
-    const v3: TreeFormatNode = {
+    const v3: TreeFormat = {
       format: v3Format,
-      previous: v2,
+
       create(entries, nextScope, limits) {
         const canonical = canonicalizeTreeManifest(entries, nextScope, limits);
         return { format: v3Format, ...canonical };
@@ -96,8 +95,8 @@ describe("tree format chain", () => {
         return referencedTreeBlobOids(manifest.entries);
       },
     };
-    const engine = createTreeFormatEngine(v3);
-    expect(treeFormatChain(v3).map(({ format }) => format)).toEqual([
+    const engine = createTreeFormatEngine([TREE_FORMAT_V1, v2, v3]);
+    expect(engine.formats.map(({ format }) => format)).toEqual([
       TREE_MANIFEST_FORMAT_V1,
       TREE_FORMAT_V2.format,
       v3Format,
@@ -191,7 +190,7 @@ describe("tree format chain", () => {
   });
 
   it("deep-freezes explicit creation, decoding, and no-op upgrade results", () => {
-    const engine = createTreeFormatEngine(TREE_FORMAT_V2);
+    const engine = createTreeFormatEngine([TREE_FORMAT_V1, TREE_FORMAT_V2]);
     const limits = {
       maxEntries: 100,
       maxManifestBytes: 16 * 1024,
@@ -251,7 +250,7 @@ describe("tree format chain", () => {
   });
 
   it("projects v2 Git provenance as unknown without changing historical bytes", () => {
-    const engine = createTreeFormatEngine(TREE_FORMAT_V2);
+    const engine = createTreeFormatEngine([TREE_FORMAT_V1, TREE_FORMAT_V2]);
     const limits = {
       maxEntries: 100,
       maxManifestBytes: 16 * 1024,
@@ -294,23 +293,28 @@ describe("tree format chain", () => {
 
   it("rejects a malformed history when an adjacent upgrade is missing", () => {
     expect(() =>
-      createTreeFormatEngine({
-        format: "broken-v2",
-        previous: TREE_FORMAT_V1,
-        create: TREE_FORMAT_V1.create,
-        decode: TREE_FORMAT_V1.decode!,
-        encode: TREE_FORMAT_V1.encode!,
-        referencedBlobOids: TREE_FORMAT_V1.referencedBlobOids,
-      }),
+      createTreeFormatEngine([
+        TREE_FORMAT_V1,
+        {
+          format: "broken-v2",
+
+          create: TREE_FORMAT_V1.create,
+          decode: TREE_FORMAT_V1.decode!,
+          encode: TREE_FORMAT_V1.encode!,
+          referencedBlobOids: TREE_FORMAT_V1.referencedBlobOids,
+        },
+      ]),
     ).toThrow("omits its adjacent upgrade");
   });
 
   it("rejects an oldest format that claims a nonexistent predecessor upgrade", () => {
     expect(() =>
-      createTreeFormatEngine({
-        ...TREE_FORMAT_V1,
-        upgradeFromPrevious: (manifest) => manifest,
-      }),
+      createTreeFormatEngine([
+        {
+          ...TREE_FORMAT_V1,
+          upgradeFromPrevious: (manifest) => manifest,
+        },
+      ]),
     ).toThrow("first tree format cannot have an adjacent upgrade");
   });
 });

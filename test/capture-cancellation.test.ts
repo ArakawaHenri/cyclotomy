@@ -39,6 +39,7 @@ async function workspaceFixture(files: number) {
   const store = await openObjectStore(
     await tempRoot("cyclotomy-capture-cancel-store-"),
   );
+
   const contents = Array.from(
     { length: files },
     (_, index) => `content-${index}\n`,

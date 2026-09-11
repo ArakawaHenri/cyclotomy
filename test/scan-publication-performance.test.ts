@@ -49,6 +49,12 @@ async function tempRoot(prefix: string): Promise<string> {
   return root;
 }
 
+async function openTempStore(prefix: string) {
+  const store = await openObjectStore(await tempRoot(prefix));
+
+  return store;
+}
+
 function reportIndicator(
   scenario: string,
   measurements: Readonly<Record<string, number>>,
@@ -140,9 +146,7 @@ describe("scan and publication performance indicators", () => {
     "publishes and reuses a 12 MiB file with repeated chunks",
     async () => {
       const workspace = await tempRoot("cyclotomy-perf-large-ws-");
-      const store = await openObjectStore(
-        await tempRoot("cyclotomy-perf-large-store-"),
-      );
+      const store = await openTempStore("cyclotomy-perf-large-store-");
       await writeFile(
         join(workspace, "large.bin"),
         Buffer.alloc(LARGE_FILE_BYTES, 0x41),
@@ -191,9 +195,7 @@ describe("scan and publication performance indicators", () => {
     "reports first and repeated publication for 1,000 files",
     async () => {
       const workspace = await tempRoot("cyclotomy-perf-many-ws-");
-      const store = await openObjectStore(
-        await tempRoot("cyclotomy-perf-many-store-"),
-      );
+      const store = await openTempStore("cyclotomy-perf-many-store-");
       for (let group = 0; group < MANY_FILE_COUNT / 50; group += 1) {
         const directory = join(workspace, `group-${group}`);
         await mkdir(directory);
@@ -234,9 +236,7 @@ describe("scan and publication performance indicators", () => {
     "publishes and reopens 1,000 unique compressed small files",
     async () => {
       const workspace = await tempRoot("cyclotomy-perf-unique-ws-");
-      const store = await openObjectStore(
-        await tempRoot("cyclotomy-perf-unique-store-"),
-      );
+      const store = await openTempStore("cyclotomy-perf-unique-store-");
       for (let group = 0; group < UNIQUE_FILE_COUNT / 50; group += 1) {
         const directory = join(workspace, `group-${group}`, "src", "nested");
         await mkdir(directory, { recursive: true });
@@ -282,9 +282,7 @@ describe("scan and publication performance indicators", () => {
     "publishes new files alongside content held only in historical packs",
     async () => {
       const workspace = await tempRoot("cyclotomy-perf-history-ws-");
-      const store = await openObjectStore(
-        await tempRoot("cyclotomy-perf-history-store-"),
-      );
+      const store = await openTempStore("cyclotomy-perf-history-store-");
       const catalog = new PackCatalog(nativeObjectLayout(store.storageRoot));
       const reusedPaths: string[] = [];
       await withWorkspaceLock(

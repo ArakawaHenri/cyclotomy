@@ -1,3 +1,6 @@
+import { METADATA_VERSIONS } from "../src/infrastructure/metadata/current.ts";
+import { TREE_FORMAT_REGISTRY } from "../src/infrastructure/tree-formats/registry.ts";
+import type { MetadataVersion } from "../src/infrastructure/metadata/version.ts";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,10 +20,7 @@ import {
   V4_METADATA_VERSION,
   V4_METADATA_WRITER_PROTOCOL,
 } from "../src/infrastructure/metadata/versions/v4.ts";
-import {
-  TREE_FORMAT_V3,
-  TREE_MANIFEST_FORMAT_V3,
-} from "../src/infrastructure/tree-formats/v3.ts";
+import { TREE_MANIFEST_FORMAT_V3 } from "../src/infrastructure/tree-formats/v3.ts";
 
 function initialize(db: DatabaseSync, version = V3_METADATA_VERSION): void {
   db.exec("BEGIN IMMEDIATE");
@@ -39,7 +39,7 @@ function writerProtocol(db: DatabaseSync, protocol: number): void {
 async function migrateTestMetadataToCurrent(
   db: DatabaseSync,
   dependencies: Parameters<typeof migrateMetadataToCurrentWithAuthority>[1],
-  current: Parameters<typeof migrateMetadataToCurrentWithAuthority>[4],
+  current: MetadataVersion,
 ): Promise<void> {
   const storeRoot = await mkdtemp(join(tmpdir(), "cyclotomy-v4-migration-"));
   try {
@@ -52,7 +52,7 @@ async function migrateTestMetadataToCurrent(
           dependencies,
           authority,
           storeRoot,
-          current,
+          METADATA_VERSIONS.slice(0, current.version),
         ),
     );
   } finally {
@@ -62,13 +62,12 @@ async function migrateTestMetadataToCurrent(
 
 describe("metadata v4 tree-v3 generation", () => {
   it("composes as exactly one adjacent tree-format generation", () => {
-    expect(V4_METADATA_VERSION.previous).toBe(V3_METADATA_VERSION);
     expect(V4_METADATA_VERSION.treeFormat).toBe(TREE_MANIFEST_FORMAT_V3);
     expect(V4_METADATA_VERSION.upgradeFromPrevious?.kind).toBe("tree-format");
     expect(() =>
       validateMetadataTreeFormatComposition(
-        V4_METADATA_VERSION,
-        TREE_FORMAT_V3,
+        METADATA_VERSIONS.slice(0, 4),
+        TREE_FORMAT_REGISTRY.formats,
       ),
     ).not.toThrow();
   });

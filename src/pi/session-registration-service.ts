@@ -201,11 +201,14 @@ export type SessionRegistrationOutcome =
   | {
       readonly kind: "active";
       readonly disposition: SessionRegistrationDisposition;
+      /** This registration completed a pending history reset. */
+      readonly historyReset: boolean;
       readonly advisory?: SessionRegistrationAdvisory;
     }
   | {
       readonly kind: "durable-but-inactive";
       readonly disposition: SessionRegistrationDisposition;
+      readonly historyReset: boolean;
       readonly cause: unknown;
     };
 
@@ -247,6 +250,8 @@ interface ExternalImportRequest extends RegistrationTarget {
 type CommittedRegistration = {
   readonly kind: "committed";
   readonly disposition: SessionRegistrationDisposition;
+  /** This registration completed a pending history reset. */
+  readonly historyReset: boolean;
   readonly advisory?: SessionRegistrationAdvisory;
 };
 
@@ -255,6 +260,7 @@ type RegistrationExecution =
   | {
       readonly kind: "durable-but-inactive";
       readonly disposition: SessionRegistrationDisposition;
+      readonly historyReset: boolean;
       readonly cause: unknown;
     };
 
@@ -880,8 +886,11 @@ export class SessionRegistrationService {
         openCurrentMetadataStore(
           join(root, "state.db"),
           {
+            signal: this.#options.signal,
             prepareTreeOidUpgrades: (roots, targetFormat) =>
-              prepareTreeOidUpgrades(store, roots, targetFormat),
+              prepareTreeOidUpgrades(store, roots, targetFormat, {
+                signal: this.#options.signal,
+              }),
           },
           writeAuthority,
         ),
@@ -1076,6 +1085,7 @@ export class SessionRegistrationService {
         return {
           kind: "active",
           disposition: execution.disposition,
+          historyReset: execution.historyReset,
           ...(execution.advisory === undefined
             ? {}
             : { advisory: execution.advisory }),
@@ -1084,6 +1094,7 @@ export class SessionRegistrationService {
         return {
           kind: "durable-but-inactive",
           disposition: execution.disposition,
+          historyReset: execution.historyReset,
           cause,
         };
       }
@@ -1264,7 +1275,11 @@ export class SessionRegistrationService {
           : plan.kind === "inherit"
             ? { kind: "inherited" }
             : { kind: "quarantined", rejection: plan.rejection };
-    return { kind: "committed", disposition };
+    return {
+      kind: "committed",
+      disposition,
+      historyReset: report.historyReset,
+    };
   }
 
   #finishExistingTarget(
@@ -1343,6 +1358,7 @@ export class SessionRegistrationService {
     return {
       kind: "durable-but-inactive",
       disposition: execution.value.disposition,
+      historyReset: execution.value.historyReset,
       cause: execution.cleanup.cause,
     };
   }
@@ -1654,6 +1670,7 @@ export class SessionRegistrationService {
       return {
         kind: "durable-but-inactive",
         disposition: initial.outcome.disposition,
+        historyReset: initial.outcome.historyReset,
         cause: initialExecution.cleanup.cause,
       };
     }
@@ -1903,8 +1920,11 @@ export class SessionRegistrationService {
           sourceMetadata = await openAuthenticatedCurrentMetadataStore(
             confirmed.proof,
             {
+              signal: this.#options.signal,
               prepareTreeOidUpgrades: (roots, targetFormat) =>
-                prepareTreeOidUpgrades(sourceStore, roots, targetFormat),
+                prepareTreeOidUpgrades(sourceStore, roots, targetFormat, {
+                  signal: this.#options.signal,
+                }),
             },
             sourceAuthority,
           );
@@ -2114,6 +2134,7 @@ export class SessionRegistrationService {
     return {
       kind: "durable-but-inactive",
       disposition: execution.value.disposition,
+      historyReset: execution.value.historyReset,
       cause: cleanupCause,
     };
   }
