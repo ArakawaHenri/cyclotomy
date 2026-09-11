@@ -1016,10 +1016,7 @@ describe("workspace write authority", () => {
 
     // The report is about lost authority, not a leaked lock: the native lock
     // really was released and the store is immediately acquirable again.
-    const probe = await acquireWorkspaceLock(root, "probe", {
-      timeoutMs: 100,
-    });
-    await probe.release();
+    await assertTestWorkspaceLockReleased(root);
   });
 });
 
@@ -1230,27 +1227,27 @@ describe("workspace lock cleanup settlement", () => {
 
     const blocker = await acquireWorkspaceLock(secondRoot, "blocker", {});
 
-    await expect(
-      runWithOrderedWorkspaceLocks(
-        [
-          { storeRoot: firstRoot },
-          {
-            storeRoot: secondRoot,
-            options: { timeoutMs: 10 },
-          },
-        ],
-        "ordered-settled-acquire-test",
-        async () => "unreachable",
-      ),
-    ).rejects.toMatchObject({
-      name: "OrderedWorkspaceLockAcquisitionError",
-      storeRoot: await realpath(secondRoot),
-    });
+    try {
+      await expect(
+        runWithOrderedWorkspaceLocks(
+          [
+            { storeRoot: firstRoot },
+            {
+              storeRoot: secondRoot,
+              options: { timeoutMs: 10 },
+            },
+          ],
+          "ordered-settled-acquire-test",
+          async () => "unreachable",
+        ),
+      ).rejects.toMatchObject({
+        name: "OrderedWorkspaceLockAcquisitionError",
+        storeRoot: await realpath(secondRoot),
+      });
 
-    const probe = await acquireWorkspaceLock(firstRoot, "probe", {
-      timeoutMs: 40,
-    });
-    await probe.release();
-    await blocker.release();
+      await assertTestWorkspaceLockReleased(firstRoot);
+    } finally {
+      await blocker.release();
+    }
   });
 });
