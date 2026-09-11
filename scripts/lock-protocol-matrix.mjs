@@ -410,17 +410,16 @@ async function main() {
     "killing a native holder releases the lock without recreating the file",
     async () => {
       const store = await newStore("native-crash");
-      const holder = startClient("new", "crash", store);
+      const holder = startClient("new", "hold", store);
       await waitForEvent(holder, "acquired");
       const before = await lstat(join(store, "workspace.lock"), {
         bigint: true,
       });
-      send(holder, "crash");
-      const exited = await waitForExit(holder);
       expect(
-        exited.signal === "SIGKILL",
-        `expected SIGKILL exit, observed ${exited.signal}`,
+        holder.child.kill("SIGKILL"),
+        "the holding process must be forcibly terminated",
       );
+      await waitForExit(holder);
 
       const successor = startClient("new", "acquire-once", store, {
         timeoutMs: 2_000,

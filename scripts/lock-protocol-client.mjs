@@ -8,7 +8,7 @@
 // Usage:
 //   node --experimental-strip-types lock-protocol-client.mjs \
 //     --client <old|new> --module <path-to-workspace-lock.ts> \
-//     --mode <acquire-once|hold|exit-holding|probe|crash> \
+//     --mode <acquire-once|hold|exit-holding|probe> \
 //     --store <storeRoot> --operation <name> --timeout <ms>
 
 import fs, { lstatSync } from "node:fs";
@@ -182,17 +182,6 @@ try {
         cleanup: execution.cleanup.kind,
         outcome: execution.kind === "completed" ? execution.value : undefined,
       });
-      break;
-    }
-    case "crash": {
-      const lock = await acquire();
-      emit({ event: "acquired", lock: lockFileState() });
-      const command = await waitForCommand();
-      if (command === null) process.exit(70);
-      process.kill(process.pid, "SIGKILL");
-      // Unreachable on POSIX; Windows terminates as well.
-      await delay(1_000);
-      process.exit(70);
       break;
     }
     default: {

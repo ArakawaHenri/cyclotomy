@@ -303,7 +303,6 @@ describe("workspace lock native protocol", () => {
     expect(entry.isSymbolicLink()).toBe(false);
     expect(entry.nlink).toBe(1n);
     expect(entry.size).toBe(0n);
-    expect(await readFile(lockPathOf(root), "utf8")).toBe("");
     expect(await readFile(markerPathOf(root), "utf8")).toBe(MARKER_BYTES);
 
     // The switch grants write authority only while the native lock is held.

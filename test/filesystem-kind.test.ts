@@ -1,4 +1,5 @@
 import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -82,9 +83,7 @@ describe("filesystem kind observation", () => {
     };
     await observeFilesystemKind("relative/path", probe);
 
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.startsWith("/")).toBe(true);
-    expect(seen[0]!.endsWith("relative/path")).toBe(true);
+    expect(seen).toEqual([resolve("relative/path")]);
   });
 
   it("probes the host without throwing for a normal directory", async () => {
