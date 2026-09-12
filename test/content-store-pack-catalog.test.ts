@@ -187,22 +187,21 @@ describe("pack catalog", () => {
     const pack = await dataPack("durable publication");
     const cancellation = new AbortController();
     const target = nativePackPath(layout, pack.pack.packId);
-    const prototype = (await fileHandlePrototype(layout.root)) as unknown as {
-      sync: FileHandle["sync"];
-    };
-    const sync = prototype.sync;
-    vi.spyOn(prototype, "sync").mockImplementation(async function (
-      this: FileHandle,
-    ) {
-      await sync.call(this);
-      if (
-        await readFile(target).then(
-          () => true,
-          () => false,
+    const verify = catalog.packReceiptStillCurrent.bind(catalog);
+    vi.spyOn(catalog, "packReceiptStillCurrent").mockImplementation(
+      async (receipt) => {
+        const current = await verify(receipt);
+        if (
+          current &&
+          (await readFile(target).then(
+            () => true,
+            () => false,
+          ))
         )
-      )
-        cancellation.abort();
-    });
+          cancellation.abort();
+        return current;
+      },
+    );
     await expect(
       withAuthority(layout, (authority) =>
         catalog.publishPack(pack, authority, { signal: cancellation.signal }),

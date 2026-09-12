@@ -1,11 +1,12 @@
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { watchForegroundDemand } from "../src/infrastructure/foreground-demand.ts";
+import * as nativeBinding from "../src/infrastructure/native-file-lock.ts";
 import { acquireWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { testWorkspaceLockIsHeld } from "./workspace-lock-fixture.ts";
 
@@ -35,6 +36,7 @@ async function root() {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const holder of children) {
     if (holder.child.exitCode === null && holder.child.signalCode === null)
       holder.child.kill();
@@ -130,5 +132,45 @@ describe("foreground demand", () => {
     } finally {
       watch.close();
     }
+  });
+
+  it("keeps foreground locking usable when the demand channel is unavailable", async () => {
+    const path = await root();
+    await mkdir(join(path, "foreground.lock"));
+    const holder = await acquireWorkspaceLock(path, "holder", {
+      background: true,
+    });
+    const binding = await nativeBinding.loadNativeFileLock();
+    const contended = Promise.withResolvers<void>();
+    vi.spyOn(nativeBinding, "loadNativeFileLock").mockResolvedValue({
+      ...binding,
+      tryAcquire(descriptor) {
+        const acquired = binding.tryAcquire(descriptor);
+        if (!acquired) contended.resolve();
+        return acquired;
+      },
+    });
+    const waiting = acquireWorkspaceLock(path, "foreground");
+    try {
+      await contended.promise;
+      await expect(watchForegroundDemand(path)).rejects.toThrow();
+    } finally {
+      await holder.release();
+    }
+    const foreground = await waiting;
+    await foreground.release();
+    expect(await testWorkspaceLockIsHeld(path)).toBe(false);
+  });
+
+  it("does not create a file through a dangling demand symlink", async (context) => {
+    context.skip(
+      process.platform === "win32",
+      "Windows file symlinks require privileges",
+    );
+    const path = await root();
+    const outside = join(await root(), "missing");
+    await symlink(outside, join(path, "foreground.lock"));
+    await expect(watchForegroundDemand(path)).rejects.toThrow();
+    await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

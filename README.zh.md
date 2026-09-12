@@ -1,10 +1,14 @@
 # Cyclotomy
 
-让工作区文件跟随 [Pi Coding Agent](https://github.com/earendil-works/pi) 的会话树。
+为 [Pi Coding Agent](https://github.com/earendil-works/pi) 会话树保存工作区检查点。
 
 [English](README.md) · [中文](README.zh.md)
 
-安装后照常使用 Pi。Cyclotomy 随对话推进保存工作区，在你回到会话树的其他位置时，可以恢复当时的文件状态。
+Pi 的对话可以在历史中穿梭；工作区不能，它永远只有此刻。
+
+Cyclotomy 让两者同行。它安静地记录对话推进时的工作区，并在你回到会话树中的另一个位置时，恢复那一刻的工作区。
+
+安装，然后照常使用 Pi。
 
 ## 安装
 

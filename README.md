@@ -4,7 +4,14 @@ Workspace checkpoints for the [Pi Coding Agent](https://github.com/earendil-work
 
 [English](README.md) · [中文](README.zh.md)
 
-Install Cyclotomy and use Pi as usual. It saves your workspace as the conversation progresses and lets you restore it when you return to another point in the session tree.
+A Pi conversation can move through its history. A workspace cannot; it has
+only the present.
+
+Cyclotomy lets them travel together. It quietly records the workspace as the
+conversation progresses and, when you return to another point in the session
+tree, restores the workspace saved there.
+
+Install it, then use Pi as usual.
 
 ## Install
 

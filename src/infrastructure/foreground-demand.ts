@@ -5,20 +5,32 @@ import {
   loadNativeFileLock,
   type NativeFileLockBinding,
 } from "./native-file-lock.ts";
+import { systemErrorCode } from "./system-error.ts";
 
 const DEMAND_FILE = "foreground.lock";
 const POLL_MS = 25;
 
 function openDemandFile(storeRoot: string) {
   const path = join(storeRoot, DEMAND_FILE);
-  const descriptor = openSync(
-    path,
+  const flags =
     constants.O_RDWR |
-      constants.O_CREAT |
-      (constants.O_NOFOLLOW ?? 0) |
-      (constants.O_NONBLOCK ?? 0),
-    0o600,
-  );
+    (constants.O_NOFOLLOW ?? 0) |
+    (constants.O_NONBLOCK ?? 0);
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      path,
+      flags | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+    );
+  } catch (cause) {
+    if (systemErrorCode(cause) !== "EEXIST") throw cause;
+    const existing = lstatSync(path);
+    if (!existing.isFile() || existing.isSymbolicLink()) {
+      throw new Error("foreground demand path is not a regular file");
+    }
+    descriptor = openSync(path, flags);
+  }
   try {
     const identity = fstatSync(descriptor, { bigint: true });
     const assertCurrent = (): void => {

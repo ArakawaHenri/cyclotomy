@@ -701,7 +701,7 @@ describe("applyTreeToWorkspace", () => {
     },
   );
 
-  it("preflights excluded-occupancy identity drift before every mutation", async () => {
+  it("preserves replaced excluded files before every mutation", async () => {
     const policy = "p\n!p/\n!p/child\n";
     await writeFile(join(root, ".gitignore"), policy);
     await writeFile(join(root, "delete-me"), "must survive preflight");
@@ -723,9 +723,10 @@ describe("applyTreeToWorkspace", () => {
 
     await expect(
       applyTreeToWorkspace(root, target, readBlob, current),
-    ).rejects.toThrow(/stale replacement preflight/u);
+    ).rejects.toBeInstanceOf(ApplyError);
     await expectRegular("delete-me", "must survive preflight");
     await expectRegular("p", "replacement ignored file");
+    await expectRegular("p-observed", "observed ignored file");
   });
 
   it("preflights occupancy that appears after a real scan", async () => {
