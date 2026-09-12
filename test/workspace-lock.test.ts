@@ -24,7 +24,10 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
-import { compareDirectoryBindings } from "../src/infrastructure/directory-binding.ts";
+import {
+  bindDirectory,
+  compareDirectoryBindings,
+} from "../src/infrastructure/directory-binding.ts";
 import {
   LockProtocolCorruptError,
   UnsupportedLockProtocolError,
@@ -201,6 +204,15 @@ async function storeRootDirectory(): Promise<string> {
   return root;
 }
 
+async function orderedStoreRoots(): Promise<readonly [string, string]> {
+  const root = await storeRootDirectory();
+  const paths = [join(root, "a"), join(root, "z")];
+  await Promise.all(paths.map((path) => mkdir(path)));
+  const bindings = await Promise.all(paths.map((path) => bindDirectory(path)));
+  bindings.sort(compareDirectoryBindings);
+  return [bindings[0]!.canonicalPath, bindings[1]!.canonicalPath];
+}
+
 /** An idle store already using the native protocol. */
 async function upgradedStoreRoot(): Promise<string> {
   const root = await storeRootDirectory();
@@ -294,9 +306,7 @@ describe("workspace lock native protocol", () => {
     expect(await pathExists(lockPathOf(root))).toBe(false);
     expect(await inspectWorkspaceLock(root)).toEqual({ kind: "absent" });
 
-    const lock = await acquireWorkspaceLock(root, "capture", {
-      timeoutMs: 500,
-    });
+    const lock = await acquireWorkspaceLock(root, "capture");
 
     const entry = await lstat(lockPathOf(root), { bigint: true });
     expect(entry.isFile()).toBe(true);
@@ -548,9 +558,7 @@ describe("workspace lock fail-closed transitions", () => {
       kind: "interrupted-switch",
     });
 
-    const lock = await acquireWorkspaceLock(root, "capture", {
-      timeoutMs: 500,
-    });
+    const lock = await acquireWorkspaceLock(root, "capture");
     await lock.release();
 
     const adopted = await lstat(lockPathOf(root), { bigint: true });
@@ -678,9 +686,7 @@ describe("workspace lock fail-closed transitions", () => {
     expect(quarantine.kind).toBe("quarantined");
     expect(await pathExists(path)).toBe(false);
 
-    const lock = await acquireWorkspaceLock(root, "capture", {
-      timeoutMs: 500,
-    });
+    const lock = await acquireWorkspaceLock(root, "capture");
     await lock.release();
     expect(await readFile(markerPathOf(root), "utf8")).toBe(MARKER_BYTES);
   });
@@ -1083,16 +1089,12 @@ describe("workspace lock cleanup settlement", () => {
     });
   });
 
-  it.each(["a", "z"])(
-    "identifies an ordered acquisition failure at the %s-sorted root",
-    async (lockedName) => {
-      const root = await storeRootDirectory();
-      const firstRoot = join(root, "a");
-      const secondRoot = join(root, "z");
-      await mkdir(firstRoot);
-      await mkdir(secondRoot);
-      const lockedRoot = lockedName === "a" ? firstRoot : secondRoot;
-      const otherRoot = lockedName === "a" ? secondRoot : firstRoot;
+  it.each(["first", "second"])(
+    "identifies an ordered acquisition failure at the %s physical root",
+    async (position) => {
+      const [firstRoot, secondRoot] = await orderedStoreRoots();
+      const lockedRoot = position === "first" ? firstRoot : secondRoot;
+      const otherRoot = position === "first" ? secondRoot : firstRoot;
       const blocker = await acquireWorkspaceLock(lockedRoot, "blocker", {});
       let actionEntered = false;
 
@@ -1114,10 +1116,13 @@ describe("workspace lock cleanup settlement", () => {
         ).toBe(await realpath(lockedRoot));
         expect(actionEntered).toBe(false);
 
-        // When the blocked root sorts second, this also proves that the first
-        // acquired member was released before the failure escaped.
-        const other = await acquireWorkspaceLock(otherRoot, "probe");
-        await other.release();
+        if (position === "first") {
+          expect(await inspectWorkspaceLock(otherRoot)).toEqual({
+            kind: "absent",
+          });
+        } else {
+          await assertTestWorkspaceLockReleased(otherRoot);
+        }
       } finally {
         await blocker.release();
       }
@@ -1219,12 +1224,7 @@ describe("workspace lock cleanup settlement", () => {
   });
 
   it("releases an earlier ordered member when later acquisition fails", async () => {
-    const root = await storeRootDirectory();
-    const firstRoot = join(root, "a");
-    const secondRoot = join(root, "z");
-    await mkdir(firstRoot);
-    await mkdir(secondRoot);
-
+    const [firstRoot, secondRoot] = await orderedStoreRoots();
     const blocker = await acquireWorkspaceLock(secondRoot, "blocker", {});
 
     try {
