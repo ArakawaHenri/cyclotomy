@@ -292,7 +292,6 @@ function registrationView(options: {
 
 async function createExternalForkFixture(
   prefix: string,
-  lockTimeoutMs?: number,
   scope: WorkspaceScope = TEST_SCOPE,
 ) {
   const parent = await mkdtemp(join(tmpdir(), prefix));
@@ -336,14 +335,7 @@ async function createExternalForkFixture(
       })}\n`,
     ),
   ]);
-  const loaded = loadCyclotomyConfig(home);
-  const config =
-    lockTimeoutMs === undefined
-      ? loaded
-      : {
-          ...loaded,
-          lock: { ...loaded.lock, timeoutMs: lockTimeoutMs },
-        };
+  const config = loadCyclotomyConfig(home);
   const sourceRuntime = new CyclotomyRuntime(config, new CyclotomyI18n("en"));
   expect(await sourceRuntime.ensureStore(sourceWorkspace)).toBe(true);
   const blobOid = await publishTestBlob(
@@ -2251,7 +2243,6 @@ describe("Cyclotomy runtime", () => {
   it("does not quarantine an operational target policy evaluation failure", async () => {
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-import-policy-operation-",
-      undefined,
       gitScope(),
     );
     const { preparation, runtime } = await openExternalForkTarget(fixture);
@@ -2326,12 +2317,9 @@ describe("Cyclotomy runtime", () => {
   it("uses the source workspace lock timeout and inherits on retry", async () => {
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-source-lock-",
-      100,
     );
-    await writeFile(
-      join(fixture.sourceStoreRoot, "settings.json"),
-      JSON.stringify({ lockTimeoutMs: 25 }),
-    );
+    const sourceSettingsPath = join(fixture.sourceStoreRoot, "settings.json");
+    await writeFile(sourceSettingsPath, JSON.stringify({ lockTimeoutMs: 25 }));
     const { preparation, runtime } = await openExternalForkTarget(fixture);
     const sourceLock = await acquireWorkspaceLock(
       fixture.sourceStoreRoot,
@@ -2361,8 +2349,9 @@ describe("Cyclotomy runtime", () => {
       ).toEqual({ barriers: 0, registrations: 0, slots: 0 });
     } finally {
       await sourceLock.release();
+      await rm(sourceSettingsPath);
+      runtime.close();
     }
-    runtime.close();
 
     await expectExternalForkInheritance(fixture);
   });
@@ -2854,7 +2843,6 @@ describe("Cyclotomy runtime", () => {
     );
     const fixture = await createExternalForkFixture(
       "cyclotomy-runtime-source-store-alias-",
-      25,
     );
     const { preparation, runtime } = await openExternalForkTarget(fixture);
     await rm(fixture.sourceStoreRoot, { recursive: true });
