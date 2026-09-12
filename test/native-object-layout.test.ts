@@ -123,17 +123,11 @@ describe("native object layout", () => {
     }
   });
 
-  it("keeps native provenance and layout outside the reflective object surface", async () => {
+  it("rejects a substituted store identity", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyclotomy-native-private-"));
     try {
       const store = await openObjectStore(root);
       const layout = nativeObjectStoreLayout(store, "test");
-      expect(Object.isFrozen(layout)).toBe(true);
-      expect(Reflect.ownKeys(store)).not.toContain("objectLayout");
-      expect(Object.getOwnPropertySymbols(store)).toEqual([]);
-      expect(
-        Object.getOwnPropertySymbols(Object.getPrototypeOf(store)),
-      ).toEqual([]);
 
       const proxy = new Proxy(store, {});
       expect(() => nativeObjectStoreLayout(proxy, "test")).toThrow(

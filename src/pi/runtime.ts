@@ -19,8 +19,7 @@ import {
   type ResolvedReadableTree,
 } from "../application/checkpoint-service.ts";
 import { CyclotomyConfigError, type CyclotomyConfig } from "../config.ts";
-import { collectCyclotomyGarbage } from "../application/gc.ts";
-import type { GcReport } from "../infrastructure/object-gc.ts";
+import { collectGarbage, type GcReport } from "../infrastructure/object-gc.ts";
 import type { NodeKey, Result } from "../domain/model.ts";
 import type { CheckpointSlot } from "../domain/checkpoint-slot.ts";
 import type { CurrentMetadataStore } from "../infrastructure/metadata.ts";
@@ -33,11 +32,15 @@ import {
   readLastAutomaticGcAt,
   writeLastAutomaticGcAt,
 } from "../infrastructure/gc-state.ts";
+import { watchForegroundDemand } from "../infrastructure/foreground-demand.ts";
+import { notifyWorkspaceLockCleanupFailure } from "./restore-notifications.ts";
 import type { GitReplayAttestation } from "../infrastructure/git-replay-risk.ts";
 import type { CurrentTreeManifest } from "../infrastructure/tree-formats/current.ts";
 import { validateTreeEntriesAgainstScope } from "../infrastructure/tree-scope-validation.ts";
 import {
   runWithWorkspaceLock,
+  WorkspaceLockTimeoutError,
+  type WorkspaceLockOptions,
   type WorkspaceLockExecution,
   type WorkspaceWriteAuthority,
 } from "../infrastructure/workspace-lock.ts";
@@ -53,7 +56,7 @@ import {
   type WorkspaceOperationOptions,
   type WorkspaceProgress,
 } from "../infrastructure/workspace-operation.ts";
-import { CyclotomyI18n } from "../presentation/i18n.ts";
+import { CyclotomyI18n } from "./i18n.ts";
 import {
   CheckpointAdmission,
   type ArrivalAttempt,
@@ -61,12 +64,9 @@ import {
 import type { PendingNavigation } from "./navigation-plan.ts";
 import type { SessionActivation } from "./pi-host-adapter.ts";
 import type { ArrivalRecoverySettlement } from "./workspace-receipt.ts";
-import {
-  formatUiDetail,
-  formatUiPath,
-} from "../presentation/restore-presentation.ts";
+import { formatUiDetail, formatUiPath } from "./restore-presentation.ts";
 import type { SessionView } from "./session-view.ts";
-import { messageOfUnknown } from "../presentation/unknown-error.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 import {
   SessionRegistrationService,
   type SessionRegistrationPreparation,
@@ -75,8 +75,6 @@ import { WorkspaceMutationAuthority } from "./workspace-mutation-authority.ts";
 
 const GC_STATE_FILE = "gc-state.json";
 const GC_OBJECT_GRACE_MS = 3_600_000;
-// Automatic maintenance yields at safe batch boundaries when its budget ends.
-const GC_AUTOMATIC_BUDGET_MS = 1_000;
 
 function initializationDetail(error: unknown): string {
   return error instanceof CyclotomyConfigError
@@ -95,6 +93,14 @@ export class CyclotomyRuntime {
   readonly #captureAbortController = new AbortController();
   #checkpointService: CheckpointService | undefined;
   #queue: Promise<unknown> = Promise.resolve();
+  #pendingOperations = 0;
+  #automaticGcContext: ExtensionContext | undefined;
+  #automaticGcTimer: ReturnType<typeof setTimeout> | undefined;
+  #automaticGcAbort: AbortController | undefined;
+  #automaticGcLastCompletedAt = 0;
+  #automaticGcNextAttemptAt = 0;
+  #automaticGcRetryMs = 1_000;
+  #automaticGcFailureNotified = false;
   #agentRunActive = false;
   #initFailureNotified = false;
   #captureFailureNotified = false;
@@ -137,6 +143,7 @@ export class CyclotomyRuntime {
 
   observeAgentRun(event: AgentStartEvent | AgentSettledEvent): void {
     this.#agentRunActive = event.type === "agent_start";
+    if (this.#agentRunActive) this.#cancelAutomaticGc();
   }
 
   /** Navigation itself keeps Pi non-idle; agent settlement includes retry gaps. */
@@ -233,7 +240,7 @@ export class CyclotomyRuntime {
 
   /**
    * The retired-generation report this engine withdrew for, if any. Callers
-   * use it to report the one deliberate maintenance outcome instead of every
+   * use it to report the history reset once instead of every
    * protection failure it caused.
    */
   get historyReset(): MetadataHistoryResetError | undefined {
@@ -293,6 +300,8 @@ export class CyclotomyRuntime {
    */
   retire(): void {
     if (this.#activation.kind === "closed") return;
+    this.#automaticGcContext = undefined;
+    this.#cancelAutomaticGc();
     this.#captureAbortController.abort();
     this.markSessionIntentionallyInactive();
   }
@@ -390,6 +399,8 @@ export class CyclotomyRuntime {
     let unsubscribe: (() => void) | undefined;
     let lastPhase: CaptureProgress["phase"] | undefined;
     let lastUpdateAt = 0;
+    let visible = false;
+    let latestProgress: CaptureProgress | undefined;
     try {
       if (context.hasUI && context.mode === "tui") {
         unsubscribe = context.ui.onTerminalInput((data) => {
@@ -401,7 +412,7 @@ export class CyclotomyRuntime {
     } catch {
       // Terminal controls can disappear while Pi replaces the active UI.
     }
-    const onProgress = (progress: CaptureProgress): void => {
+    const showProgress = (progress: CaptureProgress): void => {
       const now = performance.now();
       if (lastPhase === progress.phase && now - lastUpdateAt < 250) return;
       lastPhase = progress.phase;
@@ -425,16 +436,26 @@ export class CyclotomyRuntime {
         }),
       );
     };
+    const onProgress = (progress: CaptureProgress): void => {
+      latestProgress = progress;
+      if (visible) showProgress(progress);
+    };
+    const progressTimer = setTimeout(() => {
+      visible = true;
+      if (latestProgress !== undefined) showProgress(latestProgress);
+    }, 250);
+    progressTimer.unref();
     try {
       onProgress({ phase: initialPhase, files: 0, bytes: 0 });
       return await action({ signal, onProgress, writeAuthority });
     } finally {
+      clearTimeout(progressTimer);
       try {
         unsubscribe?.();
       } catch {
         // A stale UI must not turn capture cleanup into a storage failure.
       }
-      this.setStatus(context, undefined);
+      if (visible) this.setStatus(context, undefined);
     }
   }
 
@@ -560,7 +581,16 @@ export class CyclotomyRuntime {
   }
 
   enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#queue.then(operation, operation);
+    this.#cancelAutomaticGc();
+    return this.#enqueueOperation(operation);
+  }
+
+  #enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.#pendingOperations += 1;
+    const result = this.#queue.then(operation, operation).finally(() => {
+      this.#pendingOperations -= 1;
+      this.#armAutomaticGc();
+    });
     this.#queue = result.catch(() => {});
     return result;
   }
@@ -570,26 +600,35 @@ export class CyclotomyRuntime {
     action: (writeAuthority: WorkspaceWriteAuthority) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<WorkspaceLockExecution<T>> {
-    return this.enqueue(async () => {
-      const execution = await runWithWorkspaceLock(
-        this.storeRoot,
+    return this.enqueue(() =>
+      this.#executeWorkspace(
         operation,
         action,
         signal === undefined
           ? this.config.lock
           : { ...this.config.lock, signal },
-      );
-      // A failed release leaves the cooperative lock's future ownership
-      // uncertain. Preserve the action's typed result, but stop this engine
-      // from admitting any later operation.
-      if (
-        execution.cleanup.kind === "failed" &&
-        this.#activation.kind === "active"
-      ) {
-        this.markSessionUnavailable(execution.cleanup.cause);
-      }
-      return execution;
-    });
+      ),
+    );
+  }
+
+  async #executeWorkspace<T>(
+    operation: string,
+    action: (writeAuthority: WorkspaceWriteAuthority) => Promise<T>,
+    options: WorkspaceLockOptions,
+  ): Promise<WorkspaceLockExecution<T>> {
+    const execution = await runWithWorkspaceLock(
+      this.storeRoot,
+      operation,
+      action,
+      options,
+    );
+    if (
+      execution.cleanup.kind === "failed" &&
+      this.#activation.kind === "active"
+    ) {
+      this.markSessionUnavailable(execution.cleanup.cause);
+    }
+    return execution;
   }
 
   async scanCurrentWorkspace(
@@ -634,46 +673,164 @@ export class CyclotomyRuntime {
     return snapshot;
   }
 
+  scheduleAutomaticGc(context: ExtensionContext): void {
+    this.#automaticGcContext = context;
+    this.#armAutomaticGc();
+  }
+
+  #cancelAutomaticGc(): void {
+    clearTimeout(this.#automaticGcTimer);
+    this.#automaticGcTimer = undefined;
+    this.#automaticGcAbort?.abort();
+  }
+
+  #deferAutomaticGc(): void {
+    this.#automaticGcNextAttemptAt = Date.now() + this.#automaticGcRetryMs;
+    this.#automaticGcRetryMs = Math.min(60_000, this.#automaticGcRetryMs * 2);
+  }
+
+  #armAutomaticGc(): void {
+    const context = this.#automaticGcContext;
+    if (
+      context === undefined ||
+      !this.isActive ||
+      this.#agentRunActive ||
+      this.#pendingOperations > 0 ||
+      this.#automaticGcAbort !== undefined ||
+      this.#automaticGcTimer !== undefined ||
+      this.config.autoGcIntervalMs <= 0
+    )
+      return;
+    const waitMs = Math.max(
+      1_000,
+      this.#automaticGcNextAttemptAt - Date.now(),
+      this.#automaticGcLastCompletedAt +
+        this.config.autoGcIntervalMs -
+        Date.now(),
+    );
+    // Node timers accept signed 32-bit delays; long configured intervals need another wakeup.
+    this.#automaticGcTimer = setTimeout(
+      () => {
+        this.#automaticGcTimer = undefined;
+        void Promise.resolve()
+          .then(() => {
+            if (!context.isIdle()) {
+              this.#armAutomaticGc();
+              return undefined;
+            }
+            return this.maybeRunAutomaticGc();
+          })
+          .then((execution) => {
+            if (execution === undefined) return;
+            notifyWorkspaceLockCleanupFailure(this, context, execution.cleanup);
+            if (execution.kind === "action-failed") throw execution.cause;
+          })
+          .catch((cause: unknown) => {
+            if (this.#automaticGcFailureNotified || !this.isActive) return;
+            this.#automaticGcFailureNotified = true;
+            this.notify(
+              context,
+              this.i18n.t("automaticGcFailed", {
+                message: formatUiDetail(messageOfUnknown(cause)),
+              }),
+              "warning",
+            );
+          });
+      },
+      Math.min(waitMs, 2_147_483_647),
+    );
+    this.#automaticGcTimer.unref();
+  }
+
   async maybeRunAutomaticGc(): Promise<
     WorkspaceLockExecution<GcReport | undefined>
   > {
+    const skipped = {
+      kind: "completed",
+      value: undefined,
+      cleanup: { kind: "settled" },
+    } as const;
     const intervalMs = this.config.autoGcIntervalMs;
-    if (intervalMs <= 0) {
-      return {
-        kind: "completed",
-        value: undefined,
-        cleanup: { kind: "settled" },
-      };
+    if (
+      intervalMs <= 0 ||
+      this.#automaticGcAbort !== undefined ||
+      this.captureSignal.aborted
+    )
+      return skipped;
+    const cancellation = new AbortController();
+    this.#automaticGcAbort = cancellation;
+    const signal = AbortSignal.any([this.captureSignal, cancellation.signal]);
+    const statePath = join(this.storeRoot, GC_STATE_FILE);
+    try {
+      return await this.#enqueueOperation(async () => {
+        signal.throwIfAborted();
+        this.#automaticGcLastCompletedAt = Math.max(
+          this.#automaticGcLastCompletedAt,
+          await readLastAutomaticGcAt(statePath),
+        );
+        if (Date.now() - this.#automaticGcLastCompletedAt < intervalMs)
+          return skipped;
+        const demand = await watchForegroundDemand(this.storeRoot);
+        const backgroundSignal = AbortSignal.any([signal, demand.signal]);
+        try {
+          const execution = await this.#executeWorkspace(
+            "auto-gc",
+            async (writeAuthority) => {
+              demand.poll();
+              this.#automaticGcLastCompletedAt = Math.max(
+                this.#automaticGcLastCompletedAt,
+                await readLastAutomaticGcAt(statePath),
+              );
+              if (Date.now() - this.#automaticGcLastCompletedAt < intervalMs)
+                return undefined;
+              const report = await collectGarbage(
+                writeAuthority,
+                this.store,
+                this.metadata,
+                {
+                  graceMs: GC_OBJECT_GRACE_MS,
+                  signal: backgroundSignal,
+                },
+              );
+              if (report.stopped === undefined) {
+                this.#automaticGcLastCompletedAt = Date.now();
+                this.#automaticGcRetryMs = 1_000;
+                this.#automaticGcFailureNotified = false;
+                await writeLastAutomaticGcAt(
+                  statePath,
+                  this.#automaticGcLastCompletedAt,
+                  writeAuthority,
+                );
+              } else {
+                this.#deferAutomaticGc();
+              }
+              return report;
+            },
+            { timeoutMs: 0, signal: backgroundSignal, background: true },
+          );
+          if (execution.kind === "action-failed") this.#deferAutomaticGc();
+          return execution;
+        } catch (cause) {
+          if (
+            cause instanceof WorkspaceLockTimeoutError ||
+            isOperationCancelled(cause, backgroundSignal)
+          ) {
+            this.#deferAutomaticGc();
+            return skipped;
+          }
+          throw cause;
+        } finally {
+          demand.close();
+        }
+      });
+    } catch (cause) {
+      this.#deferAutomaticGc();
+      if (isOperationCancelled(cause, signal)) return skipped;
+      throw cause;
+    } finally {
+      this.#automaticGcAbort = undefined;
+      this.#armAutomaticGc();
     }
-    const storeRoot = this.storeRoot;
-    const statePath = join(storeRoot, GC_STATE_FILE);
-    if (Date.now() - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
-      return {
-        kind: "completed",
-        value: undefined,
-        cleanup: { kind: "settled" },
-      };
-    }
-    return this.enqueueWorkspaceExecution("auto-gc", async (writeAuthority) => {
-      const startedAt = Date.now();
-      if (startedAt - (await readLastAutomaticGcAt(statePath)) < intervalMs) {
-        return undefined;
-      }
-      // Record partial passes too: a store that needs a maintenance window
-      // must not consume the same interactive budget on every turn.
-      const report = await collectCyclotomyGarbage(
-        writeAuthority,
-        this.store,
-        this.metadata,
-        {
-          objectGraceMs: GC_OBJECT_GRACE_MS,
-          budgetMs: GC_AUTOMATIC_BUDGET_MS,
-          signal: this.captureSignal,
-        },
-      );
-      await writeLastAutomaticGcAt(statePath, startedAt, writeAuthority);
-      return report;
-    });
   }
 
   async resolveReadableTreeIn(
@@ -765,6 +922,8 @@ export class CyclotomyRuntime {
   }
 
   close(): void {
+    this.#automaticGcContext = undefined;
+    this.#cancelAutomaticGc();
     this.#captureAbortController.abort();
     this.#activation = { kind: "closed" };
     this.#registrations.close();

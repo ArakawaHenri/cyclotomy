@@ -1,3 +1,7 @@
+import {
+  readTestSessionHistory,
+  resetTestSessionHistory,
+} from "./session-history-fixture.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,12 +10,9 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createCurrentMetadataStore,
-  MetadataError,
-  MetadataFingerprintChangedError,
   MetadataHistoryResetError,
   openCurrentMetadataStore as openCurrentMetadataStoreWithLease,
   type CurrentMetadataStore,
-  type ForgetSessionHistoryInput,
 } from "../src/infrastructure/metadata.ts";
 import { METADATA_WRITER_PROTOCOL_FUNCTION } from "../src/infrastructure/metadata/schema.ts";
 import { validateMetadataVersion } from "../src/infrastructure/metadata/version.ts";
@@ -28,6 +29,7 @@ import {
   readTestSessionRegistration,
   registerTestSession,
   testMetadataWriteAuthority,
+  testMetadataWriteAuthorityBinding,
 } from "./metadata-fixture.ts";
 import {
   holdTestWorkspaceWriteAuthority,
@@ -83,25 +85,16 @@ function authorityOf(store: CurrentMetadataStore) {
   return testMetadataWriteAuthority(store);
 }
 
-function previewedHistory(store: CurrentMetadataStore, sessionId: string) {
-  const history = store.describeSessionHistory(sessionId);
-  if (history === undefined) throw new Error("session history is missing");
-  return history.fingerprint;
+function sessionHistory(store: CurrentMetadataStore, sessionId: string) {
+  return readTestSessionHistory(
+    testMetadataWriteAuthorityBinding(store).storeRoot,
+    sessionId,
+  );
 }
 
-function forget(
-  store: CurrentMetadataStore,
-  sessionId: string,
-  expectedFingerprint: ForgetSessionHistoryInput["expectedFingerprint"] = previewedHistory(
-    store,
-    sessionId,
-  ),
-): ReturnType<CurrentMetadataStore["forgetSessionHistory"]> {
-  return store.forgetSessionHistory(authorityOf(store), {
-    sessionId,
-    sessionFile: SESSION_FILE,
-    expectedFingerprint,
-  });
+function resetHistory(store: CurrentMetadataStore, sessionId: string): void {
+  const { storeRoot, authority } = testMetadataWriteAuthorityBinding(store);
+  resetTestSessionHistory(storeRoot, sessionId, authority);
 }
 
 function registrationOf(root: string, sessionId: string) {
@@ -173,26 +166,6 @@ function seedLineage(
   }
 }
 
-function protectCoordinate(
-  store: CurrentMetadataStore,
-  sessionId: string,
-  coordinates: readonly string[],
-  sessionFile: string = SESSION_FILE,
-): void {
-  const entryId = coordinates.at(-1)!;
-  const result = store.protectLocation(authorityOf(store), {
-    identity: { sessionId, sessionFile },
-    entryId,
-    activeAncestryEntryIds: coordinates,
-    expectation: { kind: "any-current" },
-  });
-  if (result.kind !== "protected") {
-    throw new Error(
-      `failed to protect ${sessionId}/${entryId}: ${result.kind}`,
-    );
-  }
-}
-
 function capture(
   store: CurrentMetadataStore,
   sessionId: string,
@@ -246,7 +219,7 @@ describe("metadata v5 session history generation", () => {
 
     const store = await reopen({ root, path });
     try {
-      expect(store.describeSessionHistory("legacy")).toMatchObject({
+      expect(sessionHistory(store, "legacy")).toMatchObject({
         sessionId: "legacy",
         sessionFile: SESSION_FILE,
         registrationState: "verified",
@@ -290,123 +263,6 @@ describe("metadata v5 session history generation", () => {
     staleConnection.close();
   });
 
-  it("describes a session's durable identity and scale counts", async () => {
-    const { store } = await createStore();
-    try {
-      expect(store.describeSessionHistory("absent")).toBeUndefined();
-      seedLineage(store, "session", ["a", "b", "c"], {
-        a: FIRST_TREE,
-        b: SECOND_TREE,
-      });
-      // A protected coordinate still carries its tree reference, and is counted
-      // as blocked rather than as an open checkpoint. The unreached leaf is
-      // open-missing, which is the absence of a row rather than a stored slot.
-      protectCoordinate(store, "session", ["a", "b"]);
-
-      expect(store.describeSessionHistory("session")).toMatchObject({
-        sessionId: "session",
-        sessionFile: SESSION_FILE,
-        registrationState: "verified",
-        epoch: 0,
-        resetPending: false,
-        slotCount: 2,
-        checkpointCount: 2,
-        blockedCount: 1,
-        hasCaptureBarrier: false,
-        treeOids: [FIRST_TREE, SECOND_TREE],
-      });
-      expect(store.getCheckpointSlot("session", "c")).toEqual({
-        kind: "open-missing",
-      });
-    } finally {
-      store.close();
-    }
-  });
-
-  it("forgets one session's history and leaves a treeless tombstone", async () => {
-    const { store } = await createStore();
-    try {
-      seedLineage(store, "session", ["a", "b", "c"], {
-        a: FIRST_TREE,
-        b: SECOND_TREE,
-      });
-      store.raiseSessionBarrier(authorityOf(store), {
-        sessionId: "session",
-        sessionFile: SESSION_FILE,
-      });
-
-      expect(forget(store, "session")).toEqual({
-        sessionId: "session",
-        epoch: 1,
-        resetPending: true,
-        removedSlots: 2,
-        removedCaptureBarrier: true,
-      });
-      expect(store.describeSessionHistory("session")).toMatchObject({
-        epoch: 1,
-        resetPending: true,
-        slotCount: 0,
-        checkpointCount: 0,
-        blockedCount: 0,
-        treeOids: [],
-      });
-      expect(store.listReferencedTreeOids()).toEqual([]);
-      expect(
-        store.hasSessionBarrier({
-          sessionId: "session",
-          sessionFile: SESSION_FILE,
-        }),
-      ).toBe(false);
-
-      // Only an authorized forget advances the epoch, once per forget.
-      expect(forget(store, "session")).toEqual({
-        sessionId: "session",
-        epoch: 2,
-        resetPending: true,
-        removedSlots: 0,
-        removedCaptureBarrier: false,
-      });
-    } finally {
-      store.close();
-    }
-  });
-
-  it("refuses a forget whose previewed state no longer matches", async () => {
-    const { store } = await createStore();
-    try {
-      seedLineage(store, "session", ["a", "b"], {
-        a: FIRST_TREE,
-        b: SECOND_TREE,
-      });
-
-      const preview = previewedHistory(store, "session");
-      protectCoordinate(store, "session", ["a", "b"]);
-      expect(() => forget(store, "session", preview)).toThrow(
-        MetadataFingerprintChangedError,
-      );
-      expect(() =>
-        store.forgetSessionHistory(authorityOf(store), {
-          sessionId: "session",
-          sessionFile: "/test-sessions/other.jsonl",
-          expectedFingerprint: previewedHistory(store, "session"),
-        }),
-      ).toThrow(MetadataError);
-
-      expect(store.describeSessionHistory("session")).toMatchObject({
-        epoch: 0,
-        resetPending: false,
-        slotCount: 2,
-        checkpointCount: 2,
-      });
-      expect(store.getCheckpointSlot("session", "a")).toMatchObject({
-        kind: "open-checkpoint",
-        treeOid: FIRST_TREE,
-      });
-    } finally {
-      store.close();
-    }
-  });
-
   it("refuses ordinary writes until a stable attach completes the reset", async () => {
     const fixture = await createStore();
     const { root, store } = fixture;
@@ -417,7 +273,7 @@ describe("metadata v5 session history generation", () => {
         sessionFile: SESSION_FILE,
       }),
     ).toBe(true);
-    forget(store, "session");
+    resetHistory(store, "session");
 
     // The connection that witnessed the forget keeps the retired generation
     // and is refused, and the failure is durable rather than a local retry.
@@ -453,7 +309,7 @@ describe("metadata v5 session history generation", () => {
           expectation: { kind: "any-current" },
         }),
       ).toThrow(/reset is pending/u);
-      expect(second.describeSessionHistory("session")).toMatchObject({
+      expect(sessionHistory(second, "session")).toMatchObject({
         epoch: 1,
         resetPending: true,
       });
@@ -468,7 +324,7 @@ describe("metadata v5 session history generation", () => {
       a: FIRST_TREE,
       b: SECOND_TREE,
     });
-    forget(fixture.store, "session");
+    resetHistory(fixture.store, "session");
     fixture.store.close();
 
     const store = await reopen(fixture);
@@ -484,7 +340,7 @@ describe("metadata v5 session history generation", () => {
       ).toEqual({ kind: "existing", historyReset: true });
       // Only the two coordinates that carried trees need a protection row; the
       // reachable leaf stays open-missing, which is the absence of a row.
-      expect(store.describeSessionHistory("session")).toMatchObject({
+      expect(sessionHistory(store, "session")).toMatchObject({
         epoch: 1,
         resetPending: false,
         slotCount: 2,
@@ -514,7 +370,7 @@ describe("metadata v5 session history generation", () => {
           seed: { kind: "fresh" },
         }),
       ).toEqual({ kind: "existing", historyReset: false });
-      expect(store.describeSessionHistory("session")).toMatchObject({
+      expect(sessionHistory(store, "session")).toMatchObject({
         epoch: 1,
         resetPending: false,
         slotCount: 2,
@@ -524,7 +380,7 @@ describe("metadata v5 session history generation", () => {
       expect(capture(store, "session", "c", ["a", "b", "c"], FIRST_TREE)).toBe(
         "committed",
       );
-      expect(store.describeSessionHistory("session")).toMatchObject({
+      expect(sessionHistory(store, "session")).toMatchObject({
         epoch: 1,
         slotCount: 3,
         checkpointCount: 1,
@@ -535,73 +391,70 @@ describe("metadata v5 session history generation", () => {
     }
   });
 
-  it.each(["attached", "maintenance"] as const)(
-    "keeps every stale write fenced after a %s connection forgets history",
-    async (actor) => {
-      const fixture = await createStore();
-      const stale = fixture.store;
-      seedLineage(stale, "session", ["a", "b"], { a: FIRST_TREE });
-      const fresh = await reopen(fixture);
-      try {
-        forget(actor === "attached" ? stale : fresh, "session");
-        finalizeTestSessionProjection(fresh, {
-          targetSessionId: "session",
-          targetSessionFile: SESSION_FILE,
-          retainedEntryIds: ["a", "b"],
-          activeAncestryEntryIds: ["a", "b"],
-          seed: { kind: "fresh" },
-        });
+  it("keeps stale writes fenced after an external history reset", async () => {
+    const fixture = await createStore();
+    const stale = fixture.store;
+    seedLineage(stale, "session", ["a", "b"], { a: FIRST_TREE });
+    const fresh = await reopen(fixture);
+    try {
+      resetHistory(fresh, "session");
+      finalizeTestSessionProjection(fresh, {
+        targetSessionId: "session",
+        targetSessionFile: SESSION_FILE,
+        retainedEntryIds: ["a", "b"],
+        activeAncestryEntryIds: ["a", "b"],
+        seed: { kind: "fresh" },
+      });
 
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          for (const write of [
-            () => capture(stale, "session", "b", ["a", "b"], FIRST_TREE),
-            () =>
-              stale.protectLocation(authorityOf(stale), {
-                identity: { sessionId: "session", sessionFile: SESSION_FILE },
-                entryId: "b",
-                activeAncestryEntryIds: ["a", "b"],
-                expectation: { kind: "any-current" },
-              }),
-            () =>
-              stale.raiseSessionBarrier(authorityOf(stale), {
-                sessionId: "session",
-                sessionFile: SESSION_FILE,
-              }),
-          ]) {
-            expect(write).toThrow(MetadataHistoryResetError);
-          }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        for (const write of [
+          () => capture(stale, "session", "b", ["a", "b"], FIRST_TREE),
+          () =>
+            stale.protectLocation(authorityOf(stale), {
+              identity: { sessionId: "session", sessionFile: SESSION_FILE },
+              entryId: "b",
+              activeAncestryEntryIds: ["a", "b"],
+              expectation: { kind: "any-current" },
+            }),
+          () =>
+            stale.raiseSessionBarrier(authorityOf(stale), {
+              sessionId: "session",
+              sessionFile: SESSION_FILE,
+            }),
+        ]) {
+          expect(write).toThrow(MetadataHistoryResetError);
         }
-        expect(fresh.listReferencedTreeOids()).toEqual([]);
-        expect(
-          fresh.hasSessionBarrier({
-            sessionId: "session",
-            sessionFile: SESSION_FILE,
-          }),
-        ).toBe(false);
-        expect(capture(fresh, "session", "b", ["a", "b"], SECOND_TREE)).toBe(
-          "committed",
-        );
-
-        finalizeTestSessionProjection(stale, {
-          targetSessionId: "session",
-          targetSessionFile: SESSION_FILE,
-          retainedEntryIds: ["a", "b"],
-          activeAncestryEntryIds: ["a", "b"],
-          seed: { kind: "fresh" },
-        });
-        expect(capture(stale, "session", "b", ["a", "b"], SECOND_TREE)).toBe(
-          "committed",
-        );
-        expect(stale.describeSessionHistory("session")).toMatchObject({
-          epoch: 1,
-          resetPending: false,
-        });
-      } finally {
-        stale.close();
-        fresh.close();
       }
-    },
-  );
+      expect(fresh.listReferencedTreeOids()).toEqual([]);
+      expect(
+        fresh.hasSessionBarrier({
+          sessionId: "session",
+          sessionFile: SESSION_FILE,
+        }),
+      ).toBe(false);
+      expect(capture(fresh, "session", "b", ["a", "b"], SECOND_TREE)).toBe(
+        "committed",
+      );
+
+      finalizeTestSessionProjection(stale, {
+        targetSessionId: "session",
+        targetSessionFile: SESSION_FILE,
+        retainedEntryIds: ["a", "b"],
+        activeAncestryEntryIds: ["a", "b"],
+        seed: { kind: "fresh" },
+      });
+      expect(capture(stale, "session", "b", ["a", "b"], SECOND_TREE)).toBe(
+        "committed",
+      );
+      expect(sessionHistory(stale, "session")).toMatchObject({
+        epoch: 1,
+        resetPending: false,
+      });
+    } finally {
+      stale.close();
+      fresh.close();
+    }
+  });
 
   it("cannot resurrect forgotten history through a fork projection", async () => {
     const { store } = await createStore();
@@ -610,7 +463,7 @@ describe("metadata v5 session history generation", () => {
         a: FIRST_TREE,
         b: SECOND_TREE,
       });
-      forget(store, "session");
+      resetHistory(store, "session");
 
       const projection = store.exportForkProjection({
         parentSessionFile: SESSION_FILE,
@@ -641,14 +494,14 @@ describe("metadata v5 session history generation", () => {
   it("keeps a forgotten generation retired across reopen", async () => {
     const fixture = await createStore();
     seedLineage(fixture.store, "session", ["a"], { a: FIRST_TREE });
-    forget(fixture.store, "session");
+    resetHistory(fixture.store, "session");
     fixture.store.close();
 
     const store = await reopen(fixture);
     try {
       // Reopening reads the stored generation: it neither re-increments the
       // epoch nor restores a coordinate the forget removed.
-      expect(store.describeSessionHistory("session")).toMatchObject({
+      expect(sessionHistory(store, "session")).toMatchObject({
         epoch: 1,
         resetPending: true,
         slotCount: 0,

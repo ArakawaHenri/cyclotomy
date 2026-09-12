@@ -1,5 +1,5 @@
-import type { CyclotomyI18n } from "../presentation/i18n.ts";
-import { messageOfUnknown } from "../presentation/unknown-error.ts";
+import type { CyclotomyI18n } from "./i18n.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 
 export type CyclotomyCommandAction =
   "status" | "pause" | "resume" | "enable" | "disable" | "usage";

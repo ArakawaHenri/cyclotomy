@@ -11,7 +11,7 @@ import {
   loadCyclotomyConfig,
   type CyclotomyConfig,
 } from "../config.ts";
-import { createCyclotomyI18n } from "../presentation/i18n.ts";
+import { createCyclotomyI18n } from "./i18n.ts";
 import { registerCyclotomyLifecycle } from "./lifecycle.ts";
 import { CyclotomyRuntime } from "./runtime.ts";
 

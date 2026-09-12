@@ -1,122 +1,47 @@
-# 锁协议过渡与授权规格
+# Workspace lock protocol
 
-状态：目录锁到原生文件锁的实现与验收契约。跨进程协议检查使用发布版 0.2.4 与当前实现；发布验收需要 Linux、macOS、Windows CI。
+Cyclotomy coordinates writers through the fixed `<store>/workspace.lock` path.
 
-## 1. 协议表示
+- Releases through 0.2.4 use a directory containing an owner record.
+- The current protocol uses a persistent, zero-length, single-link regular file protected by an operating-system lock. `lock-protocol.json` records `{ "format": 1, "protocol": "native-file-v1" }`.
 
-所有版本使用同一个固定路径 `<store>/workspace.lock`：
+## Acquisition and handover
 
-- 旧协议：目录，内含 `owner-<uuid>.json`。
-- 新协议：常驻的零长度、单链接普通文件，使用原生整文件锁。
+A writable open binds the physical store directory and obtains its workspace lock before opening metadata. Lock protocol, metadata schema, and tree format have independent commit boundaries.
 
-不另建一个与旧目录互不排斥的业务锁。0.2.4 的 `mkdir` 遇到普通文件会失败，随后目录类型检查会拒绝授予 `WorkspaceWriteAuthority`。这一拒绝条件由已经发布的代码提供，不依赖旧客户端理解新标记。
+For a fresh store, the lock file is created exclusively. To convert an old store, Cyclotomy waits for the existing directory to disappear and competes to create the regular file at the same path. If another old client creates the directory first, the new client retries without overwriting it. A file's creation never substitutes for actually acquiring its native lock.
 
-另设 `<store>/lock-protocol.json`：
+The file and directory protocols exclude each other at the same path. Published 0.2.4 rejects a regular file where it expects a directory. The protocol marker is published only after native acquisition and physical identity verification. Unknown markers and inconsistent path shapes fail closed.
 
-```json
-{ "format": 1, "protocol": "native-file-v1" }
-```
+Normal acquisition opens an existing native lock without `O_CREAT`. Releasing it closes the owned handle and leaves the file in place. Process termination releases the operating-system lock.
 
-标记通过同目录临时文件原子发布，并按平台持久化契约完成同步。它记录已完成的协议切换，不能替代实际持锁。未知、损坏的标记不允许降级为旧协议。
+## Foreground priority
 
-### 1.1 有序协议表
+Foreground operations first try the workspace lock normally. A contending operation holds a shared operating-system lock on the persistent empty `foreground.lock` file while it waits and runs. Multiple waiters coexist, and process exit releases their demand automatically.
 
-锁模块维护一张从旧到新的只读协议表，当前仅包含实际存在的旧目录协议和 `native-file-v1`；最新版由表尾确定，协议标识直接索引到表中位置。旧目录协议由发布版的路径形态识别，不为它补写一个不存在的历史标记。协议表不使用 `previous` 对象链，也不预建尚未存在的后继协议。
+Automatic GC tries the workspace lock without waiting. While running, it briefly probes the demand file with an exclusive lock every 25 ms and cancels when a waiter appears. The probe is released immediately. GC keeps the workspace lock until its current durable operation and resource cleanup have finished; the demand file never grants write authority. A missing or invalid demand channel postpones maintenance without changing foreground write authorization.
 
-每个相邻转换由锁模块中的专用交接函数实现，负责取得源协议互斥、排斥旧写入者、处理中断和竞争，并返回目标协议下实际持有的锁。每步提交前重新核验路径与协议；竞争造成状态变化时重新识别，不能继续执行基于过时观察选择的步骤。普通业务只有在交接完成后才能取得写权限。
+## Authority
 
-这张表与元数据、树格式的版本表分别维护。元数据版本不代替锁协议版本，锁交接也不依赖需要业务写锁才能执行的 SQL 迁移。已是最新协议只跳过转换，每次业务操作仍须真正取得原生锁并验证身份。
+The write authority binds the store, parent directory chain and open lock file by their physical identities. Persistent writes and destructive operations revalidate that binding. A mismatch permanently revokes the authority, even if the original path is later restored. Cleanup never deletes a replacement owner's path.
 
-## 2. 正常取得规则
+These checks cannot roll back a filesystem call already entered into the kernel. Failures preserve the distinction between completed work, possible workspace changes and unsuccessful cleanup.
 
-正常可写打开调用锁模块的统一取得入口。该入口识别协议并自动执行所需的初始化、相邻交接或中断续接，成功后直接返回当前协议下持有的锁；不要求升级命令或用户确认。只读诊断使用独立的观察入口。未知或损坏状态仍报告实际错误，自动升级不意味着抢占旧锁或覆盖不一致文件。
+## Interrupted state
 
-| 协议标记       | 固定锁路径             | 新实现的行为                                                       |
-| -------------- | ---------------------- | ------------------------------------------------------------------ |
-| 缺失           | 不存在                 | 独占建立当前协议文件；旧客户端抢先建立目录时转入旧协议交接         |
-| 缺失           | 旧目录                 | 自动进入旧协议交接流程，完成后才授予业务写权限                     |
-| 缺失           | 合法的零长度普通文件   | 视为可能中断的切换；取得该文件原生锁、复核身份后自动补全标记       |
-| native-file-v1 | 合法的零长度普通文件   | 打开已有文件并取得原生锁，复核身份和标记后授予权限                 |
-| native-file-v1 | 不存在、目录或其他类型 | `lock-protocol-inconsistent`，拒绝写入；不得自动重建锁文件         |
-| 未知或损坏     | 任意                   | `unsupported-lock-protocol` 或 `lock-protocol-corrupt`，只提供诊断 |
+| State                                      | Behavior                                                       |
+| ------------------------------------------ | -------------------------------------------------------------- |
+| Existing legacy directory                  | Wait; an old owner record never authorizes stealing it.        |
+| No marker and no lock path                 | Compete to initialize the native file.                         |
+| Valid native file without marker           | Acquire the file, verify identity and finish the marker.       |
+| Native marker and valid file               | Acquire the existing native lock.                              |
+| Native marker with missing or invalid file | Reject without recreating the lock.                            |
+| Native protocol with V4 metadata           | After acquiring the lock, continue the V4→V5 metadata upgrade. |
 
-普通文件还必须满足稳定父目录绑定、单链接、无符号链接等约束。已有非空文件不是合法的新协议对象，不覆盖其内容。
+An abandoned legacy directory requires an offline filesystem operation: stop every accessing process, back up the store, verify that the path is a directory and that the marker is absent, and move the directory aside. Native lock files are never removed for recovery. User-facing details are in [configuration and storage](configuration.md).
 
-新协议正常路径使用不带 `O_CREAT` 的打开方式。初始化、交接、竞争重试和最终取得共享一个总截止时间与取消信号，不在每个阶段重新计时。协议已经激活后不回退到目录锁。
+## Verification
 
-## 3. 旧目录到原生文件的交接
+`npm run test:lock-protocol` compares the current lock implementation with the published 0.2.4 artifact across seven cross-process scenarios: old-holder exclusion, old-client refusal after activation, exclusive-create races, forced process termination, abandoned old directories, multiple native contenders and physical lock replacement.
 
-1. 绑定存储根及父目录身份，通过现有旧协议真实取得目录锁。只查看 owner 文件或 PID 不够。
-2. 持旧锁验证支持的存储状态。交接代码此时不执行捕获、恢复或 GC。
-3. 按旧协议释放自己的授权和目录锁。释放失败则停止交接，不删除或改名其他 owner 的路径。
-4. 在固定路径尝试 `open(..., O_CREAT | O_EXCL, 0600)`，创建零长度文件。目录与文件之间没有原子替换，竞争胜负由这次独占创建决定。
-5. 若旧进程先 `mkdir` 成功，独占创建必须失败；新实现退回步骤 1，尊重取得旧锁的进程。不得覆盖该目录。
-6. 若另一个新进程先创建文件，使用它已经创建的合法文件，参与同一原生锁竞争；不得另开一个独立 inode。
-7. 无论谁创建文件，都必须实际取得该文件的原生锁。创建文件本身不代表持锁。
-8. 比较已打开句柄、固定路径和存储根身份，重新检查协议标记及存储版本。原子发布 native-file-v1 标记之后，才允许业务操作取得写授权。
-
-步骤 3 至步骤 7 之间没有业务写权限。间隙可以让旧进程先完成一次操作，但不允许旧写入者与新写入者并发。重试会耗尽截止时间，这是可报告的竞争结果，不是安全性漏洞。
-
-若旧锁长期存在，即使其 owner 看似已经退出，也不自动偷锁。`doctor` 给出旧锁恢复建议；一次性的离线恢复要求关闭所有可能访问该存储的 Pi 实例，再隔离原目录。恢复范围严格限制为该旧锁目录。
-
-## 4. 身份绑定和永久吊销
-
-原生互斥与工作区写授权是两个条件。持锁对象必须记录精确 BigInt 身份：存储根、固定路径的父目录链，以及打开的锁文件 `dev/ino`。
-
-在等待完成后、交接标记提交前、授予写权限前，以及关键持久提交和破坏性文件调用前，按原有授权边界复核：
-
-- 句柄仍指向所持锁的普通文件。
-- 固定路径仍指向该文件。
-- 存储根和父目录链仍绑定同一物理目录。
-- 协议标记仍为当前支持的协议。
-
-任何失配永久吊销这次授权。后来把旧路径移回来不能恢复权限；释放时仅关闭本进程自己的句柄，不按路径删除新 owner 的文件。
-
-已提交或已进入内核的文件操作不能被身份复核回滚。发现失配后停止继续写入，并如实报告可能发生的改动。此机制不宣称能抵御任意同用户进程在每个系统调用间主动替换整个控制目录。
-
-## 5. 中断恢复表
-
-| 中断点                         | 重启后的行为                                         |
-| ------------------------------ | ---------------------------------------------------- |
-| 等待旧 owner 期间              | 原 owner 继续受尊重；没有产生新写权限                |
-| 已取得旧目录锁，但尚未成功释放 | 旧协议可能留下僵尸目录，需要一次离线恢复             |
-| 旧锁已释放，新文件尚未创建     | 标记缺失，重新按旧协议交接                           |
-| 新文件已创建，标记尚未提交     | 旧客户端因文件类型拒绝；新客户端取得原生锁后完成标记 |
-| 标记已提交                     | 原生锁随句柄/进程结束释放，正常重新取得              |
-| 标记称 native，但文件缺失      | 报告不一致；不自动创建新 inode 与潜在旧持有者分裂    |
-
-原生锁激活后，进程退出会释放互斥；交接尚未完成时，遗留目录仍可能需要离线恢复。
-
-## 6. 锁协议与元数据版本
-
-锁协议与元数据分别提交。目录锁交接完成后，进程可能在元数据从 V4 升到 V5 之前退出，因此原生锁与 V4 同时存在是可恢复的中断状态。下一次正常可写打开取得原生锁后继续元数据迁移。
-
-原生文件锁排斥 0.2.4 的依据是同路径的目录/文件类型互斥。V5 的版本检查和 writer fence 保护元数据：冷开更高版本会由版本识别拒绝；已有旧连接在事务入口发现 schema 变化时停止。writer fence 是额外的写入约束，不假设每种不兼容请求都会走到 SQL trigger。
-
-同版本的 history_epoch 不一致表示历史被主动清理，应撤销旧代操作并在合法边界接入新代，不能报告为“需要升级软件”。
-
-## 7. 验收覆盖
-
-`npm run test:lock-protocol` 使用发布的 0.2.4 包与当前锁模块运行七种跨进程场景：
-
-| 场景                       | 必须满足的行为                             |
-| -------------------------- | ------------------------------------------ |
-| 旧客户端持有目录锁         | 新客户端等待或超时；旧者释放后自动交接     |
-| 原生协议已激活，持锁或空闲 | 旧客户端均无法取得目录锁授权               |
-| 独占创建文件时旧客户端抢先 | 新客户端重试，不覆盖旧 owner 的目录        |
-| 原生持有者被杀死           | 后继进程复用同一锁文件并成功取得互斥       |
-| 旧客户端退出时遗留目录     | 普通取得继续等待；明确的离线恢复隔离原目录 |
-| 两个新客户端竞争           | 使用同一 inode，始终只有一个持有者         |
-| 原生锁路径被替换           | 原授权失效，释放时保留替代对象             |
-
-这些场景验证协议互斥。`test/maintenance-lock-integration.test.ts` 另行通过真实 Pi 的捕获、恢复命令及维护 CLI 的 GC 入口验证业务边界：外部进程持锁期间不得提交检查点、改写工作区或删除垃圾；释放后操作完成，检查点内容可读取。
-
-常规测试还覆盖全新工作区直接产生检查点、存储根/父目录/锁文件被替换时永久吊销授权、标记损坏、等待和交接期间取消、V4→V5 迁移及旧连接拒绝，以及 forget 前后实例交错时旧 epoch 不能提交或复活历史。
-
-协议矩阵、业务集成和故障注入分别验证互斥、调用入口和失效边界。三者都必须通过；这些检查不等同于驱动发布版 Pi 执行完整业务流程。所有功能与协议检查在 Linux、macOS、Windows 上执行。
-
-## 8. 回退
-
-原生协议一旦激活，重装 0.2.4 也不能直接取得锁。若交接中断且元数据仍为 V4，必须先关闭所有访问进程，核验存储版本，再受控撤销 native 标记和锁文件，让旧版恢复创建目录锁。不能把一次非阻塞取锁成功当作所有进程都已关闭。
-
-元数据已升级 V5 时，回退需要恢复升级前的一致存储备份；不得直接降低 `user_version`。备份和物理对象必须来自同一一致时点，具体边界见维护 CLI 契约。
+`test/pi-lock-integration.test.ts` exercises capture and restore under cross-process contention, then verifies that automatic GC yields to local and external foreground operations and subsequently completes. `test/foreground-demand.test.ts` covers concurrent waiters, cancellation and process termination. Other tests cover ordered multi-store acquisition, permanent authority revocation, cancellation and resource cleanup. CI runs these checks on Linux, macOS and Windows.

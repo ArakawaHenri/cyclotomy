@@ -8,10 +8,6 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import assert from "node:assert/strict";
 
-import {
-  collectCyclotomyGarbage,
-  type CyclotomyGcOptions,
-} from "../src/application/gc.ts";
 import { contentIdFromBytes } from "../src/infrastructure/content-store/ids.ts";
 import {
   collectGarbage,
@@ -31,7 +27,7 @@ const ALL_MANAGED_SCOPE = { kind: "all-managed" } as const;
 /**
  * GC scale indicators for the budgets in docs/performance-contract.md
  * §3-§4: G10-vs-G1 peak-RSS delta (<= 128 MiB), full-GC duration ratio
- * (<= 15), automatic maintenance front end (~1 s), and extra file descriptors
+ * (<= 15), and extra file descriptors
  * (<= 64).
  *
  * These runs are indicators and trends only. The contract reserves acceptance
@@ -52,15 +48,8 @@ const ALL_MANAGED_SCOPE = { kind: "all-managed" } as const;
 const G1_ROOTS = positiveIntegerEnv("CYCLOTOMY_GC_BENCH_ROOTS", 32);
 const G10_ROOTS = G1_ROOTS * 10;
 const FILES_PER_TREE = positiveIntegerEnv("CYCLOTOMY_GC_BENCH_FILES", 64);
-// The automatic front end runs on the contract's small qualified dataset, so
-// keep this scenario several times smaller than G1 while still guaranteeing
-// that a 1 ms budget expires before marking can finish.
-const MAINTENANCE_ROOTS = Math.max(16, Math.min(G1_ROOTS, 24));
-const MAINTENANCE_FILES_PER_TREE = Math.max(16, Math.min(FILES_PER_TREE, 32));
-
 const BLOB_BYTES = 1024;
 const CHANGED_BYTES = 16;
-const AUTOMATIC_BUDGET_MS = 1_000;
 const PUBLICATION_CONCURRENCY = 32;
 const RSS_SAMPLE_INTERVAL_MS = 20;
 const OPERATION = "GC performance benchmark";
@@ -289,16 +278,6 @@ function openFileDescriptorCount(): number | null {
   }
 }
 
-function listFilesRecursively(directory: string): readonly string[] {
-  const files: string[] = [];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) files.push(...listFilesRecursively(path));
-    else files.push(path);
-  }
-  return files.sort();
-}
-
 interface MeasuredPass {
   readonly report: GcReport;
   readonly durationMs: number;
@@ -318,17 +297,6 @@ function withCollectionLock(
   const root = nativeObjectStoreLayout(store, OPERATION).root;
   return withWorkspaceLock(root, OPERATION, (authority) =>
     collectGarbage(authority, store, metadata, options),
-  );
-}
-
-function withAutomaticCollectionLock(
-  store: NativeObjectStore,
-  metadata: Pick<CurrentMetadataStore, "listReferencedTreeOids">,
-  options: CyclotomyGcOptions,
-): Promise<GcReport> {
-  const root = nativeObjectStoreLayout(store, OPERATION).root;
-  return withWorkspaceLock(root, OPERATION, (authority) =>
-    collectCyclotomyGarbage(authority, store, metadata, options),
   );
 }
 
@@ -477,67 +445,8 @@ async function reportScaleIndicators(): Promise<void> {
   });
 }
 
-async function reportMaintenanceIndicators(): Promise<void> {
-  const fixture = await buildGcBenchmarkFixture(
-    MAINTENANCE_ROOTS,
-    MAINTENANCE_FILES_PER_TREE,
-  );
-  const metadata = { listReferencedTreeOids: () => fixture.rootOids };
-  const objectsPath = join(fixture.storeRoot, "objects");
-  const objectsBefore = listFilesRecursively(objectsPath);
-  const budgetStopStartedAt = performance.now();
-  const budgetStop = await withAutomaticCollectionLock(
-    fixture.store,
-    metadata,
-    { objectGraceMs: 0, budgetMs: 1 },
-  );
-  const budgetStopMs = performance.now() - budgetStopStartedAt;
-  assert.equal(budgetStop.stopped, "budget-exceeded");
-  assert.equal(budgetStop.freedBytes, 0);
-  assert.deepEqual(listFilesRecursively(objectsPath), objectsBefore);
-
-  const completedStartedAt = performance.now();
-  const completed = await withAutomaticCollectionLock(fixture.store, metadata, {
-    objectGraceMs: 0,
-    budgetMs: 1_000_000,
-  });
-  const completedMs = performance.now() - completedStartedAt;
-  assert.equal(completed.stopped, undefined);
-  assert.ok(completed.removedBlobs >= fixture.deadObjectCount);
-  assert.ok(completed.freedBytes > 0);
-  for (const deadPath of fixture.deadSamplePaths)
-    await assert.rejects(stat(deadPath), { code: "ENOENT" });
-  await fixture.store.readTree(fixture.rootOids[0]!);
-  reportIndicator("gc-maintenance/budget-stop", {
-    roots: MAINTENANCE_ROOTS,
-    filesPerTree: MAINTENANCE_FILES_PER_TREE,
-    deadObjects: fixture.deadObjectCount,
-    budgetMs: 1,
-    frontEndMs: budgetStopMs,
-    stopped: budgetStop.stopped ?? "completed",
-    freedBytes: budgetStop.freedBytes,
-  });
-  reportIndicator("gc-maintenance/completed", {
-    roots: MAINTENANCE_ROOTS,
-    filesPerTree: MAINTENANCE_FILES_PER_TREE,
-    deadObjects: fixture.deadObjectCount,
-    budgetMs: 1_000_000,
-    frontEndMs: completedMs,
-    stopped: completed.stopped ?? null,
-    removedBlobs: completed.removedBlobs,
-    keptObjects: completed.keptObjects,
-    freedBytes: completed.freedBytes,
-  });
-  reportIndicator("gc-maintenance/front-end-budget", {
-    automaticBudgetMs: AUTOMATIC_BUDGET_MS,
-    budgetStopFrontEndMs: budgetStopMs,
-    completedFrontEndMs: completedMs,
-  });
-}
-
 try {
   await reportScaleIndicators();
-  await reportMaintenanceIndicators();
 } finally {
   await Promise.all(
     roots.map((root) => rm(root, { recursive: true, force: true })),

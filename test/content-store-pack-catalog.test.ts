@@ -5,6 +5,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   rename,
   rm,
   unlink,
@@ -15,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { isOperationCancelled } from "../src/infrastructure/workspace-operation.ts";
 
 import {
   CatalogPackHandle,
@@ -149,6 +151,69 @@ afterEach(async () => {
 });
 
 describe("pack catalog", () => {
+  it("cleans an interrupted temporary write without publishing partial content", async () => {
+    const layout = await createLayout();
+    const catalog = new PackCatalog(layout);
+    const pack = await dataPack("cancelled publication");
+    const cancellation = new AbortController();
+    const prototype = (await fileHandlePrototype(layout.root)) as unknown as {
+      writeFile: FileHandle["writeFile"];
+    };
+    const write = prototype.writeFile;
+    vi.spyOn(prototype, "writeFile").mockImplementation(async function (
+      this: FileHandle,
+      data,
+      options,
+    ) {
+      if (typeof data !== "string" && Buffer.from(data).equals(pack.bytes)) {
+        await this.write(data.subarray(0, 16));
+        cancellation.abort(new Error("cancel during temporary write"));
+      }
+      return write.call(this, data, options);
+    });
+    const failure = await rejected(
+      withAuthority(layout, (authority) =>
+        catalog.publishPack(pack, authority, { signal: cancellation.signal }),
+      ),
+    );
+    expect(isOperationCancelled(failure, cancellation.signal)).toBe(true);
+    expect((await catalog.inventory()).packs).toEqual([]);
+    expect(await readdir(layout.incomingPacks)).toEqual([]);
+  });
+
+  it("finishes a visible publication before observing cancellation", async () => {
+    const layout = await createLayout();
+    const catalog = new PackCatalog(layout);
+    const pack = await dataPack("durable publication");
+    const cancellation = new AbortController();
+    const target = nativePackPath(layout, pack.pack.packId);
+    const prototype = (await fileHandlePrototype(layout.root)) as unknown as {
+      sync: FileHandle["sync"];
+    };
+    const sync = prototype.sync;
+    vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: FileHandle,
+    ) {
+      await sync.call(this);
+      if (
+        await readFile(target).then(
+          () => true,
+          () => false,
+        )
+      )
+        cancellation.abort();
+    });
+    await expect(
+      withAuthority(layout, (authority) =>
+        catalog.publishPack(pack, authority, { signal: cancellation.signal }),
+      ),
+    ).resolves.toMatchObject({ disposition: "published" });
+    expect(cancellation.signal.aborted).toBe(true);
+    expect(await readFile(target)).toEqual(Buffer.from(pack.bytes));
+    expect((await catalog.inventory()).packs).toHaveLength(1);
+    expect(await readdir(layout.incomingPacks)).toEqual([]);
+  });
+
   it("appends a small pack without reading unrelated historical payloads", async () => {
     const layout = await createLayout();
     const catalog = new PackCatalog(layout);

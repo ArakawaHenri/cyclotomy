@@ -150,7 +150,6 @@ describe("stored tree format v3", () => {
       limits,
     );
     expect(authenticated.manifest.entries).toEqual(ascending);
-    expect(authenticated.structuralObjectOids).toContain(firstOid);
     expect(authenticated.structuralObjects[0]).toEqual({
       kind: "root",
       oid: firstOid,
@@ -161,9 +160,6 @@ describe("stored tree format v3", () => {
     expect(
       authenticated.structuralObjects.some(({ kind }) => kind === "node"),
     ).toBe(true);
-    expect(authenticated.structuralObjects.map(({ oid }) => oid)).toEqual(
-      authenticated.structuralObjectOids,
-    );
     expect(authenticated.contentIds).toEqual(
       ascending.map((entry) => {
         if (entry.type !== "regular") throw new Error("expected regular entry");
@@ -201,9 +197,9 @@ describe("stored tree format v3", () => {
       store.read,
       limits,
     );
-    const changedNodes = changedTree.structuralObjectOids.filter(
-      (oid) => store.structures.get(oid)?.kind === "node",
-    );
+    const changedNodes = changedTree.structuralObjects
+      .map(({ oid }) => oid)
+      .filter((oid) => store.structures.get(oid)?.kind === "node");
 
     expect(changedOid).not.toBe(originalOid);
     expect(changedNodes.length).toBe(originalNodes.size);
@@ -411,9 +407,9 @@ describe("stored tree format v3", () => {
       limits,
     );
     expect(authenticated.manifest).toEqual(manifest);
-    expect([...authenticated.structuralObjectOids].sort()).toEqual(
-      [...firstStore.structures.keys()].sort(),
-    );
+    expect(
+      [...authenticated.structuralObjects.map(({ oid }) => oid)].sort(),
+    ).toEqual([...firstStore.structures.keys()].sort());
   });
 
   it("round-trips a legal Git scope path larger than the soft node target", async () => {
@@ -860,7 +856,9 @@ describe("stored tree format v3", () => {
     );
 
     expect(authenticated.manifest.format).toBe(TREE_MANIFEST_FORMAT_V2);
-    expect(authenticated.structuralObjectOids).toEqual([treeOid]);
+    expect(authenticated.structuralObjects.map(({ oid }) => oid)).toEqual([
+      treeOid,
+    ]);
     expect(authenticated.structuralObjects).toEqual([
       { kind: "root", oid: treeOid },
     ]);

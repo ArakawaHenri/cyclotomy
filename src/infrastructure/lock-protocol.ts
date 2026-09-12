@@ -84,11 +84,6 @@ export class LockProtocolCorruptError extends Error {
   }
 }
 
-/** Exact canonical bytes published as a completed protocol switch marker. */
-export function nativeLockProtocolMarkerBytes(): Buffer {
-  return Buffer.from(MARKER_BYTES);
-}
-
 export function lockProtocolMarkerPath(storeRoot: string): string {
   return join(storeRoot, LOCK_PROTOCOL_MARKER_FILE);
 }
@@ -215,7 +210,7 @@ function readMarkerBytes(
 /**
  * Read and authenticate the durable protocol marker. The file is small and
  * bounded, so the synchronous implementation is usable on the pre-mutation
- * authority-assertion path as well as by read-only diagnostics.
+ * authority-assertion path.
  */
 export function readLockProtocolMarkerSync(
   storeRoot: string,

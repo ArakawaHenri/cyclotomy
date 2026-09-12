@@ -168,7 +168,3 @@ export function workspaceStorePath(
   const hash = createHash("sha256").update(canonicalWorkspace).digest("hex");
   return resolve(storageRootPath, hash);
 }
-
-export function storeMetadataPath(root: string): string {
-  return join(root, "state.db");
-}

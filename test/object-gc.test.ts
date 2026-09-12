@@ -1,4 +1,3 @@
-import { performance } from "node:perf_hooks";
 import { isOperationCancelled } from "../src/infrastructure/workspace-operation.ts";
 import { createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
@@ -53,6 +52,8 @@ import {
 } from "../src/infrastructure/workspace-lock.ts";
 import { nativeObjectLayout } from "../src/infrastructure/workspace-store.ts";
 import {
+  checkpointState,
+  readTestSessionRegistration,
   commitTestNodeState,
   createTestCurrentMetadataStore,
   registerTestSession,
@@ -545,8 +546,7 @@ describe("object garbage collection", () => {
       commitTestNodeState(metadata, "s", "leaf", treeOid);
     });
 
-    // The distinct class is what the CLI turns into an actionable refusal
-    // rather than a generic I/O failure.
+    // The refusal preserves retained data without attempting deletion.
     await expect(
       collectGarbage(store, metadata, { maxObjects: 2 }),
     ).rejects.toBeInstanceOf(GarbageCollectionLimitError);
@@ -2027,120 +2027,60 @@ async function plantOrphan(root: string, nibble: string): Promise<string> {
   return orphan;
 }
 
-describe("garbage collection budgets and cancellation", () => {
-  it("changes nothing when the budget is spent before the first write", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-budget-"));
+describe("garbage collection cancellation", () => {
+  it("reports completed pack publication when cancellation stops compaction", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-published-stop-"));
     roots.push(root);
     const store = await openObjectStore(root);
-    const orphan = await plantOrphan(root, "a");
-
-    const report = await collectGarbage(
-      store,
-      { listReferencedTreeOids: () => [] },
-      { graceMs: 1, now: Date.now(), budgetMs: 0 },
+    const bytes = Buffer.from(
+      "retained content through an interrupted compaction",
     );
-
+    const blobOid = await publishTestBlob(store, bytes);
+    const treeOid = await publishTestTree(
+      store,
+      [{ path: "live.txt", type: "regular", blobOid, recreationMode: 0o644 }],
+      scope,
+    );
+    const metadata = { listReferencedTreeOids: () => [treeOid] };
+    const controller = new AbortController();
+    const publishPack = PackCatalog.prototype.publishPack;
+    const published = vi
+      .spyOn(PackCatalog.prototype, "publishPack")
+      .mockImplementationOnce(async function (
+        this: PackCatalog,
+        ...args: Parameters<typeof publishPack>
+      ) {
+        const result = await publishPack.apply(this, args);
+        controller.abort();
+        return result;
+      });
+    const report = await collectGarbage(store, metadata, {
+      graceMs: 0,
+      now: Date.now() + 60_000,
+      signal: controller.signal,
+    });
+    expect(published).toHaveBeenCalledOnce();
     expect(report).toMatchObject({
-      stopped: "budget-exceeded",
-      removedBlobs: 0,
+      stopped: "cancelled",
+      writtenPacks: 1,
       removedTrees: 0,
-      removedTmpFiles: 0,
+      removedBlobs: 0,
+      removedPacks: 0,
       freedBytes: 0,
       keptObjects: null,
     });
-    await expect(readFile(orphan, "utf8")).resolves.toBe("orphan a");
-  });
-
-  it("stops when planning consumes the budget before the first mutation", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cyclotomy-gc-budget-plan-"));
-    roots.push(root);
-    const store = await openObjectStore(root);
-    const orphan = await plantOrphan(root, "9");
-    let clock = 0;
-    vi.spyOn(performance, "now").mockImplementation(() => clock);
-    const report = await collectGarbage(
-      store,
-      { listReferencedTreeOids: () => [] },
-      {
-        graceMs: 0,
-        budgetMs: 10_000,
-        onProgress: ({ phase }) => {
-          if (phase === "compaction") clock = 10_001;
-        },
-      },
-    );
-    expect(clock).toBe(10_001);
-    expect(report).toMatchObject({
-      stopped: "budget-exceeded",
-      removedBlobs: 0,
-      writtenPacks: 0,
-      freedBytes: 0,
+    published.mockRestore();
+    await expect(store.readTree(treeOid)).resolves.toMatchObject({
+      entries: [{ path: "live.txt", blobOid }],
     });
-    await expect(readFile(orphan, "utf8")).resolves.toBe("orphan 9");
+    await expect(store.readBlob(blobOid)).resolves.toEqual(bytes);
+    const resumed = await collectGarbage(store, metadata, {
+      graceMs: 0,
+      now: Date.now() + 60_000,
+    });
+    expect(resumed.stopped).toBeUndefined();
+    await expect(store.readBlob(blobOid)).resolves.toEqual(bytes);
   });
-
-  it.each(["cancelled", "budget-exceeded"] as const)(
-    "reports completed pack publication when %s stops compaction",
-    async (reason) => {
-      const root = await mkdtemp(
-        join(tmpdir(), "cyclotomy-gc-published-stop-"),
-      );
-      roots.push(root);
-      const store = await openObjectStore(root);
-      const bytes = Buffer.from(
-        "retained content through an interrupted compaction",
-      );
-      const blobOid = await publishTestBlob(store, bytes);
-      const treeOid = await publishTestTree(
-        store,
-        [{ path: "live.txt", type: "regular", blobOid, recreationMode: 0o644 }],
-        scope,
-      );
-      const metadata = { listReferencedTreeOids: () => [treeOid] };
-      const controller = new AbortController();
-      let clock = 0;
-      vi.spyOn(performance, "now").mockImplementation(() => clock);
-      const publishPack = PackCatalog.prototype.publishPack;
-      const published = vi
-        .spyOn(PackCatalog.prototype, "publishPack")
-        .mockImplementationOnce(async function (
-          this: PackCatalog,
-          ...args: Parameters<typeof publishPack>
-        ) {
-          const result = await publishPack.apply(this, args);
-          if (reason === "cancelled") controller.abort();
-          else clock = 10_001;
-          return result;
-        });
-      const report = await collectGarbage(store, metadata, {
-        graceMs: 0,
-        now: Date.now() + 60_000,
-        budgetMs: 10_000,
-        signal: controller.signal,
-      });
-      expect(published).toHaveBeenCalledOnce();
-      expect(report).toMatchObject({
-        stopped: reason,
-        writtenPacks: 1,
-        removedTrees: 0,
-        removedBlobs: 0,
-        removedPacks: 0,
-        freedBytes: 0,
-        keptObjects: null,
-      });
-      published.mockRestore();
-      await expect(store.readTree(treeOid)).resolves.toMatchObject({
-        entries: [{ path: "live.txt", blobOid }],
-      });
-      await expect(store.readBlob(blobOid)).resolves.toEqual(bytes);
-      const resumed = await collectGarbage(store, metadata, {
-        graceMs: 0,
-        now: Date.now() + 60_000,
-      });
-      expect(resumed.stopped).toBeUndefined();
-      await expect(store.readBlob(blobOid)).resolves.toEqual(bytes);
-    },
-  );
 
   it.each([false, true])(
     "cancels inside a rooted content read and retains cleanup failure=%s",
@@ -2378,5 +2318,50 @@ describe("garbage collection budgets and cancellation", () => {
     expect(events.map(({ phase }) => phase)).toContain("sweep");
     const sweep = events.filter(({ phase }) => phase === "sweep");
     expect(sweep.at(-1)).toMatchObject({ done: 1, total: 1 });
+  });
+});
+
+describe("durable checkpoint roots", () => {
+  it("keeps checkpoint objects rooted regardless of session-file existence", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cyclotomy-gc-session-"));
+    roots.push(directory);
+    const metadata = await createTestCurrentMetadataStore(
+      join(directory, "state.db"),
+      directory,
+    );
+    try {
+      const store = await openObjectStore(directory);
+      const blobOid = await publishTestBlob(store, Buffer.from("rooted"));
+      const treeOid = await publishTestTree(
+        store,
+        [
+          {
+            path: "rooted.txt",
+            type: "regular",
+            blobOid,
+            recreationMode: 0o644,
+          },
+        ],
+        ALL_MANAGED_SCOPE,
+      );
+      const sessionFile = join(directory, "not-yet-persisted.jsonl");
+      await withTestMetadataWriteAuthority(directory, metadata, () => {
+        registerTestSession(metadata, "live", sessionFile, ["entry"]);
+        commitTestNodeState(metadata, "live", "entry", treeOid);
+      });
+
+      const report = await collectGarbage(store, metadata, {
+        now: Date.now() + 1_000,
+        graceMs: 0,
+      });
+
+      expect(report).toMatchObject({ removedTrees: 0, removedBlobs: 0 });
+      expect(
+        readTestSessionRegistration(join(directory, "state.db"), "live"),
+      ).toBeDefined();
+      expect(checkpointState(metadata, "live", "entry")?.treeOid).toBe(treeOid);
+    } finally {
+      metadata.close();
+    }
   });
 });

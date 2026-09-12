@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
-import { CyclotomyI18n } from "../src/presentation/i18n.ts";
+import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import {
   notifyCheckpointInitializationConflict,
   notifyPostMutationConflict,
@@ -10,7 +10,7 @@ import {
   notifyRestorePreparationConflict,
   notifyRestoreProtocolOutcome,
 } from "../src/pi/restore-notifications.ts";
-import { formatUiDetail } from "../src/presentation/restore-presentation.ts";
+import { formatUiDetail } from "../src/pi/restore-presentation.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 
 function plan(

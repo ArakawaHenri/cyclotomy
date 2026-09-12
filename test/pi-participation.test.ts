@@ -23,7 +23,6 @@ import {
   checkpointState,
   createTestCurrentMetadataStore,
 } from "./metadata-fixture.ts";
-import {} from "../src/infrastructure/workspace-lock.ts";
 
 let workspace: string;
 let agentDir: string;
@@ -136,7 +135,6 @@ describe("Cyclotomy participation boundary", () => {
           onProgress: (progress) => {
             options.onProgress?.(progress);
             if (progress.phase === phase && !consumed) {
-              expect(pi.statuses.get("cyclotomy")).toContain("Esc to cancel");
               consumed = pi.terminalInput("\u001b");
               expect(options.signal?.aborted).toBe(true);
             }
@@ -242,35 +240,47 @@ describe("Cyclotomy participation boundary", () => {
     db.close();
   });
 
-  it("throttles file progress while showing each phase and clearing the status", async () => {
+  it("keeps immediate capture progress invisible", async () => {
     const pi = new FakePi(workspace, registerCyclotomy);
     pi.manager.appendEntry();
     const statuses = vi.spyOn(pi.context.ui, "setStatus");
-    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
     vi.spyOn(CheckpointService.prototype, "prepareCurrent").mockImplementation(
       async (_view, options = {}) => {
-        options.onProgress?.({ phase: "scan", files: 1, bytes: 1024 });
-        clock.mockReturnValue(100);
-        options.onProgress?.({ phase: "scan", files: 2, bytes: 2048 });
-        clock.mockReturnValue(300);
         options.onProgress?.({ phase: "scan", files: 3, bytes: 3072 });
         options.onProgress?.({ phase: "publish", files: 3, bytes: 3072 });
-        options.onProgress?.({ phase: "validate", files: 3, bytes: 3072 });
         return { ok: false, error: { kind: "cancelled" } };
       },
     );
-
     await pi.startSession("startup");
-
-    const progress = statuses.mock.calls
-      .map(([, message]) => message)
-      .filter((message) => message?.includes("files"));
-    expect(progress).toHaveLength(4);
-    expect(progress[0]).toContain("scanning · 0 files");
-    expect(progress[1]).toContain("scanning · 3 files");
-    expect(progress[2]).toContain("saving · 3 files");
-    expect(progress[3]).toContain("verifying · 3 files");
+    expect(
+      statuses.mock.calls.some(([, message]) => message?.includes("files")),
+    ).toBe(false);
     expect(pi.statuses.has("cyclotomy")).toBe(false);
+  });
+
+  it("shows the latest progress for a slow capture and clears it afterward", async () => {
+    const pi = new FakePi(workspace, registerCyclotomy);
+    pi.manager.appendEntry();
+    const shown = Promise.withResolvers<void>();
+    const setStatus = pi.context.ui.setStatus;
+    vi.spyOn(pi.context.ui, "setStatus").mockImplementation((key, message) => {
+      setStatus(key, message);
+      if (message?.includes("scanning · 3 files")) shown.resolve();
+    });
+    vi.spyOn(
+      CheckpointService.prototype,
+      "prepareCurrent",
+    ).mockImplementationOnce(async (_view, options = {}) => {
+      options.onProgress?.({ phase: "scan", files: 3, bytes: 3072 });
+      await shown.promise;
+      expect(pi.statuses.get("cyclotomy")).toContain("Esc to cancel");
+      expect(pi.terminalInput("\u001b")).toBe(true);
+      expect(options.signal?.aborted).toBe(true);
+      return { ok: false, error: { kind: "cancelled" } };
+    });
+    await pi.startSession("startup");
+    expect(pi.statuses.has("cyclotomy")).toBe(false);
+    expect(pi.terminalInputHandlers.size).toBe(0);
   });
 
   it("starts paused when CYCLOTOMY_ENABLED is zero and resumes explicitly", async () => {
@@ -531,17 +541,18 @@ describe("Cyclotomy participation boundary", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const prepare = CheckpointService.prototype.prepareCurrent;
     vi.spyOn(
-      CyclotomyRuntime.prototype,
-      "maybeRunAutomaticGc",
-    ).mockImplementation(async () => {
+      CheckpointService.prototype,
+      "prepareCurrent",
+    ).mockImplementationOnce(async function (
+      this: CheckpointService,
+      view,
+      options,
+    ) {
       entered();
       await gate;
-      return {
-        kind: "completed",
-        value: undefined,
-        cleanup: { kind: "settled" },
-      };
+      return prepare.call(this, view, options);
     });
     const close = vi.spyOn(CyclotomyRuntime.prototype, "close");
     const inFlight = pi.endTurn(0);
@@ -663,17 +674,19 @@ describe("Cyclotomy participation boundary", () => {
     pi.manager.appendEntry();
 
     await pi.startSession("startup");
+    expect(pi.notifications).toEqual([]);
     await pi.runCommand("cyclotomy");
     expect(pi.notifications.at(-1)).toEqual({
       message:
-        "Cyclotomy is paused in this Pi instance. Run /cyclotomy resume to start it again.",
+        "Cyclotomy requires a saved session. It is unavailable with --no-session or in-memory sessions.",
       level: "info",
     });
 
     pi.notifications.length = 0;
     await pi.runCommand("cyclotomy", "resume");
     expect(pi.notifications.at(-1)).toEqual({
-      message: "Cyclotomy is unavailable in this session.",
+      message:
+        "Cyclotomy requires a saved session. It is unavailable with --no-session or in-memory sessions.",
       level: "info",
     });
     expect(

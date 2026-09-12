@@ -1,4 +1,3 @@
-import { readSessionHistoryFingerprint } from "./metadata/history.ts";
 import {
   closeSync,
   constants as fsConstants,
@@ -19,7 +18,6 @@ import {
   captureCheckpointSlot,
   checkpointSlotIsBlocked,
   checkpointSlotsEqual,
-  checkpointSlotTreeOid,
   releaseCheckpointSlot,
   type BlockedCheckpointSlot,
   type CheckpointSlot,
@@ -30,7 +28,6 @@ import {
 } from "../domain/checkpoint-lineage.ts";
 import {
   MetadataError,
-  MetadataFingerprintChangedError,
   MetadataHistoryResetError,
   MetadataUnavailableError,
 } from "./metadata-error.ts";
@@ -63,7 +60,6 @@ import {
 
 export {
   MetadataError,
-  MetadataFingerprintChangedError,
   MetadataHistoryResetError,
   MetadataUnavailableError,
 } from "./metadata-error.ts";
@@ -864,30 +860,6 @@ function requireVerifiedSessionIn(
   }
 }
 
-/**
- * Maintenance operations act on a session that no live runtime owns, so they
- * require the exact registered identity without requiring a verified runtime
- * registration state.
- */
-function requireRegisteredSessionIn(
-  db: DatabaseSync,
-  sessionId: string,
-  expectedSessionFile: string,
-): void {
-  const row = db
-    .prepare(`SELECT session_file FROM session_registry WHERE session_id = ?`)
-    .get(sessionId) as { readonly session_file: unknown } | undefined;
-  const registeredFile =
-    row === undefined
-      ? undefined
-      : requireNonEmpty(row.session_file, "session file");
-  if (registeredFile !== requireNonEmpty(expectedSessionFile, "session file")) {
-    throw new MetadataError(
-      `session ${JSON.stringify(sessionId)} is not registered for history maintenance`,
-    );
-  }
-}
-
 function reconcileSessionBarrierIn(
   db: DatabaseSync,
   sessionId: string,
@@ -1280,45 +1252,6 @@ function exportForkProjectionIn(
   };
 }
 
-/**
- * The durable history identity of one session. `epoch` advances exactly once
- * per authorized whole-session forget; `resetPending` is the treeless tombstone
- * that a stable attach must complete before ordinary writes resume.
- */
-export interface SessionHistoryState {
-  readonly sessionId: string;
-  readonly epoch: number;
-  readonly resetPending: boolean;
-}
-
-/** Everything a maintenance preview needs to describe and later re-authenticate one session's history. */
-export interface SessionHistorySnapshot extends SessionHistoryState {
-  readonly fingerprint: string;
-  readonly sessionFile: string;
-  readonly registrationState: "pending" | "verified";
-  readonly slotCount: number;
-  readonly checkpointCount: number;
-  readonly blockedCount: number;
-  readonly hasCaptureBarrier: boolean;
-  /** Canonical, unique and sorted, so a preview token is comparison-stable. */
-  readonly treeOids: readonly TreeOid[];
-}
-
-export interface ForgetSessionHistoryInput {
-  readonly sessionId: string;
-  readonly sessionFile: string;
-  /**
-   * The fingerprinted state a preview authenticated. Deletion happens only if
-   * the stored history still matches it exactly.
-   */
-  readonly expectedFingerprint: string;
-}
-
-export interface ForgetSessionHistoryReport extends SessionHistoryState {
-  readonly removedSlots: number;
-  readonly removedCaptureBarrier: boolean;
-}
-
 /** Operations available only after the database is at the current schema. */
 export interface CurrentMetadataStore {
   getCheckpointSlot(sessionId: string, entryId: string): CheckpointSlot;
@@ -1356,11 +1289,6 @@ export interface CurrentMetadataStore {
     sessionId: string,
     sessionFile: string,
   ): MetadataSessionIdentityMatch;
-  describeSessionHistory(sessionId: string): SessionHistorySnapshot | undefined;
-  forgetSessionHistory(
-    authority: WorkspaceWriteAuthority,
-    input: ForgetSessionHistoryInput,
-  ): ForgetSessionHistoryReport;
   exportForkProjection(
     input: ExportForkProjectionInput,
   ): ForkCheckpointProjection | undefined;
@@ -2124,126 +2052,6 @@ class SqliteMetadataConnection implements CurrentMetadataStore {
     return report;
   }
 
-  /** Read one session's durable history identity and scale counts. */
-  describeSessionHistory(
-    sessionId: string,
-  ): SessionHistorySnapshot | undefined {
-    const checkedSessionId = requireNonEmpty(sessionId, "session id");
-    return this.#readTransaction((db) => {
-      const registration = db
-        .prepare(
-          `SELECT session_id, session_file, registration_state
-           FROM session_registry WHERE session_id = ?`,
-        )
-        .get(checkedSessionId) as
-        | {
-            readonly session_file: unknown;
-            readonly registration_state: unknown;
-          }
-        | undefined;
-      if (registration === undefined) return undefined;
-      const history = sessionHistoryIn(db, checkedSessionId);
-      let slotCount = 0;
-      let checkpointCount = 0;
-      let blockedCount = 0;
-      const treeOids = new Set<TreeOid>();
-      const rows = db
-        .prepare(
-          `SELECT tree_oid, capture_state FROM checkpoint_slot
-           WHERE session_id = ?`,
-        )
-        .iterate(checkedSessionId) as unknown as Iterable<CheckpointSlotRow>;
-      for (const row of rows) {
-        const slot = checkpointSlotFromRow(row, "session history slot");
-        slotCount += 1;
-        if (checkpointSlotIsBlocked(slot)) blockedCount += 1;
-        const treeOid = checkpointSlotTreeOid(slot);
-        if (treeOid === undefined) continue;
-        checkpointCount += 1;
-        treeOids.add(treeOid);
-      }
-      return {
-        fingerprint: readSessionHistoryFingerprint(
-          db,
-          CURRENT_METADATA_VERSION.version,
-          checkedSessionId,
-        )!,
-        sessionId: checkedSessionId,
-        sessionFile: requireNonEmpty(registration.session_file, "session file"),
-        registrationState: sessionRegistrationStateFrom(
-          registration.registration_state,
-        ),
-        epoch: history.epoch,
-        resetPending: history.resetPending,
-        slotCount,
-        checkpointCount,
-        blockedCount,
-        hasCaptureBarrier: sessionHasBarrierIn(db, checkedSessionId),
-        treeOids: Object.freeze([...treeOids].sort()),
-      };
-    });
-  }
-
-  /**
-   * Remove one session's history references in a single transaction: every
-   * slot, the capture barrier, and the treeless reset tombstone that keeps the
-   * advanced epoch visible. Physical objects are reclaimed separately by GC,
-   * which is why this reports counts rather than bytes.
-   */
-  forgetSessionHistory(
-    authority: WorkspaceWriteAuthority,
-    input: ForgetSessionHistoryInput,
-  ): ForgetSessionHistoryReport {
-    const sessionId = requireNonEmpty(input.sessionId, "session id");
-    const sessionFile = requireNonEmpty(input.sessionFile, "session file");
-    return this.#writeTransaction(authority, (db) => {
-      requireRegisteredSessionIn(db, sessionId, sessionFile);
-      if (
-        readSessionHistoryFingerprint(
-          db,
-          CURRENT_METADATA_VERSION.version,
-          sessionId,
-        ) !== input.expectedFingerprint
-      ) {
-        throw new MetadataFingerprintChangedError(
-          "the checkpoint mapping or session identity differs",
-        );
-      }
-      const expectedEpoch = sessionHistoryIn(db, sessionId).epoch;
-
-      const removedSlots = Number(
-        db
-          .prepare(`DELETE FROM checkpoint_slot WHERE session_id = ?`)
-          .run(sessionId).changes,
-      );
-      const removedCaptureBarrier =
-        Number(
-          db
-            .prepare(`DELETE FROM session_capture_barrier WHERE session_id = ?`)
-            .run(sessionId).changes,
-        ) === 1;
-      const advanced = db
-        .prepare(
-          `UPDATE session_history
-           SET history_epoch = history_epoch + 1, reset_pending = 1
-           WHERE session_id = ? AND history_epoch = ?`,
-        )
-        .run(sessionId, expectedEpoch);
-      if (Number(advanced.changes) !== 1) {
-        throw new MetadataError(
-          "session history epoch changed while forgetting",
-        );
-      }
-      return {
-        sessionId,
-        epoch: expectedEpoch + 1,
-        resetPending: true,
-        removedSlots,
-        removedCaptureBarrier,
-      };
-    });
-  }
-
   /** Every checkpoint-bearing slot, open or blocked, is an object-GC root. */
   listReferencedTreeOids(limit?: number): string[] {
     return this.#readTransaction((db) => [
@@ -2451,19 +2259,6 @@ export function openCurrentMetadataStore(
   dependencies.signal?.throwIfAborted();
   return finishOpeningCurrentMetadataStore(
     openMetadataMigrationCandidate(path, authority),
-    dependencies,
-  );
-}
-
-/** Maintenance may upgrade an existing database, but cannot create root authority. */
-export function openExistingMetadataStore(
-  path: string,
-  dependencies: MetadataMigrationDependencies,
-  authority: WorkspaceWriteAuthority,
-): Promise<CurrentMetadataStore> {
-  dependencies.signal?.throwIfAborted();
-  return finishOpeningCurrentMetadataStore(
-    openMetadataMigrationCandidate(path, authority, undefined, "never"),
     dependencies,
   );
 }

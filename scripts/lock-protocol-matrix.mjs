@@ -4,7 +4,7 @@
 // with npm, its lock module is relocated outside node_modules so Node's type
 // stripping applies, and it is executed in its own process. Every row drives
 // cross-process protocol behavior. Business entry points are exercised by
-// test/maintenance-lock-integration.test.ts.
+// test/pi-lock-integration.test.ts.
 //
 // Usage:
 //   npm run test:lock-protocol -- [--keep]
@@ -20,6 +20,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -27,14 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  applyLockRecovery,
-  previewLockRecovery,
-} from "../src/application/lock-recovery.ts";
-import {
-  inspectWorkspaceLock,
-  acquireWorkspaceLock,
-} from "../src/infrastructure/workspace-lock.ts";
+import { acquireWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const driverPath = fileURLToPath(
@@ -444,11 +438,10 @@ async function main() {
       send(old, "release");
       await waitForExit(old);
 
-      // The directory survives its process, and no preview may treat the dead
-      // owner record as proof that the lock is free.
-      const observed = await inspectWorkspaceLock(store);
+      // The directory survives its process; the dead
+      // owner record does not prove that the lock is free.
       expect(
-        observed.kind === "legacy-directory",
+        (await pathState(join(store, "workspace.lock"))) === "directory",
         "the abandoned directory must be observed as a legacy lock",
       );
       let blocked = false;
@@ -465,24 +458,14 @@ async function main() {
         "the abandoned legacy directory must block ordinary acquisition",
       );
 
-      const recovery = await previewLockRecovery(store);
-      expect(
-        recovery.recoverable,
-        "the abandoned directory must be recoverable",
-      );
-      const quarantined = await applyLockRecovery(store, recovery.planToken, {
-        offline: true,
-      });
-      expect(
-        quarantined.kind === "quarantined",
-        "offline recovery must quarantine",
-      );
+      const quarantined = join(store, "workspace.lock.abandoned");
+      await rename(join(store, "workspace.lock"), quarantined);
       expect(
         (await pathState(join(store, "workspace.lock"))) === "absent",
         "the fixed path must be free after quarantine",
       );
       expect(
-        (await readdir(quarantined.path)).length === 1,
+        (await readdir(quarantined)).length === 1,
         "the quarantined directory must preserve the old owner record",
       );
 
@@ -550,10 +533,12 @@ async function main() {
         replacement === "replacement",
         "release must not delete or rewrite a replacement object",
       );
-      const diagnostic = await inspectWorkspaceLock(store);
+      const retry = startClient("new", "acquire-once", store);
+      const refused = await waitForEvent(retry, "error");
+      await waitForExit(retry);
       expect(
-        diagnostic.kind === "inconsistent",
-        `the store must report the inconsistency, observed ${diagnostic.kind}`,
+        refused.name === "WorkspaceLockProtocolInconsistentError",
+        `the replacement must refuse acquisition, observed ${refused.name}`,
       );
       return "authority revoked permanently; replacement preserved";
     },

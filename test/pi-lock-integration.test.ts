@@ -1,3 +1,4 @@
+import * as garbageCollection from "../src/infrastructure/object-gc.ts";
 import { fork } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
@@ -5,9 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runCli } from "../src/cli/main.ts";
 import { contentIdFromBytes } from "../src/infrastructure/content-store/ids.ts";
-import { readMetadataReadonly } from "../src/infrastructure/metadata-readonly.ts";
 import * as nativeBinding from "../src/infrastructure/native-file-lock.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
 import { RealPiHarness } from "./real-pi.ts";
@@ -20,10 +19,12 @@ afterEach(async () => {
   harness = undefined;
 });
 
-async function capturedWorkspace(): Promise<RealPiHarness> {
+async function capturedWorkspace(gcIntervalMs = 0): Promise<RealPiHarness> {
   const pi = new RealPiHarness();
   harness = pi;
-  await pi.start();
+  await pi.start({
+    settings: { locale: "en", gc: { intervalMs: gcIntervalMs } },
+  });
   await pi.writeWorkspaceFile("a.txt", "saved");
   await pi.turn("capture saved content");
   expect(checkpointTree(pi)).toBeTypeOf("string");
@@ -47,14 +48,26 @@ function checkpointTree(pi: RealPiHarness): string {
   }
 }
 
-function historyFingerprint(pi: RealPiHarness): string {
-  const result = readMetadataReadonly(
-    join(pi.storeRoot, "state.db"),
-    (queries) => queries.sessionFingerprint(pi.sessionId),
-  );
-  expect(result.status.kind).toBe("ready");
-  expect(result.data).toBeTypeOf("string");
-  return result.data!;
+function historyState(pi: RealPiHarness): string {
+  const db = new DatabaseSync(join(pi.storeRoot, "state.db"), {
+    readOnly: true,
+  });
+  try {
+    return JSON.stringify({
+      slots: db
+        .prepare(
+          "SELECT entry_id, tree_oid, capture_state FROM checkpoint_slot WHERE session_id = ? ORDER BY entry_id",
+        )
+        .all(pi.sessionId),
+      history: db
+        .prepare(
+          "SELECT history_epoch, reset_pending FROM session_history WHERE session_id = ?",
+        )
+        .get(pi.sessionId),
+    });
+  } finally {
+    db.close();
+  }
 }
 
 async function withExternalLock<T>(
@@ -79,10 +92,10 @@ async function withExternalLock<T>(
       signal: AbortSignal.timeout(10_000),
     });
     expect(message).toMatchObject({ type: "acquired" });
-    const binding = await nativeBinding.loadExclusiveFileLock();
+    const binding = await nativeBinding.loadNativeFileLock();
     const contended = Promise.withResolvers<void>();
     const spy = vi
-      .spyOn(nativeBinding, "loadExclusiveFileLock")
+      .spyOn(nativeBinding, "loadNativeFileLock")
       .mockResolvedValue({
         ...binding,
         tryAcquire(fd) {
@@ -113,16 +126,16 @@ async function withExternalLock<T>(
 describe("business writes under cross-process workspace contention", () => {
   it("commits a real Pi capture only after the external holder releases", async () => {
     const pi = await capturedWorkspace();
-    const before = historyFingerprint(pi);
+    const before = historyState(pi);
     await pi.writeWorkspaceFile("a.txt", "updated");
 
     await withExternalLock(
       pi.storeRoot,
       () => pi.turn("capture updated content"),
-      () => expect(historyFingerprint(pi)).toBe(before),
+      () => expect(historyState(pi)).toBe(before),
     );
 
-    expect(historyFingerprint(pi)).not.toBe(before);
+    expect(historyState(pi)).not.toBe(before);
     const objects = await openObjectStore(pi.storeRoot);
     const tree = await objects.readTree(checkpointTree(pi));
     expect(tree.entries.find((entry) => entry.path === "a.txt")).toMatchObject({
@@ -134,7 +147,7 @@ describe("business writes under cross-process workspace contention", () => {
   it("applies a real Pi restore only after the external holder releases", async () => {
     const pi = await capturedWorkspace();
     const target = checkpointTree(pi);
-    const before = historyFingerprint(pi);
+    const before = historyState(pi);
     const file = join(pi.workspace, "a.txt");
     await pi.writeWorkspaceFile("a.txt", "changed");
     pi.selectIndex = 1;
@@ -144,7 +157,7 @@ describe("business writes under cross-process workspace contention", () => {
       () => pi.command("/restore"),
       async () => {
         expect(await readFile(file, "utf8")).toBe("changed");
-        expect(historyFingerprint(pi)).toBe(before);
+        expect(historyState(pi)).toBe(before);
       },
     );
 
@@ -153,41 +166,81 @@ describe("business writes under cross-process workspace contention", () => {
     expect(pi.extensionErrors).toEqual([]);
   });
 
-  it("deletes garbage through the CLI only after the external holder releases", async () => {
-    const pi = await capturedWorkspace();
-    const target = checkpointTree(pi);
-    const before = historyFingerprint(pi);
-    const incoming = join(pi.storeRoot, "objects", "packs", "incoming");
-    await mkdir(incoming, { recursive: true });
-    const garbage = join(
-      incoming,
-      `.${"a".repeat(64)}.${process.pid}.123e4567-e89b-42d3-a456-426614174000.pack.tmp`,
-    );
-    await writeFile(garbage, Buffer.alloc(4096));
-    await utimes(garbage, new Date(0), new Date(0));
-    const out: string[] = [];
-    const err: string[] = [];
-
-    const code = await withExternalLock(
-      pi.storeRoot,
-      () =>
-        runCli(
-          ["--workspace", pi.workspace, "gc", "--json"],
-          { out: (text) => out.push(text), err: (text) => err.push(text) },
-          { env: { PI_CODING_AGENT_DIR: pi.agentDir }, cwd: pi.workspace },
-        ),
-      async () => {
+  it.each(["local", "pause", "external"] as const)(
+    "yields automatic GC to a %s foreground operation, then finishes cleanup",
+    async (foreground) => {
+      const entered = Promise.withResolvers<void>();
+      const collect = garbageCollection.collectGarbage;
+      vi.spyOn(garbageCollection, "collectGarbage").mockImplementationOnce(
+        async (authority, store, metadata, options) => {
+          const signal = options?.signal;
+          if (signal === undefined)
+            throw new Error("automatic GC has no cancellation signal");
+          entered.resolve();
+          if (!signal.aborted) await once(signal, "abort");
+          return collect(authority, store, metadata, options);
+        },
+      );
+      const pi = await capturedWorkspace(1);
+      const target = checkpointTree(pi);
+      const incoming = join(pi.storeRoot, "objects", "packs", "incoming");
+      await mkdir(incoming, { recursive: true });
+      const garbage = join(
+        incoming,
+        `.${"a".repeat(64)}.${process.pid}.123e4567-e89b-42d3-a456-426614174000.pack.tmp`,
+      );
+      await writeFile(garbage, Buffer.alloc(4096));
+      await utimes(garbage, new Date(0), new Date(0));
+      await entered.promise;
+      if (foreground === "local") {
+        await pi.writeWorkspaceFile("a.txt", "foreground content");
+        await pi.turn("capture while cleanup is running");
+        const objects = await openObjectStore(pi.storeRoot);
+        const tree = await objects.readTree(checkpointTree(pi));
+        expect(
+          tree.entries.find((entry) => entry.path === "a.txt"),
+        ).toMatchObject({
+          blobOid: contentIdFromBytes(Buffer.from("foreground content")),
+        });
+      } else if (foreground === "pause") {
+        await pi.command("/cyclotomy pause");
         expect((await stat(garbage)).size).toBe(4096);
-        expect(historyFingerprint(pi)).toBe(before);
-      },
-    );
-
-    expect(code, out.join("") || err.join("")).toBe(0);
-    const result = JSON.parse(out.join("")).result;
-    expect(result.removedTmpFiles).toBeGreaterThanOrEqual(1);
-    expect(BigInt(result.freedBytes)).toBeGreaterThanOrEqual(4096n);
-    await expect(stat(garbage)).rejects.toMatchObject({ code: "ENOENT" });
-    const objects = await openObjectStore(pi.storeRoot);
-    await expect(objects.readTree(target)).resolves.toBeDefined();
-  });
+        await pi.command("/cyclotomy resume");
+      } else {
+        const child = fork(
+          new URL("./fixtures/workspace-lock-child.ts", import.meta.url),
+          [pi.storeRoot, "foreground", "hold", "10000"],
+          {
+            execArgv: ["--experimental-strip-types", "--no-warnings"],
+            stdio: ["ignore", "ignore", "inherit", "ipc"],
+          },
+        );
+        const exited = once(child, "exit");
+        try {
+          const [message] = await once(child, "message", {
+            signal: AbortSignal.timeout(15000),
+          });
+          expect(message).toMatchObject({ type: "acquired" });
+          expect((await stat(garbage)).size).toBe(4096);
+        } finally {
+          if (child.connected) child.disconnect();
+          await exited;
+        }
+      }
+      await vi.waitFor(
+        async () => {
+          await expect(stat(garbage)).rejects.toMatchObject({ code: "ENOENT" });
+        },
+        { timeout: 10000 },
+      );
+      const objects = await openObjectStore(pi.storeRoot);
+      await expect(objects.readTree(target)).resolves.toBeDefined();
+      expect(pi.extensionErrors).toEqual([]);
+      expect(
+        pi.notifications.some(({ message }) =>
+          message.includes("cleanup failed"),
+        ),
+      ).toBe(false);
+    },
+  );
 });

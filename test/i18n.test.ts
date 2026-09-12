@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  CyclotomyI18n,
-  resolveCyclotomyLocale,
-} from "../src/presentation/i18n.ts";
+import { CyclotomyI18n, resolveCyclotomyLocale } from "../src/pi/i18n.ts";
 import type { WorkspaceRestorePlan } from "../src/infrastructure/restore-plan.ts";
 
 function plan(
@@ -216,11 +213,9 @@ describe("Cyclotomy Pi localization", () => {
     const zh = new CyclotomyI18n("zh-CN").t("choiceNavigationIntro");
 
     expect(en).toContain("current files");
-    expect(en).toContain("Detached");
     expect(en).toContain("destination checkpoint");
     expect(en).not.toContain("save this node");
     expect(zh).toContain("保留当前文件");
-    expect(zh).toContain("Detached");
     expect(zh).toContain("目标检查点");
     expect(zh).not.toContain("保存当前节点");
   });
@@ -247,29 +242,29 @@ describe("Cyclotomy Pi localization", () => {
     ).toContain("未知 Git 版本");
   });
 
-  it("explains how to leave Detached state", () => {
+  it("explains how to restore after keeping current files", () => {
     const en = new CyclotomyI18n("en").t("navigationDetached");
     const zh = new CyclotomyI18n("zh-CN").t("navigationDetached");
 
     for (const message of [en, zh]) {
-      expect(message).toContain("/drift");
       expect(message).toContain("/restore");
     }
-    expect(en).toContain("Detached");
     expect(en).toContain("current files");
     expect(en).toContain("new branch");
-    expect(zh).toContain("Detached");
     expect(zh).toContain("当前文件");
     expect(zh).toContain("新分支");
   });
 
-  it("marks both clean and changed protected workspaces as Detached", () => {
-    for (const locale of ["en", "zh-CN"] as const) {
+  it("explains that protected files still need confirmation", () => {
+    for (const [locale, fact] of [
+      ["en", "confirmation"],
+      ["zh-CN", "尚待确认"],
+    ] as const) {
       const i18n = new CyclotomyI18n(locale);
-      expect(i18n.t("driftCleanProtected")).toContain("Detached");
       expect(i18n.t("driftCleanProtected")).toContain("/restore");
+      expect(i18n.t("driftCleanProtectedFact")).toContain(fact);
       expect(i18n.t("driftTitleDetached", { preview: "preview" })).toContain(
-        "Detached",
+        fact,
       );
     }
   });

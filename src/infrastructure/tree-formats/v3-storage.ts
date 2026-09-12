@@ -1495,7 +1495,6 @@ async function readV3Tree(
         Object.freeze({ kind: structuralKinds.get(oid)!, oid }),
       ),
     ),
-    structuralObjectOids,
     contentIds: Object.freeze(contentIds),
   });
 }

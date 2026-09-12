@@ -10,47 +10,26 @@ import {
   type WorkspaceWriteAuthority,
 } from "./workspace-lock.ts";
 
-type GcScheduleState =
-  | { readonly kind: "absent" }
-  | { readonly kind: "valid"; readonly lastRunAt: number }
-  | { readonly kind: "invalid"; readonly cause: unknown };
-
-async function readAutomaticGcSchedule(path: string): Promise<GcScheduleState> {
+/** A malformed timestamp cannot prevent collection of unreferenced objects. */
+export async function readLastAutomaticGcAt(path: string): Promise<number> {
   let contents: string;
   try {
     contents = await readFile(path, "utf8");
   } catch (cause) {
-    return systemErrorCode(cause) === "ENOENT"
-      ? { kind: "absent" }
-      : { kind: "invalid", cause };
+    if (systemErrorCode(cause) === "ENOENT") return 0;
+    throw cause;
   }
   try {
     const parsed = JSON.parse(contents) as { lastGcAt?: unknown };
-    if (
-      typeof parsed.lastGcAt === "number" &&
-      Number.isFinite(parsed.lastGcAt) &&
-      parsed.lastGcAt >= 0
-    ) {
-      return { kind: "valid", lastRunAt: parsed.lastGcAt };
-    }
-    throw new Error("automatic GC schedule has an invalid lastGcAt value");
-  } catch (cause) {
-    return { kind: "invalid", cause };
-  }
-}
-
-/** Read the advisory last-run timestamp without hiding a corrupt state file. */
-export async function readLastAutomaticGcAt(path: string): Promise<number> {
-  const state = await readAutomaticGcSchedule(path);
-  switch (state.kind) {
-    case "absent":
-      return 0;
-    case "valid":
-      return state.lastRunAt;
-    case "invalid":
-      throw new Error("automatic GC schedule is unreadable", {
-        cause: state.cause,
-      });
+    const timestamp = parsed.lastGcAt;
+    return typeof timestamp === "number" &&
+      Number.isFinite(timestamp) &&
+      timestamp >= 0 &&
+      timestamp <= Date.now()
+      ? timestamp
+      : 0;
+  } catch {
+    return 0;
   }
 }
 

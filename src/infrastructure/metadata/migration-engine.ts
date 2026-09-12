@@ -1,10 +1,7 @@
 import { type DatabaseSync } from "node:sqlite";
 
 import { isTreeOid, type TreeOid } from "../../domain/model.ts";
-import {
-  MetadataError,
-  MetadataFingerprintChangedError,
-} from "../metadata-error.ts";
+import { MetadataError } from "../metadata-error.ts";
 import {
   assertWorkspaceWriteAuthority,
   type WorkspaceWriteAuthority,
@@ -23,11 +20,6 @@ import {
   requireMetadataVersion,
   validateMetadataVersion,
 } from "./version.ts";
-
-import {
-  assertSessionHistoryExpectation,
-  readSessionHistoryFingerprint,
-} from "./history.ts";
 
 type OrdinaryMetadataUpgrade = Extract<
   AdjacentMetadataUpgrade,
@@ -126,14 +118,6 @@ function prepareTotalTreeUpgrade(
     }
     return Object.freeze({ source, target });
   });
-  const expectedSources = new Set(sourceRoots);
-  for (const source of proposed.keys()) {
-    if (!expectedSources.has(source)) {
-      throw new MetadataError(
-        "tree-format migration returned an unexpected metadata root",
-      );
-    }
-  }
 
   return Object.freeze({
     sourceRoots,
@@ -175,7 +159,6 @@ async function captureAndPrepareNextUpgrade(
   try {
     const source = requireMetadataVersion(versions, db);
     validateMetadataVersion(db, source);
-    assertSessionHistoryExpectation(db, source.version, dependencies.history);
     if (source === versions.at(-1)) {
       db.exec("COMMIT");
       return { kind: "current" };
@@ -250,17 +233,13 @@ function applyPreparedUpgrade(
   >,
   dependencies: MetadataMigrationDependencies,
 ): ApplyPreparedUpgradeResult {
-  const { signal, history } = dependencies;
+  const { signal } = dependencies;
   signal?.throwIfAborted();
   const upgrade = prepared.upgrade;
   db.exec("BEGIN IMMEDIATE");
   try {
     const observed = metadataSchemaVersion(db);
     if (observed !== upgrade.source.version) {
-      if (history !== undefined)
-        throw new MetadataFingerprintChangedError(
-          "metadata version changed during history migration",
-        );
       // Another process advanced while external immutable objects were being
       // prepared. Re-discover the next edge from the committed version.
       db.exec("ROLLBACK");
@@ -268,7 +247,6 @@ function applyPreparedUpgrade(
       return "version-changed";
     }
     validateMetadataVersion(db, upgrade.source);
-    assertSessionHistoryExpectation(db, observed, history);
     if (
       upgrade.kind === "tree-format" &&
       !treeRootsAreEqual(
@@ -282,22 +260,6 @@ function applyPreparedUpgrade(
       return "tree-roots-changed";
     }
 
-    const successorFingerprint =
-      history === undefined
-        ? undefined
-        : readSessionHistoryFingerprint(
-            db,
-            observed,
-            history.sessionId,
-            upgrade.kind === "tree-format"
-              ? new Map(
-                  upgrade.prepared.replacements.map(({ source, target }) => [
-                    source,
-                    target,
-                  ]),
-                )
-              : undefined,
-          );
     signal?.throwIfAborted();
     assertWorkspaceWriteAuthority(authority, storeRoot);
     dropWriterFences(db, upgrade.source.schema);
@@ -319,20 +281,7 @@ function applyPreparedUpgrade(
         "tree-format migration did not preserve the exact mapped root set",
       );
     }
-    if (
-      history !== undefined &&
-      readSessionHistoryFingerprint(
-        db,
-        upgrade.successor.version,
-        history.sessionId,
-      ) !== successorFingerprint
-    ) {
-      throw new MetadataFingerprintChangedError(
-        "migration did not preserve the mapped checkpoint history",
-      );
-    }
     db.exec("COMMIT");
-    if (history !== undefined) history.fingerprint = successorFingerprint!;
     return "applied";
   } catch (error) {
     rollbackPreservingPrimary(db);

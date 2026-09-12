@@ -5,7 +5,7 @@ import {
   parseCyclotomyCommandArguments,
   presentCyclotomyStatus,
 } from "../src/pi/cyclotomy-command.ts";
-import { CyclotomyI18n } from "../src/presentation/i18n.ts";
+import { CyclotomyI18n } from "../src/pi/i18n.ts";
 
 describe("/cyclotomy command presentation", () => {
   it("treats no arguments as status and accepts instance and global actions", () => {

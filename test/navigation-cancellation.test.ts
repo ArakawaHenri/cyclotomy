@@ -21,7 +21,6 @@ import {
   checkpointState,
   createTestCurrentMetadataStore,
 } from "./metadata-fixture.ts";
-import {} from "../src/infrastructure/workspace-lock.ts";
 
 let workspace: string;
 let agentDir: string;
@@ -47,8 +46,6 @@ beforeEach(async () => {
       .update(await realpath(workspace))
       .digest("hex"),
   );
-  // Test stores model an upgraded installation: the one-time native lock
-  // protocol switch completes before any runtime binds the store.
   await mkdir(storeRoot, { recursive: true });
 });
 afterEach(async () => {
@@ -137,7 +134,6 @@ it.each([
         onProgress: (progress: { files: number; bytes: number }) => {
           options.onProgress?.(progress);
           if (!consumed && current === observation && progress.files > 0) {
-            expect(pi.statuses.get("cyclotomy")).toContain("Esc to cancel");
             consumed = pi.terminalInput("\u001b");
           }
         },

@@ -3,18 +3,8 @@ import { join } from "node:path";
 
 import { systemErrorCode } from "./system-error.ts";
 
-export function storeDirectoryPresent(root: string): boolean {
-  try {
-    const entry = lstatSync(root);
-    return entry.isDirectory() && !entry.isSymbolicLink();
-  } catch (cause) {
-    if (systemErrorCode(cause) === "ENOENT") return false;
-    throw cause;
-  }
-}
-
 /** Empty layout directories are allowed; one file is enough to prove data exists. */
-export function storedObjectsPresent(root: string): boolean {
+function storedObjectsPresent(root: string): boolean {
   function visit(path: string, depth: number): boolean {
     let entry;
     try {

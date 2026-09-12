@@ -12,10 +12,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  openCurrentMetadataStore,
-  openExistingMetadataStore,
-} from "../src/infrastructure/metadata.ts";
+import { openCurrentMetadataStore } from "../src/infrastructure/metadata.ts";
 import { MetadataUnavailableError } from "../src/infrastructure/metadata-error.ts";
 import { withWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { METADATA_WRITER_PROTOCOL_FUNCTION } from "../src/infrastructure/metadata/schema.ts";
@@ -66,41 +63,23 @@ describe("store opening", () => {
       await mkdir(join(path, "objects", "blobs", "aa"), { recursive: true });
       await writeFile(object, "checkpoint data");
       if (kind === "empty") await writeFile(join(path, "state.db"), "");
-      for (const open of [
-        openCurrentMetadataStore,
-        openExistingMetadataStore,
-      ]) {
-        await expect(
-          withWorkspaceLock(path, "open", async (authority) => {
-            const store = await open(
-              join(path, "state.db"),
-              dependencies,
-              authority,
-            );
-            store.close();
-          }),
-        ).rejects.toBeInstanceOf(MetadataUnavailableError);
-      }
+
+      await expect(
+        withWorkspaceLock(path, "open", async (authority) => {
+          const store = await openCurrentMetadataStore(
+            join(path, "state.db"),
+            dependencies,
+            authority,
+          );
+          store.close();
+        }),
+      ).rejects.toBeInstanceOf(MetadataUnavailableError);
       expect(await readFile(object, "utf8")).toBe("checkpoint data");
       if (kind === "missing")
         expect(await readdir(path)).not.toContain("state.db");
       else expect(await readFile(join(path, "state.db"))).toHaveLength(0);
     },
   );
-
-  it("never initializes metadata for maintenance", async () => {
-    const path = await root();
-    await expect(
-      withWorkspaceLock(path, "gc", (authority) =>
-        openExistingMetadataStore(
-          join(path, "state.db"),
-          dependencies,
-          authority,
-        ),
-      ),
-    ).rejects.toBeInstanceOf(MetadataUnavailableError);
-    expect(await readdir(path)).not.toContain("state.db");
-  });
 
   it.each(["wal", "journal"])(
     "lets SQLite recover a valid %s before migration",
@@ -137,16 +116,21 @@ describe("store opening", () => {
       if (kind === "journal") db.exec("ROLLBACK");
       db.close();
       await withWorkspaceLock(target, "open", async (authority) => {
-        const store = await openExistingMetadataStore(
+        const store = await openCurrentMetadataStore(
           join(target, "state.db"),
           dependencies,
           authority,
         );
-        expect(store.describeSessionHistory("saved")).toBeDefined();
-        expect(store.describeSessionHistory("committed") !== undefined).toBe(
-          kind === "wal",
+        expect(store.matchSessionIdentity("saved", "/saved.jsonl")).toBe(
+          "exact",
         );
-        expect(store.describeSessionHistory("uncommitted-0")).toBeUndefined();
+        expect(
+          store.matchSessionIdentity("committed", "/committed.jsonl") ===
+            "exact",
+        ).toBe(kind === "wal");
+        expect(
+          store.matchSessionIdentity("uncommitted-0", "/unused.jsonl"),
+        ).toBe("absent");
         store.close();
       });
     },

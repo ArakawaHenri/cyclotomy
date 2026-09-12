@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -7,17 +6,8 @@ import {
   openSync,
   type BigIntStats,
 } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  rename,
-  rmdir,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { hostname } from "node:os";
+import { lstat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -32,18 +22,17 @@ import {
 } from "./directory-binding.ts";
 import {
   lockProtocolMarkerMatches,
-  LockProtocolCorruptError,
   publishLockProtocolMarker,
   readLockProtocolMarkerSync,
   UnsupportedLockProtocolError,
   WORKSPACE_LOCK_FILE,
   type NativeLockProtocolMarker,
-  type LockProtocolMarkerObservation,
 } from "./lock-protocol.ts";
 import {
-  loadExclusiveFileLock,
-  type ExclusiveFileLockBinding,
+  loadNativeFileLock,
+  type NativeFileLockBinding,
 } from "./native-file-lock.ts";
+import { tryHoldForegroundDemand } from "./foreground-demand.ts";
 import { systemErrorCode } from "./system-error.ts";
 
 export {
@@ -60,18 +49,17 @@ export type {
 } from "./lock-protocol.ts";
 export {
   NativeFileLockUnavailableError,
-  type ExclusiveFileLockBinding,
+  type NativeFileLockBinding,
 } from "./native-file-lock.ts";
 
-const LEGACY_OWNER_PREFIX = "owner-";
-const LEGACY_OWNER_SUFFIX = ".json";
-const LEGACY_OWNER_FILE_MAX_BYTES = 16 * 1024;
 const LOCK_POLL_MS = 25;
 
 export interface WorkspaceLockOptions {
   /** Time to wait for another cooperative operation. Default 5 seconds. */
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** Background work yields instead of announcing foreground demand. */
+  readonly background?: boolean;
 }
 
 export interface WorkspaceLock {
@@ -86,26 +74,6 @@ declare const WORKSPACE_WRITE_AUTHORITY: unique symbol;
 export interface WorkspaceWriteAuthority {
   readonly [WORKSPACE_WRITE_AUTHORITY]: true;
 }
-
-/** Owner record of the legacy directory protocol, for diagnostics only. */
-export interface LegacyWorkspaceLockOwner {
-  readonly token: string;
-  readonly pid: number;
-  readonly hostname: string;
-  readonly operation: string;
-  readonly acquiredAt: number;
-}
-
-interface LegacyOwnerRecord {
-  readonly owner: LegacyWorkspaceLockOwner;
-  readonly path: string;
-}
-
-/** Read-only view of the legacy directory lock's owner record. */
-export type LegacyWorkspaceLockOwnerObservation =
-  | { readonly kind: "empty" }
-  | { readonly kind: "valid"; readonly owner: LegacyWorkspaceLockOwner }
-  | { readonly kind: "ambiguous" };
 
 interface LockFileIdentity {
   readonly device: bigint;
@@ -138,10 +106,11 @@ interface WorkspaceWriteAuthorityState {
   readonly parentChain: readonly ParentChainEntry[];
   readonly lockFile: LockFileIdentity;
   readonly descriptor: number;
-  readonly nativeBinding: ExclusiveFileLockBinding;
+  readonly nativeBinding: NativeFileLockBinding;
   readonly marker: NativeLockProtocolMarker;
   readonly operation: string;
   readonly acquiredAt: number;
+  readonly releaseDemand: (() => void) | undefined;
   phase: WorkspaceWriteAuthorityPhase;
 }
 
@@ -182,7 +151,7 @@ export class WorkspaceLockTimeoutError extends Error {
 
   constructor(operation: string, timeoutMs: number, lockPath: string) {
     super(
-      `timed out after ${timeoutMs} ms waiting for the Cyclotomy workspace lock (${operation}) at ${lockPath}; the lock may be active or abandoned. Run "cyclotomy doctor" to inspect it. If it reports an abandoned legacy lock, confirm that every process using this store has stopped, then run "cyclotomy lock recover --offline"`,
+      `timed out after ${timeoutMs} ms waiting for the Cyclotomy workspace lock (${operation}) at ${lockPath}; another Pi instance may still be using this store`,
     );
     this.name = "WorkspaceLockTimeoutError";
     this.lockPath = lockPath;
@@ -216,9 +185,7 @@ export class WorkspaceLockProtocolInconsistentError extends Error {
   readonly detail: string;
 
   constructor(storeRoot: string, detail: string) {
-    super(
-      `inconsistent Cyclotomy lock protocol at ${storeRoot}: ${detail}. Run "cyclotomy doctor" for diagnostics`,
-    );
+    super(`inconsistent Cyclotomy lock protocol at ${storeRoot}: ${detail}`);
     this.name = "WorkspaceLockProtocolInconsistentError";
     this.storeRoot = storeRoot;
     this.detail = detail;
@@ -450,12 +417,6 @@ function validateTimingOptions(timeoutMs: number): void {
   }
 }
 
-async function wait(milliseconds: number): Promise<void> {
-  await new Promise<void>((resolveWait) => {
-    setTimeout(resolveWait, milliseconds);
-  });
-}
-
 async function waitWithinDeadline(
   startedAt: number,
   timeoutMs: number,
@@ -468,7 +429,12 @@ async function waitWithinDeadline(
   if (remaining <= 0) {
     throw new WorkspaceLockTimeoutError(operation, timeoutMs, lockPath);
   }
-  await wait(Math.min(LOCK_POLL_MS, remaining));
+  try {
+    await delay(Math.min(LOCK_POLL_MS, remaining), undefined, { signal });
+  } catch (cause) {
+    signal?.throwIfAborted();
+    throw cause;
+  }
 }
 
 type LockPathKind = "absent" | "directory" | "file" | "other";
@@ -560,6 +526,8 @@ interface WorkspaceLockAttempt {
   readonly startedAt: number;
   readonly timeoutMs: number;
   readonly signal: AbortSignal | undefined;
+  readonly background: boolean;
+  releaseDemand: (() => void) | undefined;
 }
 
 function assertLockAttempt(attempt: WorkspaceLockAttempt): void {
@@ -593,13 +561,19 @@ function waitForLock(attempt: WorkspaceLockAttempt): Promise<void> {
 }
 
 async function acquireNativeBinding(
-  nativeBinding: ExclusiveFileLockBinding,
+  nativeBinding: NativeFileLockBinding,
   descriptor: number,
   attempt: WorkspaceLockAttempt,
 ): Promise<void> {
   for (;;) {
     assertLockAttempt(attempt);
     if (nativeBinding.tryAcquire(descriptor)) return;
+    if (!attempt.background) {
+      attempt.releaseDemand ??= tryHoldForegroundDemand(
+        attempt.binding.canonicalPath,
+        nativeBinding,
+      );
+    }
     await waitForLock(attempt);
   }
 }
@@ -610,7 +584,6 @@ function authorityLock(state: WorkspaceWriteAuthorityState): WorkspaceLock {
   workspaceWriteAuthorityStates.set(authority, state);
 
   let releaseInFlight: Promise<void> | undefined;
-  let released = false;
   const lock: WorkspaceLock = {
     operation: state.operation,
     acquiredAt: state.acquiredAt,
@@ -630,13 +603,14 @@ function authorityLock(state: WorkspaceWriteAuthorityState): WorkspaceLock {
         }
         let releaseError: unknown;
         try {
-          if (!released) state.nativeBinding.release(state.descriptor);
+          state.nativeBinding.release(state.descriptor);
         } catch (error) {
           releaseError = error;
         } finally {
-          if (!released) {
-            released = true;
+          try {
             closeSync(state.descriptor);
+          } finally {
+            state.releaseDemand?.();
           }
         }
         if (releaseError !== undefined) throw releaseError;
@@ -649,36 +623,7 @@ function authorityLock(state: WorkspaceWriteAuthorityState): WorkspaceLock {
   return lock;
 }
 
-interface WorkspaceLockProtocol {
-  readonly id: "legacy-directory" | "native-file-v1";
-  readonly acquire: (
-    attempt: WorkspaceLockAttempt,
-    marker: LockProtocolMarkerObservation,
-  ) => Promise<WorkspaceLock>;
-  readonly upgradeFromPrevious?: (
-    attempt: WorkspaceLockAttempt,
-    held: WorkspaceLock,
-  ) => Promise<WorkspaceLock>;
-}
-
-const WORKSPACE_LOCK_PROTOCOLS: readonly WorkspaceLockProtocol[] =
-  Object.freeze([
-    Object.freeze({ id: "legacy-directory", acquire: acquireLegacyProtocol }),
-    Object.freeze({
-      id: "native-file-v1",
-      acquire: acquireNativeProtocol,
-      upgradeFromPrevious: upgradeToNativeProtocol,
-    }),
-  ]);
-const LOCK_PROTOCOL_INDEX = new Map(
-  WORKSPACE_LOCK_PROTOCOLS.map(({ id }, index) => [id, index]),
-);
-const CURRENT_LOCK_PROTOCOL = WORKSPACE_LOCK_PROTOCOLS.at(-1)!;
-
-/** Another cooperative client advanced the protocol while this call waited. */
-class WorkspaceLockProtocolChanged extends Error {}
-
-/** Acquire the current protocol, performing any adjacent handover on the way. */
+/** Existing legacy directories remain occupied until their owner removes them. */
 export async function acquireWorkspaceLock(
   storeRoot: string,
   operation: string,
@@ -698,108 +643,61 @@ export async function acquireWorkspaceLock(
     startedAt,
     timeoutMs,
     signal: options.signal,
+    background: options.background === true,
+    releaseDemand: undefined,
   };
 
-  for (;;) {
-    assertLockAttempt(attempt);
-    const marker = readLockProtocolMarkerSync(binding.canonicalPath);
-    if (marker.kind === "unsupported") {
-      throw new UnsupportedLockProtocolError(
-        binding.canonicalPath,
-        marker.observedFormat,
-        marker.observedProtocol,
-      );
-    }
-    const pathKind = await observeLockPathKind(lockPath);
-    if (marker.kind === "absent" && pathKind === "other") {
-      throw new UnsafeWorkspaceLockPathError(lockPath);
-    }
-    const protocol =
-      marker.kind === "absent"
-        ? pathKind === "directory"
-          ? "legacy-directory"
-          : CURRENT_LOCK_PROTOCOL.id
-        : marker.kind;
-    const sourceIndex = LOCK_PROTOCOL_INDEX.get(protocol)!;
-    let held: WorkspaceLock | undefined;
-    try {
-      held = await WORKSPACE_LOCK_PROTOCOLS[sourceIndex]!.acquire(
+  try {
+    for (;;) {
+      assertLockAttempt(attempt);
+      const marker = readLockProtocolMarkerSync(binding.canonicalPath);
+      if (marker.kind === "unsupported") {
+        throw new UnsupportedLockProtocolError(
+          binding.canonicalPath,
+          marker.observedFormat,
+          marker.observedProtocol,
+        );
+      }
+      if (marker.kind === "absent") {
+        const kind = await observeLockPathKind(lockPath);
+        if (kind === "other") throw new UnsafeWorkspaceLockPathError(lockPath);
+        if (kind === "directory") {
+          await waitForLock(attempt);
+          continue;
+        }
+      }
+      const nativeBinding = await loadNativeFileLock();
+      assertLockAttempt(attempt);
+      const opened =
+        marker.kind === "absent"
+          ? await openOrCreateNativeLockFile(attempt)
+          : await openNativeLockFile(lockPath);
+      if (opened === undefined) {
+        await waitForLock(attempt);
+        continue;
+      }
+      return await holdNativeLock(
         attempt,
-        marker,
+        opened,
+        nativeBinding,
+        marker.kind === "native-file-v1" ? marker : undefined,
       );
-      for (
-        let index = sourceIndex + 1;
-        index < WORKSPACE_LOCK_PROTOCOLS.length;
-        index += 1
-      ) {
-        held = await WORKSPACE_LOCK_PROTOCOLS[index]!.upgradeFromPrevious!(
-          attempt,
-          held,
-        );
-      }
-      return held;
-    } catch (cause) {
-      try {
-        await held?.release();
-      } catch (cleanup) {
-        throw new AggregateError(
-          [cause, cleanup],
-          "workspace lock handover and cleanup both failed",
-          { cause },
-        );
-      }
-      if (!(cause instanceof WorkspaceLockProtocolChanged)) throw cause;
-      await waitForLock(attempt);
     }
+  } finally {
+    attempt.releaseDemand?.();
   }
-}
-
-async function acquireLegacyProtocol(
-  attempt: WorkspaceLockAttempt,
-): Promise<WorkspaceLock> {
-  const legacy = await acquireLegacyDirectoryLock(attempt);
-  let released: Promise<void> | undefined;
-  return {
-    operation: attempt.operation,
-    acquiredAt: legacy.owner.acquiredAt,
-    release: () => (released ??= releaseLegacyDirectoryLock(legacy)),
-  };
-}
-
-async function upgradeToNativeProtocol(
-  attempt: WorkspaceLockAttempt,
-  held: WorkspaceLock,
-): Promise<WorkspaceLock> {
-  assertLockAttempt(attempt);
-  await held.release();
-  return createAndPublishNativeLock(attempt);
-}
-
-async function acquireNativeProtocol(
-  attempt: WorkspaceLockAttempt,
-  marker: LockProtocolMarkerObservation,
-): Promise<WorkspaceLock> {
-  if (marker.kind === "absent") return createAndPublishNativeLock(attempt);
-  if (marker.kind !== "native-file-v1") {
-    throw new UnsupportedLockProtocolError(
-      attempt.binding.canonicalPath,
-      marker.observedFormat,
-      marker.observedProtocol,
-    );
-  }
-  const nativeBinding = await loadExclusiveFileLock();
-  assertLockAttempt(attempt);
-  const opened = await openNativeLockFile(attempt.lockPath);
-  return holdNativeLock(attempt, opened, nativeBinding, marker);
 }
 
 /** Exclusive creation respects a directory or file another client won first. */
 async function openOrCreateNativeLockFile(
   attempt: WorkspaceLockAttempt,
-): Promise<{
-  readonly descriptor: number;
-  readonly identity: LockFileIdentity;
-}> {
+): Promise<
+  | {
+      readonly descriptor: number;
+      readonly identity: LockFileIdentity;
+    }
+  | undefined
+> {
   for (;;) {
     assertLockAttempt(attempt);
     let descriptor: number;
@@ -816,7 +714,7 @@ async function openOrCreateNativeLockFile(
       if (systemErrorCode(error) === "EEXIST") {
         const kind = await observeLockPathKind(attempt.lockPath);
         if (kind === "file") return openNativeLockFile(attempt.lockPath);
-        if (kind === "directory") throw new WorkspaceLockProtocolChanged();
+        if (kind === "directory") return undefined;
         if (kind === "other")
           throw new UnsafeWorkspaceLockPathError(attempt.lockPath);
       } else if (!isTransientContentionError(error)) {
@@ -841,20 +739,11 @@ async function openOrCreateNativeLockFile(
   }
 }
 
-async function createAndPublishNativeLock(
-  attempt: WorkspaceLockAttempt,
-): Promise<WorkspaceLock> {
-  const nativeBinding = await loadExclusiveFileLock();
-  assertLockAttempt(attempt);
-  const opened = await openOrCreateNativeLockFile(attempt);
-  return holdNativeLock(attempt, opened, nativeBinding);
-}
-
 /** The marker is committed only while the exact persistent file is locked. */
 async function holdNativeLock(
   attempt: WorkspaceLockAttempt,
   opened: { readonly descriptor: number; readonly identity: LockFileIdentity },
-  nativeBinding: ExclusiveFileLockBinding,
+  nativeBinding: NativeFileLockBinding,
   marker?: NativeLockProtocolMarker,
 ): Promise<WorkspaceLock> {
   try {
@@ -884,6 +773,7 @@ async function holdNativeLock(
       marker,
       operation: attempt.operation,
       acquiredAt: Date.now(),
+      releaseDemand: attempt.releaseDemand,
       phase: { kind: "active" },
     };
     try {
@@ -896,7 +786,9 @@ async function holdNativeLock(
       );
     }
     assertLockAttempt(attempt);
-    return authorityLock(state);
+    const lock = authorityLock(state);
+    attempt.releaseDemand = undefined;
+    return lock;
   } catch (cause) {
     try {
       nativeBinding.release(opened.descriptor);
@@ -906,493 +798,6 @@ async function holdNativeLock(
     closeSync(opened.descriptor);
     throw cause;
   }
-}
-
-function sameOwnerFileObservation(
-  left: BigIntStats,
-  right: BigIntStats,
-): boolean {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.mode === right.mode &&
-    left.nlink === right.nlink &&
-    left.size === right.size &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs
-  );
-}
-
-function parseLegacyOwner(
-  text: string,
-  expectedToken: string | undefined,
-): LegacyWorkspaceLockOwner | undefined {
-  let parsed: Partial<LegacyWorkspaceLockOwner>;
-  try {
-    parsed = JSON.parse(text) as Partial<LegacyWorkspaceLockOwner>;
-  } catch {
-    return undefined;
-  }
-  if (
-    typeof parsed.token !== "string" ||
-    parsed.token.length === 0 ||
-    (expectedToken !== undefined && parsed.token !== expectedToken) ||
-    typeof parsed.pid !== "number" ||
-    !Number.isSafeInteger(parsed.pid) ||
-    parsed.pid <= 0 ||
-    typeof parsed.hostname !== "string" ||
-    parsed.hostname.length === 0 ||
-    typeof parsed.operation !== "string" ||
-    typeof parsed.acquiredAt !== "number" ||
-    !Number.isFinite(parsed.acquiredAt)
-  ) {
-    return undefined;
-  }
-  return {
-    token: parsed.token,
-    pid: parsed.pid,
-    hostname: parsed.hostname,
-    operation: parsed.operation,
-    acquiredAt: parsed.acquiredAt,
-  };
-}
-
-async function readLegacyOwnerFile(
-  path: string,
-  expectedToken: string | undefined,
-): Promise<LegacyOwnerRecord | undefined> {
-  let pathBefore: BigIntStats;
-  try {
-    pathBefore = await lstat(path, { bigint: true });
-  } catch {
-    return undefined;
-  }
-  if (
-    pathBefore.isSymbolicLink() ||
-    !pathBefore.isFile() ||
-    pathBefore.nlink !== 1n ||
-    pathBefore.size > LEGACY_OWNER_FILE_MAX_BYTES
-  ) {
-    return undefined;
-  }
-
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    const before = await handle.stat({ bigint: true });
-    if (
-      !before.isFile() ||
-      before.nlink !== 1n ||
-      before.size > LEGACY_OWNER_FILE_MAX_BYTES ||
-      !sameOwnerFileObservation(pathBefore, before)
-    ) {
-      return undefined;
-    }
-    const allocated = Buffer.allocUnsafe(Number(before.size));
-    let offset = 0;
-    while (offset < allocated.byteLength) {
-      const { bytesRead } = await handle.read(
-        allocated,
-        offset,
-        allocated.byteLength - offset,
-        offset,
-      );
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    const probe = Buffer.allocUnsafe(1);
-    const { bytesRead: extraBytes } = await handle.read(probe, 0, 1, offset);
-    const [after, pathAfter] = await Promise.all([
-      handle.stat({ bigint: true }),
-      lstat(path, { bigint: true }),
-    ]);
-    if (
-      extraBytes !== 0 ||
-      offset !== allocated.byteLength ||
-      !sameOwnerFileObservation(before, after) ||
-      !sameOwnerFileObservation(after, pathAfter)
-    ) {
-      return undefined;
-    }
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(allocated);
-    const owner = parseLegacyOwner(text, expectedToken);
-    return owner === undefined ? undefined : { owner, path };
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-}
-
-async function observeLegacyOwnerState(
-  lockPath: string,
-): Promise<LegacyWorkspaceLockOwnerObservation | undefined> {
-  let names: string[];
-  try {
-    names = await readdir(lockPath);
-  } catch (error) {
-    if (systemErrorCode(error) === "ENOENT") return undefined;
-    throw error;
-  }
-  if (names.length === 0) return { kind: "empty" };
-  const ownerNames = names.filter(
-    (name) =>
-      name.startsWith(LEGACY_OWNER_PREFIX) &&
-      name.endsWith(LEGACY_OWNER_SUFFIX),
-  );
-  const name = ownerNames[0];
-  if (ownerNames.length !== 1 || name === undefined || names.length !== 1) {
-    return { kind: "ambiguous" };
-  }
-  const token = name.slice(
-    LEGACY_OWNER_PREFIX.length,
-    -LEGACY_OWNER_SUFFIX.length,
-  );
-  const record = await readLegacyOwnerFile(join(lockPath, name), token);
-  return record === undefined
-    ? { kind: "ambiguous" }
-    : { kind: "valid", owner: record.owner };
-}
-
-async function removeEmptyDirectory(path: string): Promise<void> {
-  try {
-    await rmdir(path);
-  } catch (error) {
-    const code = systemErrorCode(error);
-    if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") {
-      throw error;
-    }
-  }
-}
-
-interface LegacyLockState {
-  readonly lockPath: string;
-  readonly device: bigint;
-  readonly inode: bigint;
-  readonly owner: LegacyWorkspaceLockOwner;
-  readonly ownerPath: string;
-  readonly ownerFile: LockFileIdentity;
-}
-
-/**
- * Really acquire the legacy directory lock. A contender using the published
- * 0.2.4 algorithm is excluded by the same `mkdir` that grants this call, so
- * automatic stale takeover stays disabled: an owner record that looks
- * abandoned is never proof that no old process is running.
- */
-async function acquireLegacyDirectoryLock(
-  attempt: WorkspaceLockAttempt,
-): Promise<LegacyLockState> {
-  const { lockPath, operation } = attempt;
-  const canonicalPath = attempt.binding.canonicalPath;
-  const owner: LegacyWorkspaceLockOwner = {
-    token: randomUUID(),
-    pid: process.pid,
-    hostname: hostname(),
-    operation,
-    acquiredAt: Date.now(),
-  };
-  const ownerPath = join(
-    lockPath,
-    `${LEGACY_OWNER_PREFIX}${owner.token}${LEGACY_OWNER_SUFFIX}`,
-  );
-
-  for (;;) {
-    assertLockAttempt(attempt);
-    let created: BigIntStats;
-    try {
-      await mkdir(lockPath, { mode: 0o700 });
-      created = await lstat(lockPath, { bigint: true });
-      const names = await readdir(lockPath);
-      if (
-        !created.isDirectory() ||
-        created.isSymbolicLink() ||
-        names.length !== 0
-      ) {
-        throw new WorkspaceLockOwnershipLostError(
-          canonicalPath,
-          "the legacy lock directory was not empty after exclusive creation",
-        );
-      }
-    } catch (error) {
-      if (error instanceof WorkspaceLockOwnershipLostError) throw error;
-      if (
-        systemErrorCode(error) !== "EEXIST" &&
-        !isTransientContentionError(error)
-      ) {
-        throw error;
-      }
-      const kind = await observeLockPathKind(lockPath);
-      if (kind === "file") throw new WorkspaceLockProtocolChanged();
-      if (kind === "other") throw new UnsafeWorkspaceLockPathError(lockPath);
-      await waitForLock(attempt);
-      continue;
-    }
-
-    try {
-      await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      const observed = await observeLegacyOwnerState(lockPath);
-      const publishedOwner = await lstat(ownerPath, { bigint: true });
-      const current = await lstat(lockPath, { bigint: true });
-      if (
-        observed === undefined ||
-        observed.kind !== "valid" ||
-        observed.owner.token !== owner.token ||
-        current.dev !== created.dev ||
-        current.ino !== created.ino ||
-        !publishedOwner.isFile() ||
-        publishedOwner.isSymbolicLink() ||
-        publishedOwner.nlink !== 1n
-      ) {
-        throw new WorkspaceLockOwnershipLostError(
-          canonicalPath,
-          "the legacy lock formation changed while its owner was published",
-        );
-      }
-      return {
-        lockPath,
-        device: created.dev,
-        inode: created.ino,
-        owner,
-        ownerPath,
-        ownerFile: lockFileIdentityOf(publishedOwner),
-      };
-    } catch (error) {
-      // Only an unchanged, empty directory may be removed through the fixed
-      // pathname; any other residue is preserved for diagnostics and the
-      // operation fails closed.
-      await removeEmptyDirectory(lockPath).catch(() => {});
-      throw error;
-    }
-  }
-}
-
-async function unlinkExactLegacyOwnerFile(
-  state: LegacyLockState,
-): Promise<void> {
-  let current: BigIntStats;
-  try {
-    current = await lstat(state.ownerPath, { bigint: true });
-  } catch (cause) {
-    throw new WorkspaceLockOwnershipLostError(
-      dirname(state.lockPath),
-      "legacy owner record disappeared during release",
-      { cause },
-    );
-  }
-  if (!sameLockFileIdentity(state.ownerFile, current)) {
-    throw new WorkspaceLockOwnershipLostError(
-      dirname(state.lockPath),
-      "legacy owner record was replaced during release",
-    );
-  }
-  try {
-    await unlink(state.ownerPath);
-  } catch (cause) {
-    if (systemErrorCode(cause) === "ENOENT") {
-      throw new WorkspaceLockOwnershipLostError(
-        dirname(state.lockPath),
-        "legacy owner record disappeared during unlink",
-        { cause },
-      );
-    }
-    throw cause;
-  }
-}
-
-async function releaseLegacyDirectoryLock(
-  state: LegacyLockState,
-): Promise<void> {
-  await unlinkExactLegacyOwnerFile(state);
-  let current: BigIntStats;
-  try {
-    current = await lstat(state.lockPath, { bigint: true });
-  } catch (cause) {
-    if (systemErrorCode(cause) === "ENOENT") {
-      throw new WorkspaceLockOwnershipLostError(
-        dirname(state.lockPath),
-        "lock directory disappeared during release",
-        { cause },
-      );
-    }
-    throw cause;
-  }
-  if (current.dev !== state.device || current.ino !== state.inode) {
-    throw new WorkspaceLockOwnershipLostError(
-      dirname(state.lockPath),
-      "lock directory was replaced during release",
-    );
-  }
-  try {
-    await rmdir(state.lockPath);
-  } catch (cause) {
-    if (systemErrorCode(cause) === "ENOENT") {
-      throw new WorkspaceLockOwnershipLostError(
-        dirname(state.lockPath),
-        "lock directory disappeared during final release",
-        { cause },
-      );
-    }
-    throw cause;
-  }
-}
-
-/** Read-only lock observation used by diagnostics; never creates or deletes. */
-export type WorkspaceLockDiagnostic =
-  | {
-      /**
-       * The native lock was acquirable: one non-blocking attempt succeeded and
-       * was released before this observation returned.
-       */
-      readonly kind: "native-acquired";
-      readonly marker: NativeLockProtocolMarker;
-    }
-  | { readonly kind: "native-busy" }
-  | {
-      readonly kind: "legacy-directory";
-      readonly owner: LegacyWorkspaceLockOwnerObservation;
-    }
-  | { readonly kind: "absent" }
-  | { readonly kind: "interrupted-switch" }
-  | { readonly kind: "corrupt"; readonly detail: string }
-  | { readonly kind: "inconsistent"; readonly detail: string }
-  | {
-      readonly kind: "unsupported";
-      readonly observedFormat: unknown;
-      readonly observedProtocol: unknown;
-    };
-
-/**
- * Observe the lock without business write authority. A native lock is held for
- * at most one non-blocking attempt and released before returning.
- */
-export async function inspectWorkspaceLock(
-  storeRoot: string,
-): Promise<WorkspaceLockDiagnostic> {
-  const binding = await bindStoreRoot(storeRoot);
-  const lockPath = join(binding.canonicalPath, WORKSPACE_LOCK_FILE);
-  let marker: ReturnType<typeof readLockProtocolMarkerSync>;
-  try {
-    marker = readLockProtocolMarkerSync(binding.canonicalPath);
-  } catch (error) {
-    if (error instanceof LockProtocolCorruptError) {
-      return { kind: "corrupt", detail: error.detail };
-    }
-    throw error;
-  }
-  if (marker.kind === "unsupported") {
-    return {
-      kind: "unsupported",
-      observedFormat: marker.observedFormat,
-      observedProtocol: marker.observedProtocol,
-    };
-  }
-  if (marker.kind === "absent") {
-    switch (await observeLockPathKind(lockPath)) {
-      case "absent":
-        return { kind: "absent" };
-      case "directory":
-        return {
-          kind: "legacy-directory",
-          owner: (await observeLegacyOwnerState(lockPath)) ?? {
-            kind: "ambiguous",
-          },
-        };
-      case "file":
-        return { kind: "interrupted-switch" };
-      default:
-        return {
-          kind: "inconsistent",
-          detail:
-            "the fixed lock path is neither a regular file nor a directory",
-        };
-    }
-  }
-
-  switch (await observeLockPathKind(lockPath)) {
-    case "absent":
-      return {
-        kind: "inconsistent",
-        detail:
-          "the native protocol marker is present but the lock file is missing",
-      };
-    case "file":
-      break;
-    case "directory":
-      return {
-        kind: "inconsistent",
-        detail:
-          "the native protocol marker is present but the fixed lock path is a directory",
-      };
-    default:
-      return {
-        kind: "inconsistent",
-        detail:
-          "the native protocol marker is present but the fixed lock path is not a regular file",
-      };
-  }
-
-  let descriptor: number;
-  try {
-    descriptor = openSync(
-      lockPath,
-      constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
-    );
-  } catch (error) {
-    if (isTransientContentionError(error)) {
-      return {
-        kind: "inconsistent",
-        detail:
-          "the lock file cannot be opened for exclusivity (permissions or read-only media)",
-      };
-    }
-    throw error;
-  }
-  try {
-    const opened = fstatSync(descriptor, { bigint: true });
-    if (!nativeLockFileShape(opened) || opened.size !== 0n) {
-      return {
-        kind: "inconsistent",
-        detail:
-          "the fixed lock path is not a zero-length single-link regular file",
-      };
-    }
-    const nativeBinding = await loadExclusiveFileLock();
-    if (!nativeBinding.tryAcquire(descriptor)) return { kind: "native-busy" };
-    nativeBinding.release(descriptor);
-    return { kind: "native-acquired", marker };
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-/**
- * One-off offline recovery: isolate a legacy directory lock that no live
- * protocol can release. Requires the operator-asserted stop condition; only the
- * fixed legacy directory is renamed, never a native lock file or any other path.
- */
-export async function quarantineLegacyWorkspaceLock(
-  storeRoot: string,
-): Promise<
-  | { readonly kind: "quarantined"; readonly path: string }
-  | { readonly kind: "nothing-to-recover" }
-  | { readonly kind: "native-protocol" }
-> {
-  const binding = await bindStoreRoot(storeRoot);
-  const lockPath = join(binding.canonicalPath, WORKSPACE_LOCK_FILE);
-  const marker = readLockProtocolMarkerSync(binding.canonicalPath);
-  if (marker.kind === "native-file-v1") return { kind: "native-protocol" };
-  if ((await observeLockPathKind(lockPath)) !== "directory") {
-    return { kind: "nothing-to-recover" };
-  }
-  const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const target = `${lockPath}.abandoned-${stamp}-${randomUUID().slice(0, 8)}`;
-  await rename(lockPath, target);
-  return { kind: "quarantined", path: target };
 }
 
 /**
@@ -1637,27 +1042,4 @@ export async function runWithOrderedWorkspaceLocks<T>(
     actionResult = { kind: "action-failed", cause };
   }
   return { ...actionResult, cleanup: await releaseOrderedLocks(acquired) };
-}
-
-/** Acquire multiple workspace locks in one canonical order to avoid AB/BA deadlocks. */
-export async function withOrderedWorkspaceLocks<T>(
-  targets: readonly OrderedWorkspaceLockTarget[],
-  operation: string,
-  action: (authorities: OrderedWorkspaceAuthorities) => Promise<T>,
-): Promise<T> {
-  const execution = await runWithOrderedWorkspaceLocks(
-    targets,
-    operation,
-    action,
-  );
-  if (execution.kind === "completed") {
-    if (execution.cleanup.kind === "settled") return execution.value;
-    throw execution.cleanup.cause;
-  }
-  if (execution.cleanup.kind === "settled") throw execution.cause;
-  throw new AggregateError(
-    [execution.cause, ...execution.cleanup.failures],
-    "ordered workspace-lock operation and cleanup both failed",
-    { cause: execution.cause },
-  );
 }

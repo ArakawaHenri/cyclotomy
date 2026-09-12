@@ -1,9 +1,4 @@
-/**
- * Minimal ambient surface for the prebuilt-only native lock dependency. Only
- * the whole-file exclusive lock operations are declared; the package ships
- * prebuilds for the supported platforms and is loaded dynamically so a missing
- * binary degrades to read-only diagnostics instead of failing module load.
- */
+/** Whole-file locking from the dependency's prebuilt native binding. */
 declare module "fs-native-extensions" {
   export interface FileLockOptions {
     readonly shared?: boolean;

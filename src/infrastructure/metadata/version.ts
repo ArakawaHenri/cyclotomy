@@ -5,7 +5,6 @@ import {
   MetadataError,
   MetadataVersionUnsupportedError,
 } from "../metadata-error.ts";
-import type { SessionHistoryExpectation } from "./history.ts";
 import {
   isDefinedMetadataSchema,
   metadataSchemaVersion,
@@ -16,7 +15,6 @@ import {
 export type MetadataSessionIdentityMatch = "absent" | "conflict" | "exact";
 
 export interface MetadataMigrationDependencies {
-  readonly history?: SessionHistoryExpectation | undefined;
   readonly signal?: AbortSignal | undefined;
   /**
    * Publish the requested-format equivalent of every supplied rooted tree.

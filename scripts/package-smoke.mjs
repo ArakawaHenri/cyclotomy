@@ -87,8 +87,7 @@ try {
   const archive = join(packDirectory, archives[0]);
 
   // Install only the packed artifact into Pi's managed user-package layout.
-  // Include runtime dependencies but omit Pi peers: the locked host supplies
-  // the public extension API, and the CLI must start independently of Pi.
+  // Include runtime dependencies; Pi supplies the extension API.
   await runNpm(
     [
       "install",
@@ -113,11 +112,6 @@ try {
   assert.equal(typeof manifest.version, "string");
   assert.deepEqual(manifest.pi?.extensions, ["./src/index.ts"]);
   assert.deepEqual(manifest.exports, { ".": "./src/index.ts" });
-  assert.deepEqual(manifest.bin, { cyclotomy: "./dist/cli.js" });
-  assert.ok(
-    await readFile(join(installedRoot, "dist", "cli.js"), "utf8"),
-    "the packed tarball must contain the built CLI (run `npm run build`)",
-  );
   const installedRequire = createRequire(
     join(installRoot, "package-smoke.cjs"),
   );
@@ -161,59 +155,8 @@ try {
     "Pi must load the entry point from the installed tarball",
   );
 
-  // The installed CLI must run from the tarball alone, without Pi's peer
-  // runtime and without the repository on disk.
-  const cliShim = join(
-    installRoot,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "cyclotomy.cmd" : "cyclotomy",
-  );
-  const runInstalledCli = (args, options) =>
-    process.platform === "win32"
-      ? execFileAsync(
-          process.env.ComSpec ?? "cmd.exe",
-          [
-            "/d",
-            "/s",
-            "/c",
-            `"${[cliShim, ...args].map((argument) => `"${argument}"`).join(" ")}"`,
-          ],
-          { ...options, windowsVerbatimArguments: true },
-        )
-      : execFileAsync(cliShim, args, options);
-  const help = await runInstalledCli(["--help"], {
-    cwd: workspace,
-    env: {
-      ...Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([key]) => key.toLowerCase() !== "node_options",
-        ),
-      ),
-      PI_CODING_AGENT_DIR: agentDir,
-    },
-  });
-  assert.match(help.stdout, /Usage: cyclotomy <command>/u);
-
-  await assert.rejects(
-    runInstalledCli(["doctor", "--workspace", join(workspace, "gone")], {
-      cwd: workspace,
-      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-    }),
-    (error) => error.code === 2,
-    "an unresolvable workspace must exit 2",
-  );
-
-  const doctor = await runInstalledCli(["doctor", "--json"], {
-    cwd: workspace,
-    env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-  });
-  assert.equal(JSON.parse(doctor.stdout).schemaVersion, 1);
-  assert.equal(JSON.parse(doctor.stdout).command, "doctor");
-
-  // Load the native dependency from the installed artifact with scripts and
-  // peers omitted, and exercise the compiled module's actual lock entry.
-  // A child process lets Windows unmap the native binary before cleanup.
+  // Exercise the installed native dependency in a child so Windows can unmap
+  // its binary before the temporary package is removed.
   const nativeStore = join(sandbox, "native-store");
   await mkdir(nativeStore);
   await execFileAsync(
@@ -221,24 +164,26 @@ try {
     [
       "--input-type=module",
       "--eval",
-      `const lock = await import(process.argv[1]);
-       const storeRoot = process.argv[2];
-       await lock.withWorkspaceLock(
-         storeRoot,
-         "installed package smoke",
-         async (authority) => {
-           lock.assertWorkspaceWriteAuthority(authority, storeRoot);
-         },
-       );`,
-      pathToFileURL(
-        join(installedRoot, "dist", "infrastructure", "workspace-lock.js"),
-      ).href,
-      nativeStore,
+      `import assert from "node:assert/strict";
+       import { openSync, closeSync } from "node:fs";
+       const binding = await import(process.argv[1]);
+       const first = openSync(process.argv[2], "wx", 0o600);
+       const second = openSync(process.argv[2], "r+");
+       try {
+         assert.equal(binding.tryLock(first), true);
+         assert.equal(binding.tryLock(second), false);
+         binding.unlock(first);
+         assert.equal(binding.tryLock(second), true);
+         binding.unlock(second);
+       } finally {
+         closeSync(second);
+         closeSync(first);
+       }`,
+      pathToFileURL(installedRequire.resolve("fs-native-extensions")).href,
+      join(nativeStore, "workspace.lock"),
     ],
     { cwd: workspace },
   );
-
-  console.log("Package smoke passed: npm tarball installed and loaded by Pi.");
 } finally {
   if (previousAgentDir === undefined) {
     delete process.env.PI_CODING_AGENT_DIR;
@@ -252,3 +197,5 @@ try {
   }
   await rm(sandbox, { recursive: true, force: true });
 }
+
+console.log("Package smoke passed: npm tarball installed and loaded by Pi.");

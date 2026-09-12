@@ -5,11 +5,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-  applySessionHistoryForget,
-  previewSessionHistoryForget,
-} from "../src/application/history-forget.ts";
-import { CyclotomyI18n } from "../src/presentation/i18n.ts";
+import { resetTestSessionHistory } from "./session-history-fixture.ts";
+import { withWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
+import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import {
   checkpointState,
@@ -90,10 +88,13 @@ describe("history reset across instances", () => {
     });
 
     // Another instance forgets this session's history while this engine is idle.
-    const preview = await previewSessionHistoryForget(storeRoot, sessionId);
-    expect(preview.issues).toEqual([]);
-    expect(preview.facts?.slotCount).toBe(1);
-    await applySessionHistoryForget(storeRoot, sessionId, preview.planToken!);
+    await withWorkspaceLock(
+      storeRoot,
+      "external history reset",
+      async (authority) => {
+        resetTestSessionHistory(storeRoot, sessionId, authority);
+      },
+    );
     expect(await sessionHistory(sessionId)).toEqual({
       epoch: 1,
       resetPending: 1,
@@ -149,8 +150,13 @@ describe("history reset across instances", () => {
     await pi.endTurn();
     const sessionId = pi.manager.sessionId;
 
-    const preview = await previewSessionHistoryForget(storeRoot, sessionId);
-    await applySessionHistoryForget(storeRoot, sessionId, preview.planToken!);
+    await withWorkspaceLock(
+      storeRoot,
+      "external history reset",
+      async (authority) => {
+        resetTestSessionHistory(storeRoot, sessionId, authority);
+      },
+    );
 
     // Reopening the same session attaches the new generation without asking
     // again and without restoring the removed coordinate.
@@ -172,6 +178,16 @@ describe("history reset across instances", () => {
     expect(
       checkpointState(db, sessionId, reopened.manager.getLeafId()!),
     ).toBeDefined();
+    const retainedLeaf = reopened.manager.getLeafId()!;
+    const retained = checkpointState(db, sessionId, retainedLeaf);
+    await writeFile(join(workspace, "a.txt"), "stale attempt");
+    await pi.endTurn();
+    expect(
+      checkpointState(db, sessionId, reopened.manager.getLeafId()!),
+    ).toBeUndefined();
+    expect(notified(pi, TEST_I18N.t("captureHistoryReset"))).toBe(true);
+    expect(checkpointState(db, sessionId, retainedLeaf)).toEqual(retained);
+    expect(retained).toBeDefined();
     db.close();
   });
 });

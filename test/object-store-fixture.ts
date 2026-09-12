@@ -9,7 +9,7 @@ import type {
   SnapshotPublication,
   TreeImportAdmission,
 } from "../src/infrastructure/object-store.ts";
-import { withOrderedWorkspaceLocks } from "../src/infrastructure/workspace-lock.ts";
+import { runWithOrderedWorkspaceLocks } from "../src/infrastructure/workspace-lock.ts";
 import type { TreeEntry } from "../src/infrastructure/tree-formats/manifest-codec.ts";
 import type { WorkspaceScope } from "../src/infrastructure/workspace-scope.ts";
 
@@ -25,7 +25,7 @@ export async function importTestTrees(
   options: { readonly signal?: AbortSignal } = {},
 ): Promise<void> {
   const targetRoot = await realpath(target.storageRoot);
-  return await withOrderedWorkspaceLocks(
+  const execution = await runWithOrderedWorkspaceLocks(
     [source, target].map(({ storageRoot }) => ({
       storeRoot: storageRoot,
       options,
@@ -37,6 +37,8 @@ export async function importTestTrees(
         ...options,
       }),
   );
+  if (execution.kind === "action-failed") throw execution.cause;
+  if (execution.cleanup.kind === "failed") throw execution.cleanup.cause;
 }
 
 async function withSourceDirectory<T>(

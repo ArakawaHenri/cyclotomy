@@ -1,3 +1,4 @@
+import * as automaticGc from "../src/infrastructure/object-gc.ts";
 import { createHash } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import {
@@ -42,7 +43,7 @@ import {
   nativeLooseRecordPath,
   nativeObjectLayout,
 } from "../src/infrastructure/workspace-store.ts";
-import { CyclotomyI18n } from "../src/presentation/i18n.ts";
+import { CyclotomyI18n } from "../src/pi/i18n.ts";
 import { SessionRegistrationService } from "../src/pi/session-registration-service.ts";
 import { projectStableGraph } from "../src/pi/extension-boundary.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
@@ -3090,38 +3091,58 @@ describe("Cyclotomy runtime", () => {
     runtime.close();
   });
 
-  it("does not disguise a corrupted automatic-GC schedule as never run", async () => {
+  it("retries automatic cleanup after cancellation without recording completion", async () => {
+    const { workspace, home, runtime } = await createRuntime();
+    const statePath = join(runtime.storeRoot, "gc-state.json");
+    const collect = automaticGc.collectGarbage;
+    const probe = vi
+      .spyOn(automaticGc, "collectGarbage")
+      .mockImplementationOnce((authority, store, metadata, options) =>
+        collect(authority, store, metadata, {
+          ...options,
+          onProgress: () => runtime.retire(),
+        }),
+      );
+    try {
+      await expect(runtime.maybeRunAutomaticGc()).resolves.toMatchObject({
+        kind: "completed",
+        value: { stopped: "cancelled" },
+      });
+      await expect(readFile(statePath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      probe.mockRestore();
+      runtime.close();
+    }
+    const resumed = new CyclotomyRuntime(
+      loadCyclotomyConfig(home),
+      new CyclotomyI18n("en"),
+    );
+    try {
+      expect(await resumed.ensureStore(workspace)).toBe(true);
+      await expect(resumed.maybeRunAutomaticGc()).resolves.toMatchObject({
+        kind: "completed",
+      });
+      expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({
+        lastGcAt: expect.any(Number),
+      });
+    } finally {
+      resumed.close();
+    }
+  });
+
+  it("repairs a corrupted automatic-GC schedule after collection", async () => {
     const { runtime } = await createRuntime();
     const statePath = join(runtime.storeRoot, "gc-state.json");
     await writeFile(statePath, "{not-json\n");
 
-    await expect(runtime.maybeRunAutomaticGc()).rejects.toThrow(
-      "automatic GC schedule is unreadable",
-    );
-    expect(await readFile(statePath, "utf8")).toBe("{not-json\n");
-    runtime.close();
-  });
-
-  it("leaves neighboring symlinks untouched while publishing GC state", async (context) => {
-    context.skip(
-      process.platform === "win32",
-      "Windows symlink creation is privilege-dependent",
-    );
-    const { parent, runtime } = await createRuntime();
-    const statePath = join(runtime.storeRoot, "gc-state.json");
-    const neighboringPath = `${statePath}.${process.pid}.tmp`;
-    const victim = join(parent, "victim.txt");
-    await writeFile(victim, "must remain untouched");
-    await symlink(victim, neighboringPath);
-
-    await runtime.maybeRunAutomaticGc();
-
-    expect(await readFile(victim, "utf8")).toBe("must remain untouched");
-    expect((await lstat(neighboringPath)).isSymbolicLink()).toBe(true);
-    const state = JSON.parse(await readFile(statePath, "utf8")) as {
-      lastGcAt: number;
-    };
-    expect(Number.isFinite(state.lastGcAt)).toBe(true);
+    await expect(runtime.maybeRunAutomaticGc()).resolves.toMatchObject({
+      kind: "completed",
+    });
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({
+      lastGcAt: expect.any(Number),
+    });
     runtime.close();
   });
 

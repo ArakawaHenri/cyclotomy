@@ -19,14 +19,12 @@
   },
   "files": [
     "src",
-    "dist",
+    "docs/configuration.md",
+    "docs/configuration.zh.md",
     "README.md",
     "README.zh.md",
     "LICENSE"
   ],
-  "bin": {
-    "cyclotomy": "./dist/cli.js"
-  },
   "keywords": [
     "pi-package"
   ],
@@ -34,7 +32,6 @@
     "node": ">=24.15.0"
   },
   "scripts": {
-    "build": "node scripts/build-cli.mjs",
     "check": "tsc -p tsconfig.json",
     "format": "prettier --write src test scripts .github package.json package-lock.json tsconfig.json vitest.config.ts README.md README.zh.md",
     "format:check": "prettier --check src test scripts .github package.json package-lock.json tsconfig.json vitest.config.ts README.md README.zh.md",
@@ -43,9 +40,9 @@
     "test:package": "node scripts/package-smoke.mjs",
     "test:performance": "vitest run test/scan-publication-performance.test.ts --reporter=verbose",
     "test:performance:gc": "node scripts/gc-performance.mjs",
-    "test:real-pi": "vitest run test/real-pi-integration.test.ts",
+    "test:real-pi": "vitest run test/real-pi-integration.test.ts test/pi-lock-integration.test.ts",
     "test:watch": "vitest",
-    "verify": "npm run format:check && npm run check && npm run build && npm test",
+    "verify": "npm run format:check && npm run check && npm test",
     "prepublishOnly": "npm run verify && npm run test:package"
   },
   "pi": {

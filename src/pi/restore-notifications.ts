@@ -10,10 +10,10 @@ import type {
 import { metadataHistoryResetIn } from "../infrastructure/metadata-error.ts";
 import type { ArrivalDisposition } from "./arrival-settlement.ts";
 import { assertNever } from "./assert-never.ts";
-import type { MessageKey } from "../presentation/i18n.ts";
-import { formatUiDetail } from "../presentation/restore-presentation.ts";
+import type { MessageKey } from "./i18n.ts";
+import { formatUiDetail } from "./restore-presentation.ts";
 import type { CyclotomyRuntime } from "./runtime.ts";
-import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { RestoreProtocolOutcome } from "./workspace-mutation-protocol.ts";
 import type {
   ArrivalReceipt,

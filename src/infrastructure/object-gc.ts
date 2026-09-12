@@ -1,5 +1,7 @@
-import { performance } from "node:perf_hooks";
-import { isOperationCancelled } from "./workspace-operation.ts";
+import {
+  yieldForCancellation,
+  isOperationCancelled,
+} from "./workspace-operation.ts";
 import { MAX_RECIPE_DEPTH } from "./content-store/chunk-recipe.ts";
 import {
   DEFAULT_COMPACTION_DECODED_BYTE_BUDGET,
@@ -74,7 +76,11 @@ import type {
   VerifiedObjectLocation,
   VerifiedContentRead,
 } from "./content-store/repository.ts";
-import { primaryFailure, withRetainedCleanup } from "./failure-settlement.ts";
+import {
+  primaryFailure,
+  retainCleanupFailure,
+  withRetainedCleanup,
+} from "./failure-settlement.ts";
 import type { CurrentMetadataStore } from "./metadata.ts";
 import {
   assertWorkspaceWriteAuthority,
@@ -109,7 +115,7 @@ export interface GcReport {
 }
 
 /** A stopped pass reports completed work; additive replacements may remain. */
-export type GcStopReason = "budget-exceeded" | "cancelled";
+export type GcStopReason = "cancelled";
 
 /** The coarse stages a pass reports progress for. */
 export type GcPhase = "mark" | "inventory" | "plan" | "compaction" | "sweep";
@@ -128,8 +134,6 @@ export interface GarbageCollectionOptions {
   readonly maxObjects?: number;
   /** Bounds one maintenance pass without adding persistent cursor state. */
   readonly maxCompactionObjects?: number;
-  /** Cooperative budget for the whole pass, checked at safe work boundaries. */
-  readonly budgetMs?: number;
   /** Cooperative cancellation; see {@link GcStopReason}. */
   readonly signal?: AbortSignal;
   /** Coarse progress for long passes; every callback is O(1). */
@@ -187,7 +191,7 @@ export class GarbageCollectionRootDriftError extends Error {
 
 /**
  * The rooted graph is larger than one pass may authenticate. Nothing is
- * removed: the operator's lever is dropping history, not retrying.
+ * removed; retained checkpoints remain intact.
  */
 export class GarbageCollectionLimitError extends RangeError {}
 
@@ -209,55 +213,17 @@ const GC_PROGRESS_STRIDE = 256;
 /** Cancellation reaches readers; durable batches finish before the next check. */
 class GarbageCollectionControl {
   readonly signal: AbortSignal;
-  readonly #deadline: number | undefined;
-  readonly #requestedSignal: AbortSignal | undefined;
-  readonly #controller = new AbortController();
   readonly #onProgress: ((progress: GcProgress) => void) | undefined;
-  readonly #timer: ReturnType<typeof setTimeout> | undefined;
   #freedBytes = 0;
+  #lastYieldAt = performance.now();
 
   constructor(options: GarbageCollectionOptions) {
-    if (
-      options.budgetMs !== undefined &&
-      (!Number.isFinite(options.budgetMs) || options.budgetMs < 0)
-    ) {
-      throw new RangeError(
-        "garbage-collection budget must be finite and non-negative",
-      );
-    }
-    this.#deadline =
-      options.budgetMs === undefined
-        ? undefined
-        : performance.now() + options.budgetMs;
-    this.#requestedSignal = options.signal;
-    this.signal =
-      options.signal === undefined
-        ? this.#controller.signal
-        : AbortSignal.any([options.signal, this.#controller.signal]);
+    this.signal = options.signal ?? new AbortController().signal;
     this.#onProgress = options.onProgress;
-    if (options.budgetMs !== undefined) {
-      this.#timer = setTimeout(
-        () => {
-          this.#controller.abort(
-            new GarbageCollectionStopError("budget-exceeded"),
-          );
-        },
-        Math.min(Math.ceil(options.budgetMs), 2_147_483_647),
-      );
-      this.#timer.unref();
-    }
   }
 
   reason(): GcStopReason | undefined {
-    if (this.#requestedSignal?.aborted === true) return "cancelled";
-    if (
-      this.#controller.signal.aborted ||
-      (this.#deadline !== undefined && performance.now() >= this.#deadline)
-    ) {
-      this.#controller.abort(new GarbageCollectionStopError("budget-exceeded"));
-      return "budget-exceeded";
-    }
-    return undefined;
+    return this.signal.aborted ? "cancelled" : undefined;
   }
 
   check(): void {
@@ -265,14 +231,17 @@ class GarbageCollectionControl {
     if (reason !== undefined) throw new GarbageCollectionStopError(reason);
   }
 
+  async checkpoint(): Promise<void> {
+    this.check();
+    if (performance.now() - this.#lastYieldAt < 8) return;
+    await yieldForCancellation(this.signal);
+    this.#lastYieldAt = performance.now();
+  }
+
   assertCanStart(phase: GcPhase): void {
     this.check();
     this.progress(phase, 0, null);
     this.check();
-  }
-
-  dispose(): void {
-    if (this.#timer !== undefined) clearTimeout(this.#timer);
   }
 
   /** Reports progress on a stride so a per-object loop stays cheap. */
@@ -715,13 +684,14 @@ async function authenticateRoots(
     return await withRetainedCleanup(
       async () => {
         for (const [index, treeOid] of roots.entries()) {
+          await control.checkpoint();
           control.assertCanStart("mark");
           control.progress("mark", index, roots.length);
           try {
             const closure = await reads.readTreeClosure(treeOid);
             let visited = 0;
             for (const object of closure.structuralObjects) {
-              if ((visited++ & 255) === 0) control.check();
+              if ((visited++ & 255) === 0) await control.checkpoint();
               const kind = structuralRecordKind(object.kind);
               addLiveKey(
                 liveKeys,
@@ -733,7 +703,7 @@ async function authenticateRoots(
               structuralKinds.set(object.oid, kinds);
             }
             for (const entry of closure.manifest.entries) {
-              if ((visited++ & 255) === 0) control.check();
+              if ((visited++ & 255) === 0) await control.checkpoint();
               if (
                 entry.type === "regular" &&
                 occurrences.length < maximumObjects
@@ -749,7 +719,7 @@ async function authenticateRoots(
               }
             }
             for (const contentId of closure.contentIds) {
-              control.check();
+              await control.checkpoint();
               addLiveKey(
                 liveKeys,
                 logicalKey("content", contentId),
@@ -783,12 +753,7 @@ async function authenticateRoots(
 
         return Object.freeze({
           liveKeys,
-          structuralKinds: new Map(
-            [...structuralKinds].map(([oid, kinds]) => [
-              oid,
-              Object.freeze(new Set(kinds)),
-            ]),
-          ),
+          structuralKinds,
           occurrences: Object.freeze(occurrences),
           authenticatedCoverage: Object.freeze(authenticatedCoverage),
           authenticatedChunked,
@@ -1063,11 +1028,11 @@ async function strictInventories(
   control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
-    control.check();
+    await control.checkpoint();
     const objects = await maintenance.inventory(maximumObjects, {
       signal: control.signal,
     });
-    control.check();
+    await control.checkpoint();
     const packs = await catalog.inventory({ signal: control.signal });
     const inventories = { objects, packs };
     assertInventoryCapacity(inventories, maximumObjects);
@@ -1095,7 +1060,7 @@ async function refreshObjectInventory(
   control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
-    control.check();
+    await control.checkpoint();
     const refreshed = {
       objects: await maintenance.inventory(maximumObjects, {
         signal: control.signal,
@@ -1117,7 +1082,7 @@ async function refreshPackInventory(
   control: GarbageCollectionControl,
 ): Promise<GarbageCollectionInventories> {
   try {
-    control.check();
+    await control.checkpoint();
     const refreshed = {
       objects: inventories.objects,
       packs: await catalog.inventory({ signal: control.signal }),
@@ -1149,12 +1114,11 @@ class CompactionResolver {
   readonly #markedContents: ReadonlyMap<string, VerifiedObjectLocation>;
   readonly #control: GarbageCollectionControl;
 
-  constructor(
+  private constructor(
     store: NativeObjectStore,
     maintenance: ObjectStoreMaintenance,
     objectInventory: MaintenanceInventory,
     catalog: PackCatalog,
-    packInventory: PackCatalogInventory,
     mark: MarkState,
     control: GarbageCollectionControl,
   ) {
@@ -1171,9 +1135,50 @@ class CompactionResolver {
       MAX_RESOLVER_PACKS,
       "logical-read",
     );
+    control.check();
+    this.#repositoryScope = this.#repository.openResolutionScope({
+      signal: control.signal,
+    });
+  }
+
+  static async create(
+    store: NativeObjectStore,
+    maintenance: ObjectStoreMaintenance,
+    objectInventory: MaintenanceInventory,
+    catalog: PackCatalog,
+    packInventory: PackCatalogInventory,
+    mark: MarkState,
+    control: GarbageCollectionControl,
+  ): Promise<CompactionResolver> {
+    const resolver = new CompactionResolver(
+      store,
+      maintenance,
+      objectInventory,
+      catalog,
+      mark,
+      control,
+    );
+    try {
+      await resolver.#index(objectInventory, packInventory, mark, control);
+      return resolver;
+    } catch (cause) {
+      throw await retainCleanupFailure(
+        cause,
+        () => resolver.dispose(),
+        "compaction index preparation and cleanup both failed",
+      );
+    }
+  }
+
+  async #index(
+    objectInventory: MaintenanceInventory,
+    packInventory: PackCatalogInventory,
+    mark: MarkState,
+    control: GarbageCollectionControl,
+  ): Promise<void> {
     let visited = 0;
     for (const object of objectInventory.objects) {
-      if ((visited++ & 255) === 0) control.check();
+      if ((visited++ & 255) === 0) await control.checkpoint();
       for (const key of maintenanceObjectKeys(object, mark)) {
         const text = recordKey(key.kind, key.logicalId);
         const candidates = this.#objectsByKey.get(text) ?? [];
@@ -1183,7 +1188,7 @@ class CompactionResolver {
     }
     for (const catalogEntry of packInventory.packs) {
       for (const entry of catalogEntry.view.entries) {
-        if ((visited++ & 255) === 0) control.check();
+        if ((visited++ & 255) === 0) await control.checkpoint();
         const text = recordKey(entry.kind, entry.logicalId);
         const candidates = this.#packEntriesByKey.get(text) ?? [];
         candidates.push({ catalog: catalogEntry, entry });
@@ -1197,10 +1202,6 @@ class CompactionResolver {
           left.entry.physicalOrdinal - right.entry.physicalOrdinal,
       );
     }
-    control.check();
-    this.#repositoryScope = this.#repository.openResolutionScope({
-      signal: control.signal,
-    });
   }
 
   readEnvelope(key: LogicalRecordKey): Promise<RecordEnvelope> {
@@ -1625,8 +1626,8 @@ async function authenticateRetainedCoverage(
     }
   }
 
-  for (const text of [...mark.liveKeys].sort(compareText)) {
-    control.check();
+  for (const text of mark.liveKeys) {
+    await control.checkpoint();
     const separator = text.indexOf(":");
     const kind = text.slice(0, separator) as RecordKind;
     const logicalId = text.slice(separator + 1);
@@ -1894,14 +1895,16 @@ function extendWithSizeTierRewrite(
   });
 }
 
-function selectCompaction(
+async function selectCompaction(
   objects: MaintenanceInventory,
   packs: PackCatalogInventory,
   mark: MarkState,
   maximumCompactionObjects: number,
   graceMs: number,
   now: number,
-): PackRewriteSelection {
+  control: GarbageCollectionControl,
+): Promise<PackRewriteSelection> {
+  let visited = 0;
   const replacementKeys = new Map<string, LogicalRecordKey>();
   const fullyDeadPackIds = new Set<string>();
   const partialPackIds = new Set<string>();
@@ -1956,7 +1959,9 @@ function selectCompaction(
     }
   };
   for (const pack of sortedPacks) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     for (const entry of pack.view.entries) {
+      if ((visited++ & 255) === 0) await control.checkpoint();
       if (entry.kind === "content") {
         noteContentPhysicalBytes(entry.logicalId, entry.length);
       }
@@ -1968,6 +1973,7 @@ function selectCompaction(
     }
   }
   for (const object of objects.objects) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     if (
       !object.temporary &&
       object.logicalId !== undefined &&
@@ -1986,10 +1992,12 @@ function selectCompaction(
         compareText(left.logicalId ?? "", right.logicalId ?? ""),
     );
   for (const object of liveLoose) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     addKeys(maintenanceObjectKeys(object, mark));
   }
 
   for (const pack of sortedPacks) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     const live = pack.view.entries.filter((entry) =>
       mark.liveKeys.has(recordKey(entry.kind, entry.logicalId)),
     );
@@ -2041,6 +2049,7 @@ function selectCompaction(
   );
   const byPath = new Map<string, Map<ContentId, number>>();
   for (const occurrence of mark.occurrences) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     let counts = byPath.get(occurrence.canonicalPath);
     if (counts === undefined) {
       counts = new Map();
@@ -2052,6 +2061,7 @@ function selectCompaction(
     );
   }
   for (const path of [...byPath.keys()].sort(compareText)) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     const counts = byPath.get(path)!;
     const selectedTargets = [...counts.keys()].filter((contentId) =>
       selectedContent.has(contentId),
@@ -2072,6 +2082,7 @@ function selectCompaction(
       .slice(0, DELTA1_MAX_ANCHORS_PER_PATH);
     const packedCandidates = new Map<string, PackCatalogEntry>();
     for (const [contentId] of candidates) {
+      if ((visited++ & 255) === 0) await control.checkpoint();
       const text = recordKey("content", contentId);
       if (unpackedContentIds.has(contentId)) {
         if (addKeys([logicalKey("content", contentId)])) {
@@ -2080,6 +2091,7 @@ function selectCompaction(
         continue;
       }
       for (const packed of packOccurrences.get(text) ?? []) {
+        if ((visited++ & 255) === 0) await control.checkpoint();
         if (packed.entry.decodedLength <= DELTA1_MAX_TARGET_BYTES) {
           packedCandidates.set(packed.pack.view.packId, packed.pack);
         }
@@ -2088,6 +2100,7 @@ function selectCompaction(
 
     let selectedTargetBytes = 0;
     for (const contentId of selectedTargets) {
+      if ((visited++ & 255) === 0) await control.checkpoint();
       const bytes = Math.min(
         contentPhysicalBytes.get(contentId) ?? 0,
         DELTA1_MAX_TARGET_BYTES,
@@ -2124,6 +2137,7 @@ function selectCompaction(
         ),
       );
       for (const key of livePackKeys(source, mark)) {
+        if ((visited++ & 255) === 0) await control.checkpoint();
         if (key.kind === "content") selectedContent.add(key.logicalId);
       }
     }
@@ -2135,6 +2149,7 @@ function selectCompaction(
   // permits; repeated passes therefore converge without an external cursor.
   const ownerByKey = new Map<string, string>();
   for (const [text, occurrences] of packOccurrences) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     if (occurrences.length > 1) {
       const selected = mark.authenticatedContents.get(
         occurrences[0]!.entry.logicalId,
@@ -2151,11 +2166,13 @@ function selectCompaction(
     }
   }
   for (const pack of sortedPacks) {
+    if ((visited++ & 255) === 0) await control.checkpoint();
     const live = livePackKeys(pack, mark);
     if (live.length === 0) continue;
     const owned: LogicalRecordKey[] = [];
     let hasNonOwnedDuplicate = false;
     for (const key of live) {
+      if ((visited++ & 255) === 0) await control.checkpoint();
       const text = recordKey(key.kind, key.logicalId);
       const owner = ownerByKey.get(text);
       if (owner === undefined || owner === pack.view.packId) {
@@ -2327,7 +2344,7 @@ async function boundCompactionDecodedBytes(
   mark: MarkState,
   control: GarbageCollectionControl,
 ): Promise<PackRewriteSelection> {
-  control.check();
+  await control.checkpoint();
   let visited = 0;
   const lengths = new Map<string, number>();
   const updateLength = (text: string, length: number): void => {
@@ -2336,7 +2353,7 @@ async function boundCompactionDecodedBytes(
   };
   for (const pack of inventories.packs.packs) {
     for (const entry of pack.view.entries) {
-      if ((visited++ & 255) === 0) control.check();
+      if ((visited++ & 255) === 0) await control.checkpoint();
       updateLength(
         recordKey(entry.kind, entry.logicalId),
         compactionReadBytes(entry, mark),
@@ -2350,7 +2367,7 @@ async function boundCompactionDecodedBytes(
     keysByLogicalId.set(key.logicalId, candidates);
   }
   for (const object of inventories.objects.objects) {
-    if ((visited++ & 255) === 0) control.check();
+    if ((visited++ & 255) === 0) await control.checkpoint();
     if (object.temporary || object.logicalId === undefined) continue;
     const candidates = keysByLogicalId.get(object.logicalId) ?? [];
     if (candidates.length === 0) continue;
@@ -2484,7 +2501,7 @@ async function ensureLargeLegacyRepresentations(
       skippedContentIds.add(contentId);
       continue;
     }
-    control.check();
+    await control.checkpoint();
     const scope = repository.openResolutionScope({ signal: control.signal });
     const materialized = await withRetainedCleanup(
       () =>
@@ -2669,9 +2686,9 @@ async function authorizeSweep(
 ): Promise<void> {
   const { authority, store, maintenance, catalog, metadata, layout, control } =
     resources;
-  control.check();
+  await control.checkpoint();
   const { initialRoots, maxObjects, replacementPackIds } = fence;
-  const coverageResolver = new CompactionResolver(
+  const coverageResolver = await CompactionResolver.create(
     store,
     maintenance,
     plan.inventories.objects,
@@ -2702,7 +2719,7 @@ async function authorizeSweep(
 
   try {
     for (const object of plan.removableObjects) {
-      control.check();
+      await control.checkpoint();
       if (
         !(await maintenance.objectIdentityStillCurrent(
           plan.inventories.objects,
@@ -2716,7 +2733,7 @@ async function authorizeSweep(
       }
     }
     for (const pack of plan.removablePacks) {
-      control.check();
+      await control.checkpoint();
       if (!(await catalog.packIdentityStillCurrent(pack))) {
         throw new GarbageCollectionNamespaceError(
           pack.path,
@@ -2741,7 +2758,7 @@ async function authorizeSweep(
   if (!sameStrings(initialRoots, rootsAtCutover)) {
     throw new GarbageCollectionRootDriftError();
   }
-  control.check();
+  await control.checkpoint();
   assertWorkspaceWriteAuthority(authority, layout.root);
 }
 
@@ -2914,8 +2931,6 @@ export async function collectGarbage(
     if (stopped !== undefined)
       return Object.freeze({ ...report, keptObjects: null, stopped });
     throw error;
-  } finally {
-    control.dispose();
   }
 }
 
@@ -2982,13 +2997,14 @@ async function runGarbageCollection(
     control,
   );
   control.assertCanStart("plan");
-  let selection = selectCompaction(
+  let selection = await selectCompaction(
     inventories.objects,
     inventories.packs,
     mark,
     maxCompactionObjects,
     graceMs,
     now,
+    control,
   );
   if (
     selection.replacementKeys.size === 0 &&
@@ -3047,7 +3063,7 @@ async function runGarbageCollection(
   // Large legacy files first become a normal chunk graph. This is additive;
   // an interruption leaves the still-rooted legacy bytes plus harmless loose
   // duplicates and the next pass resumes without persistent migration state.
-  control.check();
+  await control.checkpoint();
   const initialHeadroom = maxObjects - inventoryObjectCount(inventories);
   const existingReplacementReservation = selection.replacementKeys.size * 2;
   const maximumNewLooseObjects = Math.floor(
@@ -3063,7 +3079,7 @@ async function runGarbageCollection(
     authority,
     control,
   );
-  control.check();
+  await control.checkpoint();
   selection = omitReplacementKeys(selection, materialized.skippedContentIds);
   mark = extendLiveMark(
     mark,
@@ -3091,7 +3107,7 @@ async function runGarbageCollection(
     mark,
     control,
   );
-  const resolver = new CompactionResolver(
+  const resolver = await CompactionResolver.create(
     store,
     maintenance,
     inventories.objects,
@@ -3107,13 +3123,14 @@ async function runGarbageCollection(
         const planSelection = async (
           selected: PackRewriteSelection,
         ): Promise<CompactionPlan> => {
-          control.check();
+          await control.checkpoint();
           const replacementContent = new Set(
             [...selected.replacementKeys.values()]
               .filter((key) => key.kind === "content")
               .map((key) => key.logicalId),
           );
           return await planCompaction({
+            signal: control.signal,
             records: Object.freeze(
               [...selected.replacementKeys.values()].map((key) =>
                 Object.freeze({ ...key, dependencies: Object.freeze([]) }),
@@ -3215,9 +3232,10 @@ async function runGarbageCollection(
 
         let encodedBatches: Array<Awaited<ReturnType<typeof encodePack>>> = [];
         for (const batch of compaction.batches) {
-          control.check();
+          await control.checkpoint();
           encodedBatches.push(
             await encodePack(batch, {
+              signal: control.signal,
               verifyMetadataId: (_kind, id, decoded) =>
                 contentIdFromBytes(decoded) === String(id),
               verifyChunkedContent: (input) =>
@@ -3281,7 +3299,7 @@ async function runGarbageCollection(
 
         try {
           for (const encoded of encodedBatches) {
-            control.check();
+            await control.checkpoint();
             const published = await catalog.publishPack(encoded, authority, {
               signal: control.signal,
             });
@@ -3308,7 +3326,7 @@ async function runGarbageCollection(
               );
             }
           }
-          control.check();
+          await control.checkpoint();
           await ensureMultiPackIndex(catalog, inventories.packs, authority);
         } catch (error) {
           mapInfrastructureError(layout.packs, error);

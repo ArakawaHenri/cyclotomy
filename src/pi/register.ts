@@ -29,13 +29,13 @@ import {
   type CyclotomyLifecycleEventType,
 } from "./cyclotomy-engine.ts";
 import { CyclotomyEngineController } from "./engine-controller.ts";
-import { createCyclotomyI18n } from "../presentation/i18n.ts";
+import { createCyclotomyI18n } from "./i18n.ts";
 import {
   notifyArrivalDispositionFailure,
   notifyWorkspaceLockCleanupFailure,
 } from "./restore-notifications.ts";
 import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
-import { messageOfUnknown } from "../presentation/unknown-error.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 
 type CyclotomyRuntimeEvent = Exclude<
   Extract<ExtensionEvent, { readonly type: CyclotomyLifecycleEventType }>,
@@ -66,6 +66,14 @@ function notify(
     else console.error(`[Cyclotomy:${level}] ${message}`);
   } catch {
     // A stale UI must not turn the participation command into a Pi failure.
+  }
+}
+
+function isMemorySession(context: ExtensionContext): boolean {
+  try {
+    return context.sessionManager.getSessionFile() === undefined;
+  } catch {
+    return false;
   }
 }
 
@@ -105,6 +113,10 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
   };
 
   const showStatus = (context: ExtensionContext): void => {
+    if (isMemorySession(context)) {
+      notify(context, i18n.t("memorySessionUnsupported"));
+      return;
+    }
     const engine = controller.current;
     const activation = engine?.runtime.activation;
     const presentation = presentCyclotomyStatus(
@@ -417,7 +429,8 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           if (result.kind === "running") {
             notify(context, i18n.t("cyclotomyResumeSucceeded"));
           } else if (result.kind === "inactive") {
-            notify(context, i18n.t("cyclotomyInactive"));
+            if (isMemorySession(context)) showStatus(context);
+            else notify(context, i18n.t("cyclotomyInactive"));
           } else if (result.kind === "failed") {
             notify(
               context,

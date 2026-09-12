@@ -82,7 +82,7 @@ import {
   type CaptureProtocolResult,
 } from "./capture-protocol.ts";
 import { PiHostAdapter } from "./pi-host-adapter.ts";
-import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import {
   type ArrivalRecoverySettlement,
   type ArrivalReceipt,
@@ -151,7 +151,6 @@ type CancellableSourceCaptureSettlement =
         SourceCaptureResult,
         { readonly kind: "failed" }
       >;
-      readonly workspaceLockCleanup: CleanupSettlement;
     }
   | {
       readonly kind: "cancelled";
@@ -172,7 +171,6 @@ type ObservedSourceCaptureSettlement =
         SourceCaptureResult,
         { readonly kind: "failed" }
       >;
-      readonly workspaceLockCleanup: CleanupSettlement;
     }
   | {
       readonly kind: "protected";
@@ -335,7 +333,6 @@ async function settleCancellableSourceCapture(
         SourceCaptureResult,
         { readonly kind: "failed" }
       >,
-      workspaceLockCleanup: receipt.workspaceLockCleanup,
     };
   }
   if (
@@ -381,11 +378,6 @@ function presentCancellableSourceCapture(
 ): void {
   if (settlement.kind === "completed") {
     runtime.setStatus(context, undefined);
-    notifyWorkspaceLockCleanupFailure(
-      runtime,
-      context,
-      settlement.workspaceLockCleanup,
-    );
     return;
   }
 
@@ -441,11 +433,6 @@ function presentObservedSourceCapture(
 ): void {
   if (settlement.kind === "completed") {
     runtime.setStatus(context, undefined);
-    notifyWorkspaceLockCleanupFailure(
-      runtime,
-      context,
-      settlement.workspaceLockCleanup,
-    );
     return;
   }
 
@@ -1361,41 +1348,10 @@ export function registerCyclotomyLifecycle(
 ): void {
   const views = new SessionViewTracker();
   pi.on("agent_start", (event) => runtime.observeAgentRun(event));
-  pi.on("agent_settled", (event) => runtime.observeAgentRun(event));
-  let automaticGcFailureNotified = false;
-  let automaticGcBudgetNotified = false;
-  const runAutomaticGc = async (context: ExtensionContext): Promise<void> => {
-    if (!runtime.isActive) return;
-    try {
-      const execution = await runtime.maybeRunAutomaticGc();
-      notifyWorkspaceLockCleanupFailure(runtime, context, execution.cleanup);
-      if (execution.kind === "action-failed") throw execution.cause;
-      automaticGcFailureNotified = false;
-      // Notify once across consecutive partial passes; further maintenance
-      // belongs in a window that can outlast the interactive budget.
-      if (execution.value?.stopped === "budget-exceeded") {
-        if (!automaticGcBudgetNotified) {
-          automaticGcBudgetNotified = true;
-          runtime.notify(
-            context,
-            runtime.i18n.t("automaticGcBudgetExceeded"),
-            "info",
-          );
-        }
-      } else {
-        automaticGcBudgetNotified = false;
-      }
-    } catch (error) {
-      if (automaticGcFailureNotified) return;
-      automaticGcFailureNotified = true;
-      runtime.notify(
-        context,
-        runtime.i18n.t("automaticGcFailed", { message: messageOf(error) }),
-        "warning",
-      );
-    }
-  };
-
+  pi.on("agent_settled", (event, context) => {
+    runtime.observeAgentRun(event);
+    runtime.scheduleAutomaticGc(context);
+  });
   const recoverLifecycleFailure = async (
     context: ExtensionContext,
   ): Promise<ArrivalRecoverySettlement> => {
@@ -1451,7 +1407,6 @@ export function registerCyclotomyLifecycle(
           SourceCaptureResult,
           { readonly kind: "failed" }
         >,
-        workspaceLockCleanup: receipt.workspaceLockCleanup,
       };
     }
     return {
@@ -1616,11 +1571,6 @@ export function registerCyclotomyLifecycle(
       }
       if (view.sessionFile === null) {
         runtime.markSessionIntentionallyInactive();
-        runtime.notify(
-          context,
-          runtime.i18n.t("memorySessionUnsupported"),
-          "warning",
-        );
         return;
       }
       if (!(await runtime.registrations.sessionOwnsCurrentWorkspace(view))) {
@@ -1734,7 +1684,7 @@ export function registerCyclotomyLifecycle(
           "warning",
         );
       }
-      await runAutomaticGc(context);
+      runtime.scheduleAutomaticGc(context);
     } catch (error) {
       const recovery = await withdrawAfterPreparationFailure(context, error);
       runtime.notify(
@@ -1843,10 +1793,7 @@ export function registerCyclotomyLifecycle(
       ) {
         runtime.notifyCaptureResult(context, true);
       }
-      // GC runs only after the turn's authoritative checkpoint is durable. Its
-      // interval gate makes this cheap; failure is hygiene-only and never turns
-      // a successful agent turn into a failed one.
-      await runAutomaticGc(context);
+      runtime.scheduleAutomaticGc(context);
     }),
   );
 

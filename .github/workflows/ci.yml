@@ -49,11 +49,6 @@ jobs:
       - name: Test
         run: npm test
 
-      # The package smoke installs `npm pack --ignore-scripts`, so dist must
-      # already exist: the published CLI is built here, not by prepack.
-      - name: Build the CLI bundle
-        run: npm run build
-
       - name: Verify installed package loads through Pi
         run: npm run test:package
 
@@ -148,9 +143,6 @@ jobs:
       - name: Run real-Pi integration against the minimum host
         run: npm run test:real-pi
 
-      - name: Build the CLI bundle
-        run: npm run build
-
       - name: Verify the package loads through the minimum host
         run: npm run test:package
 
@@ -196,9 +188,6 @@ jobs:
 
       - name: Probe real-Pi integration
         run: npm run test:real-pi
-
-      - name: Build the CLI bundle
-        run: npm run build
 
       - name: Verify the package loads through the latest host
         run: npm run test:package

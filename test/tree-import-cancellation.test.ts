@@ -1,4 +1,7 @@
-import { assertTestWorkspaceLockReleased } from "./workspace-lock-fixture.ts";
+import {
+  assertTestWorkspaceLockReleased,
+  testWorkspaceLockIsHeld,
+} from "./workspace-lock-fixture.ts";
 import { mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +27,6 @@ import {
   publishTestBlob,
   publishTestTree,
 } from "./object-store-fixture.ts";
-import { inspectWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
 import { ALL_MANAGED_SCOPE } from "./workspace-scope-fixture.ts";
 
 const roots: string[] = [];
@@ -227,9 +229,9 @@ describe("tree import cancellation and source verification", () => {
     await Promise.resolve();
     expect(settled).toBe(false);
     for (const store of [source, target])
-      await expect(
-        inspectWorkspaceLock(store.storageRoot),
-      ).resolves.toMatchObject({ kind: "native-busy" });
+      await expect(testWorkspaceLockIsHeld(store.storageRoot)).resolves.toBe(
+        true,
+      );
     release();
     const failure = await outcome;
     expect(isOperationCancelled(failure, controller.signal)).toBe(true);

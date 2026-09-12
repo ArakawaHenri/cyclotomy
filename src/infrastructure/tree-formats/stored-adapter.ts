@@ -52,8 +52,6 @@ export interface AuthenticatedStoredTree {
     readonly kind: StoredTreeStructuralKind;
     readonly oid: TreeOid;
   }[];
-  /** Root first; the remaining order has no semantic meaning. */
-  readonly structuralObjectOids: readonly TreeOid[];
   /** Complete raw-content closure, including regular files. */
   readonly contentIds: readonly string[];
 }
@@ -131,7 +129,6 @@ export function inlineStoredTreeFormatAdapter(
         structuralObjects: Object.freeze([
           Object.freeze({ kind: "root" as const, oid: treeOid }),
         ]),
-        structuralObjectOids: Object.freeze([treeOid]),
         contentIds: Object.freeze([...node.referencedBlobOids(manifest)]),
       });
     },

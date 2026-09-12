@@ -90,14 +90,3 @@ export function metadataHistoryResetIn(
   }
   return undefined;
 }
-
-/**
- * The stored history no longer matches the fingerprint a maintenance preview
- * authenticated, so applying that preview would delete something unreviewed.
- */
-export class MetadataFingerprintChangedError extends MetadataError {
-  constructor(detail: string) {
-    super(`session history changed after it was previewed: ${detail}`);
-    this.name = "MetadataFingerprintChangedError";
-  }
-}

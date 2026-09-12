@@ -30,7 +30,7 @@ import {
 import type { CyclotomyRuntime } from "./runtime.ts";
 import { readSessionView, type SessionView } from "./session-view.ts";
 import { withdrawAfterStoreBindingFailure } from "./store-binding-failure.ts";
-import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { ArrivalReceipt } from "./workspace-receipt.ts";
 
 function finishRestore(

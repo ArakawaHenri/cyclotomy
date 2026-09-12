@@ -1,3 +1,4 @@
+import { yieldForCancellation } from "../workspace-operation.ts";
 import { timingSafeEqual } from "node:crypto";
 
 import { CHUNKED_CONTENT_MIN_BYTES } from "./chunk-recipe.ts";
@@ -119,6 +120,7 @@ export interface CompactionPlan {
 }
 
 export interface PlanCompactionInput {
+  readonly signal?: AbortSignal;
   readonly records: readonly LiveCompactionRecord[];
   readonly contentPathOccurrences: readonly ContentPathOccurrence[];
   readonly read: CompactionReadAccess;
@@ -511,13 +513,16 @@ function deltaRecord(
   };
 }
 
-function occurrenceCounts(
+async function occurrenceCounts(
   occurrences: readonly ContentPathOccurrence[],
   liveContentIds: ReadonlySet<ContentId>,
   smallContent: ReadonlyMap<ContentId, SmallContent>,
-): ReadonlyMap<string, ReadonlyMap<ContentId, number>> {
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<string, ReadonlyMap<ContentId, number>>> {
   const mutable = new Map<string, Map<ContentId, number>>();
+  let visited = 0;
   for (const occurrence of occurrences) {
+    if ((visited++ & 255) === 0) await yieldForCancellation(signal);
     if (
       occurrence.canonicalPath.length === 0 ||
       occurrence.canonicalPath.includes("\0")
@@ -640,12 +645,13 @@ function selectAnchorsByPath(
   return { anchorIds, anchorsByPath };
 }
 
-function chooseDeltaBases(
+async function chooseDeltaBases(
   small: ReadonlyMap<ContentId, SmallContent>,
   countsByPath: ReadonlyMap<string, ReadonlyMap<ContentId, number>>,
   anchorsByPath: ReadonlyMap<string, readonly RankedContent[]>,
   anchorIds: ReadonlySet<ContentId>,
-): ReadonlyMap<ContentId, ContentId> {
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<ContentId, ContentId>> {
   const pathsByContent = new Map<ContentId, string[]>();
   for (const [path, counts] of countsByPath) {
     for (const contentId of counts.keys()) {
@@ -659,6 +665,7 @@ function chooseDeltaBases(
   for (const target of [...small.values()].sort((left, right) =>
     compareText(left.contentId, right.contentId),
   )) {
+    await yieldForCancellation(signal);
     if (anchorIds.has(target.contentId)) {
       continue;
     }
@@ -666,6 +673,7 @@ function chooseDeltaBases(
     for (const path of (pathsByContent.get(target.contentId) ?? []).sort(
       compareCanonicalPaths,
     )) {
+      await yieldForCancellation(signal);
       for (const candidate of anchorsByPath.get(path) ?? []) {
         const previous = rankedCandidates.get(candidate.content.contentId);
         if (
@@ -777,6 +785,7 @@ function freezeBatch(batch: PendingBatch): EncodePackInput {
 export async function planCompaction(
   input: PlanCompactionInput,
 ): Promise<CompactionPlan> {
+  input.signal?.throwIfAborted();
   const limits = input.packLimits ?? DEFAULT_COMPACTION_PACK_LIMITS;
   validateLimits(limits);
 
@@ -790,7 +799,10 @@ export async function planCompaction(
   const logicalDependencies: LogicalDependencyFact[] = [];
   let admittedDecodedBytes = 0;
 
+  let visited = 0;
   for (const live of sortedInputs) {
+    input.signal?.throwIfAborted();
+    if ((visited++ & 255) === 0) await yieldForCancellation(input.signal);
     const key = parseKey(live);
     const serializedKey = keyText(key);
     if (seen.has(serializedKey)) {
@@ -873,17 +885,19 @@ export async function planCompaction(
     }
   }
 
-  const countsByPath = occurrenceCounts(
+  const countsByPath = await occurrenceCounts(
     input.contentPathOccurrences,
     liveContentIds,
     small,
+    input.signal,
   );
   const { anchorIds, anchorsByPath } = selectAnchorsByPath(countsByPath, small);
-  const selectedBases = chooseDeltaBases(
+  const selectedBases = await chooseDeltaBases(
     small,
     countsByPath,
     anchorsByPath,
     anchorIds,
+    input.signal,
   );
 
   const pending: PendingBatch[] = [];
@@ -980,6 +994,7 @@ export async function planCompaction(
   }
   appendPending(pending, metadataBuilder);
 
+  await yieldForCancellation(input.signal);
   const batches = pending.map(freezeBatch);
   const physicalDependencies: Delta1DependencyFact[] = [];
   pending.forEach((batch, batchIndex) => {

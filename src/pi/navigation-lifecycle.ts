@@ -55,7 +55,7 @@ import { assertNever } from "./assert-never.ts";
 import { formatCaptureFailure } from "./capture-failure.ts";
 import { sourceCaptureFailureImpact } from "./source-capture-failure.ts";
 import { withdrawAfterStoreBindingFailure } from "./store-binding-failure.ts";
-import { messageOfUnknown as messageOf } from "../presentation/unknown-error.ts";
+import { messageOfUnknown as messageOf } from "./unknown-error.ts";
 import type { PiHostAdapter } from "./pi-host-adapter.ts";
 import type {
   ArrivalReceipt,

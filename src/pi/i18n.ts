@@ -63,8 +63,6 @@ const EN = {
     "Cyclotomy could not resume automatic checkpoints ({{message}}). Fix the problem, then run /cyclotomy resume.",
   automaticGcFailed:
     "Automatic storage cleanup failed ({{message}}). Cyclotomy will try again later.",
-  automaticGcBudgetExceeded:
-    "Automatic storage cleanup reached its time budget. Run `cyclotomy gc` when convenient to continue.",
   captureFailureDetail: "Details: {{message}}",
   captureCancelled: "Checkpoint cancelled.",
   captureCancelledProtected:
@@ -135,21 +133,19 @@ const EN = {
   navigationChangedBeforeDeparture:
     "The workspace or checkpoint changed after the preview. Navigation was cancelled; review the files and try /tree again.",
   navigationDetached:
-    "Navigation completed with the current files in Detached state. New work can be checkpointed on the new branch; run /drift, then /restore to reconcile this node.",
-  navigationDetachedFact:
-    "Navigation completed with the current files in Detached state.",
+    "Navigation completed with the current files. New work will be checkpointed on the new branch; use /restore to apply this node's checkpoint.",
+  navigationDetachedFact: "Navigation completed with the current files.",
   sessionRestoreNeedsUi:
     "The loaded session has different files and needs confirmation. Current files were kept; run /drift, then use /restore in the interactive TUI.",
   sessionRestoreNeedsUiFact:
     "The loaded session has different files and needs confirmation. Current files were kept.",
   sessionRestoreDeferredRpc:
-    "The loaded session has different files. Current files were kept in Detached state; use /restore to apply the checkpoint.",
+    "The loaded session has different files. Current files were kept; use /restore to apply the checkpoint.",
   sessionRestoreDeferredRpcFact:
-    "The loaded session has different files. Current files were kept in Detached state.",
+    "The loaded session has different files. Current files were kept.",
   sessionRestoreCancelled:
-    "Continuing with the current files in Detached state. New work will be checkpointed on a new branch.",
-  sessionRestoreCancelledFact:
-    "Continuing with the current files in Detached state.",
+    "Continuing with the current files. New work will be checkpointed on a new branch.",
+  sessionRestoreCancelledFact: "Continuing with the current files.",
   sessionMissingProtected:
     "This node has no checkpoint. Run /restore to save the current workspace as its first checkpoint.",
   sessionMissingFact: "This node has no checkpoint.",
@@ -245,10 +241,12 @@ const EN = {
   driftCleanInherited:
     "No drift · workspace matches the checkpoint inherited from the nearest ancestor.",
   driftCleanProtected:
-    "Detached · no drift. Run /restore to attach the workspace to this node.",
-  driftCleanProtectedFact: "Detached · no drift.",
+    "No file differences. Use /restore to confirm the current files for this node.",
+  driftCleanProtectedFact:
+    "No file differences; the current files await confirmation for this node.",
   driftTitle: "Workspace drift\n{{preview}}",
-  driftTitleDetached: "Workspace drift · Detached\n{{preview}}",
+  driftTitleDetached:
+    "Workspace drift · current files await confirmation\n{{preview}}",
   driftTitleInherited:
     "Workspace drift · nearest ancestor checkpoint\n{{preview}}",
   previewPathOne: "{{count}} path",
@@ -289,105 +287,18 @@ const EN = {
   choiceLoadedTitle: "Loaded session differs from workspace",
   choiceLoadedIntro:
     "Choose which files to continue with. Restoring discards the differences below.",
-  choiceLoadedSafe: "Use current files in Detached state",
+  choiceLoadedSafe: "Keep current files",
   choiceLoadedRestore: "Restore loaded checkpoint",
   choiceNavigationTitle: "Destination workspace differs",
   choiceNavigationIntro:
-    "Keep the current files in Detached state, or apply the destination checkpoint shown below.",
+    "Keep the current files, or apply the destination checkpoint shown below.",
   choiceNavigationSafe: "Stay at current node",
-  choiceNavigationDetach: "Navigate in Detached state — keep current workspace",
+  choiceNavigationDetach: "Navigate and keep current files",
   choiceNavigationRestore: "Navigate and restore",
   driftUsage: "Usage: /drift",
   restoreUsage: "Usage: /restore",
   cyclotomyUsage: "Usage: /cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy command failed: {{message}}",
-  cliUsage: `Usage: cyclotomy <command> [options]
-
-Commands:
-  doctor                  Diagnose the store without changing it
-  history                 List per-session scale statistics
-  history forget <id>     Preview or apply removing one session's history
-  inventory               Report store space and scale observations
-  lock recover --offline  Preview or quarantine a legacy directory lock
-  gc                      Reclaim unreferenced objects
-
-Options:
-  --workspace <path>      Workspace to inspect (default: current directory)
-  --locale <auto|en|zh-CN>
-  --json                  Write one JSON document to stdout
-  --apply <token>         Apply a previously previewed plan
-  --session <id>          Session selected by inventory
-  --page-size <n>         History page size (1-500)
-  --cursor <token>        History continuation cursor
-  --offline               Assert that every accessing process has stopped
-  --help                  Show this message`,
-  cliCancelled: "cancelled",
-  cliGcProgress: "gc · {{phase}}{{detail}}",
-  cliGcCancelled:
-    "stopped on request; the pass completed only the removals it already made",
-  cliGcBudgetExceeded:
-    "stopped at a safe boundary after reaching its time budget; completed work is reported above",
-  cliGcGraphLimit:
-    "the rooted object graph is larger than one collection may authenticate, so nothing was removed; drop history with `cyclotomy history forget <session>` and run gc again",
-  cliUsageError: "usage error: {{message}}",
-  cliConfigurationError: "configuration error: {{detail}}",
-  cliWorkspaceUnresolved: "the workspace {{path}} cannot be resolved",
-  cliStoreAbsentRefusal:
-    "the store does not exist; nothing was created or changed",
-  cliNetworkRefusal:
-    "write commands refuse a store on a network filesystem ({{filesystem}})",
-  cliSummary: "cyclotomy {{command}} · {{status}}",
-  cliStatusOk: "ok",
-  cliStatusObservational: "observational",
-  cliStatusPartial: "partial",
-  cliStatusBusy: "busy",
-  cliStatusUnavailable: "unavailable",
-  cliStatusUnsupported: "unsupported",
-  cliStatusBlocked: "blocked",
-  cliStatusPreview: "preview",
-  cliStatusApplied: "applied",
-  cliStatusError: "error",
-  cliLabelWorkspace: "workspace",
-  cliLabelStore: "store",
-  cliLabelMetadata: "metadata",
-  cliLabelLock: "lock",
-  cliLabelFilesystem: "filesystem",
-  cliLabelIssues: "issues",
-  cliLabelNone: "none",
-  cliLabelSessions: "sessions",
-  cliLabelSlots: "slots",
-  cliLabelCheckpointed: "checkpointed",
-  cliLabelBlockedSlots: "blocked",
-  cliLabelTrees: "trees",
-  cliLabelEpoch: "history epoch",
-  cliLabelResetPending: "reset pending",
-  cliLabelSession: "session",
-  cliLabelPlanToken: "plan token",
-  cliLabelApplyHint: "apply with --apply {{token}}",
-  cliLabelRecoverable: "recoverable",
-  cliLabelNothingToRecover: "nothing to recover",
-  cliLabelQuarantined: "quarantined at {{path}}",
-  cliLabelObjects: "objects",
-  cliLabelCapacity: "capacity",
-  cliLabelFacts: "facts",
-  cliLabelFiles: "files",
-  cliLabelRemovedSlots: "removed slots",
-  cliLabelUnknown: "unknown",
-  cliLabelYes: "yes",
-  cliLabelNo: "no",
-  cliLabelComplete: "complete",
-  cliLabelIncomplete: "incomplete",
-  cliLabelPresent: "present",
-  cliLabelAbsent: "absent",
-  cliLabelCapacityWithin: "within",
-  cliLabelBytes: "bytes",
-  cliLabelRemoved: "removed",
-  cliLabelFreed: "reclaimed",
-  cliLabelKept: "kept",
-  cliLabelStopped: "stopped",
-  cliLabelSchema: "schema",
-  cliLabelNextCursor: "next cursor",
-  cliLabelTotals: "totals",
 } as const;
 
 export type MessageKey = keyof typeof EN;
@@ -429,8 +340,6 @@ const ZH_CN: Record<MessageKey, string> = {
   arrivalAdmissionStopped:
     "Cyclotomy 无法恢复自动检查点（{{message}}）。修复问题后执行 /cyclotomy resume。",
   automaticGcFailed: "自动清理存储失败（{{message}}）。Cyclotomy 稍后会重试。",
-  automaticGcBudgetExceeded:
-    "自动清理已达到时间预算。方便时请运行 `cyclotomy gc` 继续清理。",
   captureFailureDetail: "详情：{{message}}",
   captureCancelled: "已取消快照。",
   captureCancelledProtected: "已取消快照，当前节点的自动检查点已暂停。",
@@ -487,19 +396,17 @@ const ZH_CN: Record<MessageKey, string> = {
   navigationChangedBeforeDeparture:
     "预览后工作区或检查点发生了变化。跳转已取消；请检查文件后重试 /tree。",
   navigationDetached:
-    "跳转已完成，并在 Detached 状态下保留当前文件。新工作仍会在新分支上保存检查点；请先运行 /drift，再用 /restore 处理当前节点。",
-  navigationDetachedFact: "跳转已完成，并在 Detached 状态下保留当前文件。",
+    "已保留当前文件并完成跳转。新分支会继续保存检查点；执行 /restore 可恢复当前节点的检查点。",
+  navigationDetachedFact: "已保留当前文件并完成跳转。",
   sessionRestoreNeedsUi:
     "载入的会话与当前文件不同，需要确认。请先运行 /drift，再在交互式 TUI 中执行 /restore。",
   sessionRestoreNeedsUiFact:
     "载入的会话与当前文件不同，需要确认。已保留当前文件。",
   sessionRestoreDeferredRpc:
-    "载入的会话与当前文件不同。已在 Detached 状态下保留当前文件；执行 /restore 可应用检查点。",
-  sessionRestoreDeferredRpcFact:
-    "载入的会话与当前文件不同。已在 Detached 状态下保留当前文件。",
-  sessionRestoreCancelled:
-    "继续使用当前文件，并进入 Detached 状态。新工作会在新分支上保存检查点。",
-  sessionRestoreCancelledFact: "继续使用当前文件，并进入 Detached 状态。",
+    "载入的会话与当前文件不同。已保留当前文件；执行 /restore 可应用检查点。",
+  sessionRestoreDeferredRpcFact: "载入的会话与当前文件不同。已保留当前文件。",
+  sessionRestoreCancelled: "继续使用当前文件。新工作会在新分支上保存检查点。",
+  sessionRestoreCancelledFact: "继续使用当前文件。",
   sessionMissingProtected:
     "当前节点没有检查点。执行 /restore 可将当前工作区保存为首个检查点。",
   sessionMissingFact: "当前节点没有检查点。",
@@ -587,12 +494,10 @@ const ZH_CN: Record<MessageKey, string> = {
     "当前节点没有检查点。执行 /restore 可将当前工作区保存为首个检查点。",
   driftClean: "没有差异 · 工作区与当前节点的检查点一致。",
   driftCleanInherited: "没有差异 · 工作区与最近祖先节点的检查点一致。",
-  driftCleanProtected:
-    "Detached · 没有差异。执行 /restore 可将工作区归入当前节点。",
-  driftCleanProtectedFact: "Detached · 没有差异。",
+  driftCleanProtected: "文件没有差异。执行 /restore 可确认当前节点的文件状态。",
+  driftCleanProtectedFact: "文件没有差异；当前节点的文件状态尚待确认。",
   driftTitle: "工作区差异\n{{preview}}",
-  driftTitleDetached:
-    "工作区差异 · Detached（当前工作区尚未归属此节点）\n{{preview}}",
+  driftTitleDetached: "工作区差异 · 当前节点的文件状态尚待确认\n{{preview}}",
   driftTitleInherited: "工作区差异 · 使用最近祖先节点的检查点\n{{preview}}",
   previewPathOne: "{{count}} 个路径",
   previewPathMany: "{{count}} 个路径",
@@ -627,102 +532,17 @@ const ZH_CN: Record<MessageKey, string> = {
   choiceManualRestore: "恢复检查点",
   choiceLoadedTitle: "载入的会话与工作区不同",
   choiceLoadedIntro: "请选择继续使用哪组文件；恢复会丢弃下列当前差异。",
-  choiceLoadedSafe: "以 Detached 状态使用当前文件",
+  choiceLoadedSafe: "保留当前文件",
   choiceLoadedRestore: "恢复会话状态",
   choiceNavigationTitle: "目标节点的工作区不同",
-  choiceNavigationIntro:
-    "保留当前文件并进入 Detached 状态，或应用下列目标检查点。",
+  choiceNavigationIntro: "保留当前文件，或应用下列目标检查点。",
   choiceNavigationSafe: "停留在当前节点",
-  choiceNavigationDetach: "以 Detached 状态跳转（保留当前工作区）",
+  choiceNavigationDetach: "跳转并保留当前文件",
   choiceNavigationRestore: "跳转并恢复",
   driftUsage: "用法：/drift",
   restoreUsage: "用法：/restore",
   cyclotomyUsage: "用法：/cyclotomy [pause|resume|enable|disable]",
   commandFailed: "Cyclotomy 命令失败：{{message}}",
-  cliUsage: `用法：cyclotomy <命令> [选项]
-
-命令：
-  doctor                  只读诊断存储，不做迁移或修复
-  history                 分页列出各会话的规模统计
-  history forget <id>     预览或执行单个会话的历史清理
-  inventory               报告存储空间与规模观测
-  lock recover --offline  预览或隔离旧目录锁
-  gc                      回收无引用对象
-
-选项：
-  --workspace <路径>      要检查的工作区（缺省为当前目录）
-  --locale <auto|en|zh-CN>
-  --json                  只向 stdout 写一个 JSON 文档
-  --apply <token>         执行已预览的计划
-  --session <id>          inventory 指定的会话
-  --page-size <n>         history 每页条数（1-500）
-  --cursor <token>        history 续页游标
-  --offline               声明所有访问进程都已停止
-  --help                  显示本说明`,
-  cliCancelled: "已取消",
-  cliGcProgress: "gc · {{phase}}{{detail}}",
-  cliGcCancelled: "已按要求停止；本次仅完成了已经执行的删除",
-  cliGcBudgetExceeded: "已达到时间预算，在安全边界停止；已完成的工作见上述计数",
-  cliGcGraphLimit:
-    "有根对象图超出单次回收可认证的范围，未删除任何内容；请先用 `cyclotomy history forget <会话>` 删除历史，再重新运行 gc",
-  cliUsageError: "用法错误：{{message}}",
-  cliConfigurationError: "配置错误：{{detail}}",
-  cliWorkspaceUnresolved: "无法解析工作区 {{path}}",
-  cliStoreAbsentRefusal: "存储不存在；未创建或修改任何内容",
-  cliNetworkRefusal:
-    "写命令拒绝在存储所在的网络文件系统上执行（{{filesystem}}）",
-  cliSummary: "cyclotomy {{command}} · {{status}}",
-  cliStatusOk: "正常",
-  cliStatusObservational: "观测结果",
-  cliStatusPartial: "不完整",
-  cliStatusBusy: "忙碌",
-  cliStatusUnavailable: "未检查",
-  cliStatusUnsupported: "不支持",
-  cliStatusBlocked: "已阻止",
-  cliStatusPreview: "预览",
-  cliStatusApplied: "已执行",
-  cliStatusError: "错误",
-  cliLabelWorkspace: "工作区",
-  cliLabelStore: "存储",
-  cliLabelMetadata: "元数据",
-  cliLabelLock: "锁",
-  cliLabelFilesystem: "文件系统",
-  cliLabelIssues: "问题",
-  cliLabelNone: "无",
-  cliLabelSessions: "会话",
-  cliLabelSlots: "slot",
-  cliLabelCheckpointed: "有检查点",
-  cliLabelBlockedSlots: "blocked",
-  cliLabelTrees: "tree",
-  cliLabelEpoch: "历史代次",
-  cliLabelResetPending: "等待重开",
-  cliLabelSession: "会话",
-  cliLabelPlanToken: "计划 token",
-  cliLabelApplyHint: "可用 --apply {{token}} 执行",
-  cliLabelRecoverable: "可恢复",
-  cliLabelNothingToRecover: "无须恢复",
-  cliLabelQuarantined: "已隔离到 {{path}}",
-  cliLabelObjects: "对象",
-  cliLabelCapacity: "容量",
-  cliLabelFacts: "事实",
-  cliLabelFiles: "文件",
-  cliLabelRemovedSlots: "已删除 slot",
-  cliLabelUnknown: "未知",
-  cliLabelYes: "是",
-  cliLabelNo: "否",
-  cliLabelComplete: "完整",
-  cliLabelIncomplete: "不完整",
-  cliLabelPresent: "存在",
-  cliLabelAbsent: "不存在",
-  cliLabelCapacityWithin: "未达阈值",
-  cliLabelBytes: "字节",
-  cliLabelRemoved: "已删除",
-  cliLabelFreed: "已回收",
-  cliLabelKept: "保留",
-  cliLabelStopped: "已停止",
-  cliLabelSchema: "schema",
-  cliLabelNextCursor: "下一页游标",
-  cliLabelTotals: "总计",
 };
 
 function looksChinese(locale: string | undefined): boolean {

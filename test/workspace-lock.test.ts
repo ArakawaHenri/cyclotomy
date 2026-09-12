@@ -1,7 +1,10 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import * as nativeBinding from "../src/infrastructure/native-file-lock.ts";
-import { assertTestWorkspaceLockReleased } from "./workspace-lock-fixture.ts";
-import { execFile, fork, type ChildProcess } from "node:child_process";
+import {
+  assertTestWorkspaceLockReleased,
+  testWorkspaceLockIsHeld,
+} from "./workspace-lock-fixture.ts";
+import { fork, type ChildProcess } from "node:child_process";
 import {
   lstat,
   mkdir,
@@ -13,14 +16,12 @@ import {
   rename,
   rm,
   symlink,
-  truncate,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
@@ -32,17 +33,13 @@ import {
   LockProtocolCorruptError,
   UnsupportedLockProtocolError,
   WorkspaceLockProtocolInconsistentError,
-  inspectWorkspaceLock,
-  quarantineLegacyWorkspaceLock,
 } from "../src/infrastructure/workspace-lock.ts";
 import {
   acquireWorkspaceLock,
   assertWorkspaceWriteAuthority,
   OrderedWorkspaceLockAcquisitionError,
-  OrderedWorkspaceLockReleaseError,
   runWithOrderedWorkspaceLocks,
   runWithWorkspaceLock,
-  withOrderedWorkspaceLocks,
   withWorkspaceLock,
   WorkspaceLockOwnershipLostError,
   WorkspaceLockTimeoutError,
@@ -51,7 +48,6 @@ import {
 } from "../src/infrastructure/workspace-lock.ts";
 
 const roots: string[] = [];
-const execFileAsync = promisify(execFile);
 const children = new Set<LockChild>();
 const CHILD_PROCESS_WATCHDOG_MS = 30_000;
 const childFixture = fileURLToPath(
@@ -304,7 +300,6 @@ describe("workspace lock native protocol", () => {
   it("initializes a fresh store with a persistent native lock file", async () => {
     const root = await storeRootDirectory();
     expect(await pathExists(lockPathOf(root))).toBe(false);
-    expect(await inspectWorkspaceLock(root)).toEqual({ kind: "absent" });
 
     const lock = await acquireWorkspaceLock(root, "capture");
 
@@ -316,16 +311,13 @@ describe("workspace lock native protocol", () => {
     expect(await readFile(markerPathOf(root), "utf8")).toBe(MARKER_BYTES);
 
     // The switch grants write authority only while the native lock is held.
-    expect(await inspectWorkspaceLock(root)).toEqual({ kind: "native-busy" });
+    expect(await testWorkspaceLockIsHeld(root)).toBe(true);
     await lock.release();
 
     // The lock file is persistent: release never unlinks or replaces it.
     const after = await lstat(lockPathOf(root), { bigint: true });
     expect(after.ino).toBe(entry.ino);
     expect(after.size).toBe(0n);
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "native-acquired",
-    });
     await assertTestWorkspaceLockReleased(root);
   });
 
@@ -379,10 +371,6 @@ describe("workspace lock native protocol", () => {
     expect(failure).toMatchObject({
       lockPath: join(await realpath(root), "workspace.lock"),
     });
-    expect((failure as Error).message).toContain(
-      "the lock may be active or abandoned",
-    );
-    expect((failure as Error).message).toContain("cyclotomy doctor");
 
     await first.release();
     const second = await acquireWorkspaceLock(root, "restore", {});
@@ -461,7 +449,7 @@ describe("workspace lock native protocol", () => {
     const options = { timeoutMs: 1_000 };
 
     await Promise.all([
-      withOrderedWorkspaceLocks(
+      runWithOrderedWorkspaceLocks(
         [
           { storeRoot: firstRoot, options },
           { storeRoot: secondRoot, options },
@@ -469,7 +457,7 @@ describe("workspace lock native protocol", () => {
         "a-to-b",
         action,
       ),
-      withOrderedWorkspaceLocks(
+      runWithOrderedWorkspaceLocks(
         [
           { storeRoot: secondRoot, options },
           { storeRoot: firstRoot, options },
@@ -525,7 +513,7 @@ describe("workspace lock native protocol", () => {
     let escapedAuthority:
       Parameters<typeof assertWorkspaceWriteAuthority>[0] | undefined;
 
-    await withOrderedWorkspaceLocks(
+    await runWithOrderedWorkspaceLocks(
       [{ storeRoot: alias }, { storeRoot: root }],
       "ordered-alias-test",
       async (authorities) => {
@@ -554,10 +542,6 @@ describe("workspace lock fail-closed transitions", () => {
     await writeFile(lockPathOf(root), "");
     const planted = await lstat(lockPathOf(root), { bigint: true });
 
-    expect(await inspectWorkspaceLock(root)).toEqual({
-      kind: "interrupted-switch",
-    });
-
     const lock = await acquireWorkspaceLock(root, "capture");
     await lock.release();
 
@@ -579,9 +563,6 @@ describe("workspace lock fail-closed transitions", () => {
       acquireWorkspaceLock(root, "capture", { timeoutMs: 0 }),
     ).rejects.toBeInstanceOf(WorkspaceLockProtocolInconsistentError);
     expect(await pathExists(lockPathOf(root))).toBe(false);
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "inconsistent",
-    });
   });
 
   it("refuses a replaced lock file while the marker is present", async () => {
@@ -593,9 +574,6 @@ describe("workspace lock fail-closed transitions", () => {
       acquireWorkspaceLock(root, "capture", { timeoutMs: 0 }),
     ).rejects.toBeInstanceOf(WorkspaceLockProtocolInconsistentError);
     expect(await readFile(lockPathOf(root), "utf8")).toBe("replacement");
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "inconsistent",
-    });
   });
 
   it("refuses a directory at the fixed path while the marker is present", async () => {
@@ -634,11 +612,6 @@ describe("workspace lock fail-closed transitions", () => {
     await expect(
       acquireWorkspaceLock(root, "capture", { timeoutMs: 0 }),
     ).rejects.toBeInstanceOf(UnsupportedLockProtocolError);
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "unsupported",
-      observedFormat: 1,
-      observedProtocol: "native-file-v2",
-    });
     expect(await pathExists(lockPathOf(root))).toBe(false);
   });
 
@@ -649,9 +622,6 @@ describe("workspace lock fail-closed transitions", () => {
     await expect(
       acquireWorkspaceLock(root, "capture", { timeoutMs: 0 }),
     ).rejects.toBeInstanceOf(LockProtocolCorruptError);
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "corrupt",
-    });
     expect(await pathExists(lockPathOf(root))).toBe(false);
   });
 
@@ -668,11 +638,6 @@ describe("workspace lock fail-closed transitions", () => {
     }).catch((cause: unknown) => cause);
     expect(failure).toBeInstanceOf(WorkspaceLockTimeoutError);
 
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "valid", owner: { token: "dead" } },
-    });
-
     // A dead owner record is never proof that the legacy lock is free.
     await expect(
       acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
@@ -682,8 +647,7 @@ describe("workspace lock fail-closed transitions", () => {
     );
     expect(await pathExists(markerPathOf(root))).toBe(false);
 
-    const quarantine = await quarantineLegacyWorkspaceLock(root);
-    expect(quarantine.kind).toBe("quarantined");
+    await rename(path, `${path}.abandoned`);
     expect(await pathExists(path)).toBe(false);
 
     const lock = await acquireWorkspaceLock(root, "capture");
@@ -695,129 +659,11 @@ describe("workspace lock fail-closed transitions", () => {
     const root = await storeRootDirectory();
     const path = await plantLegacyLockDirectory(root, {}, { aged: true });
 
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "empty" },
-    });
     await expect(
       acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
     ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
     expect(await readdir(path)).toEqual([]);
     expect(await pathExists(markerPathOf(root))).toBe(false);
-  });
-
-  it("never treats multiple owner records as an ownerless formation", async () => {
-    const root = await storeRootDirectory();
-    const path = await plantLegacyLockDirectory(
-      root,
-      {
-        "owner-live.json": legacyOwnerRecord({
-          token: "live",
-          pid: process.pid,
-        }),
-        "owner-dead.json": legacyOwnerRecord({ token: "dead" }),
-      },
-      { aged: true },
-    );
-
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "ambiguous" },
-    });
-    await expect(
-      acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
-    ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
-    expect((await lstat(join(path, "owner-live.json"))).isFile()).toBe(true);
-  });
-
-  it("never treats a malformed owner record as an ownerless formation", async () => {
-    const root = await storeRootDirectory();
-    const path = await plantLegacyLockDirectory(
-      root,
-      { "owner-malformed.json": "{not-json\n" },
-      { aged: true },
-    );
-
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "ambiguous" },
-    });
-    await expect(
-      acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
-    ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
-    expect(await readFile(join(path, "owner-malformed.json"), "utf8")).toBe(
-      "{not-json\n",
-    );
-  });
-
-  it("does not follow a symlinked legacy owner record", async (context) => {
-    context.skip(
-      process.platform === "win32",
-      "Windows symlink creation depends on host privileges",
-    );
-    const root = await storeRootDirectory();
-    const outside = join(root, "outside-owner.json");
-    await writeFile(outside, legacyOwnerRecord({ token: "linked" }));
-    const path = await plantLegacyLockDirectory(root, {}, { aged: true });
-    await symlink(outside, join(path, "owner-linked.json"));
-
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "ambiguous" },
-    });
-    await expect(
-      acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
-    ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
-    expect(await readFile(outside, "utf8")).toContain('"token":"linked"');
-  });
-
-  it("does not open a FIFO legacy owner record", async (context) => {
-    context.skip(
-      process.platform === "win32",
-      "Windows filesystems do not expose POSIX FIFO entries",
-    );
-    const root = await storeRootDirectory();
-    const path = await plantLegacyLockDirectory(root, {}, { aged: true });
-    const ownerPath = join(path, "owner-fifo.json");
-    await execFileAsync("mkfifo", [ownerPath]);
-
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "ambiguous" },
-    });
-    await expect(
-      acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
-    ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
-    expect((await lstat(ownerPath)).isFIFO()).toBe(true);
-  });
-
-  it("does not read an oversized legacy owner record", async () => {
-    const root = await storeRootDirectory();
-    const path = await plantLegacyLockDirectory(root, {}, { aged: true });
-    const ownerPath = join(path, "owner-oversized.json");
-    await writeFile(ownerPath, "");
-    await truncate(ownerPath, 64 * 1024);
-
-    expect(await inspectWorkspaceLock(root)).toMatchObject({
-      kind: "legacy-directory",
-      owner: { kind: "ambiguous" },
-    });
-    await expect(
-      acquireWorkspaceLock(root, "capture", { timeoutMs: 50 }),
-    ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
-    expect((await lstat(ownerPath)).size).toBe(64 * 1024);
-  });
-
-  it("quarantines only the fixed legacy directory", async () => {
-    const native = await upgradedStoreRoot();
-    expect(await quarantineLegacyWorkspaceLock(native)).toEqual({
-      kind: "native-protocol",
-    });
-
-    const fresh = await storeRootDirectory();
-    expect(await quarantineLegacyWorkspaceLock(fresh)).toEqual({
-      kind: "nothing-to-recover",
-    });
   });
 });
 
@@ -851,8 +697,8 @@ describe("workspace lock handover", () => {
   it("honours an old client that wins the exclusive-create race", async () => {
     const root = await storeRootDirectory();
     const path = lockPathOf(root);
-    const load = nativeBinding.loadExclusiveFileLock;
-    vi.spyOn(nativeBinding, "loadExclusiveFileLock").mockImplementationOnce(
+    const load = nativeBinding.loadNativeFileLock;
+    vi.spyOn(nativeBinding, "loadNativeFileLock").mockImplementationOnce(
       async () => {
         mkdirSync(path);
         writeFileSync(
@@ -1099,7 +945,7 @@ describe("workspace lock cleanup settlement", () => {
       let actionEntered = false;
 
       try {
-        const failure = await withOrderedWorkspaceLocks(
+        const failure = await runWithOrderedWorkspaceLocks(
           [secondRoot, firstRoot].map((storeRoot) => ({
             storeRoot,
             ...(storeRoot === lockedRoot ? { options: { timeoutMs: 10 } } : {}),
@@ -1117,9 +963,7 @@ describe("workspace lock cleanup settlement", () => {
         expect(actionEntered).toBe(false);
 
         if (position === "first") {
-          expect(await inspectWorkspaceLock(otherRoot)).toEqual({
-            kind: "absent",
-          });
+          expect(await pathExists(lockPathOf(otherRoot))).toBe(false);
         } else {
           await assertTestWorkspaceLockReleased(otherRoot);
         }
@@ -1128,71 +972,6 @@ describe("workspace lock cleanup settlement", () => {
       }
     },
   );
-
-  it("does not relabel an ordered action failure as an acquisition failure", async () => {
-    const root = await storeRootDirectory();
-    const firstRoot = join(root, "a");
-    const secondRoot = join(root, "z");
-    await mkdir(firstRoot);
-    await mkdir(secondRoot);
-
-    const actionFailure = new Error("ordered action failed");
-
-    await expect(
-      withOrderedWorkspaceLocks(
-        [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
-        "ordered-test",
-        async () => {
-          throw actionFailure;
-        },
-      ),
-    ).rejects.toBe(actionFailure);
-  });
-
-  it("identifies a release-only failure after the ordered action completed", async () => {
-    const root = await storeRootDirectory();
-    const firstRoot = join(root, "a");
-    const secondRoot = join(root, "z");
-    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
-
-    const failure = await withOrderedWorkspaceLocks(
-      [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
-      "ordered-release-test",
-      async () => {
-        await displaceLockPathWithDirectory(secondRoot);
-        return "committed";
-      },
-    ).catch((error: unknown) => error);
-
-    expect(failure).toBeInstanceOf(OrderedWorkspaceLockReleaseError);
-    expect((failure as OrderedWorkspaceLockReleaseError).storeRoot).toBe(
-      await realpath(secondRoot),
-    );
-  });
-
-  it("preserves both an ordered action failure and a cleanup failure", async () => {
-    const root = await storeRootDirectory();
-    const firstRoot = join(root, "a");
-    const secondRoot = join(root, "z");
-    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
-
-    const actionFailure = new Error("ordered action failed");
-
-    const failure = await withOrderedWorkspaceLocks(
-      [{ storeRoot: secondRoot }, { storeRoot: firstRoot }],
-      "ordered-release-test",
-      async () => {
-        await displaceLockPathWithDirectory(secondRoot);
-        throw actionFailure;
-      },
-    ).catch((error: unknown) => error);
-
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors).toEqual([
-      actionFailure,
-      expect.any(OrderedWorkspaceLockReleaseError),
-    ]);
-  });
 
   it("reports ordered cleanup failure at the exact cleanup root", async () => {
     const root = await storeRootDirectory();

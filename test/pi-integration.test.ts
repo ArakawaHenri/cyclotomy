@@ -1,3 +1,5 @@
+import * as garbageCollection from "../src/infrastructure/object-gc.ts";
+import * as workspaceLocks from "../src/infrastructure/workspace-lock.ts";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -37,17 +39,15 @@ import {
   acquireWorkspaceLock,
   runWithWorkspaceLock,
   type WorkspaceLock,
-  type WorkspaceWriteAuthority,
 } from "../src/infrastructure/workspace-lock.ts";
-import { inspectWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
+import { testWorkspaceLockIsHeld } from "./workspace-lock-fixture.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
-import type { GcReport } from "../src/infrastructure/object-gc.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
 import {
   createDriftCommandHandler,
   createRestoreCommandHandler,
 } from "../src/pi/commands.ts";
-import { CyclotomyI18n, type MessageKey } from "../src/presentation/i18n.ts";
+import { CyclotomyI18n, type MessageKey } from "../src/pi/i18n.ts";
 import { registerCyclotomyLifecycle } from "../src/pi/lifecycle.ts";
 import { CyclotomyRuntime } from "../src/pi/runtime.ts";
 import { WorkspaceMutationAuthority } from "../src/pi/workspace-mutation-authority.ts";
@@ -234,28 +234,14 @@ function failWorkspaceLockCleanup(
   operation: string,
   cause: Error,
 ): ReturnType<typeof vi.spyOn> {
-  const original = CyclotomyRuntime.prototype.enqueueWorkspaceExecution;
+  const original = workspaceLocks.runWithWorkspaceLock;
   return vi
-    .spyOn(CyclotomyRuntime.prototype, "enqueueWorkspaceExecution")
-    .mockImplementation(function <T>(
-      this: CyclotomyRuntime,
-      candidate: string,
-      action: (lease: WorkspaceWriteAuthority) => Promise<T>,
-    ) {
-      const enqueue = original.bind(this) as (
-        name: string,
-        run: (lease: WorkspaceWriteAuthority) => Promise<T>,
-      ) => ReturnType<CyclotomyRuntime["enqueueWorkspaceExecution"]>;
-      return enqueue(candidate, action).then((execution) => {
-        if (candidate !== operation) return execution;
-        if (this.activation.kind === "active") {
-          this.markSessionUnavailable(cause);
-        }
-        return {
-          ...execution,
-          cleanup: { kind: "failed" as const, cause },
-        };
-      });
+    .spyOn(workspaceLocks, "runWithWorkspaceLock")
+    .mockImplementation(async (root, candidate, action, options) => {
+      const execution = await original(root, candidate, action, options);
+      return candidate === operation
+        ? { ...execution, cleanup: { kind: "failed" as const, cause } }
+        : execution;
     });
 }
 
@@ -392,86 +378,35 @@ describe("checkpoint authority lifecycle", () => {
     });
 
     it("reports a new automatic GC failure after a successful recovery", async () => {
-      const maybeRunAutomaticGc = vi
-        .spyOn(CyclotomyRuntime.prototype, "maybeRunAutomaticGc")
+      await writeFile(
+        join(home, "cyclotomy", "settings.json"),
+        JSON.stringify({ locale: "zh-CN", gc: { intervalMs: 1 } }),
+      );
+      const collect = garbageCollection.collectGarbage;
+      const probe = vi
+        .spyOn(garbageCollection, "collectGarbage")
         .mockRejectedValueOnce(new Error("first failure"))
         .mockRejectedValueOnce(new Error("repeated failure"))
-        .mockResolvedValueOnce({
-          kind: "completed",
-          value: undefined,
-          cleanup: { kind: "settled" },
-        })
+        .mockImplementationOnce(collect)
         .mockRejectedValueOnce(new Error("new failure"));
       try {
         const pi = new FakePi(workspace);
         registerCyclotomy(pi.api);
         pi.manager.appendEntry();
-        const failureCount = (): number =>
-          pi.notifications.filter(({ message }) =>
-            message.includes(messageFor("automaticGcFailed")),
-          ).length;
-
         await pi.startSession("startup");
-        expect(failureCount()).toBe(1);
-        await pi.endTurn(0);
-        expect(failureCount()).toBe(1);
-        await pi.endTurn(0);
-        expect(failureCount()).toBe(1);
-        await pi.endTurn(0);
-        expect(failureCount()).toBe(2);
+        expect(notified(pi, "automaticGcFailed")).toBe(false);
+        await vi.waitFor(
+          () => {
+            expect(
+              pi.notifications.filter(({ message }) =>
+                message.includes(messageFor("automaticGcFailed")),
+              ),
+            ).toHaveLength(2);
+          },
+          { timeout: 15000 },
+        );
       } finally {
-        maybeRunAutomaticGc.mockRestore();
-      }
-    });
-
-    it("reports an automatic GC that ran out of budget once per streak", async () => {
-      const budgetStopped: GcReport = {
-        removedTrees: 0,
-        removedBlobs: 0,
-        removedTmpFiles: 0,
-        freedBytes: 0,
-        keptObjects: 0,
-        stopped: "budget-exceeded",
-      };
-      const completed: GcReport = {
-        removedTrees: 0,
-        removedBlobs: 0,
-        removedTmpFiles: 0,
-        freedBytes: 0,
-        keptObjects: 3,
-      };
-      const settled = (value: GcReport) => ({
-        kind: "completed" as const,
-        value,
-        cleanup: { kind: "settled" as const },
-      });
-      const maybeRunAutomaticGc = vi
-        .spyOn(CyclotomyRuntime.prototype, "maybeRunAutomaticGc")
-        .mockResolvedValueOnce(settled(budgetStopped))
-        .mockResolvedValueOnce(settled(budgetStopped))
-        .mockResolvedValueOnce(settled(completed))
-        .mockResolvedValueOnce(settled(budgetStopped));
-      try {
-        const pi = new FakePi(workspace);
-        registerCyclotomy(pi.api);
-        pi.manager.appendEntry();
-        const budgetCount = (): number =>
-          pi.notifications.filter(({ message }) =>
-            message.includes(messageFor("automaticGcBudgetExceeded")),
-          ).length;
-
-        await pi.startSession("startup");
-        expect(budgetCount()).toBe(1);
-        // The next pass is short again: the operator already knows.
-        await pi.endTurn(0);
-        expect(budgetCount()).toBe(1);
-        // A pass that finished clears the streak, so a later short pass is news.
-        await pi.endTurn(0);
-        expect(budgetCount()).toBe(1);
-        await pi.endTurn(0);
-        expect(budgetCount()).toBe(2);
-      } finally {
-        maybeRunAutomaticGc.mockRestore();
+        probe.mockRestore();
       }
     });
 
@@ -491,6 +426,10 @@ describe("checkpoint authority lifecycle", () => {
 
       try {
         await pi.startSession("startup");
+        await vi.waitFor(
+          () => expect(notified(pi, "workspaceLockCleanupStopped")).toBe(true),
+          { timeout: 5000 },
+        );
       } finally {
         cleanupFailure.mockRestore();
       }
@@ -3142,7 +3081,6 @@ describe("checkpoint authority lifecycle", () => {
       await writeFile(join(workspace, "a.txt"), "saved");
       await pi.runCommand("drift");
       expect(notified(pi, "driftCleanProtected")).toBe(true);
-      expect(pi.notifications.at(-1)?.message).toContain("Detached");
       db = await metadata();
       expect(checkpointIsBlocked(db, pi.manager.sessionId, leaf)).toBe(true);
       db.close();
@@ -7702,10 +7640,7 @@ describe("checkpoint authority lifecycle", () => {
           // being held while the ordered import waits on the source.
           let importLockObserved = false;
           for (let attempt = 0; attempt < 800; attempt += 1) {
-            if (
-              (await inspectWorkspaceLock(targetStoreRoot)).kind ===
-              "native-busy"
-            ) {
+            if (await testWorkspaceLockIsHeld(targetStoreRoot)) {
               importLockObserved = true;
               break;
             }

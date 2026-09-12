@@ -1,6 +1,9 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { tryHoldForegroundDemand } from "../../src/infrastructure/foreground-demand.ts";
+import { loadNativeFileLock } from "../../src/infrastructure/native-file-lock.ts";
 import { acquireWorkspaceLock } from "../../src/infrastructure/workspace-lock.ts";
 
-type ChildMode = "hold" | "once";
+type ChildMode = "hold" | "once" | "demand";
 
 interface ChildMessage {
   readonly type: "acquired" | "released" | "error";
@@ -42,10 +45,26 @@ async function main(): Promise<void> {
   if (
     root === undefined ||
     operation === undefined ||
-    (mode !== "hold" && mode !== "once") ||
+    (mode !== "hold" && mode !== "once" && mode !== "demand") ||
     !Number.isFinite(timeoutMs)
   ) {
     throw new Error("invalid workspace-lock child arguments");
+  }
+
+  if (mode === "demand") {
+    const binding = await loadNativeFileLock();
+    let release = tryHoldForegroundDemand(root, binding);
+    while (release === undefined) {
+      await delay(5);
+      release = tryHoldForegroundDemand(root, binding);
+    }
+    try {
+      await send({ type: "acquired", pid: process.pid });
+      await waitForRelease();
+    } finally {
+      release();
+    }
+    return;
   }
 
   const lock = await acquireWorkspaceLock(root, operation, {

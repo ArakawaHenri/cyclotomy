@@ -1,7 +1,7 @@
 import type { CaptureFailure } from "../application/capture.ts";
 import { assertNever } from "./assert-never.ts";
-import type { CyclotomyI18n } from "../presentation/i18n.ts";
-import { messageOfUnknown } from "../presentation/unknown-error.ts";
+import type { CyclotomyI18n } from "./i18n.ts";
+import { messageOfUnknown } from "./unknown-error.ts";
 
 /** Convert structured capture facts to bounded presentation detail. */
 export function formatCaptureFailure(

@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 describe("automatic GC state", () => {
-  it("distinguishes an absent, valid, and corrupt schedule", async () => {
+  it("treats missing or malformed schedule hints as due", async () => {
     const storeRoot = await mkdtemp(join(tmpdir(), "cyclotomy-gc-state-"));
     roots.push(storeRoot);
     const statePath = join(storeRoot, "gc-state.json");
@@ -28,9 +28,7 @@ describe("automatic GC state", () => {
     writeFileSync(statePath, `${JSON.stringify({ lastGcAt: 42 })}\n`);
     await expect(readLastAutomaticGcAt(statePath)).resolves.toBe(42);
     writeFileSync(statePath, "{not-json\n");
-    await expect(readLastAutomaticGcAt(statePath)).rejects.toThrow(
-      "automatic GC schedule is unreadable",
-    );
+    await expect(readLastAutomaticGcAt(statePath)).resolves.toBe(0);
   });
 
   it("does not overwrite a successor after lock ownership is lost", async () => {

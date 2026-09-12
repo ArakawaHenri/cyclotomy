@@ -1026,6 +1026,7 @@ async function createAndSyncTemporary(
   bytes: Uint8Array,
   parents: CatalogDirectoryChain,
   authority: WorkspaceWriteAuthority,
+  signal?: AbortSignal,
 ): Promise<OwnedTemporary> {
   const expectedParent = parents.at(-1);
   if (expectedParent === undefined || expectedParent.path !== directory) {
@@ -1051,7 +1052,8 @@ async function createAndSyncTemporary(
   let openedIdentity: CatalogFileIdentity | undefined;
   try {
     assertWorkspaceWriteAuthority(authority, layout.root);
-    await handle.writeFile(bytes);
+    await handle.writeFile(bytes, { signal });
+    signal?.throwIfAborted();
     assertWorkspaceWriteAuthority(authority, layout.root);
     await handle.sync();
     openedIdentity = identityFor(path, await handle.stat());
@@ -1857,7 +1859,6 @@ export class PackCatalog {
       fail("limit-exceeded", "pack publication exceeds incoming-file limits");
     }
 
-    // From the first namespace write onward, finish this durable publication.
     signal?.throwIfAborted();
     const shard = verified.pack.packId.slice(0, 2);
     const targetParents = await ensureShardDirectory(
@@ -1890,9 +1891,11 @@ export class PackCatalog {
       verified.bytes,
       incomingParents,
       authority,
+      signal,
     );
     let renamed = false;
     try {
+      signal?.throwIfAborted();
       await assertDirectoryChainCurrent(targetParents);
       await assertDirectoryChainCurrent(incomingParents);
       await assertPrivateIdentityCurrent(
@@ -1901,6 +1904,8 @@ export class PackCatalog {
         `incoming pack ${verified.pack.packId}`,
       );
       assertWorkspaceWriteAuthority(authority, this.#layout.root);
+      signal?.throwIfAborted();
+      // Once visible, finish synchronizing the publication before cancellation.
       try {
         await rename(temporary.path, target);
         renamed = true;

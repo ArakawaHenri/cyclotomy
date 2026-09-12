@@ -1,3 +1,4 @@
+import { yieldForCancellation } from "../workspace-operation.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import {
@@ -209,6 +210,7 @@ export interface PackPublicationOptions extends PackVerificationOptions {
     readonly recipeId: RecipeId;
     readonly decodedLength: number;
   }) => boolean | Promise<boolean>;
+  readonly signal?: AbortSignal;
 }
 
 export interface EncodePackInput {
@@ -2176,9 +2178,12 @@ async function encodePackInternal(
   input: EncodePackInput,
   options: PackPublicationOptions = {},
 ): Promise<EncodedPack> {
+  await yieldForCancellation(options.signal);
   const layout = preparePackLayout(input);
 
   for (let ordinal = 0; ordinal < layout.physicalRecords.length; ordinal += 1) {
+    options.signal?.throwIfAborted();
+    if ((ordinal & 255) === 0) await yieldForCancellation(options.signal);
     const physical = layout.physicalRecords[ordinal];
     if (physical === undefined) {
       invalid("invalid-input", "pack input record is missing");
@@ -2211,6 +2216,7 @@ async function encodePackInternal(
     }
   }
 
+  await yieldForCancellation(options.signal);
   const authenticatedWriter = new CanonicalWriter().writeBytes(layout.header);
   for (const frame of layout.recordFrames) {
     authenticatedWriter.writeBytes(frame);

@@ -86,8 +86,8 @@ export function formatUiPath(path: string): string {
 }
 
 /** Render an untrusted host/filesystem detail as one terminal line. */
-export function formatUiDetail(detail: unknown, maxLength = 200): string {
-  return escapeForDisplay(String(detail), false, maxLength).text;
+export function formatUiDetail(detail: unknown): string {
+  return escapeForDisplay(String(detail), false, 200).text;
 }
 
 export function restoreActionCount(plan: RestorePreview): number {

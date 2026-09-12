@@ -1,3 +1,14 @@
+import { setImmediate as yieldImmediate } from "node:timers/promises";
+
+/** Let queued input and cancellation reach long CPU-bound storage operations. */
+export async function yieldForCancellation(
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  await yieldImmediate();
+  signal?.throwIfAborted();
+}
+
 export interface WorkspaceProgress {
   readonly files: number;
   readonly bytes: number;
