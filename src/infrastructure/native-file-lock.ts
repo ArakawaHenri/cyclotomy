@@ -9,7 +9,7 @@ export interface NativeLockFileStat {
   readonly size: bigint;
 }
 
-/** The addon owns its OS handle; runtime file descriptors never cross the ABI. */
+/** Explicitly closed OS handles; environment exit releases outstanding files. */
 export interface NativeLockFile {
   stat(): NativeLockFileStat;
   tryLock(shared?: boolean): boolean;
@@ -19,9 +19,6 @@ export interface NativeLockFile {
 
 export interface NativeFileLockBinding {
   open(path: string, create?: boolean): NativeLockFile;
-  tryAcquire(file: NativeLockFile): boolean;
-  tryAcquireShared(file: NativeLockFile): boolean;
-  release(file: NativeLockFile): void;
 }
 
 export class NativeFileLockUnavailableError extends Error {
@@ -43,14 +40,11 @@ export async function loadNativeFileLock(): Promise<NativeFileLockBinding> {
       const require = createRequire(import.meta.url);
       const addon = require(
         `../../prebuilds/${process.platform}-${process.arch}/file-lock.node`,
-      ) as Pick<NativeFileLockBinding, "open">;
+      ) as NativeFileLockBinding;
       return Object.freeze({
         open(path: string, create = false): NativeLockFile {
           return addon.open(toNamespacedPath(path), create);
         },
-        tryAcquire: (file: NativeLockFile) => file.tryLock(),
-        tryAcquireShared: (file: NativeLockFile) => file.tryLock(true),
-        release: (file: NativeLockFile) => file.unlock(),
       });
     } catch (cause) {
       throw new NativeFileLockUnavailableError(cause);

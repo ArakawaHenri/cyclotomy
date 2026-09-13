@@ -46,7 +46,7 @@ it("never replaces an existing file during exclusive creation", async () => {
     expect(() => binding.open(target, true)).toThrow(
       expect.objectContaining({ code: "EEXIST" }),
     );
-    expect(binding.tryAcquire(first)).toBe(true);
+    expect(first.tryLock()).toBe(true);
   } finally {
     first.close();
   }
@@ -66,7 +66,7 @@ it("rejects closed handles without touching a subsequently opened file", async (
     expect(() => first.stat()).toThrow(
       expect.objectContaining({ code: "EBADF" }),
     );
-    expect(binding.tryAcquire(next)).toBe(true);
+    expect(next.tryLock()).toBe(true);
     expect(() => next.tryLock.call({})).toThrow(TypeError);
   } finally {
     next.close();

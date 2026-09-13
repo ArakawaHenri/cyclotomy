@@ -1,13 +1,8 @@
 import assert from "node:assert/strict";
 import { createInterface } from "node:readline";
-import {
-  closeSync,
-  fstatSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
@@ -29,8 +24,6 @@ function open(path) {
   return {
     tryLock: (shared = false) =>
       shared ? binding.tryAcquireShared(fd) : binding.tryAcquire(fd),
-    unlock: () => binding.release(fd),
-    stat: () => fstatSync(fd, { bigint: true }),
     close: () => closeSync(fd),
   };
 }
@@ -41,9 +34,6 @@ async function execute(c) {
       return true;
     case "try":
       return files.get(c.id).tryLock(c.shared ?? false);
-    case "unlock":
-      files.get(c.id).unlock();
-      return true;
     case "close":
       files.get(c.id).close();
       files.delete(c.id);
@@ -86,6 +76,47 @@ async function execute(c) {
           await lock.release();
         }
         await delay(1);
+      }
+      return true;
+    }
+    case "lifecycle": {
+      const bindingPath = join(
+        root,
+        "native/build/Release/file-lock-tracked.node",
+      );
+      const tracked = createRequire(import.meta.url)(bindingPath);
+      assert.equal(tracked.outstanding(), 0);
+      for (const close of [true, false]) {
+        for (let i = 0; i < 3; i++) {
+          const worker = new Worker(
+            new URL(
+              "../test/fixtures/native-lock-lifecycle-worker.mjs",
+              import.meta.url,
+            ),
+            { workerData: { bindingPath, path: c.path, close } },
+          );
+          try {
+            const outstanding = await new Promise((resolve, reject) => {
+              worker.once("message", resolve);
+              worker.once("error", reject);
+            });
+            assert.equal(
+              outstanding,
+              close ? 0 : 16,
+              "explicit close must reclaim native allocations",
+            );
+          } finally {
+            await worker.terminate();
+          }
+          const deadline = performance.now() + 5000;
+          while (tracked.outstanding() !== 0 && performance.now() < deadline)
+            await delay(5);
+          assert.equal(
+            tracked.outstanding(),
+            0,
+            "worker exit must reclaim native allocations",
+          );
+        }
       }
       return true;
     }

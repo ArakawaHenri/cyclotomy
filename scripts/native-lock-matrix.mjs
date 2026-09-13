@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
@@ -62,7 +62,12 @@ class Client {
     this.child.stdin.write(`${JSON.stringify(command)}\n`);
     const result = await response;
     if (errorName) assert.equal(result.name, errorName, JSON.stringify(result));
-    else assert.equal(result.ok, true, JSON.stringify(result));
+    else
+      assert.equal(
+        result.ok,
+        true,
+        `${this.runtime.name}: ${JSON.stringify(result)}`,
+      );
     return result.value;
   }
   async close(kill = false) {
@@ -178,6 +183,7 @@ try {
   await Promise.all(concurrent.map((c) => c.close()));
   for (const runtime of runtimes.filter((r) => r.version === "current")) {
     const c = new Client(runtime);
+    await c.call({ op: "lifecycle", path: lockPath });
     assert.equal(await c.call({ op: "worker", path: lockPath, id: "w" }), true);
     await c.call({ op: "open", path: lockPath, id: "probe" });
     assert.equal(await c.call({ op: "try", id: "probe" }), false);
@@ -186,7 +192,7 @@ try {
     await c.close();
   }
   console.log(
-    "Native lock matrix passed: production locks, cancellation, shared holders, crash/worker release, concurrent writes.",
+    "Native lock matrix passed: production locks, cancellation, shared holders, crash/worker release, native allocation cleanup, concurrent writes.",
   );
 } finally {
   await Promise.all([...clients].map((c) => c.close(true)));

@@ -59,14 +59,14 @@ export function tryHoldForegroundDemand(
   try {
     const file = openDemandFile(storeRoot, binding);
     handle = file.handle;
-    if (!binding.tryAcquireShared(handle)) {
+    if (!handle.tryLock(true)) {
       handle.close();
       return undefined;
     }
     file.assertCurrent();
     const held = handle;
     return () => {
-      // Closing the descriptor releases the advisory lock on every platform.
+      // Closing the handle releases the advisory lock on every platform.
       try {
         held.close();
       } catch {
@@ -98,8 +98,8 @@ export async function watchForegroundDemand(storeRoot: string): Promise<{
     if (cancellation.signal.aborted) return;
     try {
       file.assertCurrent();
-      if (binding.tryAcquire(file.handle)) {
-        binding.release(file.handle);
+      if (file.handle.tryLock()) {
+        file.handle.unlock();
       } else {
         cancellation.abort();
       }

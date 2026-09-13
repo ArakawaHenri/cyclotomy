@@ -101,7 +101,6 @@ interface WorkspaceWriteAuthorityState {
   readonly parentChain: readonly ParentChainEntry[];
   readonly lockFile: LockFileIdentity;
   readonly file: NativeLockFile;
-  readonly nativeBinding: NativeFileLockBinding;
   readonly marker: NativeLockProtocolMarker;
   readonly operation: string;
   readonly acquiredAt: number;
@@ -555,14 +554,14 @@ function waitForLock(attempt: WorkspaceLockAttempt): Promise<void> {
   );
 }
 
-async function acquireNativeBinding(
+async function acquireNativeLock(
   nativeBinding: NativeFileLockBinding,
   file: NativeLockFile,
   attempt: WorkspaceLockAttempt,
 ): Promise<void> {
   for (;;) {
     assertLockAttempt(attempt);
-    if (nativeBinding.tryAcquire(file)) return;
+    if (file.tryLock()) return;
     if (!attempt.background) {
       attempt.releaseDemand ??= tryHoldForegroundDemand(
         attempt.binding.canonicalPath,
@@ -598,7 +597,7 @@ function authorityLock(state: WorkspaceWriteAuthorityState): WorkspaceLock {
         }
         let releaseError: unknown;
         try {
-          state.nativeBinding.release(state.file);
+          state.file.unlock();
         } catch (error) {
           releaseError = error;
         } finally {
@@ -740,7 +739,7 @@ async function holdNativeLock(
   marker?: NativeLockProtocolMarker,
 ): Promise<WorkspaceLock> {
   try {
-    await acquireNativeBinding(nativeBinding, opened.file, attempt);
+    await acquireNativeLock(nativeBinding, opened.file, attempt);
     assertLockAttempt(attempt);
     const pathEntry = lstatSync(attempt.lockPath, { bigint: true });
     if (
@@ -762,7 +761,6 @@ async function holdNativeLock(
       parentChain: attempt.parentChain,
       lockFile: opened.identity,
       file: opened.file,
-      nativeBinding,
       marker,
       operation: attempt.operation,
       acquiredAt: Date.now(),
@@ -784,7 +782,7 @@ async function holdNativeLock(
     return lock;
   } catch (cause) {
     try {
-      nativeBinding.release(opened.file);
+      opened.file.unlock();
     } catch {
       // Preserve acquisition, publication or identity failure.
     }

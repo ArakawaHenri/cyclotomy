@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { contentIdFromBytes } from "../src/infrastructure/content-store/ids.ts";
-import * as nativeBinding from "../src/infrastructure/native-file-lock.ts";
+import { watchForegroundDemand } from "../src/infrastructure/foreground-demand.ts";
 import { openObjectStore } from "../src/infrastructure/object-store.ts";
 import { RealPiHarness } from "./real-pi.ts";
 
@@ -86,28 +86,17 @@ async function withExternalLock<T>(
   const exited = once(holder, "exit");
   const watchdog = setTimeout(() => holder.kill(), 15_000);
   let pending: Promise<T> | undefined;
-  let restoreBinding: (() => void) | undefined;
+  let watch: Awaited<ReturnType<typeof watchForegroundDemand>> | undefined;
   try {
     const [message] = await once(holder, "message", {
       signal: AbortSignal.timeout(10_000),
     });
     expect(message).toMatchObject({ type: "acquired" });
-    const binding = await nativeBinding.loadNativeFileLock();
-    const contended = Promise.withResolvers<void>();
-    const spy = vi
-      .spyOn(nativeBinding, "loadNativeFileLock")
-      .mockResolvedValue({
-        ...binding,
-        tryAcquire(fd) {
-          const acquired = binding.tryAcquire(fd);
-          if (!acquired) contended.resolve();
-          return acquired;
-        },
-      });
-    restoreBinding = () => spy.mockRestore();
+    watch = await watchForegroundDemand(root);
+    const contended = once(watch.signal, "abort");
     pending = action();
     await Promise.race([
-      contended.promise,
+      contended,
       pending.then(() => {
         throw new Error("business operation completed without contending");
       }),
@@ -117,7 +106,7 @@ async function withExternalLock<T>(
     if (holder.connected) holder.disconnect();
     await exited;
     clearTimeout(watchdog);
-    restoreBinding?.();
+    watch?.close();
     await pending?.catch(() => undefined);
   }
   return await pending!;

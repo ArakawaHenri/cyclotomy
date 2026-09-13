@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { watchForegroundDemand } from "../src/infrastructure/foreground-demand.ts";
-import * as nativeBinding from "../src/infrastructure/native-file-lock.ts";
-import { acquireWorkspaceLock } from "../src/infrastructure/workspace-lock.ts";
+import {
+  acquireWorkspaceLock,
+  WorkspaceLockTimeoutError,
+} from "../src/infrastructure/workspace-lock.ts";
 import { testWorkspaceLockIsHeld } from "./workspace-lock-fixture.ts";
 
 const roots: string[] = [];
@@ -36,7 +38,6 @@ async function root() {
 }
 
 afterEach(async () => {
-  vi.restoreAllMocks();
   for (const holder of children) {
     if (holder.child.exitCode === null && holder.child.signalCode === null)
       holder.child.kill();
@@ -140,24 +141,15 @@ describe("foreground demand", () => {
     const holder = await acquireWorkspaceLock(path, "holder", {
       background: true,
     });
-    const binding = await nativeBinding.loadNativeFileLock();
-    const contended = Promise.withResolvers<void>();
-    vi.spyOn(nativeBinding, "loadNativeFileLock").mockResolvedValue({
-      ...binding,
-      tryAcquire(descriptor) {
-        const acquired = binding.tryAcquire(descriptor);
-        if (!acquired) contended.resolve();
-        return acquired;
-      },
-    });
-    const waiting = acquireWorkspaceLock(path, "foreground");
     try {
-      await contended.promise;
+      await expect(
+        acquireWorkspaceLock(path, "foreground", { timeoutMs: 50 }),
+      ).rejects.toBeInstanceOf(WorkspaceLockTimeoutError);
       await expect(watchForegroundDemand(path)).rejects.toThrow();
     } finally {
       await holder.release();
     }
-    const foreground = await waiting;
+    const foreground = await acquireWorkspaceLock(path, "foreground");
     await foreground.release();
     expect(await testWorkspaceLockIsHeld(path)).toBe(false);
   });

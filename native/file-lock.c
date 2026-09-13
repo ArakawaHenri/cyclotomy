@@ -9,7 +9,6 @@
 
 typedef struct {
   lock_handle fd;
-  bool cleanup_registered;
 } lock_file;
 static const napi_type_tag lock_file_tag = {0x47f5d6637bd940f4ULL,
                                             0xa7e80655ef066da3ULL};
@@ -208,51 +207,47 @@ static unsigned long change_lock(lock_handle fd, bool shared, bool release,
   return 0;
 }
 
+/* Explicit close and environment teardown are the only resource owners.
+ * No object finalizer may access a record after environment cleanup frees it.
+ */
 static void cleanup(void *data) {
   lock_file *file = data;
-  file->cleanup_registered = false;
-  lock_handle fd = file->fd;
-  file->fd = LOCK_CLOSED;
-  if (fd != LOCK_CLOSED)
-    close_handle(fd);
-}
-
-static void finalize(napi_env env, void *data, void *hint) {
-  (void)hint;
-  lock_file *file = data;
-  if (file->cleanup_registered)
-    napi_remove_env_cleanup_hook(env, cleanup, file);
-  cleanup(file);
+  close_handle(file->fd);
   free(file);
 }
 
-static lock_file *receiver(napi_env env, napi_callback_info info, size_t *argc,
-                           napi_value *argv) {
+static napi_value receiver(napi_env env, napi_callback_info info, size_t *argc,
+                           napi_value *argv, lock_file **file) {
   napi_value self;
   bool tagged = false;
-  lock_file *file = NULL;
-  if (napi_get_cb_info(env, info, argc, argv, &self, NULL) != napi_ok ||
-      napi_check_object_type_tag(env, self, &lock_file_tag, &tagged) !=
+  NAPI(napi_get_cb_info(env, info, argc, argv, &self, NULL));
+  if (napi_check_object_type_tag(env, self, &lock_file_tag, &tagged) !=
           napi_ok ||
-      !tagged || napi_unwrap(env, self, (void **)&file) != napi_ok ||
-      file == NULL) {
+      !tagged) {
     napi_throw_type_error(env, NULL, "Invalid lock file receiver");
     return NULL;
   }
-  return file;
+  *file = NULL;
+  napi_status status = napi_unwrap(env, self, (void **)file);
+  if (status != napi_ok && status != napi_invalid_arg) {
+    napi_throw_error(env, NULL, "Cannot unwrap lock file");
+    return NULL;
+  }
+  return self;
 }
 
 static napi_value try_lock(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
-  lock_file *file = receiver(env, info, &argc, argv);
-  if (!file)
+  lock_file *file;
+  if (receiver(env, info, &argc, argv, &file) == NULL)
     return NULL;
   bool shared = false;
   if (argc)
     NAPI(napi_get_value_bool(env, argv[0], &shared));
   bool acquired = false;
-  unsigned long error = change_lock(file->fd, shared, false, &acquired);
+  unsigned long error = change_lock(file == NULL ? LOCK_CLOSED : file->fd,
+                                    shared, false, &acquired);
   if (error)
     return system_error(env, error);
   napi_value value;
@@ -262,11 +257,12 @@ static napi_value try_lock(napi_env env, napi_callback_info info) {
 
 static napi_value unlock(napi_env env, napi_callback_info info) {
   size_t argc = 0;
-  lock_file *file = receiver(env, info, &argc, NULL);
-  if (!file)
+  lock_file *file;
+  if (receiver(env, info, &argc, NULL, &file) == NULL)
     return NULL;
   bool acquired = false;
-  unsigned long error = change_lock(file->fd, false, true, &acquired);
+  unsigned long error = change_lock(file == NULL ? LOCK_CLOSED : file->fd,
+                                    false, true, &acquired);
   if (error)
     return system_error(env, error);
   return NULL;
@@ -274,16 +270,14 @@ static napi_value unlock(napi_env env, napi_callback_info info) {
 
 static napi_value close_file(napi_env env, napi_callback_info info) {
   size_t argc = 0;
-  lock_file *file = receiver(env, info, &argc, NULL);
-  if (!file)
+  lock_file *file;
+  napi_value self = receiver(env, info, &argc, NULL, &file);
+  if (self == NULL || file == NULL)
     return NULL;
-  lock_handle fd = file->fd;
-  file->fd = LOCK_CLOSED;
-  if (file->cleanup_registered) {
-    napi_remove_env_cleanup_hook(env, cleanup, file);
-    file->cleanup_registered = false;
-  }
-  unsigned long error = fd == LOCK_CLOSED ? 0 : close_handle(fd);
+  NAPI(napi_remove_wrap(env, self, (void **)&file));
+  NAPI(napi_remove_env_cleanup_hook(env, cleanup, file));
+  unsigned long error = close_handle(file->fd);
+  free(file);
   if (error)
     return system_error(env, error);
   return NULL;
@@ -291,11 +285,11 @@ static napi_value close_file(napi_env env, napi_callback_info info) {
 
 static napi_value stat_file(napi_env env, napi_callback_info info) {
   size_t argc = 0;
-  lock_file *file = receiver(env, info, &argc, NULL);
-  if (!file)
+  lock_file *file;
+  if (receiver(env, info, &argc, NULL, &file) == NULL)
     return NULL;
   struct lock_stat st = {0};
-  unsigned long error = read_stat(file->fd, &st);
+  unsigned long error = read_stat(file == NULL ? LOCK_CLOSED : file->fd, &st);
   if (error)
     return system_error(env, error);
   napi_value result, value;
@@ -376,29 +370,22 @@ static napi_value open_file(napi_env env, napi_callback_info info) {
     return NULL;
   }
   file->fd = fd;
-  file->cleanup_registered = false;
   napi_value result;
-  if (napi_create_object(env, &result) != napi_ok ||
-      napi_wrap(env, result, file, finalize, NULL, NULL) != napi_ok) {
-    finalize(env, file, NULL);
-    napi_throw_error(env, NULL, "Cannot wrap lock file");
-    return NULL;
-  }
-  // Environment teardown can precede object finalization when a worker exits.
-  if (napi_add_env_cleanup_hook(env, cleanup, file) != napi_ok) {
-    cleanup(file);
-    napi_throw_error(env, NULL, "Cannot register lock file cleanup");
-    return NULL;
-  }
-  file->cleanup_registered = true;
-  NAPI(napi_type_tag_object(env, result, &lock_file_tag));
   napi_property_descriptor methods[] = {
       {"tryLock", NULL, try_lock, NULL, NULL, NULL, napi_default, NULL},
       {"unlock", NULL, unlock, NULL, NULL, NULL, napi_default, NULL},
       {"close", NULL, close_file, NULL, NULL, NULL, napi_default, NULL},
       {"stat", NULL, stat_file, NULL, NULL, NULL, napi_default, NULL},
   };
-  NAPI(napi_define_properties(env, result, 4, methods));
+  if (napi_create_object(env, &result) != napi_ok ||
+      napi_type_tag_object(env, result, &lock_file_tag) != napi_ok ||
+      napi_define_properties(env, result, 4, methods) != napi_ok ||
+      napi_wrap(env, result, file, NULL, NULL, NULL) != napi_ok ||
+      napi_add_env_cleanup_hook(env, cleanup, file) != napi_ok) {
+    cleanup(file);
+    napi_throw_error(env, NULL, "Cannot create lock file");
+    return NULL;
+  }
   return result;
 }
 

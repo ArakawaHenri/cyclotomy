@@ -7,8 +7,8 @@ export async function testWorkspaceLockIsHeld(
   const binding = await loadNativeFileLock();
   const file = binding.open(join(storeRoot, "workspace.lock"));
   try {
-    if (!binding.tryAcquire(file)) return true;
-    binding.release(file);
+    if (!file.tryLock()) return true;
+    file.unlock();
     return false;
   } finally {
     file.close();
