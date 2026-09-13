@@ -13,7 +13,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
@@ -165,21 +165,26 @@ try {
       "--input-type=module",
       "--eval",
       `import assert from "node:assert/strict";
-       import { openSync, closeSync } from "node:fs";
-       const binding = await import(process.argv[1]);
-       const first = openSync(process.argv[2], "wx", 0o600);
-       const second = openSync(process.argv[2], "r+");
+       import { createRequire } from "node:module";
+       const binding = createRequire(import.meta.url)(process.argv[1]);
+       const first = binding.open(process.argv[2], true);
+       const second = binding.open(process.argv[2]);
        try {
-         assert.equal(binding.tryLock(first), true);
-         assert.equal(binding.tryLock(second), false);
-         binding.unlock(first);
-         assert.equal(binding.tryLock(second), true);
-         binding.unlock(second);
+         assert.equal(first.tryLock(), true);
+         assert.equal(second.tryLock(), false);
+         first.unlock();
+         assert.equal(second.tryLock(), true);
+         second.unlock();
        } finally {
-         closeSync(second);
-         closeSync(first);
+         second.close();
+         first.close();
        }`,
-      pathToFileURL(installedRequire.resolve("fs-native-extensions")).href,
+      join(
+        installedRoot,
+        "prebuilds",
+        `${process.platform}-${process.arch}`,
+        "file-lock.node",
+      ),
       join(nativeStore, "workspace.lock"),
     ],
     { cwd: workspace },

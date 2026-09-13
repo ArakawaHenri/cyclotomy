@@ -40,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Build native locks
+        run: npm run build:native
+
       - name: Check formatting
         run: npm run format:check
 
@@ -78,11 +81,61 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Build native locks
+        run: npm run build:native
+
       # The matrix fetches the published 0.2.4 artifact and drives real
       # cross-process contention against it, so the handover contract is
       # accepted on all three platforms rather than on the maintainer's host.
       - name: Run the lock transition matrix
         run: npm run test:lock-protocol
+
+  native-locks:
+    if: github.event_name != 'schedule'
+    name: Native locks · ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux, arch: x64 }
+          - { os: ubuntu-22.04-arm, platform: linux, arch: arm64 }
+          - { os: macos-15-intel, platform: darwin, arch: x64 }
+          - { os: macos-latest, platform: darwin, arch: arm64 }
+          - { os: windows-latest, platform: win32, arch: x64 }
+          - { os: windows-11-arm, platform: win32, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Build native locks
+        if: matrix.platform != 'linux'
+        run: npm run build:native
+      - name: Build Linux locks with the Node glibc baseline
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work" -v "$node_root:/node:ro" -w /work \
+            quay.io/pypa/manylinux_2_28_${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }} \
+            /node/bin/node scripts/build-native.mjs --nodedir=/node --python=/opt/python/cp312-cp312/bin/python
+      - name: Verify Node, Deno and published locks interoperate
+        run: npm run test:lock-runtimes
+      - name: Preserve verified native binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
+          path: prebuilds/
+          if-no-files-found: error
 
   zstd-host-regression:
     if: github.event_name != 'schedule'
@@ -137,6 +190,9 @@ jobs:
           test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "0.84.0"
           test "$(node -p "require('./node_modules/@earendil-works/pi-tui/package.json').version")" = "0.84.0"
 
+      - name: Build native locks
+        run: npm run build:native
+
       - name: Type-check against the minimum host
         run: npm run check
 
@@ -182,6 +238,9 @@ jobs:
       - name: Verify the resolved host version
         shell: bash
         run: test "$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version")" = "${{ steps.latest.outputs.version }}"
+
+      - name: Build native locks
+        run: npm run build:native
 
       - name: Type-check against the latest host
         run: npm run check

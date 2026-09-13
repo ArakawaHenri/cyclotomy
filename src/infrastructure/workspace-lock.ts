@@ -1,11 +1,4 @@
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  type BigIntStats,
-} from "node:fs";
+import { lstatSync, type BigIntStats } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { dirname, join, resolve } from "node:path";
@@ -31,6 +24,8 @@ import {
 import {
   loadNativeFileLock,
   type NativeFileLockBinding,
+  type NativeLockFile,
+  type NativeLockFileStat,
 } from "./native-file-lock.ts";
 import { tryHoldForegroundDemand } from "./foreground-demand.ts";
 import { systemErrorCode } from "./system-error.ts";
@@ -105,7 +100,7 @@ interface WorkspaceWriteAuthorityState {
   readonly lockPath: string;
   readonly parentChain: readonly ParentChainEntry[];
   readonly lockFile: LockFileIdentity;
-  readonly descriptor: number;
+  readonly file: NativeLockFile;
   readonly nativeBinding: NativeFileLockBinding;
   readonly marker: NativeLockProtocolMarker;
   readonly operation: string;
@@ -242,11 +237,11 @@ async function bindStoreRoot(path: string): Promise<DirectoryBinding> {
   }
 }
 
-function nativeLockFileShape(entry: BigIntStats): boolean {
-  return entry.isFile() && !entry.isSymbolicLink() && entry.nlink === 1n;
+function nativeLockFileShape(entry: NativeLockFileStat): boolean {
+  return (entry.mode & 0o170000n) === 0o100000n && entry.nlink === 1n;
 }
 
-function lockFileIdentityOf(entry: BigIntStats): LockFileIdentity {
+function lockFileIdentityOf(entry: NativeLockFileStat): LockFileIdentity {
   return {
     device: entry.dev,
     inode: entry.ino,
@@ -258,7 +253,7 @@ function lockFileIdentityOf(entry: BigIntStats): LockFileIdentity {
 
 function sameLockFileIdentity(
   expected: LockFileIdentity,
-  current: BigIntStats,
+  current: NativeLockFileStat,
 ): boolean {
   return (
     current.dev === expected.device &&
@@ -358,7 +353,7 @@ function verifyNativeLockState(
     "expected workspace store",
   );
   assertParentChain(state.parentChain);
-  const opened = fstatSync(state.descriptor, { bigint: true });
+  const opened = state.file.stat();
   if (
     !nativeLockFileShape(opened) ||
     !sameLockFileIdentity(state.lockFile, opened)
@@ -460,8 +455,11 @@ function inconsistent(storeRoot: string, detail: string): never {
  * Open the fixed lock path without creating it, and prove that the opened
  * handle and the pathname both name one zero-length single-link regular file.
  */
-async function openNativeLockFile(lockPath: string): Promise<{
-  readonly descriptor: number;
+async function openNativeLockFile(
+  lockPath: string,
+  nativeBinding: NativeFileLockBinding,
+): Promise<{
+  readonly file: NativeLockFile;
   readonly identity: LockFileIdentity;
 }> {
   const storeRoot = dirname(lockPath);
@@ -474,12 +472,9 @@ async function openNativeLockFile(lockPath: string): Promise<{
         : `the native protocol marker is present but ${lockPath} cannot be opened as a regular file`,
     );
   }
-  let descriptor: number;
+  let file: NativeLockFile;
   try {
-    descriptor = openSync(
-      lockPath,
-      constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
-    );
+    file = nativeBinding.open(lockPath);
   } catch (error) {
     const code = systemErrorCode(error);
     if (code === "ENOENT" || code === "ELOOP" || code === "EISDIR") {
@@ -491,7 +486,7 @@ async function openNativeLockFile(lockPath: string): Promise<{
     throw error;
   }
   try {
-    const opened = fstatSync(descriptor, { bigint: true });
+    const opened = file.stat();
     let pathEntry: BigIntStats;
     try {
       pathEntry = lstatSync(lockPath, { bigint: true });
@@ -511,9 +506,9 @@ async function openNativeLockFile(lockPath: string): Promise<{
         `${lockPath} is not the exact zero-length regular lock file`,
       );
     }
-    return { descriptor, identity: lockFileIdentityOf(opened) };
+    return { file, identity: lockFileIdentityOf(opened) };
   } catch (error) {
-    closeSync(descriptor);
+    file.close();
     throw error;
   }
 }
@@ -562,12 +557,12 @@ function waitForLock(attempt: WorkspaceLockAttempt): Promise<void> {
 
 async function acquireNativeBinding(
   nativeBinding: NativeFileLockBinding,
-  descriptor: number,
+  file: NativeLockFile,
   attempt: WorkspaceLockAttempt,
 ): Promise<void> {
   for (;;) {
     assertLockAttempt(attempt);
-    if (nativeBinding.tryAcquire(descriptor)) return;
+    if (nativeBinding.tryAcquire(file)) return;
     if (!attempt.background) {
       attempt.releaseDemand ??= tryHoldForegroundDemand(
         attempt.binding.canonicalPath,
@@ -603,12 +598,12 @@ function authorityLock(state: WorkspaceWriteAuthorityState): WorkspaceLock {
         }
         let releaseError: unknown;
         try {
-          state.nativeBinding.release(state.descriptor);
+          state.nativeBinding.release(state.file);
         } catch (error) {
           releaseError = error;
         } finally {
           try {
-            closeSync(state.descriptor);
+            state.file.close();
           } finally {
             state.releaseDemand?.();
           }
@@ -670,8 +665,8 @@ export async function acquireWorkspaceLock(
       assertLockAttempt(attempt);
       const opened =
         marker.kind === "absent"
-          ? await openOrCreateNativeLockFile(attempt)
-          : await openNativeLockFile(lockPath);
+          ? await openOrCreateNativeLockFile(attempt, nativeBinding)
+          : await openNativeLockFile(lockPath, nativeBinding);
       if (opened === undefined) {
         await waitForLock(attempt);
         continue;
@@ -691,29 +686,24 @@ export async function acquireWorkspaceLock(
 /** Exclusive creation respects a directory or file another client won first. */
 async function openOrCreateNativeLockFile(
   attempt: WorkspaceLockAttempt,
+  nativeBinding: NativeFileLockBinding,
 ): Promise<
   | {
-      readonly descriptor: number;
+      readonly file: NativeLockFile;
       readonly identity: LockFileIdentity;
     }
   | undefined
 > {
   for (;;) {
     assertLockAttempt(attempt);
-    let descriptor: number;
+    let file: NativeLockFile;
     try {
-      descriptor = openSync(
-        attempt.lockPath,
-        constants.O_RDWR |
-          constants.O_CREAT |
-          constants.O_EXCL |
-          (constants.O_NOFOLLOW ?? 0),
-        0o600,
-      );
+      file = nativeBinding.open(attempt.lockPath, true);
     } catch (error) {
       if (systemErrorCode(error) === "EEXIST") {
         const kind = await observeLockPathKind(attempt.lockPath);
-        if (kind === "file") return openNativeLockFile(attempt.lockPath);
+        if (kind === "file")
+          return openNativeLockFile(attempt.lockPath, nativeBinding);
         if (kind === "directory") return undefined;
         if (kind === "other")
           throw new UnsafeWorkspaceLockPathError(attempt.lockPath);
@@ -724,16 +714,16 @@ async function openOrCreateNativeLockFile(
       continue;
     }
     try {
-      const entry = fstatSync(descriptor, { bigint: true });
+      const entry = file.stat();
       if (!nativeLockFileShape(entry) || entry.size !== 0n) {
         inconsistent(
           attempt.binding.canonicalPath,
           "the newly created lock file is not a zero-length regular file",
         );
       }
-      return { descriptor, identity: lockFileIdentityOf(entry) };
+      return { file, identity: lockFileIdentityOf(entry) };
     } catch (cause) {
-      closeSync(descriptor);
+      file.close();
       throw cause;
     }
   }
@@ -742,12 +732,15 @@ async function openOrCreateNativeLockFile(
 /** The marker is committed only while the exact persistent file is locked. */
 async function holdNativeLock(
   attempt: WorkspaceLockAttempt,
-  opened: { readonly descriptor: number; readonly identity: LockFileIdentity },
+  opened: {
+    readonly file: NativeLockFile;
+    readonly identity: LockFileIdentity;
+  },
   nativeBinding: NativeFileLockBinding,
   marker?: NativeLockProtocolMarker,
 ): Promise<WorkspaceLock> {
   try {
-    await acquireNativeBinding(nativeBinding, opened.descriptor, attempt);
+    await acquireNativeBinding(nativeBinding, opened.file, attempt);
     assertLockAttempt(attempt);
     const pathEntry = lstatSync(attempt.lockPath, { bigint: true });
     if (
@@ -768,7 +761,7 @@ async function holdNativeLock(
       lockPath: attempt.lockPath,
       parentChain: attempt.parentChain,
       lockFile: opened.identity,
-      descriptor: opened.descriptor,
+      file: opened.file,
       nativeBinding,
       marker,
       operation: attempt.operation,
@@ -791,11 +784,11 @@ async function holdNativeLock(
     return lock;
   } catch (cause) {
     try {
-      nativeBinding.release(opened.descriptor);
+      nativeBinding.release(opened.file);
     } catch {
       // Preserve acquisition, publication or identity failure.
     }
-    closeSync(opened.descriptor);
+    opened.file.close();
     throw cause;
   }
 }

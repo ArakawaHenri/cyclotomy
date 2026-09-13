@@ -2,3 +2,5 @@ node_modules/
 coverage/
 dist/
 *.tsbuildinfo
+native/build/
+prebuilds/

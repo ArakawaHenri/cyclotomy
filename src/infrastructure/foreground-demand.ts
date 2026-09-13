@@ -1,42 +1,35 @@
-import { closeSync, constants, fstatSync, lstatSync, openSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { join } from "node:path";
 
 import {
   loadNativeFileLock,
   type NativeFileLockBinding,
+  type NativeLockFile,
 } from "./native-file-lock.ts";
 import { systemErrorCode } from "./system-error.ts";
 
 const DEMAND_FILE = "foreground.lock";
 const POLL_MS = 25;
 
-function openDemandFile(storeRoot: string) {
+function openDemandFile(storeRoot: string, binding: NativeFileLockBinding) {
   const path = join(storeRoot, DEMAND_FILE);
-  const flags =
-    constants.O_RDWR |
-    (constants.O_NOFOLLOW ?? 0) |
-    (constants.O_NONBLOCK ?? 0);
-  let descriptor: number;
+  let handle: NativeLockFile;
   try {
-    descriptor = openSync(
-      path,
-      flags | constants.O_CREAT | constants.O_EXCL,
-      0o600,
-    );
+    handle = binding.open(path, true);
   } catch (cause) {
     if (systemErrorCode(cause) !== "EEXIST") throw cause;
     const existing = lstatSync(path);
     if (!existing.isFile() || existing.isSymbolicLink()) {
       throw new Error("foreground demand path is not a regular file");
     }
-    descriptor = openSync(path, flags);
+    handle = binding.open(path);
   }
   try {
-    const identity = fstatSync(descriptor, { bigint: true });
+    const identity = handle.stat();
     const assertCurrent = (): void => {
       const current = lstatSync(path, { bigint: true });
       if (
-        !identity.isFile() ||
+        (identity.mode & 0o170000n) !== 0o100000n ||
         !current.isFile() ||
         current.isSymbolicLink() ||
         identity.size !== 0n ||
@@ -50,9 +43,9 @@ function openDemandFile(storeRoot: string) {
       }
     };
     assertCurrent();
-    return { descriptor, assertCurrent };
+    return { handle, assertCurrent };
   } catch (cause) {
-    closeSync(descriptor);
+    handle.close();
     throw cause;
   }
 }
@@ -62,28 +55,28 @@ export function tryHoldForegroundDemand(
   storeRoot: string,
   binding: NativeFileLockBinding,
 ): (() => void) | undefined {
-  let descriptor: number | undefined;
+  let handle: NativeLockFile | undefined;
   try {
-    const file = openDemandFile(storeRoot);
-    descriptor = file.descriptor;
-    if (!binding.tryAcquireShared(descriptor)) {
-      closeSync(descriptor);
+    const file = openDemandFile(storeRoot, binding);
+    handle = file.handle;
+    if (!binding.tryAcquireShared(handle)) {
+      handle.close();
       return undefined;
     }
     file.assertCurrent();
-    const held = descriptor;
+    const held = handle;
     return () => {
       // Closing the descriptor releases the advisory lock on every platform.
       try {
-        closeSync(held);
+        held.close();
       } catch {
         // Demand is only a scheduling hint, never a workspace write authority.
       }
     };
   } catch {
-    if (descriptor !== undefined) {
+    if (handle !== undefined) {
       try {
-        closeSync(descriptor);
+        handle.close();
       } catch {
         // An unavailable hint must not prevent ordinary workspace locking.
       }
@@ -99,14 +92,14 @@ export async function watchForegroundDemand(storeRoot: string): Promise<{
   close(): void;
 }> {
   const binding = await loadNativeFileLock();
-  const file = openDemandFile(storeRoot);
+  const file = openDemandFile(storeRoot, binding);
   const cancellation = new AbortController();
   const probe = (): void => {
     if (cancellation.signal.aborted) return;
     try {
       file.assertCurrent();
-      if (binding.tryAcquire(file.descriptor)) {
-        binding.release(file.descriptor);
+      if (binding.tryAcquire(file.handle)) {
+        binding.release(file.handle);
       } else {
         cancellation.abort();
       }
@@ -122,7 +115,7 @@ export async function watchForegroundDemand(storeRoot: string): Promise<{
     poll: probe,
     close() {
       clearInterval(timer);
-      closeSync(file.descriptor);
+      file.handle.close();
     },
   };
 }

@@ -19,6 +19,7 @@
   },
   "files": [
     "src",
+    "prebuilds",
     "docs/configuration.md",
     "docs/configuration.zh.md",
     "README.md",
@@ -43,7 +44,9 @@
     "test:real-pi": "vitest run test/real-pi-integration.test.ts test/pi-lock-integration.test.ts",
     "test:watch": "vitest",
     "verify": "npm run format:check && npm run check && npm test",
-    "prepublishOnly": "npm run verify && npm run test:package"
+    "prepublishOnly": "node scripts/check-prebuilds.mjs && npm run verify && npm run test:package",
+    "build:native": "node scripts/build-native.mjs",
+    "test:lock-runtimes": "node scripts/native-lock-matrix.mjs"
   },
   "pi": {
     "extensions": [
@@ -54,13 +57,11 @@
     "@earendil-works/pi-coding-agent": ">=0.84.0",
     "@earendil-works/pi-tui": ">=0.84.0"
   },
-  "dependencies": {
-    "fs-native-extensions": "1.5.1"
-  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1",
     "@types/node": "24.12.4",
+    "node-gyp": "13.0.2",
     "prettier": "3.9.6",
     "typescript": "5.9.3",
     "vitest": "4.1.9"

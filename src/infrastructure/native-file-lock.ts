@@ -1,16 +1,27 @@
-import type * as FsNativeExtensions from "fs-native-extensions";
+import { createRequire } from "node:module";
+import { toNamespacedPath } from "node:path";
 
-/**
- * Whole-file locks implemented by the operating system. The lock
- * is owned by the open file description, so unrelated open/close calls in the
- * same process cannot release it, and process termination releases it without
- * touching the file. Acquisition is always non-blocking; callers own deadline
- * and cancellation so no thread-pool wait is uninterruptible.
- */
+export interface NativeLockFileStat {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly mode: bigint;
+  readonly nlink: bigint;
+  readonly size: bigint;
+}
+
+/** The addon owns its OS handle; runtime file descriptors never cross the ABI. */
+export interface NativeLockFile {
+  stat(): NativeLockFileStat;
+  tryLock(shared?: boolean): boolean;
+  unlock(): void;
+  close(): void;
+}
+
 export interface NativeFileLockBinding {
-  tryAcquire(fd: number): boolean;
-  tryAcquireShared(fd: number): boolean;
-  release(fd: number): void;
+  open(path: string, create?: boolean): NativeLockFile;
+  tryAcquire(file: NativeLockFile): boolean;
+  tryAcquireShared(file: NativeLockFile): boolean;
+  release(file: NativeLockFile): void;
 }
 
 export class NativeFileLockUnavailableError extends Error {
@@ -25,30 +36,25 @@ export class NativeFileLockUnavailableError extends Error {
 
 let bindingPromise: Promise<NativeFileLockBinding> | undefined;
 
-function loadBinding(): Promise<NativeFileLockBinding> {
-  bindingPromise ??= import("fs-native-extensions").then(
-    (module: typeof FsNativeExtensions) =>
-      Object.freeze({
-        tryAcquire(fd: number): boolean {
-          return module.tryLock(fd);
-        },
-        tryAcquireShared(fd: number): boolean {
-          return module.tryLock(fd, 0, 0, { shared: true });
-        },
-        release(fd: number): void {
-          module.unlock(fd);
-        },
-      }),
-  );
-  return bindingPromise;
-}
-
-/** Resolve the platform binding once; failures stay fail-closed and typed. */
+/** Non-blocking OS locks leave deadlines and cancellation with the caller. */
 export async function loadNativeFileLock(): Promise<NativeFileLockBinding> {
-  try {
-    return await loadBinding();
-  } catch (cause) {
-    if (cause instanceof NativeFileLockUnavailableError) throw cause;
-    throw new NativeFileLockUnavailableError(cause);
-  }
+  bindingPromise ??= Promise.resolve().then(() => {
+    try {
+      const require = createRequire(import.meta.url);
+      const addon = require(
+        `../../prebuilds/${process.platform}-${process.arch}/file-lock.node`,
+      ) as Pick<NativeFileLockBinding, "open">;
+      return Object.freeze({
+        open(path: string, create = false): NativeLockFile {
+          return addon.open(toNamespacedPath(path), create);
+        },
+        tryAcquire: (file: NativeLockFile) => file.tryLock(),
+        tryAcquireShared: (file: NativeLockFile) => file.tryLock(true),
+        release: (file: NativeLockFile) => file.unlock(),
+      });
+    } catch (cause) {
+      throw new NativeFileLockUnavailableError(cause);
+    }
+  });
+  return bindingPromise;
 }

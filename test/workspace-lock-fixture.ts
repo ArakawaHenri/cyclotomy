@@ -1,18 +1,17 @@
-import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { loadNativeFileLock } from "../src/infrastructure/native-file-lock.ts";
 
 export async function testWorkspaceLockIsHeld(
   storeRoot: string,
 ): Promise<boolean> {
-  const file = await open(join(storeRoot, "workspace.lock"), "r+");
+  const binding = await loadNativeFileLock();
+  const file = binding.open(join(storeRoot, "workspace.lock"));
   try {
-    const binding = await loadNativeFileLock();
-    if (!binding.tryAcquire(file.fd)) return true;
-    binding.release(file.fd);
+    if (!binding.tryAcquire(file)) return true;
+    binding.release(file);
     return false;
   } finally {
-    await file.close();
+    file.close();
   }
 }
 
