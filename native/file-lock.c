@@ -251,7 +251,7 @@ static napi_value try_lock(napi_env env, napi_callback_info info) {
   bool shared = false;
   if (argc)
     NAPI(napi_get_value_bool(env, argv[0], &shared));
-  bool acquired;
+  bool acquired = false;
   unsigned long error = change_lock(file->fd, shared, false, &acquired);
   if (error)
     return system_error(env, error);
@@ -265,7 +265,7 @@ static napi_value unlock(napi_env env, napi_callback_info info) {
   lock_file *file = receiver(env, info, &argc, NULL);
   if (!file)
     return NULL;
-  bool acquired;
+  bool acquired = false;
   unsigned long error = change_lock(file->fd, false, true, &acquired);
   if (error)
     return system_error(env, error);
@@ -294,7 +294,7 @@ static napi_value stat_file(napi_env env, napi_callback_info info) {
   lock_file *file = receiver(env, info, &argc, NULL);
   if (!file)
     return NULL;
-  struct lock_stat st;
+  struct lock_stat st = {0};
   unsigned long error = read_stat(file->fd, &st);
   if (error)
     return system_error(env, error);
