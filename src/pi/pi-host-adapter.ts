@@ -13,6 +13,36 @@ import type {
   UserBashEventResult,
 } from "@earendil-works/pi-coding-agent";
 
+/** Optional host execution identity, independent of persisted session ancestry. */
+export type SessionExecution =
+  | {
+      readonly kind: "main";
+      readonly workspaceRoot: string;
+      readonly depth: 0;
+    }
+  | {
+      readonly kind: "subagent";
+      readonly workspaceRoot: string;
+      readonly parent: {
+        readonly sessionId: string;
+        readonly cwd: string;
+        readonly workspaceRoot: string;
+      } | null;
+      readonly runId?: string;
+      readonly depth: number;
+    };
+
+export function sharesParentWorkspace(context: ExtensionContext): boolean {
+  const { execution } = context as ExtensionContext & {
+    readonly execution?: SessionExecution;
+  };
+  return (
+    execution?.kind === "subagent" &&
+    execution.parent !== null &&
+    execution.workspaceRoot === execution.parent.workspaceRoot
+  );
+}
+
 /** Runtime availability as observed at one Pi event boundary. */
 export type SessionActivation =
   | { readonly kind: "active" }

@@ -37,6 +37,8 @@ const EN = {
     "Cyclotomy could not save the global default ({{message}}).",
   cyclotomyRunning: "Cyclotomy is running.",
   cyclotomyInactive: "Cyclotomy is unavailable in this session.",
+  cyclotomySharedWorkspace:
+    "Cyclotomy does not manage checkpoints in this subagent because it shares its parent's workspace.",
   cyclotomyPaused:
     "Cyclotomy is paused in this Pi instance. Run /cyclotomy resume to start it again.",
   cyclotomyStoppedWithError:
@@ -61,6 +63,8 @@ const EN = {
     "Automatic checkpoints are paused at the current node ({{message}}). Run /drift before continuing.",
   arrivalAdmissionStopped:
     "Cyclotomy could not resume automatic checkpoints ({{message}}). Fix the problem, then run /cyclotomy resume.",
+  automaticGcScheduleFailed:
+    "Storage cleanup completed, but its schedule could not be saved ({{message}}).",
   automaticGcFailed:
     "Automatic storage cleanup failed ({{message}}). Cyclotomy will try again later.",
   captureFailureDetail: "Details: {{message}}",
@@ -95,6 +99,8 @@ const EN = {
     "Cyclotomy could not checkpoint the current workspace, so the operation was cancelled.",
   sourceCaptureStopped:
     "Cyclotomy stopped. Fix the reported problem, then run /cyclotomy resume.",
+  sourceCaptureDeferred:
+    "Checkpoint not saved. This location is protected; later turns can still create checkpoints.",
   sourceCaptureProtected:
     "Automatic checkpoints are paused at the current node. Run /drift before continuing.",
   continueWithDrift: "Run /drift before continuing.",
@@ -317,6 +323,8 @@ const ZH_CN: Record<MessageKey, string> = {
   cyclotomySettingsSaveFailed: "Cyclotomy 无法保存全局默认值（{{message}}）。",
   cyclotomyRunning: "Cyclotomy 正在运行。",
   cyclotomyInactive: "当前会话无法使用 Cyclotomy。",
+  cyclotomySharedWorkspace:
+    "当前子代理与父会话共享工作区，Cyclotomy 不单独管理此会话的检查点。",
   cyclotomyPaused:
     "Cyclotomy 已在当前 Pi 实例中暂停。执行 /cyclotomy resume 可重新启动。",
   cyclotomyStoppedWithError:
@@ -339,6 +347,8 @@ const ZH_CN: Record<MessageKey, string> = {
     "当前节点的自动检查点已暂停（{{message}}）。继续前请先运行 /drift。",
   arrivalAdmissionStopped:
     "Cyclotomy 无法恢复自动检查点（{{message}}）。修复问题后执行 /cyclotomy resume。",
+  automaticGcScheduleFailed:
+    "存储清理已完成，但无法保存调度记录（{{message}}）。",
   automaticGcFailed: "自动清理存储失败（{{message}}）。Cyclotomy 稍后会重试。",
   captureFailureDetail: "详情：{{message}}",
   captureCancelled: "已取消快照。",
@@ -366,6 +376,8 @@ const ZH_CN: Record<MessageKey, string> = {
   sourceCaptureFailed: "Cyclotomy 无法保存当前工作区，因此已取消本次操作。",
   sourceCaptureStopped:
     "Cyclotomy 已停止。修复报告的问题后执行 /cyclotomy resume。",
+  sourceCaptureDeferred:
+    "此次未保存检查点，当前位置已保护；后续轮次仍可创建检查点。",
   sourceCaptureProtected: "当前节点的自动检查点已暂停。继续前请先运行 /drift。",
   continueWithDrift: "继续前请先运行 /drift。",
   continueAfterResume: "修复问题后执行 /cyclotomy resume。",

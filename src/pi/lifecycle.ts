@@ -158,7 +158,7 @@ type CancellableSourceCaptureSettlement =
       readonly workspaceLockCleanup: CleanupSettlement;
     }
   | {
-      readonly kind: "withdrawn";
+      readonly kind: "protected" | "withdrawn";
       readonly failure: SourceCaptureFailure;
       readonly workspaceLockCleanup: CleanupSettlement;
       readonly recovery: ArrivalRecoverySettlement;
@@ -345,11 +345,49 @@ async function settleCancellableSourceCapture(
       workspaceLockCleanup: receipt.workspaceLockCleanup,
     };
   }
+  let protectionFailure: unknown;
+  if (
+    receipt.workspaceLockCleanup.kind !== "failed" &&
+    sourceCaptureFailureImpact(failure) === "protect-location"
+  ) {
+    try {
+      // Protect the exact source without invalidating its enclosing preparation.
+      const execution = await runtime.enqueueWorkspaceExecution(
+        "protect-failed-source",
+        async (authority) => {
+          const view = readSessionView(context);
+          runtime.assertSessionUsable(view);
+          const node = runtime.checkpoints.captureAnchor(view);
+          if (node === undefined)
+            throw new Error("failed source has no current coordinate");
+          return runtime.workspaceMutations.protectCurrentNode(
+            authority,
+            view,
+            node,
+          );
+        },
+      );
+      if (execution.kind === "action-failed") throw execution.cause;
+      if (execution.value.kind === "unsettled") throw execution.value.cause;
+      return {
+        kind: runtime.isActive ? "protected" : "withdrawn",
+        failure,
+        workspaceLockCleanup: receipt.workspaceLockCleanup,
+        recovery: {
+          arrival: execution.value,
+          workspaceLockCleanup: execution.cleanup,
+        },
+      };
+    } catch (cause) {
+      protectionFailure = cause;
+    }
+  }
   const recovery = await runtime.withdrawFromParticipation(
     context,
     receipt.workspaceLockCleanup.kind === "failed"
       ? receipt.workspaceLockCleanup.cause
-      : (sourceCaptureFailureCause(failure) ??
+      : (protectionFailure ??
+          sourceCaptureFailureCause(failure) ??
           new Error(formatSourceCaptureFailure(runtime.i18n, failure))),
   );
   return {
@@ -402,7 +440,9 @@ function presentCancellableSourceCapture(
       runtime.i18n.t(
         settlement.kind === "cancelled"
           ? "sourceCaptureFailed"
-          : "sourceCaptureStopped",
+          : settlement.kind === "protected"
+            ? "sourceCaptureDeferred"
+            : "sourceCaptureStopped",
       ),
       runtime.i18n.t("captureFailureDetail", {
         message: formatSourceCaptureFailure(runtime.i18n, settlement.failure),
@@ -416,7 +456,7 @@ function presentCancellableSourceCapture(
     settlement.workspaceLockCleanup,
     presentedCauses,
   );
-  if (settlement.kind === "withdrawn") {
+  if (settlement.kind !== "cancelled") {
     notifyArrivalRecovery(
       runtime,
       context,
@@ -1845,13 +1885,9 @@ export function registerCyclotomyLifecycle(
                 capture,
               );
               presentCancellableSourceCapture(runtime, context, settlement);
-              if (settlement.kind === "completed") {
-                return { action: "continue" as const };
-              }
-              if (settlement.kind === "withdrawn") {
-                return { action: "continue" as const };
-              }
-              return { action: "handled" as const };
+              return settlement.kind === "cancelled"
+                ? { action: "handled" as const }
+                : { action: "continue" as const };
             },
           );
           if (preparation.kind !== "completed") {

@@ -10,11 +10,10 @@ import {
   recipeIdFromCanonicalBytes,
 } from "../src/infrastructure/content-store/ids.ts";
 import {
-  buildMultiPackIndex,
+  buildMultiPackIndexFromViews,
   decodeMultiPackIndex,
 } from "../src/infrastructure/content-store/multi-pack-index.ts";
 import {
-  decodePack,
   encodePack,
   MAX_METADATA_RECORD_BYTES,
   measurePackInputBytes,
@@ -188,7 +187,10 @@ describe("content-store pack", () => {
         .update(result.bytes.subarray(0, checksumOffset))
         .digest("hex"),
     );
-    const reopened = decodePack(result.bytes, result.pack.packId);
+    const reopened = await openAuthenticatedPack(
+      new CountingPackReader(result.bytes),
+      result.pack.packId,
+    );
     const candidates = reopened.lookup({
       kind: "content",
       logicalId: contentIdFromBytes(decoded),
@@ -200,6 +202,7 @@ describe("content-store pack", () => {
     expect(Buffer.from(await reopened.readVerified(candidates[0]!))).toEqual(
       decoded,
     );
+    await reopened.close();
   });
 
   it("authenticates through bounded positional reads and owns an explicit scope", async () => {
@@ -438,7 +441,7 @@ describe("content-store pack", () => {
       decodedLength: decoded.byteLength,
     });
     const midx = decodeMultiPackIndex(
-      buildMultiPackIndex([encoded.pack]).bytes,
+      buildMultiPackIndexFromViews([encoded.pack.indexView()]).bytes,
     );
     expect(midx.packs[0]).toMatchObject({
       packId: encoded.pack.packId,
@@ -630,9 +633,6 @@ describe("content-store pack", () => {
     malformed[payloadOffset + 4] = 7;
     const resigned = resignPack(malformed);
 
-    expect(() => decodePack(resigned)).toThrow(
-      /COPY range exceeds its selected base/u,
-    );
     const source = new CountingPackReader(resigned);
     await expect(openAuthenticatedPack(source)).rejects.toThrow(
       /COPY range exceeds its selected base/u,
@@ -648,40 +648,41 @@ describe("content-store pack", () => {
 
     const changed = Uint8Array.from(encoded.bytes);
     changed[12] = (changed[12] ?? 0) ^ 1;
-    expect(() => decodePack(changed)).toThrowError(PackFormatError);
     const changedReader = new CountingPackReader(changed);
     await expect(openAuthenticatedPack(changedReader)).rejects.toThrowError(
       PackFormatError,
     );
     expect(changedReader.closeCalls).toBe(1);
-    expect(() => decodePack(encoded.bytes, "0".repeat(64))).toThrowError(
-      PackFormatError,
-    );
-    expect(() =>
-      decodePack(Uint8Array.from([...encoded.bytes, 0])),
-    ).toThrowError(PackFormatError);
+    await expect(
+      openAuthenticatedPack(
+        new CountingPackReader(encoded.bytes),
+        "0".repeat(64),
+      ),
+    ).rejects.toThrowError(PackFormatError);
+    await expect(
+      openAuthenticatedPack(
+        new CountingPackReader(Uint8Array.from([...encoded.bytes, 0])),
+      ),
+    ).rejects.toThrowError(PackFormatError);
 
     const unknownFlags = Uint8Array.from(encoded.bytes);
     unknownFlags[10] = 1;
-    expect(() => decodePack(resignPack(unknownFlags))).toThrowError(
-      /unsupported flags/u,
-    );
+    await expect(
+      openAuthenticatedPack(new CountingPackReader(resignPack(unknownFlags))),
+    ).rejects.toThrowError(/unsupported flags/u);
 
     const invalidFooter = Uint8Array.from(encoded.bytes);
     const invalidFooterOffset = footerOffset(invalidFooter);
     invalidFooter[invalidFooterOffset] =
       (invalidFooter[invalidFooterOffset] ?? 0) ^ 1;
-    expect(() => decodePack(resignPack(invalidFooter))).toThrowError(
-      PackFormatError,
-    );
+    await expect(
+      openAuthenticatedPack(new CountingPackReader(resignPack(invalidFooter))),
+    ).rejects.toThrowError(PackFormatError);
 
     const invalidOffset = Uint8Array.from(encoded.bytes);
     const offsetPosition = firstFooterEntryOffsetPosition(invalidOffset);
     invalidOffset[offsetPosition] = (invalidOffset[offsetPosition] ?? 0) + 1;
     const resignedInvalidOffset = resignPack(invalidOffset);
-    expect(() => decodePack(resignedInvalidOffset)).toThrowError(
-      /physical record boundary/u,
-    );
     const invalidOffsetReader = new CountingPackReader(resignedInvalidOffset);
     await expect(openAuthenticatedPack(invalidOffsetReader)).rejects.toThrow(
       /physical record boundary/u,

@@ -23,7 +23,6 @@ import {
   type PackId,
   type PackIndexEntry,
   type PackIndexView,
-  type PackVerificationOptions,
 } from "./pack.ts";
 import {
   RECORD_ENCODING_CODES,
@@ -99,31 +98,12 @@ export type MultiPackIndexValidation =
   | { readonly kind: "current" }
   | { readonly kind: "stale"; readonly reason: string };
 
-export type MultiPackIndexResolution =
-  | {
-      readonly kind: "hit";
-      readonly bytes: Uint8Array;
-      readonly packEntry: PackIndexEntry;
-    }
-  | { readonly kind: "stale"; readonly reason: string };
-
 /** Pack-index capability shared by in-memory and streaming packs. */
 export interface PackIndexLookup {
   readonly packId: PackId;
   readonly packClass: PackClass;
   readonly byteLength: number;
   entryForPhysicalOrdinal(physicalOrdinal: number): PackIndexEntry | undefined;
-}
-
-export interface PackReadLookup extends PackIndexLookup {
-  readVerified(
-    entry: PackIndexEntry,
-    options?: PackVerificationOptions,
-  ): Promise<Uint8Array>;
-}
-
-interface AuthenticatedPackViewSource {
-  indexView(): PackIndexView;
 }
 
 export type MultiPackIndexLocation =
@@ -377,14 +357,6 @@ export class MultiPackIndex {
   }
 }
 
-export function buildMultiPackIndex(
-  sourcePacks: readonly AuthenticatedPackViewSource[],
-): BuiltMultiPackIndex {
-  return buildMultiPackIndexFromViews(
-    sourcePacks.map((pack) => pack.indexView()),
-  );
-}
-
 /** Build from payload-free pack footer views, one retained per pack. */
 export function buildMultiPackIndexFromViews(
   sourcePacks: readonly PackIndexView[],
@@ -625,16 +597,6 @@ function canonicalPackList(
   return sorted;
 }
 
-export function validateMultiPackIndex(
-  index: MultiPackIndex,
-  sourcePacks: readonly AuthenticatedPackViewSource[],
-): MultiPackIndexValidation {
-  return validateMultiPackIndexViews(
-    index,
-    sourcePacks.map((pack) => pack.indexView()),
-  );
-}
-
 /** Validate cache completeness using only pack footer views. */
 export function validateMultiPackIndexViews(
   index: MultiPackIndex,
@@ -744,27 +706,5 @@ export function resolveMultiPackIndexEntry(
     kind: "hit",
     pack,
     packEntry,
-  };
-}
-
-/** Verify and materialize a full or delta1 representation after locating it. */
-export async function readMultiPackIndexEntry(
-  index: MultiPackIndex,
-  candidate: MultiPackIndexEntry,
-  packsById: ReadonlyMap<string, PackReadLookup>,
-  options: PackVerificationOptions = {},
-): Promise<MultiPackIndexResolution> {
-  const location = resolveMultiPackIndexEntry(index, candidate, packsById);
-  if (location.kind === "stale") {
-    return location;
-  }
-  const readable = packsById.get(location.pack.packId);
-  if (readable === undefined) {
-    return { kind: "stale", reason: "selected pack is unavailable" };
-  }
-  return {
-    kind: "hit",
-    bytes: await readable.readVerified(location.packEntry, options),
-    packEntry: location.packEntry,
   };
 }

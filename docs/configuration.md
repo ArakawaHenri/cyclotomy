@@ -46,10 +46,13 @@ setting stops Cyclotomy and reports the problem. Fix it, then run
 
 Checkpoint limits apply when saving a new checkpoint or importing history.
 Lowering them does not make an existing checkpoint unreadable or unrestorable.
+A failed workspace scan skips that checkpoint. Once the current location is protected, later turns can capture again without restarting Cyclotomy.
 
 Changing `storageDir` selects a different store; it does not move existing
 data. Pi's `PI_CODING_AGENT_DIR` changes the location of both the agent
 directory and Cyclotomy's default storage root.
+
+When the host identifies a subagent as sharing its parent's workspace, Cyclotomy skips separate checkpoint management. Main sessions, independent worktrees, and sessions without that host information follow the usual rules. No additional configuration is needed.
 
 ## Stored data
 
@@ -57,7 +60,7 @@ Use a local filesystem on Linux (glibc), macOS or Windows for the store. Network
 
 Checkpoints live outside the workspace, under `<Pi agent directory>/cyclotomy/<workspace-id>/` by default. They contain unencrypted managed files. Uninstalling Cyclotomy does not delete them.
 
-Automatic cleanup reclaims unreferenced objects. History has no automatic expiry or total storage quota. Cleanup runs during idle time, yields when foreground work needs the workspace, and retries automatically. Its memory requirements grow with retained history.
+Automatic cleanup reclaims unreferenced objects. History has no automatic expiry or total storage quota. Cleanup runs during idle time, yields when foreground work needs the workspace, and retries automatically. Its memory requirements grow with retained history. The schedule file is only a hint: a read failure does not prevent cleanup, and a save failure is reported separately from completed cleanup.
 
 If stored data is damaged, stop Pi and copy the complete store before attempting recovery. Restore a consistent backup or select a new `storageDir`. Editing metadata or deleting individual packs can make otherwise recoverable checkpoints unusable.
 

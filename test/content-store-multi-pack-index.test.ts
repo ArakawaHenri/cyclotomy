@@ -5,13 +5,10 @@ import { describe, expect, it } from "vitest";
 import { CanonicalReader } from "../src/infrastructure/content-store/canonical-binary.ts";
 import { contentIdFromBytes } from "../src/infrastructure/content-store/ids.ts";
 import {
-  buildMultiPackIndex,
   buildMultiPackIndexFromViews,
   decodeMultiPackIndex,
   MultiPackIndexError,
-  readMultiPackIndexEntry,
   resolveMultiPackIndexEntry,
-  validateMultiPackIndex,
   validateMultiPackIndexViews,
 } from "../src/infrastructure/content-store/multi-pack-index.ts";
 import {
@@ -74,8 +71,14 @@ describe("multi-pack index", () => {
     const secondBytes = Buffer.from("second", "utf8");
     const first = await dataPack(firstBytes);
     const second = await dataPack(secondBytes);
-    const built = buildMultiPackIndex([second, first]);
-    expect(buildMultiPackIndex([first, second]).bytes).toEqual(built.bytes);
+    const built = buildMultiPackIndexFromViews([
+      second.indexView(),
+      first.indexView(),
+    ]);
+    expect(
+      buildMultiPackIndexFromViews([first.indexView(), second.indexView()])
+        .bytes,
+    ).toEqual(built.bytes);
     const firstView = first.indexView();
     const secondView = second.indexView();
     expect(Object.keys(firstView).sort()).toEqual([
@@ -85,14 +88,8 @@ describe("multi-pack index", () => {
       "packId",
     ]);
     expect(Object.isFrozen(firstView)).toBe(true);
-    expect(buildMultiPackIndexFromViews([secondView, firstView]).bytes).toEqual(
-      built.bytes,
-    );
     const reopened = decodeMultiPackIndex(built.bytes);
 
-    expect(validateMultiPackIndex(reopened, [first, second])).toEqual({
-      kind: "current",
-    });
     expect(
       validateMultiPackIndexViews(reopened, [secondView, firstView]),
     ).toEqual({ kind: "current" });
@@ -101,7 +98,7 @@ describe("multi-pack index", () => {
       logicalId: contentIdFromBytes(secondBytes),
     });
     expect(candidates).toHaveLength(1);
-    const resolved = await readMultiPackIndexEntry(
+    const resolved = resolveMultiPackIndexEntry(
       reopened,
       candidates[0]!,
       new Map([
@@ -111,38 +108,49 @@ describe("multi-pack index", () => {
     );
     expect(resolved.kind).toBe("hit");
     if (resolved.kind === "hit") {
-      expect(Buffer.from(resolved.bytes)).toEqual(secondBytes);
+      expect(
+        Buffer.from(await second.readVerified(resolved.packEntry)),
+      ).toEqual(secondBytes);
     }
   });
 
   it("reports an obsolete pack set as stale instead of treating MIDX as authority", async () => {
     const first = await dataPack(Buffer.from("first", "utf8"));
     const second = await dataPack(Buffer.from("second", "utf8"));
-    const { index } = buildMultiPackIndex([first, second]);
+    const { index } = buildMultiPackIndexFromViews([
+      first.indexView(),
+      second.indexView(),
+    ]);
     const candidate = index.entries[0]!;
 
-    expect(validateMultiPackIndex(index, [first])).toMatchObject({
+    expect(
+      validateMultiPackIndexViews(index, [first.indexView()]),
+    ).toMatchObject({
       kind: "stale",
     });
-    await expect(
-      readMultiPackIndexEntry(index, candidate, new Map()),
-    ).resolves.toMatchObject({ kind: "stale" });
+    expect(
+      resolveMultiPackIndexEntry(index, candidate, new Map()),
+    ).toMatchObject({ kind: "stale" });
   });
 
   it("rejects candidates that do not exactly match their pack footer", async () => {
     const pack = await dataPack(Buffer.from("content", "utf8"));
-    const { index } = buildMultiPackIndex([pack]);
+    const { index } = buildMultiPackIndexFromViews([pack.indexView()]);
     const candidate = index.entries[0]!;
     const changed = { ...candidate, offset: candidate.offset + 1 };
 
-    await expect(
-      readMultiPackIndexEntry(index, changed, new Map([[pack.packId, pack]])),
-    ).resolves.toMatchObject({ kind: "stale" });
+    expect(
+      resolveMultiPackIndexEntry(
+        index,
+        changed,
+        new Map([[pack.packId, pack]]),
+      ),
+    ).toMatchObject({ kind: "stale" });
   });
 
   it("detects a checksummed but stale cached offset against the pack footer", async () => {
     const pack = await dataPack(Buffer.from("content", "utf8"));
-    const built = buildMultiPackIndex([pack]);
+    const built = buildMultiPackIndexFromViews([pack.indexView()]);
     const staleBytes = Uint8Array.from(built.bytes);
     const offsetPosition = firstMidxEntryOffsetPosition(staleBytes);
     staleBytes[offsetPosition] = (staleBytes[offsetPosition] ?? 0) + 1;
@@ -159,17 +167,19 @@ describe("multi-pack index", () => {
   });
 
   it("round-trips an empty rebuildable cache", () => {
-    const built = buildMultiPackIndex([]);
+    const built = buildMultiPackIndexFromViews([]);
     const decoded = decodeMultiPackIndex(built.bytes);
 
     expect(decoded.packs).toEqual([]);
     expect(decoded.entries).toEqual([]);
-    expect(validateMultiPackIndex(decoded, [])).toEqual({ kind: "current" });
+    expect(validateMultiPackIndexViews(decoded, [])).toEqual({
+      kind: "current",
+    });
   });
 
   it("rejects checksum damage, trailing bytes, and authenticated unknown flags", async () => {
     const pack = await dataPack(Buffer.from("content", "utf8"));
-    const built = buildMultiPackIndex([pack]);
+    const built = buildMultiPackIndexFromViews([pack.indexView()]);
     const damaged = Uint8Array.from(built.bytes);
     damaged[12] = (damaged[12] ?? 0) ^ 1;
 

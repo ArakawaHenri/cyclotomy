@@ -4,23 +4,17 @@ import { open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { retainCleanupFailure } from "./failure-settlement.ts";
-import { systemErrorCode } from "./system-error.ts";
 import {
   assertWorkspaceWriteAuthority,
   type WorkspaceWriteAuthority,
 } from "./workspace-lock.ts";
 
-/** A malformed timestamp cannot prevent collection of unreferenced objects. */
+/** An unreadable schedule hint cannot prevent collection. */
 export async function readLastAutomaticGcAt(path: string): Promise<number> {
-  let contents: string;
   try {
-    contents = await readFile(path, "utf8");
-  } catch (cause) {
-    if (systemErrorCode(cause) === "ENOENT") return 0;
-    throw cause;
-  }
-  try {
-    const parsed = JSON.parse(contents) as { lastGcAt?: unknown };
+    const parsed = JSON.parse(await readFile(path, "utf8")) as {
+      lastGcAt?: unknown;
+    };
     const timestamp = parsed.lastGcAt;
     return typeof timestamp === "number" &&
       Number.isFinite(timestamp) &&

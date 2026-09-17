@@ -36,6 +36,7 @@ import {
 } from "./restore-notifications.ts";
 import { applyActiveArrivalSettlement } from "./active-arrival-settlement.ts";
 import { messageOfUnknown } from "./unknown-error.ts";
+import { sharesParentWorkspace } from "./pi-host-adapter.ts";
 
 type CyclotomyRuntimeEvent = Exclude<
   Extract<ExtensionEvent, { readonly type: CyclotomyLifecycleEventType }>,
@@ -80,6 +81,7 @@ function isMemorySession(context: ExtensionContext): boolean {
 /** Assemble Cyclotomy behind one permanent, pass-through Pi boundary. */
 export function registerCyclotomy(pi: ExtensionAPI): void {
   let sessionStartObserved = false;
+  let sharedParentWorkspace = false;
   const agentDir = getAgentDir();
   const config = startupConfig(agentDir);
   const environmentEnabled = process.env.CYCLOTOMY_ENABLED;
@@ -113,6 +115,10 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
   };
 
   const showStatus = (context: ExtensionContext): void => {
+    if (sharedParentWorkspace) {
+      notify(context, i18n.t("cyclotomySharedWorkspace"));
+      return;
+    }
     if (isMemorySession(context)) {
       notify(context, i18n.t("memorySessionUnsupported"));
       return;
@@ -285,7 +291,8 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
       return;
     }
     sessionStartObserved = true;
-    if (!automaticStartupEnabled) {
+    sharedParentWorkspace = sharesParentWorkspace(context);
+    if (sharedParentWorkspace || !automaticStartupEnabled) {
       await controller.stop();
       return;
     }
@@ -372,6 +379,7 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
               context,
               i18n.t(enabled ? "cyclotomyEnabled" : "cyclotomyDisabled"),
             );
+            if (enabled && sharedParentWorkspace) showStatus(context);
           } catch (cause) {
             notify(
               context,
@@ -384,6 +392,10 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           return;
         }
         case "pause":
+          if (sharedParentWorkspace) {
+            showStatus(context);
+            return;
+          }
           try {
             await retireCurrentParticipation(context);
             notify(context, i18n.t("cyclotomyPauseSucceeded"));
@@ -392,6 +404,10 @@ export function registerCyclotomy(pi: ExtensionAPI): void {
           }
           return;
         case "resume": {
+          if (sharedParentWorkspace) {
+            showStatus(context);
+            return;
+          }
           const current = controller.current;
           if (current?.runtime.isActive === true) {
             showStatus(context);

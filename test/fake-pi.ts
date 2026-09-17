@@ -10,6 +10,7 @@ import { mkdtempSync } from "node:fs";
 import { lstat, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SessionExecution } from "../src/pi/pi-host-adapter.ts";
 
 /**
  * Minimal in-memory Pi host for integration tests. It reproduces the host
@@ -260,15 +261,18 @@ export class FakePi {
   #api: ExtensionAPI;
   #context: ExtensionContext;
   #factory: ExtensionFactory | undefined;
+  readonly #execution: SessionExecution | undefined;
   factoryLoads = 0;
 
   constructor(
     cwd: string,
     factory?: ExtensionFactory,
     initialManager?: FakeSessionManager,
+    execution?: SessionExecution,
   ) {
     FakePi.#activeHosts.add(this);
     this.#factory = factory;
+    this.#execution = execution;
     this.#sessionDirectory = mkdtempSync(
       join(process.env.PI_CODING_AGENT_DIR ?? tmpdir(), "cyclotomy-fake-pi-"),
     );
@@ -364,6 +368,7 @@ export class FakePi {
       },
     };
     return {
+      ...(this.#execution === undefined ? {} : { execution: this.#execution }),
       get cwd() {
         return self.manager.getCwd();
       },

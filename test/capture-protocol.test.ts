@@ -269,14 +269,14 @@ describe("source capture failure impact", () => {
         kind: "capture",
         value: { kind: "scan-incomplete", phase: "capture", problems: [] },
       },
-      "withdraw-participation",
+      "protect-location",
     ],
     [
       {
         kind: "capture",
         value: { kind: "scan-failed", phase: "validation", cause },
       },
-      "withdraw-participation",
+      "protect-location",
     ],
     [
       { kind: "capture", value: { kind: "publish-failed", cause } },

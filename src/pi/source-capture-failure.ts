@@ -15,7 +15,7 @@ export type SourceCaptureFailure =
   | { readonly kind: "exception"; readonly cause: unknown };
 
 export type SourceCaptureFailureImpact =
-  "cancel-operation" | "withdraw-participation";
+  "cancel-operation" | "protect-location" | "withdraw-participation";
 
 export function sourceCaptureFailureImpact(
   failure: SourceCaptureFailure,
@@ -31,6 +31,7 @@ export function sourceCaptureFailureImpact(
       switch (failure.value.kind) {
         case "scan-incomplete":
         case "scan-failed":
+          return "protect-location";
         case "publish-failed":
         case "history-reset":
         case "metadata-failed":

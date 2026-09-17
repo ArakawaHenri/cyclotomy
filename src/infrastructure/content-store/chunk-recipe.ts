@@ -8,8 +8,6 @@ import {
 import {
   FASTCDC_V1_PROFILE,
   FastCdcV1StreamBuilder,
-  chunkFastCdcV1,
-  type FastCdcChunk,
   type FastCdcStreamChunk,
 } from "./fastcdc.ts";
 import {
@@ -95,13 +93,6 @@ export interface CanonicalRecipeObject {
   readonly recipeId: RecipeId;
   readonly bytes: Uint8Array;
   readonly value: RecipeRoot | RecipeNode;
-}
-
-export interface ChunkRecipePlan {
-  readonly rootId: RecipeId;
-  readonly root: RecipeRoot;
-  /** Unique objects in children-before-parents publication order. */
-  readonly objects: readonly CanonicalRecipeObject[];
 }
 
 export interface RecipeGraphLimits {
@@ -689,88 +680,6 @@ function validateContentReferences(
   }
 }
 
-export function buildChunkRecipePlan(
-  contentId: ContentId,
-  decodedLength: number,
-  chunks: readonly ContentChunkReference[],
-  limits: RecipeGraphLimits,
-): ChunkRecipePlan {
-  assertLimits(limits);
-  parseContentId(contentId);
-  assertSafeLength(decodedLength, "content decoded length");
-  if (decodedLength < CHUNKED_CONTENT_MIN_BYTES) {
-    throw new CanonicalBinaryError(
-      "unexpected-value",
-      `chunked content must be at least ${CHUNKED_CONTENT_MIN_BYTES} bytes`,
-    );
-  }
-  validateContentReferences(chunks, decodedLength);
-  if (chunks.length > limits.maxChunks) {
-    throw new CanonicalBinaryError(
-      "limit-exceeded",
-      "chunk count exceeds the build limit",
-    );
-  }
-
-  const uniqueObjects = new Map<RecipeId, CanonicalRecipeObject>();
-  let references: ChildRecipeReference[] = [];
-  for (let offset = 0; offset < chunks.length; offset += MAX_LEAF_REFERENCES) {
-    const node = summarizeLeaf(
-      chunks.slice(offset, offset + MAX_LEAF_REFERENCES),
-    );
-    const object = canonicalObject(node);
-    uniqueObjects.set(object.recipeId, object);
-    references.push(referenceFor(object.recipeId, node));
-  }
-  while (references.length > 1) {
-    const parents: ChildRecipeReference[] = [];
-    for (
-      let offset = 0;
-      offset < references.length;
-      offset += MAX_BRANCH_REFERENCES
-    ) {
-      const node = summarizeBranch(
-        references.slice(offset, offset + MAX_BRANCH_REFERENCES),
-      );
-      const object = canonicalObject(node);
-      uniqueObjects.set(object.recipeId, object);
-      parents.push(referenceFor(object.recipeId, node));
-    }
-    references = parents;
-  }
-  const child = references[0];
-  if (child === undefined) {
-    throw new CanonicalBinaryError(
-      "truncated",
-      "recipe plan has no root child",
-    );
-  }
-  const root = Object.freeze({
-    kind: "root",
-    profile: FASTCDC_V1_PROFILE.id,
-    contentId,
-    decodedLength,
-    depth: child.depth + 1,
-    nodeCount: checkedAdd(1, child.nodeCount, "root node count"),
-    chunkCount: child.chunkCount,
-    child,
-  } as const);
-  assertWithinLimits(
-    root.decodedLength,
-    root.depth,
-    root.nodeCount,
-    root.chunkCount,
-    limits,
-  );
-  const rootObject = canonicalObject(root);
-  uniqueObjects.set(rootObject.recipeId, rootObject);
-  return Object.freeze({
-    rootId: rootObject.recipeId,
-    root,
-    objects: Object.freeze([...uniqueObjects.values()]),
-  });
-}
-
 function assertAuthenticatedRecipeObject(
   expectedId: RecipeId,
   bytes: Uint8Array,
@@ -956,37 +865,6 @@ export async function authenticateChunkRecipeGraph(
     chunks: Object.freeze(chunks),
     recipeIds: Object.freeze([...recipeIds]),
   });
-}
-
-export function describeChunkedContent(
-  input: Uint8Array,
-  limits: RecipeGraphLimits,
-): ChunkRecipePlan & { readonly chunks: readonly FastCdcChunk[] } {
-  if (input.byteLength < CHUNKED_CONTENT_MIN_BYTES) {
-    throw new RangeError(
-      `chunked content must be at least ${CHUNKED_CONTENT_MIN_BYTES} bytes`,
-    );
-  }
-  const boundaries = chunkFastCdcV1(input);
-  if (boundaries.length < 2) {
-    throw new RangeError(
-      "content produces one FastCDC chunk and must use a full representation",
-    );
-  }
-  const references = boundaries.map((chunk) => ({
-    kind: "content" as const,
-    contentId: contentIdFromBytes(
-      input.subarray(chunk.offset, chunk.offset + chunk.length),
-    ),
-    decodedLength: chunk.length,
-  }));
-  const plan = buildChunkRecipePlan(
-    contentIdFromBytes(input),
-    input.byteLength,
-    references,
-    limits,
-  );
-  return Object.freeze({ ...plan, chunks: boundaries });
 }
 
 /**

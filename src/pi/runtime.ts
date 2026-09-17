@@ -796,11 +796,24 @@ export class CyclotomyRuntime {
                 this.#automaticGcLastCompletedAt = Date.now();
                 this.#automaticGcRetryMs = 1_000;
                 this.#automaticGcFailureNotified = false;
-                await writeLastAutomaticGcAt(
-                  statePath,
-                  this.#automaticGcLastCompletedAt,
-                  writeAuthority,
-                );
+                try {
+                  await writeLastAutomaticGcAt(
+                    statePath,
+                    this.#automaticGcLastCompletedAt,
+                    writeAuthority,
+                  );
+                } catch (cause) {
+                  const context = this.#automaticGcContext;
+                  if (context !== undefined) {
+                    this.notify(
+                      context,
+                      this.i18n.t("automaticGcScheduleFailed", {
+                        message: formatUiDetail(messageOfUnknown(cause)),
+                      }),
+                      "warning",
+                    );
+                  }
+                }
               } else {
                 this.#deferAutomaticGc();
               }

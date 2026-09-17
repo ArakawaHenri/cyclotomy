@@ -29,6 +29,9 @@ describe("automatic GC state", () => {
     await expect(readLastAutomaticGcAt(statePath)).resolves.toBe(42);
     writeFileSync(statePath, "{not-json\n");
     await expect(readLastAutomaticGcAt(statePath)).resolves.toBe(0);
+    await rm(statePath);
+    mkdirSync(statePath);
+    await expect(readLastAutomaticGcAt(statePath)).resolves.toBe(0);
   });
 
   it("does not overwrite a successor after lock ownership is lost", async () => {

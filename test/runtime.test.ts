@@ -60,6 +60,7 @@ import {
 } from "./metadata-fixture.ts";
 import { publishTestBlob, publishTestTree } from "./object-store-fixture.ts";
 import { ALL_MANAGED_SCOPE, gitScope } from "./workspace-scope-fixture.ts";
+import { FakePi } from "./fake-pi.ts";
 
 const roots: string[] = [];
 const TEST_SCOPE = ALL_MANAGED_SCOPE;
@@ -3144,6 +3145,38 @@ describe("Cyclotomy runtime", () => {
       lastGcAt: expect.any(Number),
     });
     runtime.close();
+  });
+
+  it("preserves completed cleanup when its schedule cannot be read or written", async () => {
+    const { workspace, runtime } = await createRuntime();
+    const pi = new FakePi(workspace);
+    const statePath = join(runtime.storeRoot, "gc-state.json");
+    await mkdir(statePath);
+    runtime.scheduleAutomaticGc(pi.context);
+    try {
+      const execution = await runtime.maybeRunAutomaticGc();
+      expect(execution).toMatchObject({
+        kind: "completed",
+        value: {
+          keptObjects: expect.any(Number),
+          freedBytes: expect.any(Number),
+        },
+        cleanup: { kind: "settled" },
+      });
+      expect(pi.notifications).toEqual([
+        expect.objectContaining({
+          message: expect.stringContaining("Storage cleanup completed"),
+          level: "warning",
+        }),
+      ]);
+      await expect(runtime.maybeRunAutomaticGc()).resolves.toMatchObject({
+        kind: "completed",
+        value: undefined,
+      });
+    } finally {
+      runtime.close();
+      await pi.dispose();
+    }
   });
 
   it("binds one runtime to one canonical workspace", async () => {

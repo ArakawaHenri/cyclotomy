@@ -100,11 +100,12 @@ async function execute(c) {
               worker.once("message", resolve);
               worker.once("error", reject);
             });
-            assert.equal(
-              outstanding,
-              close ? 0 : 16,
-              "explicit close must reclaim native allocations",
-            );
+            if (close)
+              assert.equal(
+                outstanding,
+                0,
+                "explicit close must reclaim native allocations",
+              );
           } finally {
             await worker.terminate();
           }

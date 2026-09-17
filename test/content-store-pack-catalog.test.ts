@@ -29,7 +29,6 @@ import {
   parseMetadataId,
 } from "../src/infrastructure/content-store/ids.ts";
 import {
-  decodePack,
   encodePack,
   PackFormatError,
   parsePackId,
@@ -600,7 +599,7 @@ describe("pack catalog", () => {
     const encoded = await dataPack("verified receipt");
     const forged: EncodedPack = {
       bytes: Uint8Array.from(encoded.bytes),
-      pack: decodePack(encoded.bytes, encoded.pack.packId),
+      pack: encoded.pack,
     };
 
     await expect(

@@ -5,8 +5,14 @@ import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildChunkRecipePlan } from "../src/infrastructure/content-store/chunk-recipe.ts";
-import { contentIdFromBytes } from "../src/infrastructure/content-store/ids.ts";
+import {
+  encodeRecipeNode,
+  encodeRecipeRoot,
+} from "../src/infrastructure/content-store/chunk-recipe.ts";
+import {
+  contentIdFromBytes,
+  recipeIdFromCanonicalBytes,
+} from "../src/infrastructure/content-store/ids.ts";
 import { encodePack } from "../src/infrastructure/content-store/pack.ts";
 import {
   createChunkedContentRecord,
@@ -33,21 +39,39 @@ const roots: string[] = [];
 const FILE_BYTES = 256 * 1024;
 
 function recipeFor(bytes: Buffer, chunks: readonly Buffer[]) {
-  return buildChunkRecipePlan(
-    contentIdFromBytes(bytes),
-    bytes.byteLength,
-    chunks.map((chunk) => ({
-      kind: "content" as const,
+  const leaf = encodeRecipeNode({
+    kind: "leaf",
+    decodedLength: bytes.byteLength,
+    depth: 1,
+    nodeCount: 1,
+    chunkCount: chunks.length,
+    chunks: chunks.map((chunk) => ({
+      kind: "content",
       contentId: contentIdFromBytes(chunk),
       decodedLength: chunk.byteLength,
     })),
-    {
-      maxChunks: 64,
-      maxDecodedBytes: bytes.byteLength,
-      maxDepth: 8,
-      maxNodes: 64,
+  });
+  const root = encodeRecipeRoot({
+    kind: "root",
+    profile: "fastcdc-v1",
+    contentId: contentIdFromBytes(bytes),
+    decodedLength: bytes.byteLength,
+    depth: 2,
+    nodeCount: 2,
+    chunkCount: chunks.length,
+    child: {
+      kind: "recipe",
+      recipeId: recipeIdFromCanonicalBytes(leaf),
+      decodedLength: bytes.byteLength,
+      depth: 1,
+      nodeCount: 1,
+      chunkCount: chunks.length,
     },
-  );
+  });
+  return {
+    rootId: recipeIdFromCanonicalBytes(root),
+    objects: [{ bytes: leaf }, { bytes: root }],
+  };
 }
 
 async function fixture() {

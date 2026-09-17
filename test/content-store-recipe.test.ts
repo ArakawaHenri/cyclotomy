@@ -4,13 +4,12 @@ import {
   CHUNKED_CONTENT_MIN_BYTES,
   MAX_RECIPE_OBJECT_BYTES,
   ChunkedContentPlanBuilder,
-  buildChunkRecipePlan,
   decodeRecipeNode,
   decodeRecipeRoot,
-  describeChunkedContent,
   encodeRecipeNode,
   encodeRecipeRoot,
   authenticateChunkRecipeGraph,
+  type CanonicalRecipeObject,
   type ContentChunkReference,
   type RecipeGraphLimits,
 } from "../src/infrastructure/content-store/chunk-recipe.ts";
@@ -38,42 +37,53 @@ function deterministicBytes(length: number): Uint8Array {
   return bytes;
 }
 
+async function buildPlan(input: Uint8Array) {
+  const objects: CanonicalRecipeObject[] = [];
+  const chunks: ContentChunkReference[] = [];
+  const builder = new ChunkedContentPlanBuilder(input.byteLength, LIMITS, {
+    content: (chunk) => {
+      chunks.push({
+        kind: "content",
+        contentId: chunk.contentId,
+        decodedLength: chunk.length,
+      });
+    },
+    recipe: (object) => {
+      objects.push(object);
+    },
+  });
+  await builder.push(input);
+  const plan = await builder.finish();
+  if (plan.kind !== "chunked")
+    throw new Error("fixture must produce multiple chunks");
+  return { ...plan, objects, chunks };
+}
+
 describe("bounded chunk recipe DAG", () => {
-  it("requires a candidate above 64 KiB to produce at least two chunks", () => {
-    expect(CHUNKED_CONTENT_MIN_BYTES).toBe(64 * 1024 + 1);
-    expect(() =>
-      describeChunkedContent(
-        new Uint8Array(CHUNKED_CONTENT_MIN_BYTES - 1),
-        LIMITS,
-      ),
+  it("rejects streaming candidates below the chunking threshold", () => {
+    expect(
+      () =>
+        new ChunkedContentPlanBuilder(CHUNKED_CONTENT_MIN_BYTES - 1, LIMITS, {
+          content: () => undefined,
+          recipe: () => undefined,
+        }),
     ).toThrow(RangeError);
-    expect(() =>
-      describeChunkedContent(new Uint8Array(96 * 1024), LIMITS),
-    ).toThrow(/one FastCDC chunk/u);
-    const multiChunk = deterministicBytes(100 * 1024);
-    expect(describeChunkedContent(multiChunk, LIMITS).root.chunkCount).toBe(2);
   });
 
-  it("rejects a canonical recipe root that merely wraps one chunk", () => {
-    const bytes = new Uint8Array(96 * 1024);
-    const chunk = Object.freeze({
-      kind: "content" as const,
-      contentId: contentIdFromBytes(bytes),
-      decodedLength: bytes.byteLength,
-    });
+  it("rejects a canonical recipe root that merely wraps one chunk", async () => {
+    const plan = await buildPlan(deterministicBytes(100 * 1024));
     expect(() =>
-      buildChunkRecipePlan(
-        chunk.contentId,
-        bytes.byteLength,
-        Object.freeze([chunk]),
-        LIMITS,
-      ),
+      encodeRecipeRoot({
+        ...plan.root,
+        chunkCount: 1,
+        child: { ...plan.root.child, chunkCount: 1 },
+      }),
     ).toThrow(/at least two/u);
   });
 
-  it("builds canonical, authenticated objects in children-before-parent order", () => {
+  it("builds canonical, authenticated objects in children-before-parent order", async () => {
     const input = deterministicBytes(1024 * 1024);
-    const plan = describeChunkedContent(input, LIMITS);
+    const plan = await buildPlan(input);
     expect(plan.root.contentId).toBe(contentIdFromBytes(input));
     expect(plan.root.chunkCount).toBe(plan.chunks.length);
     expect(plan.objects.at(-1)?.recipeId).toBe(plan.rootId);
@@ -93,35 +103,22 @@ describe("bounded chunk recipe DAG", () => {
     }
   });
 
-  it("splits large reference sets so every canonical node stays below 32 KiB", () => {
-    const chunkId = parseContentId("ab".repeat(32));
-    const chunks: ContentChunkReference[] = Array.from(
-      { length: 1_000 },
-      () => ({
-        kind: "content",
-        contentId: chunkId,
-        decodedLength: FASTCDC_V1_PROFILE.minimumBytes,
-      }),
+  it("bounds emitted nodes when a content stream requires multiple leaves", async () => {
+    const plan = await buildPlan(deterministicBytes(64 * 1024 * 1024));
+    expect(plan.objects.some(({ value }) => value.kind === "branch")).toBe(
+      true,
     );
-    const decodedLength = chunks.length * FASTCDC_V1_PROFILE.minimumBytes;
-    const plan = buildChunkRecipePlan(
-      parseContentId("cd".repeat(32)),
-      decodedLength,
-      chunks,
-      LIMITS,
-    );
-
-    expect(plan.root.chunkCount).toBe(1_000);
-    expect(plan.root.nodeCount).toBe(4); // root + branch + two leaves
-    expect(plan.objects).toHaveLength(4);
     expect(
-      Math.max(...plan.objects.map((object) => object.bytes.byteLength)),
+      Math.max(...plan.objects.map(({ bytes }) => bytes.byteLength)),
     ).toBeLessThanOrEqual(MAX_RECIPE_OBJECT_BYTES);
+    expect(
+      plan.chunks.reduce((total, chunk) => total + chunk.decodedLength, 0),
+    ).toBe(64 * 1024 * 1024);
   });
 
   it("authenticates and flattens the complete bounded graph", async () => {
     const input = deterministicBytes(2 * 1024 * 1024);
-    const plan = describeChunkedContent(input, LIMITS);
+    const plan = await buildPlan(input);
     const objects = new Map(
       plan.objects.map((object) => [object.recipeId, object.bytes] as const),
     );
@@ -234,7 +231,7 @@ describe("bounded chunk recipe DAG", () => {
 
   it("enforces root identity and decoded-byte, depth, node, and chunk limits", async () => {
     const input = deterministicBytes(1024 * 1024);
-    const plan = describeChunkedContent(input, LIMITS);
+    const plan = await buildPlan(input);
     const rootBytes = plan.objects.at(-1)?.bytes;
     expect(rootBytes).toBeDefined();
     if (rootBytes === undefined) {
@@ -298,9 +295,8 @@ describe("bounded chunk recipe DAG", () => {
 });
 
 describe("streaming chunk representation plan", () => {
-  it("matches the whole-buffer golden plan with bounded chunk callbacks", async () => {
+  it("preserves the published 0.3.2 recipe IDs across streaming boundaries", async () => {
     const input = deterministicBytes(3 * 1024 * 1024);
-    const expected = describeChunkedContent(input, LIMITS);
     const candidates: {
       readonly contentId: string;
       readonly length: number;
@@ -359,10 +355,14 @@ describe("streaming chunk representation plan", () => {
     if (observed.kind !== "chunked") {
       throw new Error("multi-chunk input unexpectedly used a full result");
     }
-    expect(observed.rootId).toBe(expected.rootId);
-    expect(recipeObjects.map((object) => object.bytes)).toEqual(
-      expected.objects.map((object) => object.bytes),
+    // cyclotomy@0.3.2: 3 MiB from the LCG above, fastcdc-v1, default recipe layout.
+    expect(observed.rootId).toBe(
+      "c3c9300eea8a9635b5b9cb045f4419fff32ee87b7a59655b3abc8096e92cfab5",
     );
+    expect(recipeObjects.map(({ recipeId }) => recipeId)).toEqual([
+      "6d2c82bdf533a17374350f3d2d849a8af3afef25521693b08411f2f129f3de92",
+      "c3c9300eea8a9635b5b9cb045f4419fff32ee87b7a59655b3abc8096e92cfab5",
+    ]);
     expect(
       Buffer.concat(candidates.map((candidate) => candidate.bytes)),
     ).toEqual(Buffer.from(input));

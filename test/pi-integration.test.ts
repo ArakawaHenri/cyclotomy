@@ -1,5 +1,7 @@
 import * as garbageCollection from "../src/infrastructure/object-gc.ts";
 import * as workspaceLocks from "../src/infrastructure/workspace-lock.ts";
+import * as workspaceScanning from "../src/infrastructure/workspace-scan.ts";
+import * as objectStores from "../src/infrastructure/object-store.ts";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -10,6 +12,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
   stat,
@@ -43,6 +46,7 @@ import {
 import { testWorkspaceLockIsHeld } from "./workspace-lock-fixture.ts";
 import { scanWorkspace } from "../src/infrastructure/workspace-scan.ts";
 import { registerCyclotomy } from "../src/pi/register.ts";
+import type { SessionExecution } from "../src/pi/pi-host-adapter.ts";
 import {
   createDriftCommandHandler,
   createRestoreCommandHandler,
@@ -535,7 +539,329 @@ describe("checkpoint authority lifecycle", () => {
     });
   });
 
+  describe("execution participation", () => {
+    it.each(["main", "unknown parent"] as const)(
+      "captures a checkpoint for a %s execution",
+      async (kind) => {
+        const root = await realpath(workspace);
+        const execution: SessionExecution =
+          kind === "main"
+            ? { kind: "main", workspaceRoot: root, depth: 0 }
+            : { kind: "subagent", workspaceRoot: root, parent: null, depth: 1 };
+        const pi = new FakePi(
+          workspace,
+          registerCyclotomy,
+          undefined,
+          execution,
+        );
+        const leaf = pi.manager.appendEntry();
+        await writeFile(join(workspace, "a.txt"), "captured");
+
+        await pi.startSession("startup");
+
+        const db = await metadata();
+        try {
+          expect(
+            checkpointState(db, pi.manager.sessionId, leaf.id),
+          ).toBeDefined();
+        } finally {
+          db.close();
+        }
+      },
+    );
+
+    it.each([
+      { name: "same cwd", depth: 1, directory: "" },
+      { name: "different cwd", depth: 1, directory: "nested" },
+      { name: "nested subagent", depth: 2, directory: "nested" },
+    ])(
+      "leaves a shared workspace untouched for $name",
+      async ({ depth, directory }) => {
+        const cwd = join(workspace, directory);
+        await mkdir(cwd, { recursive: true });
+        const root = await realpath(workspace);
+        const execution: SessionExecution = {
+          kind: "subagent",
+          workspaceRoot: root,
+          depth,
+          parent: { sessionId: "parent", cwd: workspace, workspaceRoot: root },
+        };
+        const scan = vi.spyOn(workspaceScanning, "scanWorkspace");
+        const open = vi.spyOn(objectStores, "openObjectStore");
+        const lock = vi.spyOn(workspaceLocks, "acquireWorkspaceLock");
+        const environmentEnabled = process.env.CYCLOTOMY_ENABLED;
+        const pi = new FakePi(cwd, registerCyclotomy, undefined, execution);
+        pi.manager.appendEntry();
+        try {
+          await pi.startSession("startup");
+          await pi.endTurn();
+          expect(pi.notifications).toEqual([]);
+          for (const args of ["", "pause", "resume", "enable"])
+            await pi.runCommand("cyclotomy", args);
+          await pi.runCommand("drift");
+          await pi.runCommand("restore");
+          expect(notified(pi, "cyclotomySharedWorkspace")).toBe(true);
+          expect(notified(pi, "cyclotomyPaused")).toBe(false);
+          expect(notified(pi, "cyclotomyResumeSucceeded")).toBe(false);
+          expect(pi.notifications.every(({ level }) => level === "info")).toBe(
+            true,
+          );
+
+          await pi.reloadExtension();
+          await pi.runCommand("cyclotomy", "resume");
+          await pi.endTurn();
+
+          expect(await readdir(join(home, "cyclotomy"))).toEqual([
+            "settings.json",
+          ]);
+          expect(scan).not.toHaveBeenCalled();
+          expect(open).not.toHaveBeenCalled();
+          expect(lock).not.toHaveBeenCalled();
+          expect(process.env.CYCLOTOMY_ENABLED).toBe(environmentEnabled);
+        } finally {
+          scan.mockRestore();
+          open.mockRestore();
+          lock.mockRestore();
+        }
+      },
+    );
+
+    it.each(["disabled", "memory"] as const)(
+      "preserves the %s session condition for an independent subagent",
+      async (condition) => {
+        if (condition === "disabled") {
+          await writeFile(
+            join(home, "cyclotomy", "settings.json"),
+            JSON.stringify({ enabled: false, locale: "zh-CN" }),
+          );
+        }
+        const manager =
+          condition === "memory"
+            ? new FakeSessionManager("memory", null, workspace)
+            : undefined;
+        const pi = new FakePi(workspace, registerCyclotomy, manager, {
+          kind: "subagent",
+          workspaceRoot: await realpath(workspace),
+          depth: 1,
+          parent: {
+            sessionId: "parent",
+            cwd: home,
+            workspaceRoot: await realpath(home),
+          },
+        });
+        pi.manager.appendEntry();
+        await pi.startSession("startup");
+        await pi.endTurn();
+        await expect(stat(storeRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        await pi.runCommand("cyclotomy");
+        expect(
+          notified(
+            pi,
+            condition === "memory"
+              ? "memorySessionUnsupported"
+              : "cyclotomyPaused",
+          ),
+        ).toBe(true);
+      },
+    );
+
+    it("captures in an independent Git worktree", async () => {
+      await execFileAsync("git", ["-C", workspace, "init", "-q"]);
+      await execFileAsync("git", [
+        "-C",
+        workspace,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "initial",
+      ]);
+      const worktree = join(home, "worktree");
+      await execFileAsync("git", [
+        "-C",
+        workspace,
+        "worktree",
+        "add",
+        "--detach",
+        worktree,
+      ]);
+      const pi = new FakePi(worktree, registerCyclotomy, undefined, {
+        kind: "subagent",
+        workspaceRoot: await realpath(worktree),
+        depth: 1,
+        parent: {
+          sessionId: "parent",
+          cwd: workspace,
+          workspaceRoot: await realpath(workspace),
+        },
+      });
+      const leaf = pi.manager.appendEntry();
+      await writeFile(join(worktree, "a.txt"), "independent");
+      await pi.startSession("startup");
+      const db = await metadataFor(worktree);
+      try {
+        expect(
+          checkpointState(db, pi.manager.sessionId, leaf.id),
+        ).toBeDefined();
+      } finally {
+        db.close();
+      }
+    });
+
+    it("keeps the main engine running when a same-process child pauses, resumes and reloads", async () => {
+      const root = await realpath(workspace);
+      const main = new FakePi(workspace, registerCyclotomy, undefined, {
+        kind: "main",
+        workspaceRoot: root,
+        depth: 0,
+      });
+      const first = main.manager.appendEntry();
+      await main.startSession("startup");
+      const manager = new FakeSessionManager(
+        "child",
+        join(home, "child.jsonl"),
+        workspace,
+      );
+      const child = new FakePi(workspace, registerCyclotomy, manager, {
+        kind: "subagent",
+        workspaceRoot: root,
+        depth: 1,
+        parent: {
+          sessionId: main.manager.sessionId,
+          cwd: workspace,
+          workspaceRoot: root,
+        },
+      });
+      manager.appendEntry();
+      await child.startSession("startup");
+      for (const args of ["pause", "resume", "enable", "disable"])
+        await child.runCommand("cyclotomy", args);
+      await child.reloadExtension();
+      await child.runCommand("cyclotomy", "resume");
+      await child.endTurn();
+      await child.dispose();
+      await writeFile(join(workspace, "a.txt"), "main still captures");
+      await main.endTurn();
+      const db = await metadata();
+      try {
+        expect(
+          checkpointState(db, main.manager.sessionId, first.id),
+        ).toBeDefined();
+        expect(
+          checkpointState(
+            db,
+            main.manager.sessionId,
+            main.manager.getLeafId()!,
+          ),
+        ).toBeDefined();
+        expect(
+          readTestSessionRegistrations(metadataPath()).map(
+            ({ sessionId }) => sessionId,
+          ),
+        ).toEqual([main.manager.sessionId]);
+      } finally {
+        db.close();
+      }
+      await main.runCommand("cyclotomy");
+      expect(notified(main, "cyclotomyRunning")).toBe(true);
+    });
+  });
+
   describe("session start, reload, and turn capture", () => {
+    it.each(["too-large", "read-failure"] as const)(
+      "keeps later checkpoints available after a %s source scan",
+      async (failure) => {
+        await writeFile(
+          join(home, "cyclotomy", "settings.json"),
+          JSON.stringify({
+            locale: "zh-CN",
+            maxFileMiB: 0.001,
+            gc: { intervalMs: 0 },
+          }),
+        );
+        const pi = new FakePi(workspace, registerCyclotomy);
+        const source = pi.manager.appendEntry();
+        await writeFile(join(workspace, "a.txt"), "before");
+        await pi.startSession("startup");
+        const scan =
+          failure === "read-failure"
+            ? vi
+                .spyOn(workspaceScanning, "scanWorkspace")
+                .mockRejectedValueOnce(new Error("temporary read failure"))
+            : undefined;
+        try {
+          if (failure === "too-large")
+            await writeFile(join(workspace, "large.txt"), "x".repeat(2048));
+          expect(await pi.submitInput("continue working")).toBe("continued");
+          await rm(join(workspace, "large.txt"), { force: true });
+          await writeFile(join(workspace, "a.txt"), "after");
+          await pi.endTurn();
+          await pi.runCommand("cyclotomy");
+          expect(notified(pi, "cyclotomyRunning")).toBe(true);
+          expect(notified(pi, "sourceCaptureStopped")).toBe(false);
+          const db = await metadata();
+          try {
+            expect(
+              checkpointIsBlocked(db, pi.manager.sessionId, source.id),
+            ).toBe(true);
+            expect(
+              checkpointState(
+                db,
+                pi.manager.sessionId,
+                pi.manager.getLeafId()!,
+              ),
+            ).toBeDefined();
+          } finally {
+            db.close();
+          }
+        } finally {
+          scan?.mockRestore();
+        }
+      },
+    );
+
+    it("withdraws when a recoverable scan cannot durably protect its source", async () => {
+      const pi = new FakePi(workspace);
+      const runtime = await preparedRuntime();
+      registerPreparedRuntime(pi.api, runtime);
+      pi.manager.appendEntry();
+      await pi.startSession("startup");
+      const scan = vi
+        .spyOn(runtime.checkpoints, "prepareCurrent")
+        .mockResolvedValueOnce({
+          ok: false,
+          error: {
+            kind: "scan-failed",
+            phase: "capture",
+            cause: new Error("temporary read failure"),
+          },
+        });
+      const exact = vi
+        .spyOn(runtime.metadata, "protectLocation")
+        .mockImplementation(() => {
+          throw new Error("protection failed");
+        });
+      const barrier = vi
+        .spyOn(runtime.metadata, "raiseSessionBarrier")
+        .mockImplementation(() => {
+          throw new Error("barrier failed");
+        });
+      try {
+        expect(
+          await pi.submitInput("continue without checkpoint management"),
+        ).toBe("continued");
+        expect(runtime.activation.kind).toBe("unavailable");
+        expect(notified(pi, "sourceCaptureStopped")).toBe(true);
+      } finally {
+        scan.mockRestore();
+        exact.mockRestore();
+        barrier.mockRestore();
+      }
+    });
+
     it("materializes the first observed concrete startup node and reload stays read-only", async () => {
       const pi = new FakePi(workspace);
       registerCyclotomy(pi.api);
@@ -6832,7 +7158,7 @@ describe("checkpoint authority lifecycle", () => {
         let executed = false;
 
         await pi.executeUserBash(
-          "must-not-run",
+          "create marker",
           async () => {
             executed = true;
             await writeFile(join(workspace, "ran"), "yes");
@@ -6843,7 +7169,9 @@ describe("checkpoint authority lifecycle", () => {
         expect(executed).toBe(true);
         expect(pi.manager.getLeafId() === source).toBe(!persistResultEntry);
         await expect(stat(join(workspace, "ran"))).resolves.toBeDefined();
-        expect(notified(pi, "sourceCaptureStopped")).toBe(true);
+        expect(notified(pi, "sourceCaptureDeferred")).toBe(true);
+        await pi.runCommand("cyclotomy");
+        expect(notified(pi, "cyclotomyRunning")).toBe(true);
         const after = await metadata();
         expect(checkpointIsBlocked(after, pi.manager.sessionId, source)).toBe(
           true,
